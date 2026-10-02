@@ -32,15 +32,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            build-essential \
-            cmake \
-            curl \
             libasound2-dev \
             libfontconfig1-dev \
             libfreetype6-dev \
-            libgtk-3-dev \
-            libnss3 \
-            ninja-build \
+            libgtk-4-dev \
+            libwebkitgtk-6.0-dev \
             pkg-config \
             zstd
 
@@ -55,11 +51,12 @@ jobs:
             . -> target
             crates/eclipse-webview -> target
 
-      - name: Install pinned CEF exporter
-        run: cargo install export-cef-dir --version 152.2.0 --locked
-
-      - name: Build and verify the complete CEF payload
-        run: tools/webview-dist/package-webview.sh
+      - name: Build Eclipse and the WebView helper
+        run: |
+          cargo build --release --locked
+          cargo build --release --locked --manifest-path crates/eclipse-webview/Cargo.toml
+          mkdir -p dist/eclipse-linux-x86_64
+          cp target/release/eclipse crates/eclipse-webview/target/release/eclipse-webview dist/eclipse-linux-x86_64/
 
       - name: Create compressed release archive
         run: |

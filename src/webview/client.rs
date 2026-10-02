@@ -1,28 +1,45 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use super::proto::{self, BridgeMethod, ConsumerMsg, CookieEntry, HelperMsg};
-use super::redact;
-use super::{fdpass, hostprobe, shm};
+use super::cef_profile;
+use super::proto::{
+    self, ClearScope, ConsumerMsg, CookiePair, HelperMsg, LoadEvent, StoredCookie, PROTO_VERSION,
+};
+use crate::framework::view_registry;
 
 pub const HELPER_NOT_FOUND_MARKER: &str = "helper binary not found";
 
-pub const NO_DISPLAY_MARKER: &str = "no display connection";
-
-pub const SANDBOX_UNAVAILABLE_MARKER: &str = "sandbox unavailable";
-
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-const SPAWN_RESULT_TIMEOUT: Duration = Duration::from_secs(15);
+const MIGRATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+const SPAWN_RESULT_TIMEOUT: Duration = HANDSHAKE_TIMEOUT
+    .saturating_add(MIGRATION_TIMEOUT)
+    .saturating_add(Duration::from_secs(5));
+
+const HELPER_EXIT_LIMIT: u32 = 3;
+
+const MISSING_LIBRARY_EXIT: i32 = 127;
+
+const DATA_DIR_ENV: &str = "ECLIPSE_WEBVIEW_DATA_DIR";
+
+const CACHE_DIR_ENV: &str = "ECLIPSE_WEBVIEW_CACHE_DIR";
+
+const CEF_PROFILE_DIR: &str = "webview-cef";
+
+const ACTIVATION_TOKEN_ENV: [&str; 2] = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"];
+
+const CLIENT_SETTINGS_SHIM_FILE_NAME: &str = "libeclipse_client_settings_path.so";
+
+const BRIDGE_RESULT_OVER_CAP: &str = "\"eclipse: bridge result exceeds the frame cap\"";
 
 #[derive(Debug, Clone)]
 pub enum ClientError {
@@ -38,9 +55,13 @@ pub enum ClientError {
 
     VersionMismatch { helper_version: u16 },
 
+    Migration(String),
+
     Encode(proto::ProtoError),
 
-    Latched(String),
+    Unavailable(String),
+
+    TimedOut(&'static str),
 
     Internal(&'static str),
 }
@@ -59,7 +80,7 @@ impl std::fmt::Display for ClientError {
                 write!(
                     f,
                     " — set config `webview_helper_path` or ECLIPSE_WEBVIEW_HELPER, or build \
-                     crates/eclipse-webview (cargo build --release with CEF_PATH set)"
+                     crates/eclipse-webview (cargo build --release against GTK 4 and WebKitGTK 6.0)"
                 )
             }
             Self::ExplicitPathMissing { source, path } => {
@@ -70,11 +91,15 @@ impl std::fmt::Display for ClientError {
             Self::Handshake(e) => write!(f, "helper handshake failed: {e}"),
             Self::VersionMismatch { helper_version } => write!(
                 f,
-                "helper protocol version mismatch: helper v{helper_version}, consumer v{}",
-                super::PROTO_VERSION
+                "helper protocol version mismatch: helper v{helper_version}, consumer \
+                 v{PROTO_VERSION}"
             ),
+            Self::Migration(e) => write!(f, "the CEF cookie migration failed: {e}"),
             Self::Encode(e) => write!(f, "message rejected before send: {e}"),
-            Self::Latched(reason) => write!(f, "web engine helper previously failed: {reason}"),
+            Self::Unavailable(reason) => write!(f, "web engine helper unavailable: {reason}"),
+            Self::TimedOut(what) => {
+                write!(f, "the web engine helper did not answer {what} in time")
+            }
             Self::Internal(what) => write!(f, "webview client internal error: {what}"),
         }
     }
@@ -83,36 +108,42 @@ impl std::fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 enum ClientSlot {
-    Unspawned(EarlyCookies),
+    Unspawned,
 
-    Live(Client, EarlyCookies),
+    Live(Client),
+
+    Restarting,
 
     Failed(String),
 }
 
-const RESPAWN_IN_PROGRESS: &str =
-    "the web engine helper is being REPLACED so the User-Agent the app set via \
-     WebSettings.setUserAgentString reaches the engine (CefSettings.user_agent is global and \
-     consumed by CefInitialize) — this op arrived inside the swap window and degrades honestly \
-     rather than being answered from a store that is mid-move (§6 2026-07-16 respawn)";
+impl ClientSlot {
+    fn live(&self) -> Result<&Client, ClientError> {
+        let reason = match self {
+            Self::Live(client) => return Ok(client),
+            Self::Unspawned => "the helper is not running".to_string(),
+            Self::Restarting => {
+                "the helper exited and restarts once its open views are closed".to_string()
+            }
+            Self::Failed(reason) => reason.clone(),
+        };
+        Err(ClientError::Unavailable(reason))
+    }
+}
 
 struct Client {
     child: Child,
 
     writer: UnixStream,
 
-    reader: Option<JoinHandle<()>>,
+    io: JoinHandle<()>,
 
-    upcall: Option<JoinHandle<()>>,
-
-    replaced: Arc<AtomicBool>,
+    upcall: JoinHandle<()>,
 }
 
-static CLIENT: Mutex<ClientSlot> = Mutex::new(ClientSlot::Unspawned(EarlyCookies::new()));
+static CLIENT: Mutex<ClientSlot> = Mutex::new(ClientSlot::Unspawned);
 
-static ACTIVE_VIEW: AtomicI64 = AtomicI64::new(0);
-
-static LIVE_VIEWS: AtomicUsize = AtomicUsize::new(0);
+static UNEXPECTED_EXITS: AtomicU32 = AtomicU32::new(0);
 
 static NEXT_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -125,462 +156,210 @@ pub fn next_request_id() -> u32 {
     }
 }
 
-static APP_USER_AGENT: Mutex<Option<String>> = Mutex::new(None);
-
-static HELPER_UA_FIXED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn normalize_app_user_agent(ua: Option<String>) -> Option<String> {
-    ua.filter(|s| !s.is_empty())
-}
-
-pub fn set_app_user_agent(ua: Option<String>) {
-    let ua = normalize_app_user_agent(ua);
-
-    if let Some(t0) = FIRST_DEFER_AT.get() {
-        let outstanding = DEFERRED_CB_IDS.lock().map(|ids| ids.len()).unwrap_or(0);
-        tracing::warn!(
-            target: "android.webkit.WebSettings",
-            outstanding,
-            elapsed_ms = t0.elapsed().as_millis(),
-            "ECLIPSE-DEFER-CB ua-set — the app reached WebSettings.setUserAgentString with \
-             {outstanding} probe-deferred setCookie ValueCallback(s) STILL unanswered. If a \
-             load-drive follows, the app TOLERATES the deferred reply and the ordering fix \
-             completes with no fabrication (§5 2026-07-16 ⏳➜🎲 / ☠️)."
-        );
-    }
-
-    if HELPER_UA_FIXED.load(Ordering::Relaxed) {
-        tracing::warn!(
-            target: "android.webkit.WebSettings",
-            ua = ua.as_deref().unwrap_or("<reset to default>"),
-            "setUserAgentString called AFTER the LIVE helper's engine User-Agent was fixed at its \
-             spawn — CefSettings.user_agent is global and consumed by CefInitialize, so THIS engine \
-             cannot present it. 2026-07-16 (§6 respawn): that is now RECOVERABLE — if a load-drive \
-             follows while no browser exists, the helper is REPLACED with one carrying this string \
-             (`maybe_respawn_for_app_ua`, which names its verdict either way). This WARN means the \
-             early spawn cost a wasted CefInitialize, NOT that the UA is lost."
-        );
-    }
-    match APP_USER_AGENT.lock() {
-        Ok(mut slot) => {
-            tracing::info!(
-                target: "android.webkit.WebSettings",
-                ua = ua.as_deref().unwrap_or("<reset to default>"),
-                "the app set its WebView User-Agent via WebSettings.setUserAgentString — Eclipse will \
-                 present it (AOSP contract: null/empty resets to the default)"
-            );
-            *slot = ua;
-        }
-
-        Err(_) => tracing::warn!(
-            target: "android.webkit.WebSettings",
-            "setUserAgentString: the app-UA store is poisoned — Eclipse's fallback UA stands"
-        ),
-    }
-}
-
-pub fn app_user_agent() -> Option<String> {
-    APP_USER_AGENT.lock().ok().and_then(|s| s.clone())
-}
-
-static HELPER_BOOT_UA: Mutex<Option<String>> = Mutex::new(None);
-
-fn helper_boot_ua() -> Option<String> {
-    HELPER_BOOT_UA.lock().ok().and_then(|s| s.clone())
-}
-
-fn ua_diag_forced() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ECLIPSE_WEBVIEW_UA_DIAG").is_ok_and(|v| !v.is_empty()))
-}
-
-fn defer_cookie_cb_enabled(v: Option<&str>) -> bool {
-    v == Some("1")
-}
-
-fn defer_cookie_cb() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let raw = std::env::var("ECLIPSE_WEBVIEW_DEFER_COOKIE_CB").ok();
-        let on = defer_cookie_cb_enabled(raw.as_deref());
-        if on {
-            tracing::warn!(
-                target: "android.webkit.CookieManager",
-                "ECLIPSE-DEFER-CB probe ENABLED (ECLIPSE_WEBVIEW_DEFER_COOKIE_CB=1) — a DEV-HOST \
-                 DIAGNOSTIC, never a default boot and never a fix. An early 3-arg setCookie(url, \
-                 value, ValueCallback) will now BUFFER like a 2-arg set instead of cold-starting the \
-                 helper, and its ValueCallback is held UNANSWERED until the flush replays the \
-                 app's ORIGINAL frame to the live engine (the REAL flag then routes back unchanged \
-                 — nothing is fabricated, nothing is dropped). AOSP states no deadline for this \
-                 callback; whether the APP tolerates the delay is exactly what this measures. If \
-                 the app stalls, this boot stalls — that IS the result."
-            );
-        }
-        on
-    })
-}
-
-static DEFERRED_CB_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
-static FIRST_DEFER_AT: OnceLock<Instant> = OnceLock::new();
-
-fn deferred_cb_request_id(msg: &ConsumerMsg) -> Option<u32> {
-    match msg {
-        ConsumerMsg::CookieSetForResult { request_id, .. } => Some(*request_id),
-        _ => None,
-    }
-}
-
-fn note_deferred_callback(request_id: u32) {
-    let _ = FIRST_DEFER_AT.set(Instant::now());
-    let outstanding = match DEFERRED_CB_IDS.lock() {
-        Ok(mut ids) => {
-            ids.push(request_id);
-            ids.len()
-        }
-        Err(_) => 0,
-    };
-    tracing::warn!(
-        target: "android.webkit.CookieManager",
-        outstanding,
-        "ECLIPSE-DEFER-CB deferred id={request_id} — holding the app's 3-arg setCookie \
-         ValueCallback UNANSWERED so this op does not cold-start the helper (and fix the engine's \
-         global User-Agent before the app has set its own). The app's ORIGINAL frame is buffered \
-         verbatim; the REAL flag is routed at flush. Watch for `ECLIPSE-DEFER-CB ua-set` — if it \
-         arrives, the app did NOT block on this callback."
-    );
-}
-
-fn note_deferred_callback_answered(request_id: u32, ok: bool) {
-    if !defer_cookie_cb() {
-        return;
-    }
-    let held = match DEFERRED_CB_IDS.lock() {
-        Ok(mut ids) => {
-            let before = ids.len();
-            ids.retain(|id| *id != request_id);
-            before != ids.len()
-        }
-        Err(_) => false,
-    };
-    if !held {
-        return;
-    }
-    let waited_ms = FIRST_DEFER_AT
-        .get()
-        .map(|t0| t0.elapsed().as_millis())
-        .unwrap_or_default();
-    tracing::warn!(
-        target: "android.webkit.CookieManager",
-        waited_ms,
-        "ECLIPSE-DEFER-CB answered id={request_id} ok={ok} — the ENGINE's REAL success flag \
-         reached the app's ValueCallback (not a fabricated one). The deferral cost the app this \
-         much wait for its reply and nothing else."
-    );
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Deferral {
-    Buffer,
-
-    NeedsEngine(&'static str),
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum SendOutcome {
-    Sent,
-
-    Buffered,
-}
-
-struct EarlyCookies {
-    mutations: Vec<ConsumerMsg>,
-
-    replayable: bool,
-}
-
-impl EarlyCookies {
-    const CAP: usize = 256;
-
-    const fn new() -> Self {
-        Self {
-            mutations: Vec::new(),
-            replayable: true,
-        }
-    }
-
-    fn push_mutation(&mut self, msg: &ConsumerMsg) {
-        if self.mutations.len() < Self::CAP {
-            self.mutations.push(msg.clone());
-            return;
-        }
-        tracing::warn!(
-            target: "android.webkit.CookieManager",
-            cap = Self::CAP,
-            "the webview cookie-mutation log hit its bound — it can no longer reproduce the \
-             engine's changes over the persistent store, so the app-UA respawn is now REFUSED \
-             for this boot. Honest degradation: the engine keeps the User-Agent it booted with."
-        );
-        self.replayable = false;
-    }
-
-    fn record_sent(&mut self, msg: &ConsumerMsg) {
-        if !self.replayable {
-            return;
-        }
-        match msg {
-            ConsumerMsg::CookieSet { .. } | ConsumerMsg::CookieSetForResult { .. } => {
-                self.push_mutation(msg);
-            }
-
-            ConsumerMsg::CookiesClear { .. } | ConsumerMsg::CookiesClearSession { .. } => {
-                self.push_mutation(msg);
-            }
-
-            ConsumerMsg::CookieGet { .. } | ConsumerMsg::CookieFlush { .. } => {}
-            _ => {}
-        }
-    }
-
-    fn retire(&mut self) {
-        self.mutations.clear();
-        self.replayable = false;
-    }
-
-    #[cfg(test)]
-    fn holds_unanswered_callback(&self) -> bool {
-        self.mutations
-            .iter()
-            .any(|m| deferred_cb_request_id(m).is_some())
-    }
-
-    fn offer(&mut self, msg: &ConsumerMsg, defer_cb: bool) -> Deferral {
-        match msg {
-
-            ConsumerMsg::CookieSet { .. } if self.mutations.len() < Self::CAP => {
-                self.mutations.push(msg.clone());
-                Deferral::Buffer
-            }
-            ConsumerMsg::CookieSet { .. } => {
-                Deferral::NeedsEngine("the deferred-cookie buffer is full")
-            }
-
-            ConsumerMsg::CookieSetForResult { .. }
-                if defer_cb && self.mutations.len() < Self::CAP =>
-            {
-                self.mutations.push(msg.clone());
-                Deferral::Buffer
-            }
-            ConsumerMsg::CookieSetForResult { .. } if defer_cb => {
-                Deferral::NeedsEngine("the deferred-cookie buffer is full")
-            }
-            ConsumerMsg::CookieSetForResult { .. } => Deferral::NeedsEngine(
-                "setCookie(url, value, ValueCallback) — only the engine yields the REAL success flag",
-            ),
-            ConsumerMsg::CookiesClear { .. } => Deferral::NeedsEngine(
-                "removeAllCookies — the persistent store may contain prior-boot cookies",
-            ),
-            ConsumerMsg::CookiesClearSession { .. } => Deferral::NeedsEngine(
-                "removeSessionCookies — only CEF can identify cookies without an expiry",
-            ),
-            ConsumerMsg::CookieGet { .. } => Deferral::NeedsEngine(
-                "getCookie — CEF owns the persistent jar and url/domain/path matching",
-            ),
-            ConsumerMsg::CookieFlush { .. } => Deferral::NeedsEngine(
-                "CookieManager.flush — only CEF can confirm persistent-store completion",
-            ),
-            _ => Deferral::NeedsEngine("an op that needs the engine reached the pre-engine gate"),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct DrawnRect {
-    view: i64,
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-}
-
-struct Shared {
-    views: Mutex<HashMap<i64, ViewShared>>,
-
-    rect: Mutex<Option<(i32, i32, u32, u32)>>,
-
-    screen_rect: Mutex<Option<DrawnRect>>,
-
-    cookie_get_waiters: Mutex<HashMap<u32, mpsc::Sender<Vec<CookieEntry>>>>,
-
-    cookie_flush_waiters: Mutex<HashMap<u32, mpsc::Sender<bool>>>,
-}
-
-fn shared() -> &'static Arc<Shared> {
-    static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
-    SHARED.get_or_init(|| {
-        Arc::new(Shared {
-            views: Mutex::new(HashMap::new()),
-            rect: Mutex::new(None),
-            screen_rect: Mutex::new(None),
-            cookie_get_waiters: Mutex::new(HashMap::new()),
-            cookie_flush_waiters: Mutex::new(HashMap::new()),
-        })
-    })
-}
-
-struct FrameBuffer {
-    mapping: shm::FrameMapping,
-    generation: u32,
-    width: u16,
-    height: u16,
-    stride: u32,
-    slot_bytes: u32,
-}
-
-impl FrameBuffer {
-    fn slot(&self, slot: u8) -> Option<&[u8]> {
-        let slot_bytes = self.slot_bytes as usize;
-        self.mapping
-            .slice(slot_bytes.checked_mul(usize::from(slot))?, slot_bytes)
-    }
-}
-
-struct HeldFrame {
-    slot: u8,
-    seq: u32,
-}
-
-enum FrameSource {
-    Empty,
-
-    Announced(FrameBuffer),
-
-    Holding {
-        buffer: FrameBuffer,
-        held: HeldFrame,
-    },
-
-    Resizing {
-        buffer: FrameBuffer,
-        held: HeldFrame,
-        next: FrameBuffer,
-    },
-}
-
-enum FrameReadyOutcome {
-    Ignored,
-
-    Held { released: Option<u32> },
-}
-
-impl FrameSource {
-    fn announce(&mut self, next: FrameBuffer) {
-        *self = match std::mem::replace(self, Self::Empty) {
-            Self::Empty | Self::Announced(_) => Self::Announced(next),
-            Self::Holding { buffer, held } | Self::Resizing { buffer, held, .. } => {
-                Self::Resizing { buffer, held, next }
-            }
-        };
-    }
-
-    fn on_frame_ready(&mut self, generation: u32, slot: u8, seq: u32) -> FrameReadyOutcome {
-        let incoming = HeldFrame { slot, seq };
-        let accepts =
-            |buffer: &FrameBuffer| buffer.generation == generation && buffer.slot(slot).is_some();
-        let (next, outcome) = match std::mem::replace(self, Self::Empty) {
-            Self::Announced(buffer) if accepts(&buffer) => (
-                Self::Holding {
-                    buffer,
-                    held: incoming,
-                },
-                FrameReadyOutcome::Held { released: None },
-            ),
-            Self::Holding { buffer, held } if accepts(&buffer) => (
-                Self::Holding {
-                    buffer,
-                    held: incoming,
-                },
-                FrameReadyOutcome::Held {
-                    released: Some(held.seq),
-                },
-            ),
-            Self::Resizing { next, .. } if accepts(&next) => (
-                Self::Holding {
-                    buffer: next,
-                    held: incoming,
-                },
-                FrameReadyOutcome::Held { released: None },
-            ),
-            unchanged => (unchanged, FrameReadyOutcome::Ignored),
-        };
-        *self = next;
-        outcome
-    }
-
-    fn latest(&self) -> Option<Stage<'_>> {
-        let (buffer, held) = match self {
-            Self::Holding { buffer, held } | Self::Resizing { buffer, held, .. } => (buffer, held),
-            Self::Empty | Self::Announced(_) => return None,
-        };
-        Some(Stage {
-            bytes: buffer.slot(held.slot)?,
-            width: u32::from(buffer.width),
-            height: u32::from(buffer.height),
-            stride: buffer.stride,
-            generation: buffer.generation,
-            seq: held.seq,
-        })
-    }
-}
-
-pub struct Stage<'a> {
-    pub bytes: &'a [u8],
-    pub width: u32,
-    pub height: u32,
-
-    pub stride: u32,
-    pub generation: u32,
-
-    pub seq: u32,
-}
-
-enum ViewPhase {
-    Open,
-
-    Closing { redrive: Option<Redrive> },
-}
-
-struct Redrive {
-    target: DriveTarget,
-    width: u16,
-    height: u16,
-}
-
-struct ViewShared {
-    phase: ViewPhase,
-
-    driven_url: String,
-
-    log_target: String,
-    frames: FrameSource,
-    started: bool,
-    finished_http: Option<i32>,
-    can_go_back: bool,
-
-    upcalls_ok: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LoadObserved {
     pub started: bool,
-    pub finished_http: Option<i32>,
-    pub upcalls_ok: u32,
+    pub finished: bool,
+    pub load_upcalls: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ShutdownReport {
-    pub helper_exit: Option<i32>,
-    pub reader_joined: bool,
+#[derive(Default)]
+struct ViewEntry {
+    created: bool,
+
+    user_agent: Option<String>,
+
+    bridges: BTreeMap<String, Vec<String>>,
+
+    shown: bool,
+
+    url: Option<String>,
+
+    can_go_back: bool,
+
+    back_closes: bool,
+
+    observed: LoadObserved,
+}
+
+impl ViewEntry {
+    fn window_visible(&self) -> bool {
+        self.created && self.shown
+    }
+
+    fn back_navigates(&self) -> bool {
+        self.can_go_back && !self.back_closes
+    }
+
+    fn close_on_back(&mut self) {
+        self.back_closes = true;
+    }
+
+    fn creation(&mut self, view: i64) -> Vec<ConsumerMsg> {
+        if self.created {
+            return Vec::new();
+        }
+        self.created = true;
+        let mut batch = vec![ConsumerMsg::CreateView { view }];
+        if let Some(user_agent) = &self.user_agent {
+            batch.push(ConsumerMsg::SetUserAgent {
+                view,
+                user_agent: user_agent.clone(),
+            });
+        }
+        batch.extend(
+            self.bridges
+                .iter()
+                .map(|(name, methods)| ConsumerMsg::BridgeRegister {
+                    view,
+                    name: name.clone(),
+                    methods: methods.clone(),
+                }),
+        );
+        batch
+    }
+
+    fn load_batch(&mut self, view: i64, shown: bool, load: ConsumerMsg) -> Vec<ConsumerMsg> {
+        let was_visible = self.window_visible();
+        let mut batch = self.creation(view);
+        self.shown = shown;
+        batch.extend(visibility_change(view, was_visible, self.window_visible()));
+        self.observed = LoadObserved::default();
+        self.back_closes = false;
+        batch.push(load);
+        batch
+    }
+
+    fn show(&mut self, view: i64, shown: bool) -> Option<ConsumerMsg> {
+        let was_visible = self.window_visible();
+        self.shown = shown;
+        if !self.window_visible() {
+            self.back_closes = false;
+        }
+        visibility_change(view, was_visible, self.window_visible())
+    }
+}
+
+fn visibility_change(view: i64, was_visible: bool, visible: bool) -> Option<ConsumerMsg> {
+    (was_visible != visible).then_some(ConsumerMsg::SetVisible { view, visible })
+}
+
+struct Views {
+    entries: BTreeMap<i64, ViewEntry>,
+
+    closing: BTreeSet<i64>,
+}
+
+impl Views {
+    const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            closing: BTreeSet::new(),
+        }
+    }
+
+    fn publish(&self) {
+        TRACKED_VIEWS.store(self.entries.len(), Ordering::Release);
+        VISIBLE_VIEWS.store(
+            self.entries
+                .values()
+                .filter(|entry| entry.window_visible())
+                .count(),
+            Ordering::Release,
+        );
+    }
+
+    fn created(&mut self, view: i64) -> Option<&mut ViewEntry> {
+        self.entries.get_mut(&view).filter(|entry| entry.created)
+    }
+
+    fn activation_target(&self, last: i64) -> Option<i64> {
+        let visible = |view: &i64| {
+            self.entries
+                .get(view)
+                .is_some_and(ViewEntry::window_visible)
+        };
+        Some(last).filter(visible).or_else(|| {
+            self.entries
+                .iter()
+                .rev()
+                .find(|(_, entry)| entry.window_visible())
+                .map(|(view, _)| *view)
+        })
+    }
+
+    fn reset_after_helper_loss(&mut self) -> usize {
+        let visible = self
+            .entries
+            .values()
+            .filter(|entry| entry.window_visible())
+            .count();
+        for entry in self.entries.values_mut() {
+            entry.created = false;
+            entry.url = None;
+            entry.can_go_back = false;
+        }
+        self.closing.clear();
+        visible
+    }
+}
+
+static VIEWS: Mutex<Views> = Mutex::new(Views::new());
+
+static TRACKED_VIEWS: AtomicUsize = AtomicUsize::new(0);
+
+static VISIBLE_VIEWS: AtomicUsize = AtomicUsize::new(0);
+
+static ACTIVATION_TARGET: AtomicI64 = AtomicI64::new(0);
+
+static ACTIVATION_WANTED: AtomicBool = AtomicBool::new(false);
+
+static COOKIE_GETS: Mutex<BTreeMap<u32, mpsc::Sender<Vec<CookiePair>>>> =
+    Mutex::new(BTreeMap::new());
+
+static COOKIE_FLUSHES: Mutex<BTreeMap<u32, mpsc::Sender<bool>>> = Mutex::new(BTreeMap::new());
+
+fn lock_client() -> Result<MutexGuard<'static, ClientSlot>, ClientError> {
+    CLIENT
+        .lock()
+        .map_err(|_| ClientError::Internal("client lock poisoned"))
+}
+
+fn lock_views() -> Result<MutexGuard<'static, Views>, ClientError> {
+    VIEWS
+        .lock()
+        .map_err(|_| ClientError::Internal("views lock poisoned"))
+}
+
+fn encode(msg: &ConsumerMsg) -> Result<Vec<u8>, ClientError> {
+    msg.encode().map_err(ClientError::Encode)
+}
+
+fn encode_all(batch: &[ConsumerMsg]) -> Result<Vec<Vec<u8>>, ClientError> {
+    batch.iter().map(encode).collect()
+}
+
+fn write_frames(slot: &ClientSlot, frames: &[Vec<u8>]) -> Result<(), ClientError> {
+    let client = slot.live()?;
+    for frame in frames {
+        (&mut &client.writer).write_all(frame).map_err(|e| {
+            ClientError::Unavailable(format!("control-socket write failed: {}", e.kind()))
+        })?;
+    }
+    Ok(())
+}
+
+fn note_visibility(batch: &[ConsumerMsg]) {
+    for msg in batch {
+        if let ConsumerMsg::SetVisible {
+            view,
+            visible: true,
+        } = msg
+        {
+            ACTIVATION_TARGET.store(*view, Ordering::Release);
+            ACTIVATION_WANTED.store(true, Ordering::Release);
+        }
+    }
 }
 
 fn resolve_helper_from(
@@ -629,7 +408,20 @@ fn resolve_helper_from(
     Err(ClientError::HelperNotFound { probed })
 }
 
-const CLIENT_SETTINGS_SHIM_FILE_NAME: &str = "libeclipse_client_settings_path.so";
+fn resolve_helper() -> Result<PathBuf, ClientError> {
+    let config_path = crate::config::Config::load()
+        .ok()
+        .and_then(|c| c.webview_helper_path)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let env_override = std::env::var_os("ECLIPSE_WEBVIEW_HELPER");
+    let exe = std::env::current_exe().ok();
+    resolve_helper_from(
+        config_path.as_deref(),
+        env_override.as_deref(),
+        exe.as_deref(),
+    )
+}
 
 fn helper_ld_preload(inherited: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
     use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
@@ -646,123 +438,81 @@ fn helper_ld_preload(inherited: &std::ffi::OsStr) -> Option<std::ffi::OsString> 
     (!kept.is_empty()).then(|| std::ffi::OsString::from_vec(kept.join(&b':')))
 }
 
-fn resolve_helper() -> Result<PathBuf, ClientError> {
-    let config_path = crate::config::Config::load()
-        .ok()
-        .and_then(|c| c.webview_helper_path)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-    let env_override = std::env::var_os("ECLIPSE_WEBVIEW_HELPER");
-    let exe = std::env::current_exe().ok();
-    resolve_helper_from(
-        config_path.as_deref(),
-        env_override.as_deref(),
-        exe.as_deref(),
-    )
-}
-
-fn prepare_webview_data_root_from(base: &Path, current_dir: &Path) -> Result<PathBuf, ClientError> {
+fn prepare_private_dir(requested: &Path) -> Result<PathBuf, ClientError> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let absolute_base = if base.is_absolute() {
-        base.to_path_buf()
-    } else {
-        current_dir.join(base)
-    };
-    let requested = absolute_base.join("webview-cef");
-    std::fs::create_dir_all(&requested)
+    std::fs::create_dir_all(requested)
         .map_err(|e| ClientError::Storage(format!("cannot create {}: {e}", requested.display())))?;
-    let root = requested.canonicalize().map_err(|e| {
+    let dir = requested.canonicalize().map_err(|e| {
         ClientError::Storage(format!("cannot canonicalize {}: {e}", requested.display()))
     })?;
-    if root.to_str().is_none() {
-        return Err(ClientError::Storage(format!(
-            "CEF requires a UTF-8 profile path, but {} is not UTF-8",
-            root.display()
-        )));
-    }
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
         ClientError::Storage(format!(
             "cannot restrict {} to owner-only mode 0700: {e}",
-            root.display()
+            dir.display()
         ))
     })?;
-    Ok(root)
+    Ok(dir)
 }
 
-fn prepare_webview_data_root() -> Result<PathBuf, ClientError> {
-    let base = crate::framework::app_data_dir().ok_or_else(|| {
+struct Storage {
+    data: PathBuf,
+    cache: PathBuf,
+    cef_profile: PathBuf,
+}
+
+fn webview_storage() -> Result<Storage, ClientError> {
+    let app_data = crate::framework::app_data_dir().ok_or_else(|| {
         ClientError::Storage(
             "no XDG/home app-data directory is available; set ECLIPSE_APP_DATA_DIR to an \
              absolute writable directory"
                 .to_string(),
         )
     })?;
-    let current_dir = std::env::current_dir()
-        .map_err(|e| ClientError::Storage(format!("cannot resolve current directory: {e}")))?;
-    prepare_webview_data_root_from(&base, &current_dir)
+    let dirs = directories::ProjectDirs::from("", "", "eclipse").ok_or_else(|| {
+        ClientError::Storage(
+            "no XDG/home cache directory is available; set XDG_CACHE_HOME or HOME".to_string(),
+        )
+    })?;
+    Ok(Storage {
+        data: prepare_private_dir(&app_data.join("webview"))?,
+        cache: prepare_private_dir(&dirs.cache_dir().join("webview"))?,
+        cef_profile: app_data.join(CEF_PROFILE_DIR),
+    })
 }
 
-fn spawn_helper_process() -> Result<(UnixStream, Child, hostprobe::ProbeOutcome), ClientError> {
-    use std::os::unix::process::CommandExt as _;
-
+fn spawn_helper_process(storage: &Storage) -> Result<(UnixStream, Child), ClientError> {
     let helper = resolve_helper()?;
-    let webview_data_root = prepare_webview_data_root()?;
-
-    let probe = match helper.parent() {
-        Some(dir) => hostprobe::probe(dir),
-        None => hostprobe::ProbeOutcome::Unavailable("helper path has no parent dir".to_string()),
-    };
-    match hostprobe::log_line(&probe) {
-        (false, line) => tracing::info!("{line}"),
-        (true, line) => tracing::warn!("{line}"),
-    }
-    let (parent_end, child_end) =
-        UnixStream::pair().map_err(|e| ClientError::Spawn(format!("socketpair failed: {e}")))?;
     let mut cmd = std::process::Command::new(&helper);
-    cmd.arg("--ipc-fd=3");
-
-    cmd.env("ECLIPSE_WEBVIEW_DATA_DIR", &webview_data_root);
-
+    cmd.env(DATA_DIR_ENV, &storage.data)
+        .env(CACHE_DIR_ENV, &storage.cache);
+    for name in ACTIVATION_TOKEN_ENV {
+        cmd.env_remove(name);
+    }
     if let Some(inherited) = std::env::var_os("LD_PRELOAD") {
         match helper_ld_preload(&inherited) {
             Some(preload) => cmd.env("LD_PRELOAD", preload),
             None => cmd.env_remove("LD_PRELOAD"),
         };
     }
+    let spawned = spawn_with_control_socket(cmd)
+        .map_err(|e| ClientError::Spawn(format!("spawn {} failed: {e}", helper.display())))?;
+    tracing::info!(
+        helper = %helper.display(),
+        "eclipse-webview helper spawned (fd-3 socketpair, exits when the socket closes, no URL \
+         in argv)"
+    );
+    Ok(spawned)
+}
 
-    if crate::config::Config::load()
-        .map(|c| c.webview_allow_unsandboxed)
-        .unwrap_or(false)
-    {
-        cmd.arg("--allow-unsandboxed");
-    }
+fn spawn_with_control_socket(
+    mut cmd: std::process::Command,
+) -> std::io::Result<(UnixStream, Child)> {
+    use std::os::unix::process::CommandExt as _;
 
-    let boot_ua = app_user_agent();
-    if let Some(ua) = &boot_ua {
-        cmd.env("ECLIPSE_WEBVIEW_APP_UA", ua);
-    }
-    if let Ok(mut slot) = HELPER_BOOT_UA.lock() {
-        *slot = boot_ua;
-    }
-
-    HELPER_UA_FIXED.store(true, Ordering::Relaxed);
-
-    if let Some(dir) = helper.parent() {
-        let mut ld = dir.as_os_str().to_owned();
-        if let Some(inherited) = std::env::var_os("LD_LIBRARY_PATH") {
-            if !inherited.is_empty() {
-                ld.push(":");
-                ld.push(inherited);
-            }
-        }
-        cmd.env("LD_LIBRARY_PATH", ld);
-    }
-    let child_fd = child_end
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(|e| ClientError::Spawn(format!("fd clone failed: {e}")))?;
-
+    let (parent_end, child_end) = UnixStream::pair()?;
+    let child_fd = child_end.as_fd().try_clone_to_owned()?;
+    cmd.arg("--ipc-fd=3");
     unsafe {
         use std::os::fd::AsRawFd as _;
         let raw = child_fd.as_raw_fd();
@@ -774,63 +524,17 @@ fn spawn_helper_process() -> Result<(UnixStream, Child, hostprobe::ProbeOutcome)
             } else if libc::dup2(raw, 3) != 3 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
             Ok(())
         });
     }
-    let child = cmd
-        .spawn()
-        .map_err(|e| ClientError::Spawn(format!("spawn {} failed: {e}", helper.display())))?;
-    drop(child_fd);
-    drop(child_end);
-    tracing::info!(
-        helper = %helper.display(),
-        "eclipse-webview helper spawned (fd-3 socketpair, PDEATHSIG, no URL in argv)"
-    );
-    Ok((parent_end, child, probe))
-}
-
-fn enrich_spawn_failure(
-    base: ClientError,
-    probe: &hostprobe::ProbeOutcome,
-    status: Option<std::process::ExitStatus>,
-) -> ClientError {
-    let ClientError::Handshake(inner) = &base else {
-        return base;
-    };
-    let Some(code) = status.and_then(|s| s.code()) else {
-        return base;
-    };
-    match probe {
-        hostprobe::ProbeOutcome::Report(r) if !r.missing.is_empty() => {
-            ClientError::Handshake(format!(
-                "helper exited before HelloAck (exit status {code}) — the dynamic linker could \
-                 not start the CEF payload; missing host libraries per the pre-spawn probe: {} \
-                 — install them and retry (handshake: {inner})",
-                r.display_missing()
-            ))
-        }
-        hostprobe::ProbeOutcome::PayloadMissing { libcef_path } => ClientError::Handshake(format!(
-            "helper exited before HelloAck (exit status {code}) — the CEF payload (libcef.so) is \
-             missing at {} — run tools/webview-dist/package-webview.sh, or build \
-             crates/eclipse-webview with CEF_PATH set (handshake: {inner})",
-            libcef_path.display()
-        )),
-        _ => ClientError::Handshake(format!(
-            "{inner} (helper exit status {code}) — likely a missing host library; run: \
-             ldd <helper-dir>/libcef.so"
-        )),
-    }
+    let child = cmd.spawn()?;
+    Ok((parent_end, child))
 }
 
 fn perform_handshake(stream: &UnixStream, timeout: Duration) -> Result<String, ClientError> {
-    let hello = ConsumerMsg::Hello {
-        version: super::PROTO_VERSION,
-    }
-    .encode()
-    .map_err(ClientError::Encode)?;
+    let hello = encode(&ConsumerMsg::Hello {
+        version: PROTO_VERSION,
+    })?;
     (&mut &*stream)
         .write_all(&hello)
         .map_err(|e| ClientError::Handshake(format!("Hello write failed: {}", e.kind())))?;
@@ -844,10 +548,11 @@ fn perform_handshake(stream: &UnixStream, timeout: Duration) -> Result<String, C
                     helper_version: version,
                 });
             }
-            let _ = stream.set_read_timeout(None);
+            stream.set_read_timeout(None).map_err(|e| {
+                ClientError::Handshake(format!("clearing the read timeout failed: {}", e.kind()))
+            })?;
             Ok(engine)
         }
-
         Ok(other) => Err(ClientError::Handshake(format!(
             "expected HelloAck, got {}",
             other.name()
@@ -858,308 +563,316 @@ fn perform_handshake(stream: &UnixStream, timeout: Duration) -> Result<String, C
     }
 }
 
+fn with_exit_status(error: ClientError, status: Option<std::process::ExitStatus>) -> ClientError {
+    match (error, status.and_then(|s| s.code())) {
+        (ClientError::Handshake(reason), Some(MISSING_LIBRARY_EXIT)) => {
+            ClientError::Handshake(format!(
+                "{reason} (helper exit status {MISSING_LIBRARY_EXIT}: a library it needs is \
+                 missing; install GTK 4.10+ and WebKitGTK 6.0 2.42+)"
+            ))
+        }
+        (ClientError::Handshake(reason), Some(code)) => {
+            ClientError::Handshake(format!("{reason} (helper exit status {code})"))
+        }
+        (error, _) => error,
+    }
+}
+
+fn cef_profile_to_import(storage: &Storage) -> Option<PathBuf> {
+    let profile = &storage.cef_profile;
+    match profile.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => {
+            tracing::warn!(
+                profile = %profile.display(),
+                "cannot look for the CEF WebView profile, so its cookies were not migrated: {e}"
+            );
+            return None;
+        }
+    }
+    let webkit_store = storage.data.join(proto::PERSISTENT_COOKIE_FILE);
+    if !matches!(webkit_store.try_exists(), Ok(false)) {
+        tracing::warn!(
+            profile = %profile.display(),
+            "keeping the CEF WebView profile without migrating it, because the WebKit cookie \
+             store already exists and the old cookies could replace newer ones"
+        );
+        return None;
+    }
+    Some(profile.clone())
+}
+
+enum Import {
+    Saved,
+
+    Unsaved(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MigrationStage {
+    Importing { request_id: u32 },
+
+    Flushing { request_id: u32 },
+}
+
+#[derive(Debug)]
+struct Migration {
+    profile: PathBuf,
+
+    total: usize,
+
+    stage: MigrationStage,
+}
+
+enum MigrationStep {
+    Send(Migration, ConsumerMsg),
+
+    Done(Migration, Import),
+
+    Unrelated(Migration, HelperMsg),
+}
+
+impl Migration {
+    fn start(profile: &Path, cookies: Vec<StoredCookie>) -> (Self, ConsumerMsg) {
+        let request_id = next_request_id();
+        let migration = Self {
+            profile: profile.to_path_buf(),
+            total: cookies.len(),
+            stage: MigrationStage::Importing { request_id },
+        };
+        (
+            migration,
+            ConsumerMsg::CookieImport {
+                request_id,
+                cookies,
+            },
+        )
+    }
+
+    fn advance(self, msg: HelperMsg) -> MigrationStep {
+        match (self.stage, msg) {
+            (
+                MigrationStage::Importing { request_id },
+                HelperMsg::CookieImportResult {
+                    request_id: answered,
+                    imported,
+                    ..
+                },
+            ) if answered == request_id => {
+                if usize::try_from(imported) != Ok(self.total) {
+                    let reason = format!("the helper stored {imported} of {} cookies", self.total);
+                    return MigrationStep::Done(self, Import::Unsaved(reason));
+                }
+                let request_id = next_request_id();
+                MigrationStep::Send(
+                    Self {
+                        stage: MigrationStage::Flushing { request_id },
+                        ..self
+                    },
+                    ConsumerMsg::CookieFlush { request_id },
+                )
+            }
+            (
+                MigrationStage::Flushing { request_id },
+                HelperMsg::CookieFlushed {
+                    request_id: answered,
+                    ok,
+                },
+            ) if answered == request_id => {
+                let outcome = if ok {
+                    Import::Saved
+                } else {
+                    Import::Unsaved("the helper could not save the imported cookies".to_string())
+                };
+                MigrationStep::Done(self, outcome)
+            }
+            (_, msg) => MigrationStep::Unrelated(self, msg),
+        }
+    }
+
+    fn conclude(self, outcome: Import) {
+        let profile = self.profile.display();
+        match outcome {
+            Import::Unsaved(reason) => tracing::warn!(
+                %profile,
+                reason,
+                "keeping the CEF WebView profile because the WebKit cookie store did not save its \
+                 cookies"
+            ),
+            Import::Saved => match std::fs::remove_dir_all(&self.profile) {
+                Ok(()) => tracing::info!(
+                    cookies = self.total,
+                    "migrated the CEF WebView cookies into the WebKit cookie store and removed the \
+                     CEF profile"
+                ),
+                Err(e) => tracing::error!(
+                    %profile,
+                    cookies = self.total,
+                    "migrated the CEF WebView cookies but cannot remove the CEF profile: {e}"
+                ),
+            },
+        }
+    }
+}
+
+fn migrate_cef_profile(
+    stream: &UnixStream,
+    profile: &Path,
+    now: SystemTime,
+    timeout: Duration,
+) -> Result<Option<Migration>, ClientError> {
+    let cookies = match cef_profile::read_cookies(profile, now) {
+        Ok(cookies) => cookies,
+        Err(e) => {
+            tracing::warn!(
+                profile = %profile.display(),
+                reason = %e,
+                "keeping the CEF WebView profile because its cookies cannot be migrated"
+            );
+            return Ok(None);
+        }
+    };
+    let (migration, import) = Migration::start(profile, cookies);
+    let frame = match encode(&import) {
+        Ok(frame) => frame,
+        Err(e) => {
+            migration.conclude(Import::Unsaved(e.to_string()));
+            return Ok(None);
+        }
+    };
+    send_migration_frame(stream, &frame)?;
+    let pending = await_migration(stream, migration, Instant::now() + timeout);
+    stream.set_read_timeout(None).map_err(|e| {
+        ClientError::Migration(format!("clearing the read timeout failed: {}", e.kind()))
+    })?;
+    pending
+}
+
+fn await_migration(
+    stream: &UnixStream,
+    mut migration: Migration,
+    deadline: Instant,
+) -> Result<Option<Migration>, ClientError> {
+    loop {
+        let Some(msg) = read_migration_reply(stream, deadline)? else {
+            tracing::warn!(
+                profile = %migration.profile.display(),
+                "the helper has not finished importing the CEF WebView cookies; the migration \
+                 completes when it answers"
+            );
+            return Ok(Some(migration));
+        };
+        migration = match migration.advance(msg) {
+            MigrationStep::Send(next, request) => {
+                send_migration_frame(stream, &encode(&request)?)?;
+                next
+            }
+            MigrationStep::Done(done, outcome) => {
+                done.conclude(outcome);
+                return Ok(None);
+            }
+            MigrationStep::Unrelated(_, other) => {
+                return Err(ClientError::Migration(format!(
+                    "expected the cookie migration's reply, got {}",
+                    other.name()
+                )))
+            }
+        };
+    }
+}
+
+fn send_migration_frame(stream: &UnixStream, frame: &[u8]) -> Result<(), ClientError> {
+    (&mut &*stream)
+        .write_all(frame)
+        .map_err(|e| ClientError::Migration(format!("write failed: {}", e.kind())))
+}
+
+fn read_migration_reply(
+    stream: &UnixStream,
+    deadline: Instant,
+) -> Result<Option<HelperMsg>, ClientError> {
+    let Some(remaining) = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+    else {
+        return Ok(None);
+    };
+    stream
+        .set_read_timeout(Some(remaining))
+        .map_err(|e| ClientError::Migration(format!("set_read_timeout failed: {}", e.kind())))?;
+    match proto::read_helper_msg(&mut &*stream) {
+        Ok(HelperMsg::Fatal { reason }) => Err(ClientError::Unavailable(reason)),
+        Ok(msg) => Ok(Some(msg)),
+        Err(proto::ProtoError::Io(
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut,
+        )) => Ok(None),
+        Err(e) => Err(ClientError::Migration(format!("protocol error: {e}"))),
+    }
+}
+
+struct Spawned {
+    child: Child,
+    writer: UnixStream,
+    upcall: JoinHandle<()>,
+}
+
 fn spawn_client(java_vm: jni::vm::JavaVM) -> Result<Client, ClientError> {
-    let (tx, rx) = mpsc::channel::<SpawnVerdict>();
-    let shared = Arc::clone(shared());
-    let handle = std::thread::Builder::new()
+    let (tx, rx) = mpsc::channel::<Result<Spawned, ClientError>>();
+    let io = std::thread::Builder::new()
         .name("eclipse-webview-io".into())
-        .spawn(move || io_thread_main(&tx, &shared, java_vm))
+        .spawn(move || io_thread_main(&tx, java_vm))
         .map_err(|e| ClientError::Spawn(format!("io-thread spawn failed: {e}")))?;
     match rx.recv_timeout(SPAWN_RESULT_TIMEOUT) {
         Ok(Ok(spawned)) => Ok(Client {
             child: spawned.child,
             writer: spawned.writer,
-            reader: Some(handle),
-            upcall: Some(spawned.upcall),
-            replaced: spawned.replaced,
+            io,
+            upcall: spawned.upcall,
         }),
         Ok(Err(e)) => {
-            let _ = handle.join();
+            let _ = io.join();
             Err(e)
         }
-
         Err(_) => Err(ClientError::Handshake(
             "helper spawn/handshake verdict timed out".into(),
         )),
     }
 }
 
-fn ensure_spawned(
-    slot: &mut ClientSlot,
-    java_vm: jni::vm::JavaVM,
-    trigger: &str,
-) -> Result<(), ClientError> {
-    let (deferred, replayable) = match slot {
-        ClientSlot::Unspawned(early) => (std::mem::take(&mut early.mutations), early.replayable),
-        _ => return Ok(()),
-    };
-    tracing::info!(
-        trigger,
-        app_ua_known = app_user_agent().is_some(),
-        deferred = deferred.len(),
-        "cold-starting the eclipse-webview helper — this FIXES the engine's global \
-         CefSettings.user_agent for the whole life of THIS helper (§6 2026-07-16 🩹➜⛔; a load-drive \
-         REPLACES it if the app's UA arrived too late — `maybe_respawn_for_app_ua`)"
-    );
-    match spawn_client(java_vm) {
-        Ok(client) => *slot = ClientSlot::Live(client, EarlyCookies::new()),
-        Err(e) => {
-            *slot = ClientSlot::Failed(e.to_string());
-            return Err(e);
-        }
-    }
-
-    for msg in &deferred {
-        if let Some(request_id) = deferred_cb_request_id(msg) {
-            tracing::warn!(
-                target: "android.webkit.CookieManager",
-                "ECLIPSE-DEFER-CB replay id={request_id} — replaying the app's ORIGINAL 3-arg \
-                 setCookie frame to the now-live engine; its ValueCallback will be answered with \
-                 the engine's REAL flag, exactly as it is without the probe"
-            );
-        }
-        send_locked(slot, msg)?;
-    }
-
-    if let ClientSlot::Live(_, log) = slot {
-        log.mutations = deferred;
-        log.replayable = replayable;
-    }
-    Ok(())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum RespawnVerdict {
-    Respawn,
-
-    Keep(&'static str),
-}
-
-fn respawn_verdict(
-    app_ua: Option<&str>,
-    boot_ua: Option<&str>,
-    ua_diag_forced: bool,
-    live_views: usize,
-    log_replayable: bool,
-    ops_in_flight: usize,
-) -> RespawnVerdict {
-    if ua_diag_forced {
-        return RespawnVerdict::Keep(
-            "ECLIPSE_WEBVIEW_UA_DIAG is forcing a diagnostic User-Agent, which OUTRANKS the app's \
-             in the helper's own ladder — a replacement would boot the identical string",
-        );
-    }
-    let Some(app_ua) = app_ua else {
-        return RespawnVerdict::Keep(
-            "the app never called WebSettings.setUserAgentString — the helper's fallback \
-             User-Agent is already the right answer",
-        );
-    };
-    if boot_ua == Some(app_ua) {
-        return RespawnVerdict::Keep(
-            "the live helper already booted with the User-Agent the app set — nothing to correct",
-        );
-    }
-    if live_views != 0 {
-        return RespawnVerdict::Keep(
-            "a WebView already has a browser — replacing the helper would DESTROY it, and a \
-             network Set-Cookie may have populated the store behind the log; degrading to the \
-             User-Agent the engine booted with (the pre-respawn behaviour, said out loud)",
-        );
-    }
-    if !log_replayable {
-        return RespawnVerdict::Keep(
-            "the cookie log can no longer reproduce the engine's store (bound reached, or a \
-             browser retired it) — a replay would silently LOSE cookies, which is exactly the \
-             lossy read-back this design refuses",
-        );
-    }
-    if ops_in_flight != 0 {
-        return RespawnVerdict::Keep(
-            "an app cookie operation is still in flight against the live helper — tearing it down \
-             would answer that ValueCallback false for a cookie the replay then sets",
-        );
-    }
-    RespawnVerdict::Respawn
-}
-
-const RESPAWN_TEARDOWN_DEADLINE: Duration = Duration::from_secs(3);
-
-fn ops_in_flight() -> usize {
-    let get_parked = shared()
-        .cookie_get_waiters
-        .lock()
-        .map(|w| w.len())
-        .unwrap_or(0);
-    let flush_parked = shared()
-        .cookie_flush_waiters
-        .lock()
-        .map(|w| w.len())
-        .unwrap_or(0);
-    crate::framework::webview_callbacks_in_flight() + get_parked + flush_parked
-}
-
-fn maybe_respawn_for_app_ua() -> bool {
-    let (old, log) = {
-        let mut slot = match CLIENT.lock() {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        let ClientSlot::Live(_, log) = &*slot else {
-            return false;
-        };
-        let app_ua = app_user_agent();
-        let boot_ua = helper_boot_ua();
-        let verdict = respawn_verdict(
-            app_ua.as_deref(),
-            boot_ua.as_deref(),
-            ua_diag_forced(),
-            LIVE_VIEWS.load(Ordering::Relaxed),
-            log.replayable,
-            ops_in_flight(),
-        );
-        match verdict {
-            RespawnVerdict::Keep(reason) => {
-                tracing::info!(
-                    target: "android.webkit.WebSettings",
-                    reason,
-                    app_ua_known = app_ua.is_some(),
-                    "webview client: NOT replacing the helper for the app's User-Agent"
-                );
-                return false;
-            }
-            RespawnVerdict::Respawn => {}
-        }
-        let Some((old, log)) = take_for_replacement(&mut slot) else {
-            return false;
-        };
-
-        HELPER_UA_FIXED.store(false, Ordering::Relaxed);
-        tracing::info!(
-            target: "android.webkit.WebSettings",
-            boot_ua = boot_ua.as_deref().unwrap_or("<the Eclipse fallback literal>"),
-            app_ua = app_ua.as_deref().unwrap_or(""),
-            logged_mutations = log.mutations.len(),
-            "webview client: REPLACING the eclipse-webview helper so the engine presents the \
-             User-Agent the app set via WebSettings.setUserAgentString — CefSettings.user_agent is \
-             global and consumed by CefInitialize, so an engine that booted on the wrong one can \
-             only be replaced, never corrected (§6 2026-07-16 respawn). The old helper never \
-             created a browser, so the ordered logged mutations completely describe its changes \
-             over the same persistent base; they replay into the replacement verbatim."
-        );
-        (old, log)
-    };
-
-    teardown_replaced_helper(old);
-
-    if let Ok(mut slot) = CLIENT.lock() {
-        if matches!(&*slot, ClientSlot::Failed(r) if r == RESPAWN_IN_PROGRESS) {
-            *slot = ClientSlot::Unspawned(log);
-            return true;
-        }
-        tracing::warn!(
-            "webview client: the helper replacement was overtaken (a shutdown raced the swap) — \
-             the cookie log is dropped and the winning state stands"
-        );
-    }
-    false
-}
-
-fn take_for_replacement(slot: &mut ClientSlot) -> Option<(Client, EarlyCookies)> {
-    let ClientSlot::Live(old, log) =
-        std::mem::replace(slot, ClientSlot::Failed(RESPAWN_IN_PROGRESS.to_string()))
-    else {
-        return None;
-    };
-    old.replaced.store(true, Ordering::Release);
-    Some((old, log))
-}
-
-fn teardown_replaced_helper(mut old: Client) {
-    ACTIVE_VIEW.store(0, Ordering::Relaxed);
-    if let Ok(bytes) = ConsumerMsg::Shutdown.encode() {
-        let _ = (&mut &old.writer).write_all(&bytes);
-    }
-    let t0 = Instant::now();
-    let mut exit: Option<i32> = None;
-    while t0.elapsed() < RESPAWN_TEARDOWN_DEADLINE {
-        match old.child.try_wait() {
-            Ok(Some(status)) => {
-                exit = status.code();
-                break;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(_) => break,
-        }
-    }
-    let killed = exit.is_none();
-    if killed {
-        let _ = old.child.kill();
-        if let Ok(status) = old.child.wait() {
-            exit = status.code();
-        }
-    }
-
-    let reader_joined = old.reader.take().map(|h| h.join().is_ok()).unwrap_or(false);
-    drop(old.upcall.take());
-    if killed || !reader_joined {
-        tracing::warn!(
-            killed,
-            reader_joined,
-            helper_exit = exit,
-            "webview client: the replaced helper did not exit cleanly — its CEF children may still \
-             hold the root_cache_path process singleton, which can make the replacement's \
-             CefInitialize exit early (pinned bindings: \"only a single app instance is allowed to \
-             run for a given CefSettings.root_cache_path value\")"
-        );
-    } else {
-        tracing::info!(
-            helper_exit = exit,
-            "webview client: the replaced helper exited cleanly (no views ⇒ cef_shutdown ran ⇒ its \
-             CEF children and the process singleton are released)"
-        );
-    }
-}
-
-struct SpawnedHelper {
-    writer: UnixStream,
-    child: Child,
-    upcall: JoinHandle<()>,
-    replaced: Arc<AtomicBool>,
-}
-
-type SpawnVerdict = Result<SpawnedHelper, ClientError>;
-
-static IO_THREAD_ID: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
-
-fn io_thread_main(tx: &mpsc::Sender<SpawnVerdict>, shared: &Arc<Shared>, java_vm: jni::vm::JavaVM) {
-    if let Ok(mut id) = IO_THREAD_ID.lock() {
-        *id = Some(std::thread::current().id());
-    }
-    let (stream, mut child, probe) = match spawn_helper_process() {
-        Ok(x) => x,
+fn io_thread_main(tx: &mpsc::Sender<Result<Spawned, ClientError>>, java_vm: jni::vm::JavaVM) {
+    let spawned = webview_storage().and_then(|storage| {
+        let cef_profile = cef_profile_to_import(&storage);
+        spawn_helper_process(&storage).map(|spawned| (cef_profile, spawned))
+    });
+    let (cef_profile, (stream, mut child)) = match spawned {
+        Ok(spawned) => spawned,
         Err(e) => {
             let _ = tx.send(Err(e));
             return;
         }
     };
-    match perform_handshake(&stream, HANDSHAKE_TIMEOUT) {
-        Ok(engine) => {
-            tracing::info!(
-                %engine,
-                protocol = u64::from(super::PROTO_VERSION),
-                "eclipse-webview helper handshake complete"
-            );
-        }
+    let started = perform_handshake(&stream, HANDSHAKE_TIMEOUT).and_then(|engine| {
+        tracing::info!(
+            %engine,
+            protocol = u64::from(PROTO_VERSION),
+            "eclipse-webview helper handshake complete"
+        );
+        cef_profile.map_or(Ok(None), |profile| {
+            migrate_cef_profile(&stream, &profile, SystemTime::now(), MIGRATION_TIMEOUT)
+        })
+    });
+    let migration = match started {
+        Ok(migration) => migration,
         Err(e) => {
             let _ = child.kill();
             let status = child.wait().ok();
-            let _ = tx.send(Err(enrich_spawn_failure(e, &probe, status)));
+            let _ = tx.send(Err(with_exit_status(e, status)));
             return;
         }
-    }
+    };
     let writer = match stream.try_clone() {
-        Ok(w) => w,
+        Ok(writer) => writer,
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -1169,16 +882,12 @@ fn io_thread_main(tx: &mpsc::Sender<SpawnVerdict>, shared: &Arc<Shared>, java_vm
             return;
         }
     };
-
-    let (up_tx, up_rx) = mpsc::channel::<UpcallEvent>();
-    let upcall_shared = Arc::clone(shared);
-    let replaced = Arc::new(AtomicBool::new(false));
-    let upcall_replaced = Arc::clone(&replaced);
-    let upcall_handle = match std::thread::Builder::new()
+    let (up_tx, up_rx) = mpsc::channel::<Upcall>();
+    let upcall = match std::thread::Builder::new()
         .name("eclipse-webview-upcall".into())
-        .spawn(move || upcall_thread_main(&up_rx, &upcall_shared, &java_vm, &upcall_replaced))
+        .spawn(move || upcall_thread_main(&up_rx, &java_vm))
     {
-        Ok(h) => h,
+        Ok(handle) => handle,
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -1188,203 +897,73 @@ fn io_thread_main(tx: &mpsc::Sender<SpawnVerdict>, shared: &Arc<Shared>, java_vm
             return;
         }
     };
-    if let Err(mpsc::SendError(returned)) = tx.send(Ok(SpawnedHelper {
-        writer,
+    if let Err(mpsc::SendError(Ok(mut spawned))) = tx.send(Ok(Spawned {
         child,
-        upcall: upcall_handle,
-        replaced,
+        writer,
+        upcall,
     })) {
-        if let Ok(mut spawned) = returned {
-            let _ = spawned.child.kill();
-            let _ = spawned.child.wait();
-        }
+        let _ = spawned.child.kill();
+        let _ = spawned.child.wait();
         return;
     }
-    reader_loop(&stream, shared, &up_tx);
-
-    wake_all_blocking_cookie_waiters();
+    reader_loop(&stream, &up_tx, migration);
 }
 
-struct Upcall {
-    widget: i64,
-    state: i32,
-
-    url: String,
-}
-
-#[derive(Default)]
-struct DispatchOut {
-    replies: Vec<ConsumerMsg>,
-    upcalls: Vec<Upcall>,
-
-    staged_view: Option<i64>,
-
-    closed: Vec<i64>,
-
-    redrives: Vec<(i64, Redrive)>,
-
-    bridge_calls: Vec<(i64, u32, String)>,
-
-    eval_results: Vec<(u32, bool, String)>,
-
-    cookie_set_results: Vec<(u32, bool)>,
-
-    cookie_lists: Vec<(u32, Vec<CookieEntry>)>,
-
-    cookie_flush_results: Vec<(u32, bool)>,
-
-    cookie_clear_results: Vec<(u32, bool)>,
-    fatal: bool,
-
-    fatal_reason: Option<String>,
-}
-
-fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut {
-    let mut out = DispatchOut::default();
-    match msg {
-        HelperMsg::LoadState {
-            view,
-            state,
-            http_status,
-        } => match views.get_mut(&view) {
-            Some(vs) => {
-                if state == 0 {
-                    vs.started = true;
-                } else {
-                    vs.finished_http = Some(http_status);
-                }
-                out.upcalls.push(Upcall {
-                    widget: view,
-                    state: i32::from(state),
-                    url: vs.driven_url.clone(),
-                });
+fn ensure_live(slot: &mut ClientSlot, java_vm: jni::vm::JavaVM) -> Result<(), ClientError> {
+    match slot {
+        ClientSlot::Live(_) => Ok(()),
+        ClientSlot::Unspawned => match spawn_client(java_vm) {
+            Ok(client) => {
+                *slot = ClientSlot::Live(client);
+                Ok(())
             }
-
-            None => {
-                tracing::debug!(
-                    view,
-                    state,
-                    "webview client: LoadState for an untracked view (no upcall fabricated)"
-                );
+            Err(e) => {
+                *slot = ClientSlot::Failed(e.to_string());
+                Err(e)
             }
         },
-        HelperMsg::FrameReady {
-            view,
-            generation,
-            slot,
-            seq,
-        } => {
-            if let Some(vs) = views.get_mut(&view) {
-                match vs.frames.on_frame_ready(generation, slot, seq) {
-                    FrameReadyOutcome::Held { released } => {
-                        out.staged_view = Some(view);
-                        if let Some(seq) = released {
-                            out.replies.push(ConsumerMsg::FrameAck {
-                                view,
-                                generation,
-                                seq,
-                            });
-                        }
-                    }
-                    FrameReadyOutcome::Ignored => {}
-                }
-            }
-        }
-        HelperMsg::Console { view, console } => {
-            tracing::info!(
-                view,
-                severity = console.severity(),
-                source = console.source(),
-                line = console.line(),
-                len = console.message_len(),
-                "webview helper console event"
-            );
-        }
-        HelperMsg::Crash { view, kind, code } => {
-            out.fatal = true;
-
-            out.fatal_reason = Some(match (kind, code) {
-                (1, 2) => format!(
-                    "web engine sandbox refused in the helper (crash kind=1 code=2) — \
-                     {SANDBOX_UNAVAILABLE_MARKER}: this host has neither unprivileged user \
-                     namespaces nor a SUID chrome-sandbox; fixes: enable unprivileged user \
-                     namespaces (sysctl kernel.unprivileged_userns_clone=1 and \
-                     user.max_user_namespaces>0; on Ubuntu 23.10+ also \
-                     kernel.apparmor_restrict_unprivileged_userns=0 or an AppArmor profile), OR \
-                     install chrome-sandbox beside libcef.so as root:root mode 4755, OR set \
-                     config webview_allow_unsandboxed=true to accept a loud unsandboxed \
-                     degradation"
-                ),
-                (1, 3) => "web engine init failed in the helper (crash kind=1 code=3) — \
-                           persistent webview storage is unavailable or violates CEF's absolute \
-                           root/cache-path contract; verify ECLIPSE_APP_DATA_DIR is writable"
-                    .to_string(),
-
-                (1, code) => format!(
-                    "web engine init failed in the helper (crash kind=1 code={code}) — \
-                     {NO_DISPLAY_MARKER} or ozone selection failure"
-                ),
-                (k, code) => format!("helper crash (view={view} kind={k} code={code})"),
-            });
-        }
-        HelperMsg::ViewClosed { view } => {
-            if let Some(vs) = views.remove(&view) {
-                out.closed.push(view);
-                if let ViewPhase::Closing {
-                    redrive: Some(redrive),
-                } = vs.phase
-                {
-                    out.redrives.push((view, redrive));
-                }
-            }
-        }
-
-        HelperMsg::BridgeCall {
-            view,
-            call_id,
-            payload_json,
-        } => out.bridge_calls.push((view, call_id, payload_json)),
-        HelperMsg::EvaluateJsResult {
-            request_id,
-            ok,
-            value_json,
-        } => out.eval_results.push((request_id, ok, value_json)),
-        HelperMsg::CookieSetResult { request_id, ok } => {
-            out.cookie_set_results.push((request_id, ok))
-        }
-        HelperMsg::CookieList {
-            request_id,
-            cookies,
-        } => out.cookie_lists.push((request_id, cookies)),
-        HelperMsg::CookieFlushDone { request_id, ok } => {
-            out.cookie_flush_results.push((request_id, ok));
-        }
-        HelperMsg::CookiesClearDone {
-            request_id,
-            removed,
-        } => out.cookie_clear_results.push((request_id, removed)),
-        HelperMsg::NavigationState { view, can_go_back } => {
-            if let Some(state) = views.get_mut(&view) {
-                state.can_go_back = can_go_back;
-            }
-        }
-
-        other @ (HelperMsg::HelloAck { .. } | HelperMsg::FrameBufferNew { .. }) => {
-            tracing::debug!(
-                msg = other.name(),
-                "webview client: ignoring out-of-phase helper message"
-            );
-        }
+        ClientSlot::Restarting | ClientSlot::Failed(_) => slot.live().map(|_| ()),
     }
-    out
 }
 
-enum UpcallEvent {
+pub struct NavigationRequest {
+    pub url: String,
+    pub method: String,
+    pub redirect: bool,
+    pub user_gesture: bool,
+}
+
+enum Upcall {
     LoadChanged {
-        widget: i64,
+        view: i64,
         state: i32,
         url: String,
     },
+
+    Progress {
+        view: i64,
+        percent: u8,
+    },
+
+    LoadFailed {
+        view: i64,
+        url: String,
+        code: i32,
+        description: String,
+    },
+
+    ResourceLoad {
+        view: i64,
+        url: String,
+    },
+
+    Policy {
+        view: i64,
+        policy_id: u32,
+        request: NavigationRequest,
+    },
+
+    Back,
 
     BridgeCall {
         view: i64,
@@ -1392,7 +971,7 @@ enum UpcallEvent {
         payload_json: String,
     },
 
-    EvalResult {
+    EvaluateJsResult {
         request_id: u32,
         ok: bool,
         value_json: String,
@@ -1403,310 +982,455 @@ enum UpcallEvent {
         ok: bool,
     },
 
-    CookiesClearResult {
+    CookiesCleared {
         request_id: u32,
         removed: bool,
     },
 
-    ViewClosedDrain {
-        widget: i64,
+    ViewClosed {
+        view: i64,
         upto_era: u64,
+    },
+
+    HelperGone {
+        visible_views: usize,
     },
 }
 
-fn upcall_thread_main(
-    rx: &mpsc::Receiver<UpcallEvent>,
-    shared: &Arc<Shared>,
-    java_vm: &jni::vm::JavaVM,
-    replaced: &AtomicBool,
-) {
-    while let Ok(event) = rx.recv() {
-        match event {
-            UpcallEvent::LoadChanged { widget, state, url } => {
-                let fired = crate::framework::fire_web_view_internal_load_changed(
-                    java_vm, widget, state, &url,
-                );
-                if fired {
-                    if let Ok(mut views) = shared.views.lock() {
-                        if let Some(vs) = views.get_mut(&widget) {
-                            vs.upcalls_ok += 1;
-                        }
-                    }
-                }
-            }
-            UpcallEvent::BridgeCall {
-                view,
-                call_id,
-                payload_json,
-            } => {
-                let (ok, result_json) =
-                    crate::framework::fire_bridge_call(java_vm, view, call_id, &payload_json);
-                match bridge_result_frame(call_id, ok, result_json) {
-                    Ok(frame) if write_frame_if_live(&frame) => {}
-                    Ok(_) => reader_fatal("control-socket write failed (BridgeResult)"),
-                    Err(e) => reader_fatal(&format!("BridgeResult encode failed: {e}")),
-                }
-            }
-            UpcallEvent::EvalResult {
-                request_id,
-                ok,
-                value_json,
-            } => {
-                crate::framework::fire_evaluate_js_result(java_vm, request_id, ok, &value_json);
-            }
-            UpcallEvent::CookieSetResult { request_id, ok } => {
-                note_deferred_callback_answered(request_id, ok);
-                crate::framework::fire_cookie_set_result(java_vm, request_id, ok);
-            }
-            UpcallEvent::CookiesClearResult {
-                request_id,
-                removed,
-            } => {
-                crate::framework::fire_cookies_clear_result(java_vm, request_id, removed);
-            }
-            UpcallEvent::ViewClosedDrain { widget, upto_era } => {
-                crate::framework::drop_bridges_for_view_closed(widget, upto_era);
-                crate::framework::drain_eval_callbacks_for_view(java_vm, widget, upto_era);
-            }
-        }
-    }
+enum Routed {
+    Upcall(Upcall),
 
-    if replaced.load(Ordering::Acquire) {
-        tracing::info!(
-            "webview client: the replaced helper's upcall thread exits without draining — every \
-             outstanding ValueCallback belongs to the replacement helper"
-        );
-        return;
-    }
-    crate::framework::drain_all_webview_callbacks(java_vm, "web engine helper connection closed");
+    Handled,
+
+    Fatal(String),
 }
 
-fn reader_loop(stream: &UnixStream, shared: &Arc<Shared>, upcalls: &mpsc::Sender<UpcallEvent>) {
+fn route(msg: HelperMsg, views: &mut Views) -> Routed {
+    let upcall = match msg {
+        HelperMsg::HelloAck { .. } => {
+            return Routed::Fatal("protocol violation: HelloAck after the handshake".into())
+        }
+        HelperMsg::Fatal { reason } => return Routed::Fatal(reason),
+        HelperMsg::LoadChanged { view, event, url } => {
+            let Some(entry) = views.created(view) else {
+                return Routed::Handled;
+            };
+            match event {
+                LoadEvent::Started => entry.observed.started = true,
+                LoadEvent::Finished => entry.observed.finished = true,
+                LoadEvent::Redirected | LoadEvent::Committed => {}
+            }
+            if event == LoadEvent::Redirected {
+                return Routed::Handled;
+            }
+            Upcall::LoadChanged {
+                view,
+                state: event.android_state(),
+                url,
+            }
+        }
+        HelperMsg::NavigationState {
+            view,
+            url,
+            title: _,
+            can_go_back,
+        } => {
+            if let Some(entry) = views.created(view) {
+                entry.url = Some(url).filter(|url| !url.is_empty());
+                entry.can_go_back = can_go_back;
+            }
+            return Routed::Handled;
+        }
+        HelperMsg::Progress { view, percent } => {
+            if views.created(view).is_none() {
+                return Routed::Handled;
+            }
+            Upcall::Progress { view, percent }
+        }
+        HelperMsg::LoadFailed {
+            view,
+            url,
+            error,
+            description,
+        } => {
+            if views.created(view).is_none() {
+                return Routed::Handled;
+            }
+            Upcall::LoadFailed {
+                view,
+                url,
+                code: error.android_code(),
+                description,
+            }
+        }
+        HelperMsg::ResourceLoad { view, url } => {
+            if views.created(view).is_none() {
+                return Routed::Handled;
+            }
+            Upcall::ResourceLoad { view, url }
+        }
+        HelperMsg::PolicyRequest {
+            view,
+            policy_id,
+            url,
+            redirect,
+            user_gesture,
+            method,
+        } => {
+            if views.created(view).is_none() {
+                return Routed::Handled;
+            }
+            Upcall::Policy {
+                view,
+                policy_id,
+                request: NavigationRequest {
+                    url,
+                    method,
+                    redirect,
+                    user_gesture,
+                },
+            }
+        }
+        HelperMsg::CloseRequested { view } => {
+            let Some(entry) = views.created(view).filter(|entry| entry.window_visible()) else {
+                return Routed::Handled;
+            };
+            entry.close_on_back();
+            Upcall::Back
+        }
+        HelperMsg::WebProcessGone { view } => {
+            let Some(entry) = views.created(view) else {
+                return Routed::Handled;
+            };
+            entry.close_on_back();
+            tracing::warn!(
+                view,
+                "the web process of a WebView ended; closing the view on the Roblox side"
+            );
+            if !entry.window_visible() {
+                return Routed::Handled;
+            }
+            Upcall::Back
+        }
+        HelperMsg::ViewClosed { view } => {
+            views.closing.remove(&view);
+            Upcall::ViewClosed {
+                view,
+                upto_era: crate::framework::bump_webview_close_era(),
+            }
+        }
+        HelperMsg::BridgeCall {
+            view,
+            call_id,
+            payload_json,
+        } => Upcall::BridgeCall {
+            view,
+            call_id,
+            payload_json,
+        },
+        HelperMsg::EvaluateJsResult {
+            request_id,
+            ok,
+            value_json,
+        } => Upcall::EvaluateJsResult {
+            request_id,
+            ok,
+            value_json,
+        },
+        HelperMsg::CookieSetResult { request_id, ok } => Upcall::CookieSetResult { request_id, ok },
+        HelperMsg::CookiesCleared {
+            request_id,
+            removed,
+        } => Upcall::CookiesCleared {
+            request_id,
+            removed,
+        },
+        HelperMsg::CookieImportResult {
+            request_id,
+            imported,
+            failed,
+        } => {
+            tracing::warn!(
+                request_id,
+                imported,
+                failed,
+                "webview client: a cookie import result matches no CEF cookie migration"
+            );
+            return Routed::Handled;
+        }
+        HelperMsg::CookieList {
+            request_id,
+            cookies,
+        } => {
+            deliver(&COOKIE_GETS, request_id, cookies);
+            return Routed::Handled;
+        }
+        HelperMsg::CookieFlushed { request_id, ok } => {
+            deliver(&COOKIE_FLUSHES, request_id, ok);
+            return Routed::Handled;
+        }
+    };
+    Routed::Upcall(upcall)
+}
+
+fn deliver<T>(waiters: &Mutex<BTreeMap<u32, mpsc::Sender<T>>>, request_id: u32, value: T) {
+    let waiter = waiters
+        .lock()
+        .ok()
+        .and_then(|mut waiters| waiters.remove(&request_id));
+    match waiter {
+        Some(tx) => {
+            let _ = tx.send(value);
+        }
+        None => tracing::debug!(
+            request_id,
+            "webview client: a cookie reply arrived after its caller stopped waiting"
+        ),
+    }
+}
+
+fn wake_all_cookie_waiters() {
+    if let Ok(mut waiters) = COOKIE_GETS.lock() {
+        waiters.clear();
+    }
+    if let Ok(mut waiters) = COOKIE_FLUSHES.lock() {
+        waiters.clear();
+    }
+}
+
+fn reader_loop(
+    stream: &UnixStream,
+    upcalls: &mpsc::Sender<Upcall>,
+    mut migration: Option<Migration>,
+) {
     loop {
         let msg = match proto::read_helper_msg(&mut &*stream) {
-            Ok(m) => m,
+            Ok(msg) => msg,
             Err(proto::ProtoError::Eof) => {
-                reader_fatal("helper closed the control socket (EOF)");
+                helper_lost(
+                    Loss::Exited("the helper closed its control socket".into()),
+                    upcalls,
+                );
                 return;
             }
             Err(e) => {
-                reader_fatal(&format!("protocol error from helper: {e}"));
+                helper_lost(
+                    Loss::Exited(format!("protocol error from the helper: {e}")),
+                    upcalls,
+                );
                 return;
             }
         };
-        if let HelperMsg::FrameBufferNew {
-            view,
-            generation,
-            width,
-            height,
-            stride,
-            slot_bytes,
-            slot_count,
-        } = msg
-        {
-            let fd = match fdpass::recv_fd_after_sentinel(stream) {
-                Ok(f) => f,
-                Err(e) => {
-                    reader_fatal(&format!("frame-buffer fd receive failed: {e}"));
-                    return;
+        let msg = match migration.take() {
+            None => msg,
+            Some(pending) => match pending.advance(msg) {
+                MigrationStep::Send(next, request) => {
+                    send_reply(&request);
+                    migration = Some(next);
+                    continue;
                 }
-            };
-            let expected = slot_bytes as usize * usize::from(slot_count);
-
-            let mapping = match shm::map_frame_buffer(fd.as_fd(), expected) {
-                Ok(m) => m,
-                Err(e) => {
-                    reader_fatal(&format!("frame-buffer memfd rejected: {e}"));
-                    return;
+                MigrationStep::Done(done, outcome) => {
+                    done.conclude(outcome);
+                    continue;
                 }
-            };
-            match shared.views.lock() {
-                Ok(mut views) => match views.get_mut(&view) {
-                    Some(vs) => {
-                        vs.frames.announce(FrameBuffer {
-                            mapping,
-                            generation,
-                            width,
-                            height,
-                            stride,
-                            slot_bytes,
-                        });
-                    }
-                    None => {
-                        tracing::debug!(
-                            view,
-                            generation,
-                            "webview client: frame buffer for an untracked view (dropped)"
-                        );
-                    }
-                },
-                Err(_) => {
-                    reader_fatal("views lock poisoned");
-                    return;
+                MigrationStep::Unrelated(pending, msg) => {
+                    migration = Some(pending);
+                    msg
                 }
-            }
-            continue;
-        }
-        let (out, close_eras) = match shared.views.lock() {
+            },
+        };
+        let routed = match VIEWS.lock() {
             Ok(mut views) => {
-                let out = dispatch(msg, &mut views);
-
-                let eras: Vec<u64> = out
-                    .closed
-                    .iter()
-                    .map(|_| crate::framework::bump_webview_close_era())
-                    .collect();
-                (out, eras)
+                let routed = route(msg, &mut views);
+                views.publish();
+                routed
             }
-            Err(_) => {
-                reader_fatal("views lock poisoned");
-                return;
-            }
+            Err(_) => Routed::Fatal("views lock poisoned".into()),
         };
-        for reply in &out.replies {
-            let frame = match reply.encode() {
-                Ok(frame) => frame,
-                Err(e) => {
-                    reader_fatal(&format!("FrameAck encode failed: {e}"));
-                    return;
-                }
-            };
-            if !write_frame_if_live(&frame) {
-                reader_fatal("control-socket write failed (FrameAck)");
+        match routed {
+            Routed::Upcall(upcall) => {
+                let _ = upcalls.send(upcall);
+            }
+            Routed::Handled => {}
+            Routed::Fatal(reason) => {
+                helper_lost(Loss::Fatal(reason), upcalls);
                 return;
             }
         }
-        if let Some(view) = out.staged_view {
-            crate::loader::vk_overlay::present_staged_webview_frame(view);
-        }
+    }
+}
 
-        for up in out.upcalls {
-            let _ = upcalls.send(UpcallEvent::LoadChanged {
-                widget: up.widget,
-                state: up.state,
-                url: up.url,
-            });
-        }
-        for (view, call_id, payload_json) in out.bridge_calls {
-            let _ = upcalls.send(UpcallEvent::BridgeCall {
-                view,
-                call_id,
-                payload_json,
-            });
-        }
-        for (request_id, ok, value_json) in out.eval_results {
-            let _ = upcalls.send(UpcallEvent::EvalResult {
-                request_id,
-                ok,
-                value_json,
-            });
-        }
-        for (request_id, ok) in out.cookie_set_results {
-            let _ = upcalls.send(UpcallEvent::CookieSetResult { request_id, ok });
-        }
-        for (request_id, cookies) in out.cookie_lists {
-            let waiter = shared
-                .cookie_get_waiters
-                .lock()
-                .ok()
-                .and_then(|mut w| w.remove(&request_id));
-            if let Some(tx) = waiter {
-                let _ = tx.send(cookies);
+enum Loss {
+    Fatal(String),
+
+    Exited(String),
+}
+
+fn slot_after(loss: Loss) -> ClientSlot {
+    match loss {
+        Loss::Fatal(reason) => ClientSlot::Failed(reason),
+        Loss::Exited(reason) => {
+            let exits = UNEXPECTED_EXITS.fetch_add(1, Ordering::AcqRel) + 1;
+            if exits >= HELPER_EXIT_LIMIT {
+                ClientSlot::Failed(format!(
+                    "{reason}; the helper exited unexpectedly {exits} times"
+                ))
             } else {
-                tracing::debug!(
-                    request_id,
-                    "webview client: dropping a late CookieList with no getCookie waiter"
-                );
+                ClientSlot::Restarting
             }
-        }
-        for (request_id, ok) in out.cookie_flush_results {
-            let waiter = shared
-                .cookie_flush_waiters
-                .lock()
-                .ok()
-                .and_then(|mut w| w.remove(&request_id));
-            if let Some(tx) = waiter {
-                let _ = tx.send(ok);
-            }
-        }
-        for (request_id, removed) in out.cookie_clear_results {
-            let _ = upcalls.send(UpcallEvent::CookiesClearResult {
-                request_id,
-                removed,
-            });
-        }
-        for (closed, upto_era) in out.closed.into_iter().zip(close_eras) {
-            let _ = ACTIVE_VIEW.compare_exchange(closed, 0, Ordering::Relaxed, Ordering::Relaxed);
-            LIVE_VIEWS.fetch_sub(1, Ordering::Relaxed);
-
-            remove_pending_bridges(closed);
-            let _ = upcalls.send(UpcallEvent::ViewClosedDrain {
-                widget: closed,
-                upto_era,
-            });
-            tracing::info!(view = closed, "webview helper confirmed ViewClosed");
-        }
-        for (widget, redrive) in out.redrives {
-            if let Err(e) = redrive_after_close(widget, redrive) {
-                tracing::warn!(
-                    view = widget,
-                    error = %e,
-                    "webview client: the load deferred behind the detached view's close could not \
-                     be replayed"
-                );
-            }
-        }
-        if out.fatal {
-            let reason = out
-                .fatal_reason
-                .unwrap_or_else(|| "helper reported a crash".into());
-            reader_fatal(&reason);
-            return;
         }
     }
 }
 
-fn reader_fatal(reason: &str) {
-    ACTIVE_VIEW.store(0, Ordering::Relaxed);
+fn helper_lost(loss: Loss, upcalls: &mpsc::Sender<Upcall>) {
+    let Ok(mut slot) = CLIENT.lock() else {
+        return;
+    };
+    if !matches!(&*slot, ClientSlot::Live(_)) {
+        tracing::debug!("webview reader exiting after teardown");
+        return;
+    }
+    let reason = match &loss {
+        Loss::Fatal(reason) | Loss::Exited(reason) => reason.clone(),
+    };
+    if let ClientSlot::Live(mut client) = std::mem::replace(&mut *slot, slot_after(loss)) {
+        let _ = client.child.kill();
+        let _ = client.child.wait();
+    }
+    let visible_views = match VIEWS.lock() {
+        Ok(mut views) => {
+            let visible = views.reset_after_helper_loss();
+            views.publish();
+            visible
+        }
+        Err(_) => 0,
+    };
+    wake_all_cookie_waiters();
+    tracing::warn!(
+        reason,
+        visible_views,
+        restarts = matches!(&*slot, ClientSlot::Restarting),
+        "eclipse-webview helper lost; closing its views on the Roblox side"
+    );
+    let _ = upcalls.send(Upcall::HelperGone { visible_views });
+}
+
+fn finish_restart() {
     if let Ok(mut slot) = CLIENT.lock() {
-        if matches!(&*slot, ClientSlot::Live(_, _)) {
-            tracing::warn!(
-                reason,
-                "eclipse-webview client: helper connection lost — latching the honest no-op \
-                 path (no respawn; subsequent WebView loads degrade to the one-shot WARN)"
-            );
-            if let ClientSlot::Live(client, _log) =
-                std::mem::replace(&mut *slot, ClientSlot::Failed(reason.to_string()))
-            {
-                let mut child = client.child;
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        } else {
-            tracing::debug!(reason, "webview reader exiting after teardown");
+        if matches!(&*slot, ClientSlot::Restarting) {
+            *slot = ClientSlot::Unspawned;
         }
     }
 }
 
-const BRIDGE_RESULT_OVER_CAP: &str = "\"eclipse: bridge result exceeds the frame cap\"";
+fn upcall_thread_main(rx: &mpsc::Receiver<Upcall>, java_vm: &jni::vm::JavaVM) {
+    let mut gone = None;
+    while let Ok(upcall) = rx.recv() {
+        match upcall {
+            Upcall::HelperGone { visible_views } => gone = Some(visible_views),
+            other => run_upcall(java_vm, other),
+        }
+    }
+    crate::framework::drain_all_webview_callbacks(java_vm, "web engine helper connection closed");
+    let Some(visible_views) = gone else {
+        return;
+    };
+    for _ in 0..visible_views {
+        crate::framework::dispatch_activity_back(java_vm);
+    }
+    finish_restart();
+}
 
-fn bridge_result_frame(
-    call_id: u32,
-    ok: bool,
-    result_json: String,
-) -> Result<Vec<u8>, proto::ProtoError> {
-    let result_len = result_json.len();
-    match (ConsumerMsg::BridgeResult {
+fn run_upcall(java_vm: &jni::vm::JavaVM, upcall: Upcall) {
+    match upcall {
+        Upcall::LoadChanged { view, state, url } => {
+            if crate::framework::fire_web_view_internal_load_changed(java_vm, view, state, &url) {
+                if let Ok(mut views) = VIEWS.lock() {
+                    if let Some(entry) = views.entries.get_mut(&view) {
+                        entry.observed.load_upcalls += 1;
+                    }
+                }
+            }
+        }
+        Upcall::Progress { view, percent } => {
+            crate::framework::fire_web_view_progress_changed(java_vm, view, i32::from(percent));
+        }
+        Upcall::LoadFailed {
+            view,
+            url,
+            code,
+            description,
+        } => {
+            crate::framework::fire_web_view_received_error(java_vm, view, &url, code, &description)
+        }
+        Upcall::ResourceLoad { view, url } => {
+            crate::framework::fire_web_view_load_resource(java_vm, view, &url);
+        }
+        Upcall::Policy {
+            view,
+            policy_id,
+            request,
+        } => {
+            let override_load =
+                crate::framework::fire_web_view_should_override_url_loading(java_vm, view, request);
+            send_reply(&ConsumerMsg::PolicyReply {
+                policy_id,
+                override_load,
+            });
+        }
+        Upcall::Back => crate::framework::dispatch_activity_back(java_vm),
+        Upcall::BridgeCall {
+            view,
+            call_id,
+            payload_json,
+        } => {
+            let (ok, result_json) =
+                crate::framework::fire_bridge_call(java_vm, view, call_id, &payload_json);
+            send_reply(&bridge_result(call_id, ok, result_json));
+        }
+        Upcall::EvaluateJsResult {
+            request_id,
+            ok,
+            value_json,
+        } => crate::framework::fire_evaluate_js_result(java_vm, request_id, ok, &value_json),
+        Upcall::CookieSetResult { request_id, ok } => {
+            crate::framework::fire_cookie_set_result(java_vm, request_id, ok);
+        }
+        Upcall::CookiesCleared {
+            request_id,
+            removed,
+        } => crate::framework::fire_cookies_clear_result(java_vm, request_id, removed),
+        Upcall::ViewClosed { view, upto_era } => {
+            crate::framework::drop_bridges_for_view_closed(view, upto_era);
+            crate::framework::drain_eval_callbacks_for_view(java_vm, view, upto_era);
+        }
+        Upcall::HelperGone { .. } => {}
+    }
+}
+
+fn send_reply(msg: &ConsumerMsg) {
+    let result = encode(msg).and_then(|frame| {
+        let slot = lock_client()?;
+        match &*slot {
+            ClientSlot::Live(_) => write_frames(&slot, &[frame]),
+            _ => Ok(()),
+        }
+    });
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "webview client: reply to the helper not delivered");
+    }
+}
+
+fn bridge_result(call_id: u32, ok: bool, result_json: String) -> ConsumerMsg {
+    let reply = ConsumerMsg::BridgeResult {
         call_id,
         ok,
         result_json,
-    })
-    .encode()
-    {
+    };
+    match reply.encode() {
         Err(proto::ProtoError::Oversized { .. }) => {
             tracing::warn!(
                 call_id,
-                result_len,
                 "webview client: the bridge result exceeds the frame cap — failing the page's \
                  call instead of dropping it"
             );
@@ -1715,80 +1439,9 @@ fn bridge_result_frame(
                 ok: false,
                 result_json: BRIDGE_RESULT_OVER_CAP.to_string(),
             }
-            .encode()
         }
-        encoded => encoded,
+        _ => reply,
     }
-}
-
-fn write_frame_if_live(frame: &[u8]) -> bool {
-    match CLIENT.lock() {
-        Ok(slot) => match &*slot {
-            ClientSlot::Live(c, _) => (&mut &c.writer).write_all(frame).is_ok(),
-            _ => true,
-        },
-        Err(_) => false,
-    }
-}
-
-fn latched_error(slot: &ClientSlot) -> Option<ClientError> {
-    match slot {
-        ClientSlot::Failed(reason) => Some(ClientError::Latched(reason.clone())),
-        _ => None,
-    }
-}
-
-fn record_view(views: &mut HashMap<i64, ViewShared>, widget: i64, driven_url: String) -> bool {
-    let log_target = redact::url_scheme_and_host_for_log(&driven_url);
-    match views.entry(widget) {
-        std::collections::hash_map::Entry::Occupied(mut e) => {
-            let vs = e.get_mut();
-            vs.driven_url = driven_url;
-            vs.log_target = log_target;
-
-            vs.started = false;
-            vs.finished_http = None;
-            false
-        }
-        std::collections::hash_map::Entry::Vacant(e) => {
-            e.insert(ViewShared {
-                phase: ViewPhase::Open,
-                driven_url,
-                log_target,
-                frames: FrameSource::Empty,
-                started: false,
-                finished_http: None,
-                can_go_back: false,
-                upcalls_ok: 0,
-            });
-            true
-        }
-    }
-}
-
-fn send_locked(slot: &mut ClientSlot, msg: &ConsumerMsg) -> Result<(), ClientError> {
-    let bytes = msg.encode().map_err(ClientError::Encode)?;
-    let write_result = match &*slot {
-        ClientSlot::Live(c, _) => (&mut &c.writer).write_all(&bytes),
-        _ => return Err(ClientError::Internal("send on a non-live client slot")),
-    };
-    if let Err(e) = write_result {
-        let reason = format!("control-socket write failed: {}", e.kind());
-        tracing::warn!(
-            reason,
-            "eclipse-webview client: latching the honest no-op path (no respawn)"
-        );
-        ACTIVE_VIEW.store(0, Ordering::Relaxed);
-        if let ClientSlot::Live(client, _log) =
-            std::mem::replace(slot, ClientSlot::Failed(reason.clone()))
-        {
-            let mut child = client.child;
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        return Err(ClientError::Latched(reason));
-    }
-    Ok(())
 }
 
 pub struct DataLoad {
@@ -1798,771 +1451,409 @@ pub struct DataLoad {
     pub encoding: Option<String>,
 }
 
-enum DriveTarget {
-    Url(String),
-    Data(DataLoad),
+pub fn load_url(java_vm: jni::vm::JavaVM, view: i64, url: String) -> Result<(), ClientError> {
+    load(java_vm, view, ConsumerMsg::LoadUrl { view, url })
 }
 
-fn drive(
+pub fn load_data(
     java_vm: jni::vm::JavaVM,
-    widget: i64,
-    target: DriveTarget,
-    width: u16,
-    height: u16,
+    view: i64,
+    load_data: DataLoad,
 ) -> Result<(), ClientError> {
-    let respawned = maybe_respawn_for_app_ua();
-
-    let mut slot = CLIENT
-        .lock()
-        .map_err(|_| ClientError::Internal("client lock poisoned"))?;
-    if let Some(e) = latched_error(&slot) {
-        return Err(e);
-    }
-    ensure_spawned(
-        &mut slot,
+    load(
         java_vm,
-        if respawned {
-            "WebView load-drive after the app-UA helper replacement — replaying the cookie log into \
-             an engine that carries the User-Agent the app set"
-        } else {
-            "WebView load-drive (loadUrl/loadDataWithBaseURL) — the app's UA is final"
+        view,
+        ConsumerMsg::LoadData {
+            view,
+            base_url: load_data.base_url.unwrap_or_default(),
+            data: load_data.data,
+            mime: load_data.mime.unwrap_or_default(),
+            encoding: load_data.encoding.unwrap_or_default(),
         },
-    )?;
-
-    let deferred = {
-        let mut views = shared()
-            .views
-            .lock()
-            .map_err(|_| ClientError::Internal("views lock poisoned"))?;
-        defer_while_closing(&mut views, widget, target, width, height)
-    };
-    let Some(target) = deferred else {
-        tracing::info!(
-            view = widget,
-            "webview client: load held until the detached view's ViewClosed, then replayed into a \
-             fresh browser"
-        );
-        return Ok(());
-    };
-    send_drive(&mut slot, widget, target, width, height)
-}
-
-fn defer_while_closing(
-    views: &mut HashMap<i64, ViewShared>,
-    widget: i64,
-    target: DriveTarget,
-    width: u16,
-    height: u16,
-) -> Option<DriveTarget> {
-    match views.get_mut(&widget).map(|vs| &mut vs.phase) {
-        Some(ViewPhase::Closing { redrive }) => {
-            *redrive = Some(Redrive {
-                target,
-                width,
-                height,
-            });
-            None
-        }
-        Some(ViewPhase::Open) | None => Some(target),
-    }
-}
-
-fn mark_closing(views: &mut HashMap<i64, ViewShared>, widget: i64) {
-    if let Some(vs) = views.get_mut(&widget) {
-        vs.phase = ViewPhase::Closing { redrive: None };
-    }
-}
-
-fn redrive_after_close(widget: i64, redrive: Redrive) -> Result<(), ClientError> {
-    let mut slot = CLIENT
-        .lock()
-        .map_err(|_| ClientError::Internal("client lock poisoned"))?;
-    if let Some(e) = latched_error(&slot) {
-        return Err(e);
-    }
-    if view_is_tracked(widget) {
-        tracing::debug!(
-            view = widget,
-            "webview client: a newer load already re-created the view; the deferred load is stale"
-        );
-        return Ok(());
-    }
-    send_drive(
-        &mut slot,
-        widget,
-        redrive.target,
-        redrive.width,
-        redrive.height,
     )
 }
 
-fn send_drive(
-    slot: &mut ClientSlot,
-    widget: i64,
-    target: DriveTarget,
-    width: u16,
-    height: u16,
-) -> Result<(), ClientError> {
-    let driven_url = match &target {
-        DriveTarget::Url(url) => url.clone(),
-        DriveTarget::Data(load) => load
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "about:blank".to_string()),
+fn load(java_vm: jni::vm::JavaVM, view: i64, request: ConsumerMsg) -> Result<(), ClientError> {
+    encode(&request)?;
+    let shown = view_registry::is_shown(view);
+    let mut slot = lock_client()?;
+    ensure_live(&mut slot, java_vm)?;
+    let batch = {
+        let mut views = lock_views()?;
+        let batch = views
+            .entries
+            .entry(view)
+            .or_default()
+            .load_batch(view, shown, request);
+        views.publish();
+        batch
     };
-    let is_new = {
-        let shared = shared();
-        let mut views = shared
-            .views
-            .lock()
-            .map_err(|_| ClientError::Internal("views lock poisoned"))?;
-        record_view(&mut views, widget, driven_url)
-    };
-    if is_new {
-        LIVE_VIEWS.fetch_add(1, Ordering::Relaxed);
+    note_visibility(&batch);
+    write_frames(&slot, &encode_all(&batch)?)
+}
 
-        if let ClientSlot::Live(_, log) = &mut *slot {
-            log.retire();
+fn send_to_created(view: i64, msg: ConsumerMsg) -> Result<(), ClientError> {
+    let frame = encode(&msg)?;
+    let slot = lock_client()?;
+    if lock_views()?.created(view).is_none() {
+        return Ok(());
+    }
+    write_frames(&slot, &[frame])
+}
+
+pub fn reload(view: i64) -> Result<(), ClientError> {
+    send_to_created(view, ConsumerMsg::Reload { view })
+}
+
+pub fn stop_loading(view: i64) -> Result<(), ClientError> {
+    send_to_created(view, ConsumerMsg::StopLoading { view })
+}
+
+pub fn go_back(view: i64) -> Result<(), ClientError> {
+    send_to_created(view, ConsumerMsg::GoBack { view })
+}
+
+pub fn evaluate_js(view: i64, request_id: u32, script: String) -> Result<(), ClientError> {
+    let frame = encode(&ConsumerMsg::EvaluateJs {
+        view,
+        request_id,
+        script,
+    })?;
+    let slot = lock_client()?;
+    if lock_views()?.created(view).is_none() {
+        return Err(ClientError::Unavailable(
+            "the WebView has not loaded a page yet".to_string(),
+        ));
+    }
+    write_frames(&slot, &[frame])
+}
+
+pub fn set_user_agent(view: i64, user_agent: Option<String>) -> Result<(), ClientError> {
+    let user_agent = user_agent.filter(|ua| !ua.is_empty());
+    let frame = encode(&ConsumerMsg::SetUserAgent {
+        view,
+        user_agent: user_agent.clone().unwrap_or_default(),
+    })?;
+    let slot = lock_client()?;
+    let created = {
+        let mut views = lock_views()?;
+        let entry = views.entries.entry(view).or_default();
+        entry.user_agent = user_agent;
+        let created = entry.created;
+        views.publish();
+        created
+    };
+    if !created {
+        return Ok(());
+    }
+    write_frames(&slot, &[frame])
+}
+
+pub fn register_bridge(view: i64, name: String, methods: Vec<String>) -> Result<(), ClientError> {
+    let frame = encode(&ConsumerMsg::BridgeRegister {
+        view,
+        name: name.clone(),
+        methods: methods.clone(),
+    })?;
+    let slot = lock_client()?;
+    let created = {
+        let mut views = lock_views()?;
+        let entry = views.entries.entry(view).or_default();
+        entry.bridges.insert(name, methods);
+        let created = entry.created;
+        views.publish();
+        created
+    };
+    if !created {
+        return Ok(());
+    }
+    write_frames(&slot, &[frame])
+}
+
+pub fn unregister_bridge(view: i64, name: String) -> Result<(), ClientError> {
+    let slot = lock_client()?;
+    let created = {
+        let mut views = lock_views()?;
+        let Some(entry) = views.entries.get_mut(&view) else {
+            return Ok(());
+        };
+        if entry.bridges.remove(&name).is_none() {
+            return Ok(());
         }
-    }
-
-    ACTIVE_VIEW.store(widget, Ordering::Relaxed);
-    if is_new {
-        send_locked(
-            slot,
-            &ConsumerMsg::CreateView {
-                view: widget,
-                width,
-                height,
-            },
-        )?;
-
-        for (name, methods) in drain_pending_bridges(widget) {
-            send_locked(
-                slot,
-                &ConsumerMsg::BridgeRegister {
-                    view: widget,
-                    name,
-                    methods,
-                },
-            )?;
-        }
-    }
-    let load_msg = match target {
-        DriveTarget::Url(url) => ConsumerMsg::LoadUrl { view: widget, url },
-        DriveTarget::Data(DataLoad {
-            base_url,
-            data,
-            mime,
-            encoding,
-        }) => ConsumerMsg::LoadDataWithBaseUrl {
-            view: widget,
-            base_url: base_url.unwrap_or_else(|| "about:blank".to_string()),
-            data,
-            mime: mime.unwrap_or_default(),
-            encoding: encoding.unwrap_or_default(),
-
-            history_url: String::new(),
-        },
+        entry.created
     };
-    send_locked(slot, &load_msg)
-}
-
-pub fn drive_load_url(
-    java_vm: jni::vm::JavaVM,
-    widget: i64,
-    url: String,
-    width: u16,
-    height: u16,
-) -> Result<(), ClientError> {
-    drive(java_vm, widget, DriveTarget::Url(url), width, height)
-}
-
-pub fn drive_load_data(
-    java_vm: jni::vm::JavaVM,
-    widget: i64,
-    load: DataLoad,
-    width: u16,
-    height: u16,
-) -> Result<(), ClientError> {
-    drive(java_vm, widget, DriveTarget::Data(load), width, height)
-}
-
-type BridgeInventory = HashMap<String, Vec<BridgeMethod>>;
-
-fn pending_bridges() -> &'static Mutex<HashMap<i64, BridgeInventory>> {
-    static P: OnceLock<Mutex<HashMap<i64, BridgeInventory>>> = OnceLock::new();
-    P.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-static PENDING_BRIDGE_VIEWS: AtomicUsize = AtomicUsize::new(0);
-
-fn buffer_pending_bridge(widget: i64, name: String, methods: Vec<BridgeMethod>) {
-    if let Ok(mut m) = pending_bridges().lock() {
-        m.entry(widget).or_default().insert(name, methods);
-        PENDING_BRIDGE_VIEWS.store(m.len(), Ordering::Relaxed);
+    if !created {
+        return Ok(());
     }
+    write_frames(
+        &slot,
+        &[encode(&ConsumerMsg::BridgeUnregister { view, name })?],
+    )
 }
 
-fn remove_pending_bridges(widget: i64) {
-    if let Ok(mut m) = pending_bridges().lock() {
-        m.remove(&widget);
-        PENDING_BRIDGE_VIEWS.store(m.len(), Ordering::Relaxed);
-    }
-}
-
-fn drain_pending_bridges(widget: i64) -> Vec<(String, Vec<BridgeMethod>)> {
-    pending_bridges()
+pub fn can_go_back(view: i64) -> bool {
+    VIEWS
         .lock()
         .ok()
-        .and_then(|mut m| {
-            let taken = m.remove(&widget);
-            PENDING_BRIDGE_VIEWS.store(m.len(), Ordering::Relaxed);
-            taken
-        })
-        .map(|b| b.into_iter().collect())
-        .unwrap_or_default()
+        .and_then(|mut views| views.created(view).map(|entry| entry.back_navigates()))
+        .unwrap_or(false)
 }
 
-fn send_with_lazy_spawn(
-    java_vm: jni::vm::JavaVM,
-    msg: &ConsumerMsg,
-) -> Result<SendOutcome, ClientError> {
-    let mut slot = CLIENT
+pub fn url(view: i64) -> Option<String> {
+    VIEWS
         .lock()
-        .map_err(|_| ClientError::Internal("client lock poisoned"))?;
-    if let Some(e) = latched_error(&slot) {
-        return Err(e);
-    }
+        .ok()
+        .and_then(|mut views| views.created(view).and_then(|entry| entry.url.clone()))
+}
 
-    let verdict = match &mut *slot {
-        ClientSlot::Unspawned(early) => Some(early.offer(msg, defer_cookie_cb())),
-        _ => None,
+pub fn close_view(view: i64) -> Result<(), ClientError> {
+    if TRACKED_VIEWS.load(Ordering::Acquire) == 0 || !lock_views()?.entries.contains_key(&view) {
+        return Ok(());
+    }
+    let slot = lock_client()?;
+    let created = {
+        let mut views = lock_views()?;
+        let Some(entry) = views.entries.remove(&view) else {
+            return Ok(());
+        };
+        if entry.created {
+            views.closing.insert(view);
+        }
+        views.publish();
+        entry.created
     };
-    match verdict {
-        Some(Deferral::Buffer) => {
-            if let Some(request_id) = deferred_cb_request_id(msg) {
-                note_deferred_callback(request_id);
-            }
-            return Ok(SendOutcome::Buffered);
+    if !created {
+        return Ok(());
+    }
+    tracing::info!(
+        view,
+        "webview client: closing the helper's view for a destroyed WebView"
+    );
+    write_frames(&slot, &[encode(&ConsumerMsg::CloseView { view })?])
+}
+
+pub fn refresh_visibility() {
+    if TRACKED_VIEWS.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let created: Vec<i64> = match VIEWS.lock() {
+        Ok(views) => views
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.created)
+            .map(|(view, _)| *view)
+            .collect(),
+        Err(_) => return,
+    };
+    if created.is_empty() {
+        return;
+    }
+    let shown: Vec<(i64, bool)> = created
+        .into_iter()
+        .map(|view| (view, view_registry::is_shown(view)))
+        .collect();
+    if let Err(e) = apply_shown(&shown) {
+        tracing::warn!(error = %e, "webview client: a WebView window visibility change was not sent");
+    }
+}
+
+fn apply_shown(shown: &[(i64, bool)]) -> Result<(), ClientError> {
+    let slot = lock_client()?;
+    let batch: Vec<ConsumerMsg> = {
+        let mut views = lock_views()?;
+        let batch = shown
+            .iter()
+            .filter_map(|&(view, shown)| views.created(view)?.show(view, shown))
+            .collect();
+        views.publish();
+        batch
+    };
+    if batch.is_empty() {
+        return Ok(());
+    }
+    note_visibility(&batch);
+    write_frames(&slot, &encode_all(&batch)?)
+}
+
+pub fn view_window_visible() -> bool {
+    VISIBLE_VIEWS.load(Ordering::Acquire) != 0
+}
+
+pub fn take_activation_request() -> bool {
+    ACTIVATION_WANTED.swap(false, Ordering::AcqRel)
+}
+
+pub fn request_activation_of_shown_view() {
+    let Ok(views) = VIEWS.lock() else {
+        return;
+    };
+    let Some(view) = views.activation_target(ACTIVATION_TARGET.load(Ordering::Acquire)) else {
+        return;
+    };
+    ACTIVATION_TARGET.store(view, Ordering::Release);
+    ACTIVATION_WANTED.store(true, Ordering::Release);
+}
+
+pub fn activate(token: String) {
+    let view = ACTIVATION_TARGET.load(Ordering::Acquire);
+    let result = encode(&ConsumerMsg::Activate { view, token }).and_then(|frame| {
+        let slot = lock_client()?;
+        let visible = lock_views()?
+            .created(view)
+            .is_some_and(|entry| entry.window_visible());
+        if !visible {
+            return Ok(());
         }
-        Some(Deferral::NeedsEngine(why)) => {
-            tracing::warn!(
-                reason = why,
-                "an early op is forcing the eclipse-webview helper to start BEFORE the app has \
-                 configured its WebView — CefSettings.user_agent is GLOBAL and consumed by \
-                 CefInitialize, so THIS engine will present Eclipse's FALLBACK User-Agent, not the \
-                 app's (§6 2026-07-16 🏆/💥). 2026-07-16 (§6 respawn): no longer a lost boot — the \
-                 first load-drive REPLACES this helper with one carrying the app's UA and replays \
-                 the cookie log into it. The cost is one wasted CefInitialize (~122 ms), paid here, \
-                 refunded there."
-            );
-            ensure_spawned(&mut slot, java_vm, why)?;
-        }
-        None => {}
-    }
-    let outcome = send_locked(&mut slot, msg).map(|()| SendOutcome::Sent)?;
-
-    if let ClientSlot::Live(_, log) = &mut *slot {
-        log.record_sent(msg);
-    }
-    Ok(outcome)
-}
-
-pub fn register_bridge(
-    java_vm: jni::vm::JavaVM,
-    widget: i64,
-    name: String,
-    methods: Vec<BridgeMethod>,
-) -> Result<(), ClientError> {
-    buffer_pending_bridge(widget, name.clone(), methods.clone());
-    if view_is_tracked(widget) {
-        send_with_lazy_spawn(
-            java_vm,
-            &ConsumerMsg::BridgeRegister {
-                view: widget,
-                name,
-                methods,
-            },
-        )
-        .map(|_| ())
-    } else {
-        Ok(())
+        write_frames(&slot, &[frame])
+    });
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "webview client: the activation token was not handed over");
     }
 }
 
-pub fn evaluate_js(
-    java_vm: jni::vm::JavaVM,
-    widget: i64,
-    request_id: u32,
-    script: String,
-) -> Result<(), ClientError> {
-    send_with_lazy_spawn(
-        java_vm,
-        &ConsumerMsg::EvaluateJsForResult {
-            view: widget,
-            request_id,
-            script,
-        },
-    )
-    .map(|_| ())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SetCookie {
-    pub name: String,
-    pub value: String,
-    pub domain: String,
-    pub path: String,
-    pub secure: bool,
-    pub http_only: bool,
-    pub expires_epoch_s: i64,
+fn send_spawning(java_vm: jni::vm::JavaVM, msg: &ConsumerMsg) -> Result<(), ClientError> {
+    let frame = encode(msg)?;
+    let mut slot = lock_client()?;
+    ensure_live(&mut slot, java_vm)?;
+    write_frames(&slot, &[frame])
 }
 
 pub fn cookie_set(
     java_vm: jni::vm::JavaVM,
-    url: String,
-    cookie: SetCookie,
-) -> Result<(), ClientError> {
-    let SetCookie {
-        name,
-        value,
-        domain,
-        path,
-        secure,
-        http_only,
-        expires_epoch_s,
-    } = cookie;
-    send_with_lazy_spawn(
-        java_vm,
-        &ConsumerMsg::CookieSet {
-            url,
-            name,
-            value,
-            domain,
-            path,
-            secure,
-            http_only,
-            expires_epoch_s,
-        },
-    )
-    .map(|_| ())
-}
-
-pub fn cookie_set_with_result(
-    java_vm: jni::vm::JavaVM,
     request_id: u32,
     url: String,
-    cookie: SetCookie,
+    header: String,
 ) -> Result<(), ClientError> {
-    let SetCookie {
-        name,
-        value,
-        domain,
-        path,
-        secure,
-        http_only,
-        expires_epoch_s,
-    } = cookie;
-    send_with_lazy_spawn(
+    send_spawning(
         java_vm,
-        &ConsumerMsg::CookieSetForResult {
+        &ConsumerMsg::CookieSet {
             request_id,
             url,
-            name,
-            value,
-            domain,
-            path,
-            secure,
-            http_only,
-            expires_epoch_s,
+            header,
         },
     )
-    .map(|_| ())
 }
 
-pub fn cookies_clear_all(java_vm: jni::vm::JavaVM, request_id: u32) -> Result<(), ClientError> {
-    send_with_lazy_spawn(java_vm, &ConsumerMsg::CookiesClear { request_id }).map(|_| ())
+pub fn cookies_clear(
+    java_vm: jni::vm::JavaVM,
+    request_id: u32,
+    scope: ClearScope,
+) -> Result<(), ClientError> {
+    send_spawning(java_vm, &ConsumerMsg::CookiesClear { request_id, scope })
 }
 
-pub fn cookies_clear_session(java_vm: jni::vm::JavaVM, request_id: u32) -> Result<(), ClientError> {
-    send_with_lazy_spawn(java_vm, &ConsumerMsg::CookiesClearSession { request_id }).map(|_| ())
+fn request_blocking<T>(
+    java_vm: jni::vm::JavaVM,
+    waiters: &'static Mutex<BTreeMap<u32, mpsc::Sender<T>>>,
+    msg: impl FnOnce(u32) -> ConsumerMsg,
+    what: &'static str,
+    timeout: Duration,
+) -> Result<T, ClientError> {
+    let request_id = next_request_id();
+    let (tx, rx) = mpsc::channel::<T>();
+    waiters
+        .lock()
+        .map_err(|_| ClientError::Internal("cookie waiters lock poisoned"))?
+        .insert(request_id, tx);
+    let forget = || {
+        if let Ok(mut waiters) = waiters.lock() {
+            waiters.remove(&request_id);
+        }
+    };
+    if let Err(e) = send_spawning(java_vm, &msg(request_id)) {
+        forget();
+        return Err(e);
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(value) => Ok(value),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            forget();
+            Err(ClientError::TimedOut(what))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ClientError::Unavailable(
+            "the helper exited before answering".to_string(),
+        )),
+    }
 }
 
 pub fn cookie_get_blocking(
     java_vm: jni::vm::JavaVM,
     url: String,
     timeout: Duration,
-) -> Result<Vec<CookieEntry>, ClientError> {
-    if IO_THREAD_ID.lock().ok().and_then(|id| *id) == Some(std::thread::current().id()) {
-        tracing::warn!(
-            "cookie_get_blocking called ON the eclipse-webview-io thread — the reply could never \
-             be delivered; serving the honest empty list immediately (fix the caller: app-code \
-             upcalls belong on the upcall thread)"
-        );
-        return Ok(Vec::new());
-    }
-    let request_id = next_request_id();
-    let (tx, rx) = mpsc::channel::<Vec<CookieEntry>>();
-
-    match shared().cookie_get_waiters.lock() {
-        Ok(mut w) => {
-            w.insert(request_id, tx);
-        }
-        Err(_) => return Err(ClientError::Internal("cookie waiters lock poisoned")),
-    }
-    match send_with_lazy_spawn(java_vm, &ConsumerMsg::CookieGet { request_id, url }) {
-        Ok(SendOutcome::Sent) => {}
-        Ok(SendOutcome::Buffered) => {
-            remove_cookie_waiter(request_id);
-            return Err(ClientError::Internal(
-                "CookieGet was buffered even though the persistent store owns its answer",
-            ));
-        }
-        Err(e) => {
-            remove_cookie_waiter(request_id);
-            return Err(e);
-        }
-    }
-    match rx.recv_timeout(timeout) {
-        Ok(cookies) => Ok(cookies),
-
-        Err(_) => {
-            remove_cookie_waiter(request_id);
-            Ok(Vec::new())
-        }
-    }
-}
-
-fn remove_cookie_waiter(request_id: u32) {
-    if let Ok(mut w) = shared().cookie_get_waiters.lock() {
-        w.remove(&request_id);
-    }
+) -> Result<Vec<CookiePair>, ClientError> {
+    request_blocking(
+        java_vm,
+        &COOKIE_GETS,
+        |request_id| ConsumerMsg::CookieGet { request_id, url },
+        "CookieManager.getCookie",
+        timeout,
+    )
 }
 
 pub fn cookie_flush_blocking(
     java_vm: jni::vm::JavaVM,
     timeout: Duration,
 ) -> Result<bool, ClientError> {
-    if IO_THREAD_ID.lock().ok().and_then(|id| *id) == Some(std::thread::current().id()) {
-        tracing::warn!(
-            "cookie_flush_blocking called ON the eclipse-webview-io thread — the completion could \
-             never be delivered; refusing the self-deadlock"
-        );
-        return Ok(false);
-    }
-    let request_id = next_request_id();
-    let (tx, rx) = mpsc::channel::<bool>();
-    match shared().cookie_flush_waiters.lock() {
-        Ok(mut w) => {
-            w.insert(request_id, tx);
-        }
-        Err(_) => return Err(ClientError::Internal("cookie flush waiters lock poisoned")),
-    }
-    match send_with_lazy_spawn(java_vm, &ConsumerMsg::CookieFlush { request_id }) {
-        Ok(SendOutcome::Sent) => {}
-        Ok(SendOutcome::Buffered) => {
-            remove_cookie_flush_waiter(request_id);
-            return Err(ClientError::Internal(
-                "cookie flush was not sent to the persistent engine",
-            ));
-        }
-        Err(e) => {
-            remove_cookie_flush_waiter(request_id);
-            return Err(e);
-        }
-    }
-    match rx.recv_timeout(timeout) {
-        Ok(ok) => Ok(ok),
-        Err(_) => {
-            remove_cookie_flush_waiter(request_id);
-            Ok(false)
-        }
-    }
+    request_blocking(
+        java_vm,
+        &COOKIE_FLUSHES,
+        |request_id| ConsumerMsg::CookieFlush { request_id },
+        "CookieManager.flush",
+        timeout,
+    )
 }
 
-fn remove_cookie_flush_waiter(request_id: u32) {
-    if let Ok(mut w) = shared().cookie_flush_waiters.lock() {
-        w.remove(&request_id);
-    }
-}
-
-fn wake_all_blocking_cookie_waiters() {
-    if let Ok(mut w) = shared().cookie_get_waiters.lock() {
-        w.clear();
-    }
-    if let Ok(mut w) = shared().cookie_flush_waiters.lock() {
-        w.clear();
-    }
-}
-
-pub fn active_view() -> i64 {
-    ACTIVE_VIEW.load(Ordering::Relaxed)
-}
-
-pub fn composited_rect() -> Option<(i32, i32, u32, u32)> {
-    shared().rect.lock().ok().and_then(|r| *r)
-}
-
-pub fn publish_composited_screen_rect(view: i64, rect: (i32, i32, u32, u32)) {
-    let (x, y, w, h) = rect;
-    if let Ok(mut r) = shared().screen_rect.lock() {
-        *r = Some(DrawnRect { view, x, y, w, h });
-    }
-}
-
-pub fn composited_screen_rect(view: i64) -> Option<(i32, i32, u32, u32)> {
-    match *shared().screen_rect.lock().ok()? {
-        Some(r) if r.view == view => Some((r.x, r.y, r.w, r.h)),
-        _ => None,
-    }
-}
-
-pub fn update_composited_rect() {
-    let view = ACTIVE_VIEW.load(Ordering::Relaxed);
-    let rect = if view == 0 {
-        None
-    } else {
-        crate::framework::view_registry::absolute_frame(view)
-    };
-    if let Ok(mut r) = shared().rect.lock() {
-        *r = rect;
-    }
-}
-
-pub fn with_latest_frame<R>(view: i64, f: impl FnOnce(&Stage<'_>) -> R) -> Option<R> {
-    let views = shared().views.lock().ok()?;
-    let stage = views.get(&view)?.frames.latest()?;
-    Some(f(&stage))
-}
-
-fn send_input(msg: &ConsumerMsg) {
-    if let Ok(mut slot) = CLIENT.lock() {
-        if matches!(&*slot, ClientSlot::Live(_, _)) {
-            let _ = send_locked(&mut slot, msg);
-        }
-    }
-}
-
-pub fn send_mouse_move(view: i64, x: i32, y: i32) {
-    send_input(&ConsumerMsg::MouseMove {
-        view,
-        x,
-        y,
-        modifiers: 0,
-        leave: false,
-    });
-}
-
-pub fn send_mouse_click(view: i64, x: i32, y: i32, down: bool) {
-    send_input(&ConsumerMsg::MouseClick {
-        view,
-        x,
-        y,
-        button: 0,
-        down,
-        click_count: 1,
-        modifiers: 0,
-    });
-}
-
-pub fn send_mouse_wheel(view: i64, x: i32, y: i32, delta_y: i32) {
-    send_input(&ConsumerMsg::MouseWheel {
-        view,
-        x,
-        y,
-        delta_x: 0,
-        delta_y,
-        modifiers: 0,
-    });
-}
-
-pub fn resize_view(view: i64, width: u16, height: u16) {
-    send_input(&ConsumerMsg::ResizeView {
-        view,
-        width,
-        height,
-    });
-}
-
-pub fn send_key(view: i64, kind: u8, windows_key_code: i32, character: u16) {
-    send_input(&ConsumerMsg::Key {
-        view,
-        kind,
-        windows_key_code,
-        native_key_code: 0,
-        character,
-        modifiers: 0,
-    });
-}
-
-pub fn can_go_back(view: i64) -> bool {
-    shared()
-        .views
+pub fn view_close_pending(view: i64) -> bool {
+    VIEWS
         .lock()
-        .ok()
-        .and_then(|views| views.get(&view).map(|state| state.can_go_back))
-        .unwrap_or(false)
-}
-
-pub fn go_back(view: i64) {
-    send_input(&ConsumerMsg::GoBack { view });
-}
-
-pub fn notify_view_freed(widget: i64) {
-    if crate::framework::has_webview_bridges() {
-        crate::framework::drop_bridges_for(widget);
-    }
-    if PENDING_BRIDGE_VIEWS.load(Ordering::Relaxed) != 0 {
-        remove_pending_bridges(widget);
-    }
-    if ACTIVE_VIEW.load(Ordering::Relaxed) == 0 && LIVE_VIEWS.load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    let tracked = shared()
-        .views
-        .lock()
-        .ok()
-        .map(|mut v| v.remove(&widget).is_some())
-        .unwrap_or(false);
-    if !tracked {
-        return;
-    }
-    LIVE_VIEWS.fetch_sub(1, Ordering::Relaxed);
-    let _ = ACTIVE_VIEW.compare_exchange(widget, 0, Ordering::Relaxed, Ordering::Relaxed);
-    tracing::info!(
-        widget,
-        "webview client: driven WebView finalized — sending CloseView (helper stays alive)"
-    );
-    if let Ok(mut slot) = CLIENT.lock() {
-        if matches!(&*slot, ClientSlot::Live(_, _)) {
-            let _ = send_locked(&mut slot, &ConsumerMsg::CloseView { view: widget });
-        }
-    }
-}
-
-pub fn notify_view_detached(widget: i64) {
-    if ACTIVE_VIEW
-        .compare_exchange(widget, 0, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
-    tracing::info!(
-        view = widget,
-        "webview client: active WebView detached from the view tree — eager CloseView (composite \
-         released; ViewClosed completes teardown)"
-    );
-    if let Ok(mut slot) = CLIENT.lock() {
-        if matches!(&*slot, ClientSlot::Live(_, _)) {
-            if let Ok(mut views) = shared().views.lock() {
-                mark_closing(&mut views, widget);
-            }
-            let _ = send_locked(&mut slot, &ConsumerMsg::CloseView { view: widget });
-        }
-    }
-}
-
-pub fn close_view(widget: i64) -> Result<(), ClientError> {
-    let mut slot = CLIENT
-        .lock()
-        .map_err(|_| ClientError::Internal("client lock poisoned"))?;
-    if let Some(e) = latched_error(&slot) {
-        return Err(e);
-    }
-    send_locked(&mut slot, &ConsumerMsg::CloseView { view: widget })
-}
-
-pub fn view_is_tracked(view: i64) -> bool {
-    shared()
-        .views
-        .lock()
-        .ok()
-        .is_some_and(|v| v.contains_key(&view))
+        .is_ok_and(|views| views.closing.contains(&view))
 }
 
 pub fn load_observed(view: i64) -> Option<LoadObserved> {
-    let views = shared().views.lock().ok()?;
-    let vs = views.get(&view)?;
-    Some(LoadObserved {
-        started: vs.started,
-        finished_http: vs.finished_http,
-        upcalls_ok: vs.upcalls_ok,
-    })
+    VIEWS
+        .lock()
+        .ok()
+        .and_then(|mut views| views.created(view).map(|entry| entry.observed))
 }
 
 pub fn failed_reason() -> Option<String> {
-    match CLIENT.lock() {
-        Ok(slot) => match &*slot {
-            ClientSlot::Failed(reason) => Some(reason.clone()),
-            _ => None,
-        },
-        Err(_) => None,
+    match &*CLIENT.lock().ok()? {
+        ClientSlot::Failed(reason) => Some(reason.clone()),
+        _ => None,
     }
 }
 
 pub fn needs_cookie_flush_before_shutdown() -> bool {
     CLIENT
         .lock()
-        .map(|slot| slot_needs_cookie_flush(&slot))
-        .unwrap_or(false)
+        .is_ok_and(|slot| matches!(&*slot, ClientSlot::Live(_)))
 }
 
-fn slot_needs_cookie_flush(slot: &ClientSlot) -> bool {
-    match slot {
-        ClientSlot::Live(_, _) => true,
-        ClientSlot::Unspawned(early) => !early.mutations.is_empty(),
-        ClientSlot::Failed(_) => false,
-    }
-}
-
-fn answer_stranded_deferred_callbacks(vm: &crate::runtime::Vm, ids: &[u32]) {
-    tracing::warn!(
-        target: "android.webkit.CookieManager",
-        stranded = ids.len(),
-        "ECLIPSE-DEFER-CB shutdown — {} probe-deferred 3-arg setCookie ValueCallback(s) were never \
-         replayed (this boot drove no WebView, so the flush never ran). Answering each FALSE now: \
-         those frames never reached the persistent engine, so those cookie operations genuinely \
-         did not complete. Nothing is left stranded.",
-        ids.len()
-    );
-    crate::framework::drain_deferred_cookie_set_callbacks(
-        vm,
-        "the web engine helper was shut down with probe-deferred setCookie replies outstanding",
-    );
+#[derive(Debug, Clone, Copy)]
+pub struct ShutdownReport {
+    pub helper_exit: Option<i32>,
+    pub reader_joined: bool,
 }
 
 pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
-    let mut stranded_cb_ids: Vec<u32> = Vec::new();
     let taken = match CLIENT.lock() {
-        Ok(mut slot) => {
-            match std::mem::replace(
-                &mut *slot,
-                ClientSlot::Failed("the web engine helper was shut down".into()),
-            ) {
-                ClientSlot::Live(c, _log) => Some(c),
-                mut other => {
-                    if let ClientSlot::Unspawned(early) = &mut other {
-                        stranded_cb_ids = early
-                            .mutations
-                            .iter()
-                            .filter_map(deferred_cb_request_id)
-                            .collect();
-                        early.mutations.clear();
-                    }
-
-                    if !matches!(&other, ClientSlot::Failed(r) if r == RESPAWN_IN_PROGRESS) {
-                        *slot = other;
-                    }
-                    None
-                }
+        Ok(mut slot) => match std::mem::replace(
+            &mut *slot,
+            ClientSlot::Failed("the web engine helper was shut down".into()),
+        ) {
+            ClientSlot::Live(client) => Some(client),
+            ClientSlot::Failed(reason) => {
+                *slot = ClientSlot::Failed(reason);
+                None
             }
-        }
+            ClientSlot::Unspawned | ClientSlot::Restarting => None,
+        },
         Err(_) => None,
     };
-    ACTIVE_VIEW.store(0, Ordering::Relaxed);
-    if !stranded_cb_ids.is_empty() {
-        answer_stranded_deferred_callbacks(vm, &stranded_cb_ids);
+    if let Ok(mut views) = VIEWS.lock() {
+        views.entries.clear();
+        views.closing.clear();
+        views.publish();
     }
     let Some(mut client) = taken else {
         return ShutdownReport {
@@ -2570,8 +1861,8 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
             reader_joined: false,
         };
     };
-    if let Ok(bytes) = ConsumerMsg::Shutdown.encode() {
-        let _ = (&mut &client.writer).write_all(&bytes);
+    if let Ok(frame) = ConsumerMsg::Shutdown.encode() {
+        let _ = (&mut &client.writer).write_all(&frame);
     }
     let t0 = Instant::now();
     let mut exit: Option<i32> = None;
@@ -2591,36 +1882,16 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
             exit = status.code();
         }
     }
-    let reader_joined = client
-        .reader
-        .take()
-        .map(|h| h.join().is_ok())
-        .unwrap_or(false);
-
-    if let Some(h) = client.upcall.take() {
-        let t0 = Instant::now();
-        while !h.is_finished() && t0.elapsed() < deadline {
-            let _ = crate::framework::pump_main_looper(vm);
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        crate::framework::retire_main_upcall_dispatch(vm);
-        let _ = h.join();
+    let reader_joined = client.io.join().is_ok();
+    let t0 = Instant::now();
+    while !client.upcall.is_finished() && t0.elapsed() < deadline {
+        let _ = crate::framework::pump_main_looper(vm);
+        std::thread::sleep(Duration::from_millis(2));
     }
-    if let Ok(mut views) = shared().views.lock() {
-        views.clear();
-    }
-    if let Ok(mut rect) = shared().rect.lock() {
-        *rect = None;
-    }
-
-    wake_all_blocking_cookie_waiters();
-    if let Ok(mut b) = pending_bridges().lock() {
-        b.clear();
-        PENDING_BRIDGE_VIEWS.store(0, Ordering::Relaxed);
-    }
-
+    crate::framework::retire_main_upcall_dispatch(vm);
+    let _ = client.upcall.join();
+    wake_all_cookie_waiters();
     crate::framework::drop_all_bridges();
-    LIVE_VIEWS.store(0, Ordering::Relaxed);
     ShutdownReport {
         helper_exit: exit,
         reader_joined,
@@ -2630,8 +1901,6 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-    use std::os::unix::fs::FileExt as _;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -2763,26 +2032,48 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("ECLIPSE_WEBVIEW_HELPER"), "{text}");
+        assert!(!text.contains("CEF"), "{text}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn persistent_webview_root_is_absolute_canonical_and_owner_only() {
+    fn the_helper_outlives_the_thread_that_started_it() {
+        let (control, mut child) = std::thread::spawn(|| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args([
+                "-c",
+                "[ \"$1\" = --ipc-fd=3 ] && [ -S /proc/self/fd/3 ] && sleep 0.3 && exit 7",
+                "sh",
+            ]);
+            spawn_with_control_socket(cmd).expect("spawn a stand-in helper")
+        })
+        .join()
+        .expect("spawning thread");
+        let status = child.wait().expect("wait for the stand-in helper");
+        drop(control);
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "the helper must finish on its own after the io thread that started it exits: \
+             {status:?}"
+        );
+    }
+
+    #[test]
+    fn webview_storage_dirs_are_absolute_canonical_and_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root = temp_dir("persistent-profile");
-        let cwd = root.join("cwd");
-        std::fs::create_dir_all(&cwd).expect("cwd");
-        let prepared = prepare_webview_data_root_from(Path::new("relative-data"), &cwd)
-            .expect("prepare persistent profile");
+        let root = temp_dir("storage");
+        let requested = root.join("app-data/../app-data/webview");
+        let prepared = prepare_private_dir(&requested).expect("prepare the storage dir");
         assert!(prepared.is_absolute());
-        assert_eq!(prepared, cwd.join("relative-data/webview-cef"));
+        assert_eq!(prepared, root.join("app-data/webview"));
         let mode = std::fs::metadata(&prepared)
-            .expect("profile metadata")
+            .expect("storage metadata")
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o700, "cookie profile must be owner-only");
+        assert_eq!(mode, 0o700, "the cookie store must be owner-only");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2792,34 +2083,32 @@ mod tests {
 
         let (client_end, helper_end) = UnixStream::pair().expect("pair");
         let ack = HelperMsg::HelloAck {
-            version: super::super::PROTO_VERSION,
-            engine: "cef/test".into(),
+            version: PROTO_VERSION,
+            engine: "webkitgtk/2.54.0".into(),
         }
         .encode()
         .expect("encode ack");
         (&mut &helper_end).write_all(&ack).expect("write ack");
         let engine = perform_handshake(&client_end, deadline).expect("current-version handshake");
-        assert_eq!(engine, "cef/test");
-
-        let hello = proto::read_consumer_msg(&mut &helper_end).expect("decode Hello");
+        assert_eq!(engine, "webkitgtk/2.54.0");
         assert_eq!(
-            hello,
+            proto::read_consumer_msg(&mut &helper_end).expect("decode Hello"),
             ConsumerMsg::Hello {
-                version: super::super::PROTO_VERSION
+                version: PROTO_VERSION
             }
         );
 
         let (client_end, helper_end) = UnixStream::pair().expect("pair");
         let ack = HelperMsg::HelloAck {
-            version: super::super::PROTO_VERSION + 1,
-            engine: "cef/future".into(),
+            version: PROTO_VERSION + 1,
+            engine: "webkitgtk/future".into(),
         }
         .encode()
         .expect("encode future ack");
         (&mut &helper_end).write_all(&ack).expect("write ack");
         match perform_handshake(&client_end, deadline) {
             Err(ClientError::VersionMismatch { helper_version }) => {
-                assert_eq!(helper_version, super::super::PROTO_VERSION + 1);
+                assert_eq!(helper_version, PROTO_VERSION + 1);
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
         }
@@ -2838,961 +2127,52 @@ mod tests {
         }
     }
 
-    fn announce_frame_buffer(
-        views: &mut HashMap<i64, ViewShared>,
-        widget: i64,
-        generation: u32,
-        width: u16,
-    ) -> [Vec<u8>; 3] {
-        let (memfd, slot_bytes) = shm::create_sealed_frame_memfd(width, 2, 3).expect("memfd");
-        let slot_len = slot_bytes as usize;
-        let payloads: [Vec<u8>; 3] = std::array::from_fn(|slot| {
-            (0..slot_len)
-                .map(|i| (i * 5 + slot * 7 + usize::from(width)) as u8)
-                .collect()
-        });
-        let file = File::from(memfd.try_clone().expect("dup"));
-        for (slot, payload) in payloads.iter().enumerate() {
-            file.write_at(payload, (slot * slot_len) as u64)
-                .expect("write slot");
-        }
-        let mapping = shm::map_frame_buffer(memfd.as_fd(), slot_len * 3).expect("map");
-        views
-            .get_mut(&widget)
-            .expect("tracked")
-            .frames
-            .announce(FrameBuffer {
-                mapping,
-                generation,
-                width,
-                height: 2,
-                stride: 4 * u32::from(width),
-                slot_bytes,
-            });
-        payloads
-    }
-
-    fn tracked_view_with_mapping(
-        views: &mut HashMap<i64, ViewShared>,
-        widget: i64,
-        driven_url: &str,
-        generation: u32,
-    ) -> [Vec<u8>; 3] {
-        assert!(record_view(views, widget, driven_url.to_string()));
-        announce_frame_buffer(views, widget, generation, 4)
-    }
-
-    fn latest_of(views: &HashMap<i64, ViewShared>, widget: i64) -> Option<(Vec<u8>, u32, u32)> {
-        let stage = views.get(&widget)?.frames.latest()?;
-        Some((stage.bytes.to_vec(), stage.generation, stage.seq))
-    }
-
     #[test]
-    fn webview_reader_never_fabricates_upcalls_and_acks_only_matching_generations() {
-        let mut views: HashMap<i64, ViewShared> = HashMap::new();
-        let widget = 0x0000_0001_0000_0000_i64;
-        let payloads = tracked_view_with_mapping(
-            &mut views,
-            widget,
-            "https://apps.roblox.com/challenge?t=x",
-            7,
-        );
-
-        let out = dispatch(
-            HelperMsg::LoadState {
-                view: 999,
-                state: 0,
-                http_status: 0,
-            },
-            &mut views,
-        );
-        assert!(out.upcalls.is_empty() && out.replies.is_empty() && !out.fatal);
-
-        let out = dispatch(
-            HelperMsg::LoadState {
-                view: widget,
-                state: 0,
-                http_status: 0,
-            },
-            &mut views,
-        );
-        assert_eq!(out.upcalls.len(), 1);
-        assert_eq!(out.upcalls[0].widget, widget);
-        assert_eq!(out.upcalls[0].state, 0);
-        assert_eq!(out.upcalls[0].url, "https://apps.roblox.com/challenge?t=x");
-        assert!(views.get(&widget).unwrap().started);
-        let out = dispatch(
-            HelperMsg::LoadState {
-                view: widget,
-                state: 3,
-                http_status: 200,
-            },
-            &mut views,
-        );
-        assert_eq!(out.upcalls.len(), 1);
-        assert_eq!(out.upcalls[0].state, 3);
-        assert_eq!(views.get(&widget).unwrap().finished_http, Some(200));
-
-        let out = dispatch(
-            HelperMsg::NavigationState {
-                view: widget,
-                can_go_back: true,
-            },
-            &mut views,
-        );
-        assert!(!out.fatal);
-        assert!(views.get(&widget).unwrap().can_go_back);
-
-        let out = dispatch(
-            HelperMsg::FrameReady {
-                view: widget,
-                generation: 6,
-                slot: 0,
-                seq: 1,
-            },
-            &mut views,
-        );
-        assert!(out.replies.is_empty() && out.staged_view.is_none());
-        assert!(latest_of(&views, widget).is_none());
-
-        let out = dispatch(
-            HelperMsg::FrameReady {
-                view: widget,
-                generation: 7,
-                slot: 0,
-                seq: 2,
-            },
-            &mut views,
-        );
-        assert!(
-            out.replies.is_empty(),
-            "the newest frame stays held until a newer one replaces it"
-        );
-        assert_eq!(out.staged_view, Some(widget));
-        assert_eq!(latest_of(&views, widget), Some((payloads[0].clone(), 7, 2)));
-        let stage = views
-            .get(&widget)
-            .unwrap()
-            .frames
-            .latest()
-            .expect("held frame");
-        assert_eq!((stage.width, stage.height, stage.stride), (4, 2, 16));
-
-        let out = dispatch(
-            HelperMsg::FrameReady {
-                view: widget,
-                generation: 7,
-                slot: 1,
-                seq: 3,
-            },
-            &mut views,
-        );
-        assert_eq!(
-            out.replies,
-            vec![ConsumerMsg::FrameAck {
-                view: widget,
-                generation: 7,
-                seq: 2,
-            }]
-        );
-        assert_eq!(latest_of(&views, widget), Some((payloads[1].clone(), 7, 3)));
-
-        let out = dispatch(
-            HelperMsg::FrameReady {
-                view: widget,
-                generation: 7,
-                slot: 3,
-                seq: 4,
-            },
-            &mut views,
-        );
-        assert!(out.replies.is_empty() && out.staged_view.is_none());
-        assert_eq!(latest_of(&views, widget), Some((payloads[1].clone(), 7, 3)));
-
-        let out = dispatch(
-            HelperMsg::Crash {
-                view: 0,
-                kind: 1,
-                code: -7,
-            },
-            &mut views,
-        );
-        assert!(out.fatal && out.upcalls.is_empty());
-        let reason = out.fatal_reason.expect("fatal reason");
-        assert!(reason.contains(NO_DISPLAY_MARKER), "reason: {reason}");
-
-        let out = dispatch(HelperMsg::ViewClosed { view: widget }, &mut views);
-        assert_eq!(out.closed, vec![widget]);
-        assert!(!views.contains_key(&widget));
-    }
-
-    #[test]
-    fn a_resize_keeps_presenting_the_held_frame_until_the_new_generation_paints() {
-        let mut views: HashMap<i64, ViewShared> = HashMap::new();
-        let widget = 0x0000_0002_0000_0000_i64;
-        let old = tracked_view_with_mapping(&mut views, widget, "https://host/", 1);
-        let out = dispatch(
-            HelperMsg::FrameReady {
-                view: widget,
-                generation: 1,
-                slot: 2,
-                seq: 1,
-            },
-            &mut views,
-        );
-        assert!(out.replies.is_empty());
-
-        let new = announce_frame_buffer(&mut views, widget, 2, 8);
-        assert_eq!(latest_of(&views, widget), Some((old[2].clone(), 1, 1)));
-        let stale = dispatch(
-            HelperMsg::FrameReady {
-                view: widget,
-                generation: 1,
-                slot: 0,
-                seq: 2,
-            },
-            &mut views,
-        );
-        assert!(stale.replies.is_empty() && stale.staged_view.is_none());
-        assert_eq!(latest_of(&views, widget), Some((old[2].clone(), 1, 1)));
-
-        let out = dispatch(
-            HelperMsg::FrameReady {
-                view: widget,
-                generation: 2,
-                slot: 0,
-                seq: 1,
-            },
-            &mut views,
-        );
-        assert!(
-            out.replies.is_empty(),
-            "the abandoned generation's frame is never acked"
-        );
-        assert_eq!(out.staged_view, Some(widget));
-        assert_eq!(latest_of(&views, widget), Some((new[0].clone(), 2, 1)));
-        let stage = views
-            .get(&widget)
-            .unwrap()
-            .frames
-            .latest()
-            .expect("held frame");
-        assert_eq!((stage.width, stage.stride), (8, 32));
-    }
-
-    #[test]
-    fn crash_kind1_code2_maps_to_the_sandbox_unavailable_reason_and_code0_stays_no_display() {
-        let mut views: HashMap<i64, ViewShared> = HashMap::new();
-        let out = dispatch(
-            HelperMsg::Crash {
-                view: 0,
-                kind: 1,
-                code: 2,
-            },
-            &mut views,
-        );
-        assert!(out.fatal);
-        let reason = out.fatal_reason.expect("fatal reason");
-        for needle in [
-            SANDBOX_UNAVAILABLE_MARKER,
-            "unprivileged user namespaces",
-            "kernel.unprivileged_userns_clone=1",
-            "root:root mode 4755",
-            "webview_allow_unsandboxed=true",
-        ] {
-            assert!(reason.contains(needle), "missing {needle:?} in {reason}");
-        }
-        assert!(!reason.contains(NO_DISPLAY_MARKER), "reason: {reason}");
-
-        for code in [0, 1, -7] {
-            let out = dispatch(
-                HelperMsg::Crash {
-                    view: 0,
-                    kind: 1,
-                    code,
-                },
-                &mut views,
-            );
-            let reason = out.fatal_reason.expect("fatal reason");
-            assert!(reason.contains(NO_DISPLAY_MARKER), "code {code}: {reason}");
-            assert!(
-                !reason.contains(SANDBOX_UNAVAILABLE_MARKER),
-                "code {code}: {reason}"
-            );
-        }
-    }
-
-    #[test]
-    fn enrich_spawn_failure_names_the_probed_missing_libs_and_exit_status() {
+    fn a_handshake_failure_names_the_helper_exit_status() {
         use std::os::unix::process::ExitStatusExt as _;
-        let exit_127 = std::process::ExitStatus::from_raw(127 << 8);
+        let failed = || ClientError::Handshake("protocol error before HelloAck: EOF".into());
+        let exit_1 = std::process::ExitStatus::from_raw(1 << 8);
         let killed = std::process::ExitStatus::from_raw(9);
-
-        let missing = hostprobe::ProbeOutcome::Report(hostprobe::HostLibReport {
-            total: 26,
-            resolved: 25,
-            missing: vec![hostprobe::MissingLib {
-                soname: "libnss3.so".into(),
-                family_hint: hostprobe::classify("libnss3.so"),
-            }],
-            inconclusive: 0,
-        });
-        let base =
-            || ClientError::Handshake("protocol error before HelloAck: unexpected EOF".into());
-        let enriched = enrich_spawn_failure(base(), &missing, Some(exit_127));
-        let ClientError::Handshake(text) = &enriched else {
-            panic!("expected Handshake, got {enriched:?}");
-        };
-        for needle in [
-            "exit status 127",
-            "dynamic linker could not start the CEF payload",
-            "libnss3.so",
-            "apt: libnss3",
-            "dnf: nss",
-            "pacman: nss",
-            "install them and retry",
-        ] {
-            assert!(text.contains(needle), "missing {needle:?} in {text}");
-        }
-
-        let payload = hostprobe::ProbeOutcome::PayloadMissing {
-            libcef_path: std::path::PathBuf::from("/pkg/libcef.so"),
-        };
-        let ClientError::Handshake(text) = enrich_spawn_failure(base(), &payload, Some(exit_127))
-        else {
-            panic!("expected Handshake");
-        };
-        assert!(text.contains("/pkg/libcef.so") && text.contains("package-webview.sh"));
-
-        let clean = hostprobe::ProbeOutcome::Report(hostprobe::HostLibReport {
-            total: 26,
-            resolved: 26,
-            missing: Vec::new(),
-            inconclusive: 0,
-        });
-        let ClientError::Handshake(text) = enrich_spawn_failure(base(), &clean, Some(exit_127))
-        else {
-            panic!("expected Handshake");
-        };
-        assert!(text.contains("likely a missing host library") && text.contains("ldd"));
-
-        let ClientError::Handshake(text) = enrich_spawn_failure(base(), &missing, Some(killed))
-        else {
-            panic!("expected Handshake");
-        };
-        assert_eq!(text, "protocol error before HelloAck: unexpected EOF");
-
-        let ClientError::Handshake(text) = enrich_spawn_failure(base(), &missing, None) else {
-            panic!("expected Handshake");
-        };
-        assert_eq!(text, "protocol error before HelloAck: unexpected EOF");
-
-        let vm = enrich_spawn_failure(
-            ClientError::VersionMismatch { helper_version: 1 },
-            &missing,
-            Some(exit_127),
+        assert_eq!(
+            with_exit_status(failed(), Some(exit_1)).to_string(),
+            "helper handshake failed: protocol error before HelloAck: EOF (helper exit status 1)"
         );
-        assert!(matches!(vm, ClientError::VersionMismatch { .. }));
-    }
-
-    #[test]
-    fn client_log_bindings_are_scheme_and_host_only_at_the_ipc_boundary() {
-        let mut views: HashMap<i64, ViewShared> = HashMap::new();
-        let widget = 42_i64;
-        assert!(record_view(
-            &mut views,
-            widget,
-            "https://host/challenge?token=SECRET".to_string(),
+        assert_eq!(
+            with_exit_status(failed(), Some(killed)).to_string(),
+            "helper handshake failed: protocol error before HelloAck: EOF"
+        );
+        let unloadable = std::process::ExitStatus::from_raw(127 << 8);
+        assert_eq!(
+            with_exit_status(failed(), Some(unloadable)).to_string(),
+            "helper handshake failed: protocol error before HelloAck: EOF (helper exit status \
+             127: a library it needs is missing; install GTK 4.10+ and WebKitGTK 6.0 2.42+)"
+        );
+        assert!(matches!(
+            with_exit_status(
+                ClientError::VersionMismatch { helper_version: 5 },
+                Some(exit_1)
+            ),
+            ClientError::VersionMismatch { helper_version: 5 }
         ));
-        let vs = views.get(&widget).unwrap();
-        assert_eq!(vs.log_target, "https://host");
-        assert!(!vs.log_target.contains("SECRET"));
-        assert_eq!(vs.driven_url, "https://host/challenge?token=SECRET");
-
-        let out = dispatch(
-            HelperMsg::LoadState {
-                view: widget,
-                state: 0,
-                http_status: 0,
-            },
-            &mut views,
-        );
-        assert_eq!(out.upcalls[0].url, "https://host/challenge?token=SECRET");
-        assert!(out.fatal_reason.is_none());
-
-        assert!(!record_view(&mut views, widget, "about:blank".to_string()));
-        assert_eq!(views.get(&widget).unwrap().log_target, redact::NON_URL);
-    }
-
-    #[test]
-    fn webview_client_degrades_to_the_warn_noop_after_failure_latch() {
-        let reason = format!("{HELPER_NOT_FOUND_MARKER}: probed nothing");
-        let slot = ClientSlot::Failed(reason.clone());
-        match latched_error(&slot) {
-            Some(ClientError::Latched(r)) => {
-                assert_eq!(r, reason);
-                assert!(
-                    ClientError::Latched(r)
-                        .to_string()
-                        .contains(HELPER_NOT_FOUND_MARKER),
-                    "the latched Display must preserve the actionable marker"
-                );
-            }
-            other => panic!("expected the latched error, got {other:?}"),
-        }
-
-        assert!(latched_error(&ClientSlot::Unspawned(EarlyCookies::new())).is_none());
-    }
-
-    #[test]
-    fn dispatch_extracts_bridge_eval_cookie_clear_and_flush_outputs() {
-        let mut views: HashMap<i64, ViewShared> = HashMap::new();
-
-        let out = dispatch(
-            HelperMsg::BridgeCall {
-                view: 7,
-                call_id: 3,
-                payload_json: "{\"iface\":\"X\",\"method\":\"m\",\"args\":[]}".to_string(),
-            },
-            &mut views,
-        );
-        assert_eq!(
-            out.bridge_calls,
-            vec![(
-                7,
-                3,
-                "{\"iface\":\"X\",\"method\":\"m\",\"args\":[]}".to_string()
-            )]
-        );
-        assert!(out.upcalls.is_empty() && !out.fatal);
-
-        let out = dispatch(
-            HelperMsg::EvaluateJsResult {
-                request_id: 11,
-                ok: true,
-                value_json: "\"echo:PING\"".to_string(),
-            },
-            &mut views,
-        );
-        assert_eq!(
-            out.eval_results,
-            vec![(11, true, "\"echo:PING\"".to_string())]
-        );
-
-        let out = dispatch(
-            HelperMsg::CookieSetResult {
-                request_id: 12,
-                ok: true,
-            },
-            &mut views,
-        );
-        assert_eq!(out.cookie_set_results, vec![(12, true)]);
-
-        let cookies = vec![CookieEntry {
-            name: "ECLIPSE_TEST".to_string(),
-            value: "1".to_string(),
-            domain: "127.0.0.1".to_string(),
-            path: "/".to_string(),
-            secure: false,
-            http_only: false,
-        }];
-        let out = dispatch(
-            HelperMsg::CookieList {
-                request_id: 13,
-                cookies: cookies.clone(),
-            },
-            &mut views,
-        );
-        assert_eq!(out.cookie_lists, vec![(13, cookies)]);
-
-        let out = dispatch(
-            HelperMsg::CookieFlushDone {
-                request_id: 14,
-                ok: true,
-            },
-            &mut views,
-        );
-        assert_eq!(out.cookie_flush_results, vec![(14, true)]);
-
-        let out = dispatch(
-            HelperMsg::CookiesClearDone {
-                request_id: 15,
-                removed: false,
-            },
-            &mut views,
-        );
-        assert_eq!(out.cookie_clear_results, vec![(15, false)]);
     }
 
     #[test]
     fn an_over_cap_bridge_result_is_answered_with_a_failure_frame() {
-        let frame =
-            bridge_result_frame(5, true, "x".repeat(8 * 1024 * 1024)).expect("fallback frame");
         assert_eq!(
-            proto::read_consumer_msg(&mut frame.as_slice()),
-            Ok(ConsumerMsg::BridgeResult {
+            bridge_result(5, true, "x".repeat(8 * 1024 * 1024)),
+            ConsumerMsg::BridgeResult {
                 call_id: 5,
                 ok: false,
                 result_json: BRIDGE_RESULT_OVER_CAP.to_string(),
-            })
+            }
         );
-
-        let frame = bridge_result_frame(6, true, "{\"a\":1}".to_string()).expect("frame");
         assert_eq!(
-            proto::read_consumer_msg(&mut frame.as_slice()),
-            Ok(ConsumerMsg::BridgeResult {
+            bridge_result(6, true, "{\"a\":1}".to_string()),
+            ConsumerMsg::BridgeResult {
                 call_id: 6,
                 ok: true,
                 result_json: "{\"a\":1}".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn normalize_app_user_agent_treats_null_and_empty_as_a_reset_to_the_default() {
-        assert_eq!(normalize_app_user_agent(None), None);
-        assert_eq!(normalize_app_user_agent(Some(String::new())), None);
-
-        let app_ua = "Mozilla/5.0 (0MB; 960x540; 160x160; 960x540; HTC unknown; unknown) \
-                      AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App 2.724.735 Phone \
-                      Hybrid()  GooglePlayStore RobloxApp/2.724.735 (GlobalDist; GooglePlayStore)";
-        assert_eq!(
-            normalize_app_user_agent(Some(app_ua.to_string())),
-            Some(app_ua.to_string())
-        );
-
-        assert_eq!(
-            normalize_app_user_agent(Some(" ".to_string())),
-            Some(" ".to_string())
-        );
-    }
-
-    fn a_cookie_set(name: &str) -> ConsumerMsg {
-        ConsumerMsg::CookieSet {
-            url: "https://www.roblox.com/".into(),
-            name: name.into(),
-            value: "v".into(),
-            domain: ".roblox.com".into(),
-            path: "/".into(),
-            secure: true,
-            http_only: true,
-            expires_epoch_s: 0,
-        }
-    }
-
-    fn a_cookie_set_cb(request_id: u32) -> ConsumerMsg {
-        ConsumerMsg::CookieSetForResult {
-            request_id,
-            url: "https://www.roblox.com/".into(),
-            name: "n".into(),
-            value: "v".into(),
-            domain: ".roblox.com".into(),
-            path: "/".into(),
-            secure: true,
-            http_only: true,
-            expires_epoch_s: 1_800_000_000,
-        }
-    }
-
-    #[test]
-    fn defer_cookie_cb_gate_is_exact_match_one_only() {
-        assert!(defer_cookie_cb_enabled(Some("1")));
-        assert!(!defer_cookie_cb_enabled(Some("")));
-        assert!(!defer_cookie_cb_enabled(Some("0")));
-        assert!(!defer_cookie_cb_enabled(Some("true")));
-        assert!(!defer_cookie_cb_enabled(Some("yes")));
-        assert!(!defer_cookie_cb_enabled(Some("1 ")));
-        assert!(!defer_cookie_cb_enabled(Some(" 1")));
-        assert!(!defer_cookie_cb_enabled(Some("11")));
-        assert!(!defer_cookie_cb_enabled(None));
-    }
-
-    #[test]
-    fn host_shutdown_does_not_spawn_cef_for_an_empty_cookie_deferral() {
-        let empty = ClientSlot::Unspawned(EarlyCookies::new());
-        assert!(!slot_needs_cookie_flush(&empty));
-
-        let mut dirty = EarlyCookies::new();
-        assert_eq!(
-            dirty.offer(&a_cookie_set("shutdown"), false),
-            Deferral::Buffer
-        );
-        assert!(slot_needs_cookie_flush(&ClientSlot::Unspawned(dirty)));
-        assert!(!slot_needs_cookie_flush(&ClientSlot::Failed(
-            "already retired".into()
-        )));
-    }
-
-    #[test]
-    fn defer_cookie_cb_off_keeps_only_fire_and_forget_sets_bufferable() {
-        let mut early = EarlyCookies::new();
-        assert_eq!(
-            early.offer(&a_cookie_set_cb(1), false),
-            Deferral::NeedsEngine(
-                "setCookie(url, value, ValueCallback) — only the engine yields the REAL success flag"
-            )
-        );
-
-        assert!(early.mutations.is_empty());
-        assert!(!early.holds_unanswered_callback());
-
-        assert_eq!(early.offer(&a_cookie_set("a"), false), Deferral::Buffer);
-        assert!(matches!(
-            early.offer(&ConsumerMsg::CookiesClear { request_id: 2 }, false),
-            Deferral::NeedsEngine(_)
-        ));
-        assert!(matches!(
-            early.offer(&ConsumerMsg::CookiesClearSession { request_id: 3 }, false),
-            Deferral::NeedsEngine(_)
-        ));
-        assert_eq!(early.mutations, vec![a_cookie_set("a")]);
-        assert!(matches!(
-            early.offer(
-                &ConsumerMsg::CookieGet {
-                    request_id: 3,
-                    url: "https://www.roblox.com/".into(),
-                },
-                false
-            ),
-            Deferral::NeedsEngine(_)
-        ));
-        assert!(matches!(
-            early.offer(&ConsumerMsg::CookieFlush { request_id: 4 }, false),
-            Deferral::NeedsEngine(_)
-        ));
-    }
-
-    #[test]
-    fn defer_cookie_cb_on_buffers_the_three_arg_set_losslessly_instead_of_spawning() {
-        let mut early = EarlyCookies::new();
-        assert_eq!(early.offer(&a_cookie_set_cb(7), true), Deferral::Buffer);
-        assert_eq!(early.mutations.len(), 1);
-        assert!(early.holds_unanswered_callback());
-
-        assert_eq!(early.mutations[0], a_cookie_set_cb(7));
-        assert_eq!(deferred_cb_request_id(&early.mutations[0]), Some(7));
-
-        assert_eq!(early.offer(&a_cookie_set("later"), true), Deferral::Buffer);
-        assert_eq!(
-            early.mutations,
-            vec![a_cookie_set_cb(7), a_cookie_set("later")]
-        );
-    }
-
-    #[test]
-    fn defer_cookie_cb_never_lets_a_clear_drop_an_unanswered_callback() {
-        let mut early = EarlyCookies::new();
-        assert_eq!(early.offer(&a_cookie_set_cb(1), true), Deferral::Buffer);
-        assert!(matches!(
-            early.offer(&ConsumerMsg::CookiesClear { request_id: 2 }, true),
-            Deferral::NeedsEngine(_)
-        ));
-        assert!(matches!(
-            early.offer(&ConsumerMsg::CookiesClearSession { request_id: 3 }, true),
-            Deferral::NeedsEngine(_)
-        ));
-
-        assert_eq!(early.mutations.len(), 1);
-        assert!(early.holds_unanswered_callback());
-    }
-
-    #[test]
-    fn defer_cookie_cb_respects_the_lemma_boundary_and_the_buffer_cap() {
-        let mut early = EarlyCookies::new();
-        assert_eq!(early.offer(&a_cookie_set_cb(1), true), Deferral::Buffer);
-        assert!(matches!(
-            early.offer(
-                &ConsumerMsg::CookieGet {
-                    request_id: 2,
-                    url: "https://www.roblox.com/".into(),
-                },
-                true
-            ),
-            Deferral::NeedsEngine(_)
-        ));
-
-        let mut full = EarlyCookies::new();
-        for i in 0..EarlyCookies::CAP {
-            assert_eq!(
-                full.offer(&a_cookie_set(&format!("c{i}")), true),
-                Deferral::Buffer
-            );
-        }
-        assert_eq!(
-            full.offer(&a_cookie_set_cb(9), true),
-            Deferral::NeedsEngine("the deferred-cookie buffer is full")
-        );
-        assert_eq!(full.mutations.len(), EarlyCookies::CAP);
-        assert!(!full.holds_unanswered_callback());
-    }
-
-    #[test]
-    fn early_cookies_defer_sets_so_a_cookie_op_never_cold_starts_the_engine() {
-        let mut early = EarlyCookies::new();
-        assert_eq!(early.offer(&a_cookie_set("a"), false), Deferral::Buffer);
-        assert_eq!(early.offer(&a_cookie_set("b"), false), Deferral::Buffer);
-        assert_eq!(early.mutations.len(), 2);
-    }
-
-    #[test]
-    fn early_cookies_never_guess_about_the_persistent_base() {
-        let mut early = EarlyCookies::new();
-        assert!(matches!(
-            early.offer(
-                &ConsumerMsg::CookieGet {
-                    request_id: 1,
-                    url: "https://www.roblox.com/".into(),
-                },
-                false
-            ),
-            Deferral::NeedsEngine(_)
-        ));
-        assert_eq!(early.offer(&a_cookie_set("a"), false), Deferral::Buffer);
-        assert!(matches!(
-            early.offer(&ConsumerMsg::CookiesClear { request_id: 2 }, false),
-            Deferral::NeedsEngine(_)
-        ));
-        assert!(matches!(
-            early.offer(&ConsumerMsg::CookiesClearSession { request_id: 3 }, false),
-            Deferral::NeedsEngine(_)
-        ));
-        assert_eq!(early.mutations, vec![a_cookie_set("a")]);
-        assert!(matches!(
-            early.offer(&ConsumerMsg::CookieFlush { request_id: 4 }, false),
-            Deferral::NeedsEngine(_)
-        ));
-    }
-
-    #[test]
-    fn early_cookies_demand_the_engine_for_matching_and_for_the_real_set_flag() {
-        let mut early = EarlyCookies::new();
-        assert_eq!(early.offer(&a_cookie_set("a"), false), Deferral::Buffer);
-        assert!(matches!(
-            early.offer(
-                &ConsumerMsg::CookieGet {
-                    request_id: 1,
-                    url: "https://www.roblox.com/".into(),
-                },
-                false
-            ),
-            Deferral::NeedsEngine(_)
-        ));
-        assert!(matches!(
-            early.offer(
-                &ConsumerMsg::CookieSetForResult {
-                    request_id: 2,
-                    url: "https://www.roblox.com/".into(),
-                    name: "n".into(),
-                    value: "v".into(),
-                    domain: ".roblox.com".into(),
-                    path: "/".into(),
-                    secure: true,
-                    http_only: true,
-                    expires_epoch_s: 0,
-                },
-                false
-            ),
-            Deferral::NeedsEngine(_)
-        ));
-
-        assert_eq!(early.mutations.len(), 1);
-    }
-
-    #[test]
-    fn early_cookies_are_bounded_and_overflow_forces_the_honest_spawn() {
-        let mut early = EarlyCookies::new();
-        for i in 0..EarlyCookies::CAP {
-            assert_eq!(
-                early.offer(&a_cookie_set(&format!("c{i}")), false),
-                Deferral::Buffer
-            );
-        }
-        assert!(matches!(
-            early.offer(&a_cookie_set("overflow"), false),
-            Deferral::NeedsEngine(_)
-        ));
-        assert_eq!(early.mutations.len(), EarlyCookies::CAP);
-    }
-
-    #[test]
-    fn early_cookie_sets_replay_in_arrival_order() {
-        let mut early = EarlyCookies::new();
-        for n in ["first", "second", "third"] {
-            assert_eq!(early.offer(&a_cookie_set(n), false), Deferral::Buffer);
-        }
-        let taken = std::mem::take(&mut early.mutations);
-        let names: Vec<&str> = taken
-            .iter()
-            .map(|m| match m {
-                ConsumerMsg::CookieSet { name, .. } => name.as_str(),
-                _ => "not-a-set",
-            })
-            .collect();
-        assert_eq!(names, vec!["first", "second", "third"]);
-    }
-
-    const MEASURED_APP_UA: &str = "Mozilla/5.0 (0MB; 960x540; 160x160; 960x540; HTC unknown; \
-                                   unknown) AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android \
-                                   App 2.724.735 Phone Hybrid()  GooglePlayStore \
-                                   RobloxApp/2.724.735 (GlobalDist; GooglePlayStore)";
-
-    #[test]
-    fn a_cookie_forced_helper_is_replaced_so_the_apps_user_agent_reaches_the_engine() {
-        assert_eq!(
-            respawn_verdict(Some(MEASURED_APP_UA), None, false, 0, true, 0),
-            RespawnVerdict::Respawn
-        );
-
-        let lower = MEASURED_APP_UA.to_lowercase();
-        assert!(
-            lower.contains("hybrid"),
-            "the app's UA must carry the Hybrid() token"
-        );
-        assert!(
-            lower.contains("android"),
-            "the app's UA must carry the android token"
-        );
-    }
-
-    #[test]
-    fn respawn_verdict_keeps_the_live_helper_for_every_recorded_reason() {
-        let app = Some(MEASURED_APP_UA);
-
-        assert!(matches!(
-            respawn_verdict(app, None, true, 0, true, 0),
-            RespawnVerdict::Keep(_)
-        ));
-
-        assert!(matches!(
-            respawn_verdict(None, None, false, 0, true, 0),
-            RespawnVerdict::Keep(_)
-        ));
-
-        assert!(matches!(
-            respawn_verdict(app, app, false, 0, true, 0),
-            RespawnVerdict::Keep(_)
-        ));
-
-        assert!(matches!(
-            respawn_verdict(app, None, false, 1, true, 0),
-            RespawnVerdict::Keep(_)
-        ));
-
-        assert!(matches!(
-            respawn_verdict(app, None, false, 0, false, 0),
-            RespawnVerdict::Keep(_)
-        ));
-
-        assert!(matches!(
-            respawn_verdict(app, None, false, 0, true, 1),
-            RespawnVerdict::Keep(_)
-        ));
-
-        assert!(matches!(
-            respawn_verdict(app, None, true, 1, true, 1),
-            RespawnVerdict::Keep(_)
-        ));
-    }
-
-    #[test]
-    fn cookie_log_replays_sets_and_clears_over_the_persistent_base_in_order() {
-        let mut log = EarlyCookies::new();
-        log.record_sent(&a_cookie_set("a"));
-        log.record_sent(&a_cookie_set_cb(1));
-        assert_eq!(log.mutations, vec![a_cookie_set("a"), a_cookie_set_cb(1)]);
-
-        log.record_sent(&ConsumerMsg::CookieGet {
-            request_id: 2,
-            url: "https://www.roblox.com/".into(),
-        });
-        assert_eq!(log.mutations.len(), 2);
-        let clear = ConsumerMsg::CookiesClear { request_id: 3 };
-        log.record_sent(&clear);
-        assert_eq!(
-            log.mutations,
-            vec![a_cookie_set("a"), a_cookie_set_cb(1), clear.clone()]
-        );
-        assert!(log.replayable);
-        let clear_session = ConsumerMsg::CookiesClearSession { request_id: 4 };
-        log.record_sent(&clear_session);
-        assert_eq!(log.mutations.last(), Some(&clear_session));
-
-        log.record_sent(&a_cookie_set("after"));
-        assert_eq!(log.mutations.last(), Some(&a_cookie_set("after")));
-
-        assert_eq!(log.mutations[4], a_cookie_set("after"));
-    }
-
-    #[test]
-    fn cookie_log_overflow_and_retirement_refuse_the_respawn_instead_of_lying() {
-        let mut log = EarlyCookies::new();
-        for i in 0..EarlyCookies::CAP {
-            log.record_sent(&a_cookie_set(&format!("c{i}")));
-        }
-        assert!(log.replayable);
-        log.record_sent(&a_cookie_set("overflow"));
-        assert_eq!(log.mutations.len(), EarlyCookies::CAP, "the bound holds");
-        assert!(
-            !log.replayable,
-            "and the respawn is surrendered, not the bound"
-        );
-        assert!(matches!(
-            respawn_verdict(Some(MEASURED_APP_UA), None, false, 0, log.replayable, 0),
-            RespawnVerdict::Keep(_)
-        ));
-
-        let mut log = EarlyCookies::new();
-        log.record_sent(&a_cookie_set("a"));
-        log.retire();
-        assert!(log.mutations.is_empty() && !log.replayable);
-        log.record_sent(&a_cookie_set("auth-token-shaped"));
-        assert!(
-            log.mutations.is_empty(),
-            "post-CreateView auth cookies must not be retained in the ART process"
-        );
-    }
-
-    #[test]
-    fn taking_a_helper_for_replacement_marks_it_so_its_upcall_thread_skips_the_drain() {
-        let (writer, _helper_end) = UnixStream::pair().expect("socketpair");
-        let replaced = Arc::new(AtomicBool::new(false));
-        let mut slot = ClientSlot::Live(
-            Client {
-                child: std::process::Command::new("true")
-                    .spawn()
-                    .expect("spawn a stand-in helper"),
-                writer,
-                reader: None,
-                upcall: None,
-                replaced: Arc::clone(&replaced),
-            },
-            EarlyCookies::new(),
-        );
-        let (mut old, _log) = take_for_replacement(&mut slot).expect("a live helper");
-        assert!(replaced.load(Ordering::Acquire));
-        assert!(matches!(&slot, ClientSlot::Failed(r) if r == RESPAWN_IN_PROGRESS));
-        assert!(take_for_replacement(&mut slot).is_none());
-        let _ = old.child.wait();
-
-        let src = include_str!("client.rs");
-        let upcall_start = src
-            .find("fn upcall_thread_main")
-            .expect("upcall_thread_main present");
-        let upcall_end = src[upcall_start..]
-            .find("fn reader_loop")
-            .expect("reader_loop follows upcall_thread_main")
-            + upcall_start;
-        let upcall_body = &src[upcall_start..upcall_end];
-        let skip = upcall_body
-            .find("if replaced.load(Ordering::Acquire)")
-            .expect("the upcall thread must check the replacement mark when its channel closes");
-        let drain = upcall_body
-            .find("drain_all_webview_callbacks")
-            .expect("the upcall thread drains callbacks when its helper connection closes");
-        assert!(
-            skip < drain && upcall_body[skip..drain].contains("return;"),
-            "a replaced helper's upcall thread must return before draining the replacement's \
-             ValueCallbacks"
+            }
         );
     }
 
@@ -3805,136 +2185,881 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    const ROBLOX_UA: &str = "Mozilla/5.0 (0MB; 960x540; 160x160; 960x540; HTC unknown; unknown) \
+                             AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App 2.724.735 \
+                             Phone Hybrid()  GooglePlayStore RobloxApp/2.724.735 (GlobalDist; \
+                             GooglePlayStore)";
+
+    fn load(view: i64) -> ConsumerMsg {
+        ConsumerMsg::LoadUrl {
+            view,
+            url: "https://www.roblox.com/login".into(),
+        }
+    }
+
     #[test]
-    fn reader_exit_wakes_all_blocking_cookie_calls_immediately() {
-        let (tx, rx) = mpsc::channel::<Vec<CookieEntry>>();
+    fn the_first_load_creates_the_view_with_its_user_agent_bridges_and_visibility() {
+        let view = 42;
+        let mut entry = ViewEntry {
+            user_agent: Some(ROBLOX_UA.to_string()),
+            ..ViewEntry::default()
+        };
+        entry.bridges.insert(
+            "__globalRobloxAndroidBridge__".into(),
+            vec!["executeRoblox".into()],
+        );
+        assert_eq!(
+            entry.load_batch(view, true, load(view)),
+            vec![
+                ConsumerMsg::CreateView { view },
+                ConsumerMsg::SetUserAgent {
+                    view,
+                    user_agent: ROBLOX_UA.to_string(),
+                },
+                ConsumerMsg::BridgeRegister {
+                    view,
+                    name: "__globalRobloxAndroidBridge__".into(),
+                    methods: vec!["executeRoblox".into()],
+                },
+                ConsumerMsg::SetVisible {
+                    view,
+                    visible: true,
+                },
+                load(view),
+            ]
+        );
+        assert!(entry.window_visible());
+        assert_eq!(
+            entry.load_batch(view, true, load(view)),
+            vec![load(view)],
+            "a later load reuses the helper's view and its window"
+        );
+    }
+
+    #[test]
+    fn a_view_without_an_app_user_agent_keeps_the_helper_default_and_starts_hidden() {
+        let view = 43;
+        let mut entry = ViewEntry::default();
+        assert_eq!(
+            entry.load_batch(view, false, load(view)),
+            vec![ConsumerMsg::CreateView { view }, load(view)]
+        );
+        assert!(!entry.window_visible());
+    }
+
+    #[test]
+    fn the_window_follows_the_android_view_and_changes_only_on_transitions() {
+        let view = 44;
+        let mut entry = ViewEntry::default();
+        assert_eq!(
+            entry.show(view, true),
+            None,
+            "an uncreated view has no window"
+        );
+        entry.load_batch(view, false, load(view));
+        assert_eq!(
+            entry.show(view, true),
+            Some(ConsumerMsg::SetVisible {
+                view,
+                visible: true
+            })
+        );
+        assert_eq!(entry.show(view, true), None);
+        assert_eq!(
+            entry.show(view, false),
+            Some(ConsumerMsg::SetVisible {
+                view,
+                visible: false
+            })
+        );
+        assert_eq!(entry.show(view, false), None);
+    }
+
+    #[test]
+    fn showing_a_window_asks_for_an_activation_token_for_that_view() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while take_activation_request() {}
+        note_visibility(&[ConsumerMsg::SetVisible {
+            view: 7,
+            visible: false,
+        }]);
+        assert!(!take_activation_request(), "hiding never asks for focus");
+        note_visibility(&[ConsumerMsg::SetVisible {
+            view: 7,
+            visible: true,
+        }]);
+        assert!(take_activation_request());
+        assert_eq!(ACTIVATION_TARGET.load(Ordering::Acquire), 7);
+        assert!(!take_activation_request(), "one request per shown window");
+    }
+
+    #[test]
+    fn a_press_withheld_from_the_game_asks_to_raise_the_shown_web_view_window() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while take_activation_request() {}
+        let hidden = registry_view(false);
+        let shown = registry_view(true);
+        {
+            let mut views = VIEWS.lock().expect("views");
+            views.entries.insert(hidden, created_entry(false));
+            views.entries.insert(shown, created_entry(true));
+            views.publish();
+        }
+        ACTIVATION_TARGET.store(hidden, Ordering::Release);
+        request_activation_of_shown_view();
+        let raised = (
+            take_activation_request(),
+            ACTIVATION_TARGET.load(Ordering::Acquire),
+        );
+        {
+            let mut views = VIEWS.lock().expect("views");
+            views.entries.remove(&hidden);
+            views.entries.remove(&shown);
+            views.publish();
+        }
+        request_activation_of_shown_view();
+        let without_window = take_activation_request();
+        free_registry_views(&[hidden, shown]);
+
+        assert_eq!(
+            raised,
+            (true, shown),
+            "the hidden view is skipped and the shown one is raised"
+        );
+        assert!(
+            !without_window,
+            "with no WebView window shown nothing is raised"
+        );
+    }
+
+    #[test]
+    fn the_last_activated_window_is_raised_again_while_it_shows() {
+        let mut views = Views::new();
+        views.entries.insert(90, created_entry(true));
+        views.entries.insert(91, created_entry(true));
+        views.entries.insert(92, created_entry(false));
+        assert_eq!(views.activation_target(90), Some(90));
+        assert_eq!(views.activation_target(92), Some(91));
+        assert_eq!(views.activation_target(93), Some(91));
+        assert_eq!(Views::new().activation_target(90), None);
+    }
+
+    fn views_with(view: i64, entry: ViewEntry) -> Views {
+        let mut views = Views::new();
+        views.entries.insert(view, entry);
+        views
+    }
+
+    fn registry_view(shown: bool) -> i64 {
+        let view = view_registry::allocate("android.webkit.WebView").expect("allocate a WebView");
+        if shown {
+            view_registry::mark_window_root(view).expect("show the WebView");
+        }
+        assert_eq!(view_registry::is_shown(view), shown);
+        view
+    }
+
+    fn free_registry_views(views: &[i64]) {
+        for &view in views {
+            view_registry::free(view).expect("free the WebView");
+        }
+    }
+
+    fn created_entry(shown: bool) -> ViewEntry {
+        ViewEntry {
+            created: true,
+            shown,
+            can_go_back: true,
+            ..ViewEntry::default()
+        }
+    }
+
+    fn upcall(routed: Routed) -> Upcall {
+        match routed {
+            Routed::Upcall(upcall) => upcall,
+            Routed::Handled => panic!("expected an upcall, the message was handled in place"),
+            Routed::Fatal(reason) => panic!("expected an upcall, got fatal {reason}"),
+        }
+    }
+
+    #[test]
+    fn load_events_reach_android_with_the_real_url_except_redirects() {
+        let view = 50;
+        let mut views = views_with(view, created_entry(true));
+        let url = "https://www.roblox.com/login?returnUrl=x";
+        for (event, state) in [
+            (LoadEvent::Started, 0),
+            (LoadEvent::Committed, 2),
+            (LoadEvent::Finished, 3),
+        ] {
+            match upcall(route(
+                HelperMsg::LoadChanged {
+                    view,
+                    event,
+                    url: url.into(),
+                },
+                &mut views,
+            )) {
+                Upcall::LoadChanged {
+                    view: got,
+                    state: got_state,
+                    url: got_url,
+                } => {
+                    assert_eq!((got, got_state, got_url.as_str()), (view, state, url));
+                }
+                _ => panic!("expected a LoadChanged upcall for {event:?}"),
+            }
+        }
+        assert!(matches!(
+            route(
+                HelperMsg::LoadChanged {
+                    view,
+                    event: LoadEvent::Redirected,
+                    url: url.into(),
+                },
+                &mut views,
+            ),
+            Routed::Handled
+        ));
+        let observed = views.entries[&view].observed;
+        assert!(observed.started && observed.finished);
+
+        assert!(matches!(
+            route(
+                HelperMsg::LoadChanged {
+                    view: view + 1,
+                    event: LoadEvent::Started,
+                    url: url.into(),
+                },
+                &mut views,
+            ),
+            Routed::Handled
+        ));
+    }
+
+    #[test]
+    fn navigation_state_backs_get_url_and_can_go_back() {
+        let view = 51;
+        let mut views = views_with(view, created_entry(true));
+        route(
+            HelperMsg::NavigationState {
+                view,
+                url: "https://www.roblox.com/home".into(),
+                title: "Home".into(),
+                can_go_back: false,
+            },
+            &mut views,
+        );
+        let entry = &views.entries[&view];
+        assert_eq!(entry.url.as_deref(), Some("https://www.roblox.com/home"));
+        assert!(!entry.can_go_back);
+        route(
+            HelperMsg::NavigationState {
+                view,
+                url: String::new(),
+                title: String::new(),
+                can_go_back: true,
+            },
+            &mut views,
+        );
+        assert_eq!(views.entries[&view].url, None, "an empty URL is no URL");
+        assert!(views.entries[&view].can_go_back);
+    }
+
+    fn navigation_state(view: i64, can_go_back: bool) -> HelperMsg {
+        HelperMsg::NavigationState {
+            view,
+            url: "https://www.roblox.com/info/terms".into(),
+            title: "Terms".into(),
+            can_go_back,
+        }
+    }
+
+    #[test]
+    fn closing_the_window_and_a_dead_page_map_to_android_back() {
+        let view = 52;
+        let mut views = views_with(view, created_entry(true));
+        assert!(views.entries[&view].back_navigates());
+        assert!(matches!(
+            upcall(route(HelperMsg::CloseRequested { view }, &mut views)),
+            Upcall::Back
+        ));
+        assert!(
+            !views.entries[&view].back_navigates(),
+            "Roblox's Back handler goes back in web history while canGoBack is true, so a \
+             window close must make that Back close the view"
+        );
+        route(navigation_state(view, true), &mut views);
+        assert!(
+            !views.entries[&view].back_navigates(),
+            "a page update before Roblox handles the Back keeps it closing the view"
+        );
+        let entry = views.entries.get_mut(&view).expect("entry");
+        entry.load_batch(view, true, load(view));
+        assert!(entry.back_navigates(), "a new load restores web history");
+
+        let dead = 57;
+        let mut views = views_with(dead, created_entry(true));
+        assert!(matches!(
+            upcall(route(HelperMsg::WebProcessGone { view: dead }, &mut views)),
+            Upcall::Back
+        ));
+        assert!(
+            !views.entries[&dead].back_navigates(),
+            "after its page died, Back closes the view instead of navigating a dead page"
+        );
+        let entry = views.entries.get_mut(&dead).expect("entry");
+        entry.show(dead, false);
+        entry.show(dead, true);
+        assert!(
+            entry.back_navigates(),
+            "once the view is hidden, a later showing navigates web history again"
+        );
+
+        let hidden = 53;
+        let mut views = views_with(hidden, created_entry(false));
+        assert!(matches!(
+            route(HelperMsg::WebProcessGone { view: hidden }, &mut views),
+            Routed::Handled
+        ));
+        assert!(!views.entries[&hidden].back_navigates());
+        assert!(
+            matches!(
+                route(HelperMsg::CloseRequested { view: hidden }, &mut views),
+                Routed::Handled
+            ),
+            "closing a window the app already hid sends no Back to the game"
+        );
+    }
+
+    #[test]
+    fn a_destroyed_view_gets_no_navigation_callback() {
+        let mut views = Views::new();
+        assert!(matches!(
+            route(
+                HelperMsg::PolicyRequest {
+                    view: 56,
+                    policy_id: 3,
+                    url: "roblox://placeId=1".into(),
+                    redirect: false,
+                    user_gesture: true,
+                    method: "GET".into(),
+                },
+                &mut views,
+            ),
+            Routed::Handled
+        ));
+    }
+
+    #[test]
+    fn page_callbacks_map_to_android_codes_and_requests() {
+        let view = 54;
+        let mut views = views_with(view, created_entry(true));
+        match upcall(route(
+            HelperMsg::LoadFailed {
+                view,
+                url: "https://nx.invalid/".into(),
+                error: proto::LoadError::HostLookup,
+                description: "Error resolving".into(),
+            },
+            &mut views,
+        )) {
+            Upcall::LoadFailed {
+                code, description, ..
+            } => {
+                assert_eq!(code, -2);
+                assert_eq!(description, "Error resolving");
+            }
+            _ => panic!("expected LoadFailed"),
+        }
+        match upcall(route(
+            HelperMsg::PolicyRequest {
+                view,
+                policy_id: 9,
+                url: "roblox://placeId=1".into(),
+                redirect: false,
+                user_gesture: true,
+                method: "GET".into(),
+            },
+            &mut views,
+        )) {
+            Upcall::Policy {
+                policy_id, request, ..
+            } => {
+                assert_eq!(policy_id, 9);
+                assert_eq!(request.url, "roblox://placeId=1");
+                assert_eq!(request.method, "GET");
+                assert!(request.user_gesture && !request.redirect);
+            }
+            _ => panic!("expected Policy"),
+        }
+        assert!(matches!(
+            upcall(route(HelperMsg::Progress { view, percent: 40 }, &mut views)),
+            Upcall::Progress { percent: 40, .. }
+        ));
+        assert!(matches!(
+            upcall(route(
+                HelperMsg::ResourceLoad {
+                    view,
+                    url: "https://css.rbxcdn.com/a.css".into()
+                },
+                &mut views
+            )),
+            Upcall::ResourceLoad { .. }
+        ));
+    }
+
+    #[test]
+    fn view_closed_ends_the_close_and_drains_by_era() {
+        let view = 55;
+        let mut views = Views::new();
+        views.closing.insert(view);
+        let before = crate::framework::bump_webview_close_era();
+        match upcall(route(HelperMsg::ViewClosed { view }, &mut views)) {
+            Upcall::ViewClosed {
+                view: closed,
+                upto_era,
+            } => {
+                assert_eq!(closed, view);
+                assert!(upto_era > before);
+            }
+            _ => panic!("expected ViewClosed"),
+        }
+        assert!(views.closing.is_empty());
+    }
+
+    #[test]
+    fn cookie_replies_wake_their_blocked_callers() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut views = Views::new();
         let request_id = next_request_id();
-        shared()
-            .cookie_get_waiters
+        let (tx, rx) = mpsc::channel();
+        COOKIE_GETS.lock().expect("waiters").insert(request_id, tx);
+        let cookies = vec![CookiePair {
+            name: ".ROBLOSECURITY".into(),
+            value: "v".into(),
+        }];
+        assert!(matches!(
+            route(
+                HelperMsg::CookieList {
+                    request_id,
+                    cookies: cookies.clone(),
+                },
+                &mut views,
+            ),
+            Routed::Handled
+        ));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(cookies));
+
+        let request_id = next_request_id();
+        let (tx, rx) = mpsc::channel();
+        COOKIE_FLUSHES
             .lock()
-            .expect("waiters lock")
+            .expect("waiters")
             .insert(request_id, tx);
-        let (flush_tx, flush_rx) = mpsc::channel::<bool>();
-        shared()
-            .cookie_flush_waiters
-            .lock()
-            .expect("flush waiters lock")
-            .insert(next_request_id(), flush_tx);
-        wake_all_blocking_cookie_waiters();
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Err(mpsc::RecvTimeoutError::Disconnected) => {}
-            other => panic!("expected an immediate Disconnected wake, got {other:?}"),
+        route(
+            HelperMsg::CookieFlushed {
+                request_id,
+                ok: true,
+            },
+            &mut views,
+        );
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(true));
+    }
+
+    #[test]
+    fn helper_failures_are_fatal_and_a_second_hello_ack_is_a_protocol_violation() {
+        let mut views = Views::new();
+        assert!(matches!(
+            route(
+                HelperMsg::Fatal {
+                    reason: "GTK could not open the display".into()
+                },
+                &mut views
+            ),
+            Routed::Fatal(reason) if reason == "GTK could not open the display"
+        ));
+        assert!(matches!(
+            route(
+                HelperMsg::HelloAck {
+                    version: PROTO_VERSION,
+                    engine: String::new()
+                },
+                &mut views
+            ),
+            Routed::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn a_lost_helper_hides_every_window_and_keeps_what_recreates_the_views() {
+        let mut views = Views::new();
+        let mut shown = created_entry(true);
+        shown.user_agent = Some(ROBLOX_UA.to_string());
+        shown.url = Some("https://www.roblox.com/login".into());
+        views.entries.insert(60, shown);
+        views.entries.insert(61, created_entry(false));
+        views.entries.insert(62, ViewEntry::default());
+        views.closing.insert(63);
+        assert_eq!(views.reset_after_helper_loss(), 1);
+        for entry in views.entries.values() {
+            assert!(!entry.created && !entry.window_visible() && !entry.can_go_back);
+            assert_eq!(entry.url, None);
         }
-        match flush_rx.recv_timeout(Duration::from_millis(200)) {
-            Err(mpsc::RecvTimeoutError::Disconnected) => {}
-            other => panic!("expected an immediate flush Disconnected wake, got {other:?}"),
+        assert_eq!(views.entries[&60].user_agent.as_deref(), Some(ROBLOX_UA));
+        assert!(views.closing.is_empty());
+
+        let view = 60;
+        let entry = views.entries.get_mut(&view).expect("entry");
+        assert_eq!(
+            entry.load_batch(view, true, load(view))[..2],
+            [
+                ConsumerMsg::CreateView { view },
+                ConsumerMsg::SetUserAgent {
+                    view,
+                    user_agent: ROBLOX_UA.to_string()
+                }
+            ],
+            "the next load recreates the view in the restarted helper"
+        );
+    }
+
+    static HELPER_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_helper_that_exits_hides_its_windows_and_asks_android_to_close_the_shown_ones() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+        let (host_end, helper_end) = UnixStream::pair().expect("socketpair");
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn a stand-in helper");
+        *CLIENT.lock().expect("client") = ClientSlot::Live(Client {
+            child,
+            writer: host_end.try_clone().expect("writer"),
+            io: std::thread::spawn(|| {}),
+            upcall: std::thread::spawn(|| {}),
+        });
+        let shown_view = registry_view(true);
+        let hidden_view = registry_view(false);
+        {
+            let mut views = VIEWS.lock().expect("views");
+            views.entries.insert(shown_view, created_entry(true));
+            views.entries.insert(hidden_view, created_entry(false));
+            views.publish();
+        }
+        assert!(view_window_visible());
+
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || reader_loop(&host_end, &tx, None));
+        drop(helper_end);
+        reader.join().expect("reader");
+
+        let gone = rx.recv_timeout(Duration::from_secs(1));
+        let restarting = matches!(*CLIENT.lock().expect("client"), ClientSlot::Restarting);
+        let hidden = !view_window_visible();
+        let uncreated = VIEWS
+            .lock()
+            .expect("views")
+            .entries
+            .values()
+            .all(|entry| !entry.created);
+        finish_restart();
+        let respawnable = matches!(*CLIENT.lock().expect("client"), ClientSlot::Unspawned);
+        {
+            let mut views = VIEWS.lock().expect("views");
+            views.entries.remove(&shown_view);
+            views.entries.remove(&hidden_view);
+            views.publish();
+        }
+        free_registry_views(&[shown_view, hidden_view]);
+        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+
+        assert!(
+            matches!(gone, Ok(Upcall::HelperGone { visible_views: 1 })),
+            "exactly the one shown view gets an Android Back"
+        );
+        assert!(restarting && hidden && uncreated);
+        assert!(
+            respawnable,
+            "the next WebView or cookie call starts a new helper"
+        );
+    }
+
+    #[test]
+    fn unexpected_helper_exits_restart_until_the_limit_then_latch() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+        assert!(matches!(
+            slot_after(Loss::Exited("EOF".into())),
+            ClientSlot::Restarting
+        ));
+        assert!(matches!(
+            slot_after(Loss::Fatal("no display".into())),
+            ClientSlot::Failed(reason) if reason == "no display"
+        ));
+        assert!(matches!(
+            slot_after(Loss::Exited("EOF".into())),
+            ClientSlot::Restarting
+        ));
+        match slot_after(Loss::Exited("EOF".into())) {
+            ClientSlot::Failed(reason) => {
+                assert!(reason.contains("exited unexpectedly 3 times"), "{reason}")
+            }
+            _ => panic!("the third unexpected exit must latch"),
+        }
+        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+    }
+
+    fn cef_storage(tag: &str) -> Storage {
+        let root = temp_dir(tag);
+        let storage = Storage {
+            data: root.join("app-data/webview"),
+            cache: root.join("cache/webview"),
+            cef_profile: root.join("app-data").join(CEF_PROFILE_DIR),
+        };
+        std::fs::create_dir_all(&storage.data).expect("create the WebKit data dir");
+        cef_profile::install_fixture(&storage.cef_profile);
+        storage
+    }
+
+    fn migrate(stream: &UnixStream, profile: &Path) -> Result<Option<Migration>, ClientError> {
+        migrate_cef_profile(
+            stream,
+            profile,
+            cef_profile::fixture_written_at(),
+            MIGRATION_TIMEOUT,
+        )
+    }
+
+    fn reply(stream: &UnixStream, msg: HelperMsg) {
+        let frame = msg.encode().expect("encode the reply");
+        (&mut &*stream).write_all(&frame).expect("write the reply");
+    }
+
+    fn answer_import(stream: &UnixStream, failed: u32) -> Vec<StoredCookie> {
+        let ConsumerMsg::CookieImport {
+            request_id,
+            cookies,
+        } = proto::read_consumer_msg(&mut &*stream).expect("read the import")
+        else {
+            panic!("the migration must start with CookieImport");
+        };
+        let total = u32::try_from(cookies.len()).expect("cookie count");
+        reply(
+            stream,
+            HelperMsg::CookieImportResult {
+                request_id,
+                imported: total - failed,
+                failed,
+            },
+        );
+        cookies
+    }
+
+    fn answer_flush(stream: &UnixStream, ok: bool) {
+        let ConsumerMsg::CookieFlush { request_id } =
+            proto::read_consumer_msg(&mut &*stream).expect("read the flush")
+        else {
+            panic!("an import must be followed by CookieFlush");
+        };
+        reply(stream, HelperMsg::CookieFlushed { request_id, ok });
+    }
+
+    fn assert_nothing_more(stream: &UnixStream) {
+        assert_eq!(
+            proto::read_consumer_msg(&mut &*stream),
+            Err(proto::ProtoError::Eof)
+        );
+    }
+
+    #[test]
+    fn only_a_cef_profile_beside_a_new_webkit_store_is_imported() {
+        let storage = cef_storage("cef-plan");
+        assert_eq!(
+            cef_profile_to_import(&storage),
+            Some(storage.cef_profile.clone())
+        );
+        let webkit_store = storage.data.join(proto::PERSISTENT_COOKIE_FILE);
+        touch(&webkit_store);
+        assert_eq!(cef_profile_to_import(&storage), None);
+        std::fs::remove_file(&webkit_store).expect("remove the WebKit store");
+        std::fs::remove_dir_all(&storage.cef_profile).expect("remove the CEF profile");
+        assert_eq!(cef_profile_to_import(&storage), None);
+    }
+
+    #[test]
+    fn a_cef_profile_is_imported_flushed_and_then_removed() {
+        let profile = cef_storage("cef-migrated").cef_profile;
+        let (client_end, helper_end) = UnixStream::pair().expect("pair");
+        let helper = std::thread::spawn(move || {
+            let cookies = answer_import(&helper_end, 0);
+            answer_flush(&helper_end, true);
+            assert_nothing_more(&helper_end);
+            cookies
+        });
+        let pending = migrate(&client_end, &profile).expect("migrate");
+        drop(client_end);
+        let cookies = helper.join().expect("fake helper");
+        assert!(pending.is_none(), "an answered migration is finished");
+        assert_eq!(cookies.len(), 12);
+        let login = cookies
+            .iter()
+            .find(|cookie| cookie.name == ".ROBLOSECURITY")
+            .expect("the login cookie is imported");
+        assert_eq!(
+            login.value,
+            "synthetic-roblosecurity-for-the-eclipse-cef-migration-test"
+        );
+        assert!(!profile.exists(), "a migrated CEF profile must be removed");
+    }
+
+    #[test]
+    fn the_cef_profile_stays_until_every_cookie_is_saved() {
+        for (tag, failed, flushed) in [("cef-rejected", 1, true), ("cef-unflushed", 0, false)] {
+            let profile = cef_storage(tag).cef_profile;
+            let (client_end, helper_end) = UnixStream::pair().expect("pair");
+            let helper = std::thread::spawn(move || {
+                answer_import(&helper_end, failed);
+                if failed == 0 {
+                    answer_flush(&helper_end, flushed);
+                }
+                assert_nothing_more(&helper_end);
+            });
+            let pending =
+                migrate(&client_end, &profile).expect("a refused import is not a protocol failure");
+            assert!(pending.is_none(), "{tag}: a refused import is finished");
+            drop(client_end);
+            helper.join().expect("fake helper");
+            assert!(profile.exists(), "{tag}: the CEF profile must stay");
         }
     }
 
     #[test]
-    fn notify_view_freed_releases_pending_bridges_for_a_never_driven_view() {
-        let widget = 0x5EED_0001_i64;
-        buffer_pending_bridge(widget, "EclipseTest".into(), Vec::new());
-        assert!(pending_bridges()
+    fn an_unreadable_cef_profile_stays_and_sends_nothing() {
+        let profile = cef_storage("cef-unreadable").cef_profile;
+        std::fs::write(profile.join(cef_profile::COOKIE_DATABASE), [0x5Au8; 4096])
+            .expect("damage the cookie database");
+        let (client_end, helper_end) = UnixStream::pair().expect("pair");
+        let pending = migrate(&client_end, &profile).expect("migrate");
+        drop(client_end);
+        assert_nothing_more(&helper_end);
+        assert!(pending.is_none());
+        assert!(profile.exists());
+    }
+
+    #[test]
+    fn a_silent_helper_keeps_the_cef_profile_and_the_socket_blocking() {
+        let profile = cef_storage("cef-silent").cef_profile;
+        let (client_end, _helper_end) = UnixStream::pair().expect("pair");
+        let pending = migrate_cef_profile(
+            &client_end,
+            &profile,
+            cef_profile::fixture_written_at(),
+            Duration::from_millis(50),
+        )
+        .expect("an unanswered import is not a protocol failure");
+        assert!(pending.is_some(), "the migration waits for the late answer");
+        assert!(profile.exists());
+        assert_eq!(client_end.read_timeout().expect("read timeout"), None);
+    }
+
+    #[test]
+    fn a_cef_migration_the_helper_answers_late_finishes_while_the_helper_runs() {
+        let _serial = HELPER_STATE_TEST_LOCK
             .lock()
-            .expect("pending lock")
-            .contains_key(&widget));
-        assert_ne!(PENDING_BRIDGE_VIEWS.load(Ordering::Relaxed), 0);
-        assert!(!view_is_tracked(widget), "never driven — never tracked");
-        notify_view_freed(widget);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+        let profile = cef_storage("cef-late").cef_profile;
+        let (client_end, helper_end) = UnixStream::pair().expect("pair");
+        let (gave_up, host_gave_up) = mpsc::channel::<()>();
+        let helper = std::thread::spawn(move || {
+            let ConsumerMsg::CookieImport {
+                request_id,
+                cookies,
+            } = proto::read_consumer_msg(&mut &helper_end).expect("read the import")
+            else {
+                panic!("the migration must start with CookieImport");
+            };
+            host_gave_up
+                .recv()
+                .expect("the host stops waiting before the answer");
+            reply(
+                &helper_end,
+                HelperMsg::CookieImportResult {
+                    request_id,
+                    imported: u32::try_from(cookies.len()).expect("cookie count"),
+                    failed: 0,
+                },
+            );
+            answer_flush(&helper_end, true);
+        });
+        let pending = migrate_cef_profile(
+            &client_end,
+            &profile,
+            cef_profile::fixture_written_at(),
+            Duration::from_millis(50),
+        )
+        .expect("migrate");
+        let kept_while_unanswered = profile.exists();
+        *CLIENT.lock().expect("client") = ClientSlot::Live(Client {
+            child: std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .expect("spawn a stand-in helper"),
+            writer: client_end.try_clone().expect("writer"),
+            io: std::thread::spawn(|| {}),
+            upcall: std::thread::spawn(|| {}),
+        });
+        gave_up.send(()).expect("release the helper");
+        let (tx, _rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || reader_loop(&client_end, &tx, pending));
+        helper.join().expect("fake helper");
+        reader.join().expect("reader");
+        finish_restart();
+        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+
         assert!(
-            !pending_bridges()
-                .lock()
-                .expect("pending lock")
-                .contains_key(&widget),
-            "a never-driven view's buffered bridge inventory must be released at finalize"
+            kept_while_unanswered,
+            "the profile stays while the import is unanswered"
+        );
+        assert!(
+            !profile.exists(),
+            "a late but complete import is flushed and the CEF profile removed"
         );
     }
 
     #[test]
-    fn notify_view_detached_clears_only_the_active_view() {
-        let active = 0x00A0_0001_0000_0000_i64;
-        let other = 0x00B0_0002_0000_0000_i64;
-        ACTIVE_VIEW.store(active, Ordering::Relaxed);
-
-        notify_view_detached(other);
-        assert_eq!(
-            ACTIVE_VIEW.load(Ordering::Relaxed),
-            active,
-            "detaching a non-active view must not clear the active gate"
-        );
-
-        notify_view_detached(active);
-        assert_eq!(
-            ACTIVE_VIEW.load(Ordering::Relaxed),
-            0,
-            "detaching the active view clears ACTIVE_VIEW (composite gate off)"
-        );
-
-        notify_view_detached(active);
-        assert_eq!(ACTIVE_VIEW.load(Ordering::Relaxed), 0);
-        ACTIVE_VIEW.store(0, Ordering::Relaxed);
-    }
-
-    #[test]
-    fn a_load_issued_while_a_detached_view_closes_is_replayed_after_view_closed() {
-        let mut views: HashMap<i64, ViewShared> = HashMap::new();
-        let widget = 0x00C0_0003_0000_0000_i64;
-        assert!(record_view(&mut views, widget, "https://a.example/".into()));
-        mark_closing(&mut views, widget);
-
-        let first = DriveTarget::Url("https://b.example/".into());
-        assert!(defer_while_closing(&mut views, widget, first, 640, 480).is_none());
-        let latest = DriveTarget::Url("https://c.example/".into());
-        assert!(defer_while_closing(&mut views, widget, latest, 800, 600).is_none());
-
-        let out = dispatch(HelperMsg::ViewClosed { view: widget }, &mut views);
-        assert_eq!(out.closed, vec![widget]);
-        assert!(!views.contains_key(&widget));
-        assert_eq!(out.redrives.len(), 1);
-        let (redriven, redrive) = &out.redrives[0];
-        assert_eq!(*redriven, widget);
-        assert!(matches!(&redrive.target, DriveTarget::Url(url) if url == "https://c.example/"));
-        assert_eq!((redrive.width, redrive.height), (800, 600));
-
-        assert!(record_view(&mut views, widget, "https://c.example/".into()));
-        let open = DriveTarget::Url("https://d.example/".into());
-        assert!(defer_while_closing(&mut views, widget, open, 1, 1).is_some());
-        let out = dispatch(HelperMsg::ViewClosed { view: widget }, &mut views);
-        assert_eq!(out.closed, vec![widget]);
-        assert!(out.redrives.is_empty());
-    }
-
-    #[test]
-    fn reader_loop_stays_jni_free_and_hands_bridge_drops_to_the_upcall_thread() {
-        let src = include_str!("client.rs");
-        let reader_start = src.find("fn reader_loop").expect("reader_loop present");
-        let reader_end = src[reader_start..]
-            .find("fn reader_fatal")
-            .expect("reader_fatal follows reader_loop")
-            + reader_start;
-        let reader_body = &src[reader_start..reader_end];
-        assert!(
-            !reader_body.contains("drop_bridges_for"),
-            "the reader thread must stay JNI-free (bridge drops belong to the upcall thread)"
-        );
-        assert!(
-            !reader_body.contains("drain_eval_callbacks"),
-            "the reader thread must stay JNI-free (eval drains belong to the upcall thread)"
-        );
-        let upcall_start = src
-            .find("fn upcall_thread_main")
-            .expect("upcall_thread_main present");
-        let upcall_body = &src[upcall_start..reader_start];
-        assert!(
-            upcall_body.contains("drop_bridges_for_view_closed"),
-            "the era-gated bridge drop must run on the upcall thread"
-        );
-
-        let banned = ["protocol ", "v1"].concat();
-        assert!(
-            !src.contains(&banned),
-            "hardcoded protocol generation string found — log/document PROTO_VERSION instead"
-        );
+    fn a_helper_failing_during_the_cef_migration_fails_its_start() {
+        let profile = cef_storage("cef-fatal").cef_profile;
+        let (client_end, helper_end) = UnixStream::pair().expect("pair");
+        let helper = std::thread::spawn(move || {
+            proto::read_consumer_msg(&mut &helper_end).expect("read the import");
+            reply(
+                &helper_end,
+                HelperMsg::Fatal {
+                    reason: "the cookie store is gone".into(),
+                },
+            );
+        });
+        match migrate(&client_end, &profile) {
+            Err(ClientError::Unavailable(reason)) => {
+                assert_eq!(reason, "the cookie store is gone");
+            }
+            other => panic!("expected the helper's failure, got {other:?}"),
+        }
+        helper.join().expect("fake helper");
+        assert!(profile.exists());
     }
 }

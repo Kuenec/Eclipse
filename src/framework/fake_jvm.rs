@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use jni::objects::JObject;
 use jni::sys::{
-    jboolean, jclass, jint, jmethodID, jobject, jstring, jthrowable, jvalue, jweak, JNIEnv,
-    JNIInvokeInterface_, JNIInvokeInterface__1_2, JNINativeInterface_, JNINativeInterface__1_6,
-    JNINativeMethod, JavaVM, JNI_OK, JNI_VERSION_1_6,
+    jboolean, jclass, jfieldID, jint, jlong, jmethodID, jobject, jstring, jthrowable, jvalue,
+    jweak, JNIEnv, JNIInvokeInterface_, JNIInvokeInterface__1_2, JNINativeInterface_,
+    JNINativeInterface__1_6, JNINativeMethod, JavaVM, JNI_OK, JNI_VERSION_1_6,
 };
 use jni::{Env, EnvUnowned, Outcome};
 
@@ -39,6 +39,9 @@ struct Heap {
     methods: Vec<String>,
     hooks: HashMap<(usize, String), Hook>,
     natives: HashMap<(String, String, String), usize>,
+    returns: HashMap<(usize, String), usize>,
+    fields: Vec<String>,
+    long_fields: HashMap<(usize, String), jlong>,
 }
 
 impl Heap {
@@ -84,6 +87,18 @@ impl Heap {
             .into_owned();
         self.methods.push(name);
         (self.methods.len() << 4) as jmethodID
+    }
+
+    fn intern_field(&mut self, name: *const c_char) -> jfieldID {
+        let name = unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned();
+        self.fields.push(name);
+        (self.fields.len() << 4) as jfieldID
+    }
+
+    fn field_name(&self, field: jfieldID) -> String {
+        self.fields[(field as usize >> 4) - 1].clone()
     }
 
     fn global_refs(&self, object: usize) -> usize {
@@ -254,7 +269,36 @@ unsafe extern "system" fn call_object_method_a(
     _args: *const jvalue,
 ) -> jobject {
     run_hook(obj, method);
-    std::ptr::null_mut()
+    let mut heap = heap();
+    let name = heap.method_name(method);
+    let returned = heap
+        .live_object(obj)
+        .and_then(|object| heap.returns.get(&(object, name)).copied());
+    match returned {
+        Some(result) => heap.add_ref(result, RefKind::Local),
+        None => std::ptr::null_mut(),
+    }
+}
+
+unsafe extern "system" fn get_field_id(
+    _env: *mut JNIEnv,
+    _class: jclass,
+    name: *const c_char,
+    _sig: *const c_char,
+) -> jfieldID {
+    heap().intern_field(name)
+}
+
+unsafe extern "system" fn get_long_field(
+    _env: *mut JNIEnv,
+    obj: jobject,
+    field: jfieldID,
+) -> jlong {
+    let heap = heap();
+    let name = heap.field_name(field);
+    heap.live_object(obj)
+        .and_then(|object| heap.long_fields.get(&(object, name)).copied())
+        .unwrap_or(0)
 }
 
 unsafe extern "system" fn call_boolean_method_a(
@@ -419,6 +463,8 @@ fn env_ptr() -> *mut JNIEnv {
                 call_void_method_a as *const (),
             ),
             (offset_of!(Table, NewObjectA), new_object_a as *const ()),
+            (offset_of!(Table, GetFieldID), get_field_id as *const ()),
+            (offset_of!(Table, GetLongField), get_long_field as *const ()),
             (
                 offset_of!(Table, GetStaticMethodID),
                 get_static_method_id as *const (),
@@ -495,6 +541,16 @@ pub(super) fn on_call(obj: &JObject, method: &str, hook: impl Fn() + Send + Sync
     heap()
         .hooks
         .insert((object, method.to_owned()), Arc::new(hook));
+}
+
+pub(super) fn on_call_return(obj: &JObject, method: &str, result: &JObject) {
+    let (object, result) = (object_of(obj), object_of(result));
+    heap().returns.insert((object, method.to_owned()), result);
+}
+
+pub(super) fn set_long_field(obj: &JObject, field: &str, value: jlong) {
+    let object = object_of(obj);
+    heap().long_fields.insert((object, field.to_owned()), value);
 }
 
 pub(super) fn strong_refs(obj: &JObject) -> usize {

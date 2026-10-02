@@ -169,6 +169,13 @@ grep -qF 'Looper.myLooper() != Looper.getMainLooper()' "$wvcp_src" || fail "Ecli
 grep -qF 'onPageStarted(WebView view, String url, Bitmap favicon)' "$wvcp_src" || fail "EclipseWebViewClientProbe.java no longer overrides the AOSP 3-arg onPageStarted — the M6 state-0 dispatch would go unpinned"
 grep -qF 'onPageFinished(WebView view, String url)' "$wvcp_src" || fail "EclipseWebViewClientProbe.java no longer overrides onPageFinished — half the confirmed 2026-07-16 defect would go unpinned"
 
+wre_src="$here/src/android/webkit/WebResourceError.java"
+[ -f "$wre_src" ] || fail "WebResourceError.java missing at $wre_src"
+grep -qF 'WebResourceError(int errorCode, CharSequence description)' "$wre_src" || fail "WebResourceError.java lost the (int, CharSequence) constructor Eclipse's onReceivedError upcall builds"
+wrr_src="$here/src/android/webkit/EclipseWebResourceRequest.java"
+[ -f "$wrr_src" ] || fail "EclipseWebResourceRequest.java missing at $wrr_src"
+grep -qF 'implements WebResourceRequest' "$wrr_src" || fail "EclipseWebResourceRequest.java no longer implements WebResourceRequest"
+
 pc_src="$here/src/android/view/PixelCopy.java"
 [ -f "$pc_src" ] || fail "PixelCopy.java compatibility surface missing at $pc_src"
 grep -qF 'public interface OnPixelCopyFinishedListener' "$pc_src" || fail "PixelCopy.java lost its completion-listener API"
@@ -204,6 +211,8 @@ grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+th
     "$here/src/android/webkit/JavascriptInterface.java" \
     "$here/src/android/webkit/EclipseBridgeProbe.java" \
     "$here/src/android/webkit/EclipseWebViewClientProbe.java" \
+    "$wre_src" \
+    "$wrr_src" \
     "$here/src/android/app/KeyguardManager.java" \
     "$kgps_src" \
     "$pc_src" \
@@ -212,7 +221,7 @@ grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+th
     "$pl_src" \
     "$r_src"
 
-for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/app/KeyguardManager*.class' 'android/security/keystore/KeyGenParameterSpec*.class' 'android/content/pm/SigningInfo*.class' 'android/content/pm/SigningCertificates*.class' 'android/os/PreloadedLibrary*.class'; do
+for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/webkit/WebResourceError*.class' 'android/webkit/EclipseWebResourceRequest*.class' 'android/app/KeyguardManager*.class' 'android/security/keystore/KeyGenParameterSpec*.class' 'android/content/pm/SigningInfo*.class' 'android/content/pm/SigningCertificates*.class' 'android/os/PreloadedLibrary*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     mapfile -t class_files < <(compgen -G "$work/classes/$pattern")
@@ -221,6 +230,8 @@ for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'andro
 done
 
 for forbidden in 'android/webkit/WebView.class' 'android/webkit/WebViewClient.class' \
+                 'android/webkit/WebChromeClient.class' 'android/webkit/WebSettings.class' \
+                 'android/webkit/WebResourceRequest.class' 'android/net/Uri.class' \
                  'android/os/Handler.class' 'android/os/Looper.class' \
                  'android/graphics/Bitmap.class' 'android/view/SurfaceView.class' \
                  'android/atl/ATLLoadedApp.class' \
@@ -234,9 +245,11 @@ for forbidden in 'android/webkit/WebView.class' 'android/webkit/WebViewClient.cl
     [ ! -e "$work/stage/$forbidden" ] || fail "compile-only stub $forbidden was staged into classes.dex — it would SHADOW the real class (first-dex-wins); fix the step-3 stage whitelist"
 done
 for stub in android/webkit/WebView.java android/webkit/WebViewClient.java \
+            android/webkit/WebChromeClient.java android/webkit/WebSettings.java \
+            android/webkit/WebResourceRequest.java android/net/Uri.java \
             android/os/Handler.java android/os/Looper.java android/graphics/Bitmap.java \
             android/view/SurfaceView.java; do
-    [ -f "$here/stubs/$stub" ] || fail "M6 compile-only stub $stub missing — EclipseWebViewClientProbe would not compile"
+    [ -f "$here/stubs/$stub" ] || fail "compile-only stub $stub missing — the overlay's WebView classes and probes would not compile"
     ! grep -qE 'static[[:space:]]+final' "$here/stubs/$stub" || fail "M6 stub $stub declares a constant — javac would INLINE its placeholder value into the overlay dex (the 2026-07-02 guard-1e class)"
 done
 
@@ -254,6 +267,14 @@ grep -qF 'Landroid/os/Handler;-><init>()V' "$wvcpsm" || fail "dexed EclipseWebVi
 
 grep -qF 'Landroid/os/Looper;->getMainLooper()' "$wvcpsm" || fail "dexed EclipseWebViewClientProbe lost its UI-thread assertion"
 grep -qF 'onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V' "$wvcpsm" || fail "dexed EclipseWebViewClientProbe lost the AOSP 3-arg onPageStarted override — internalLoadChanged's state-0 dispatch would miss it (and the stub has drifted from the classes2 shadow)"
+
+wresm="$work/smali-check/android/webkit/WebResourceError.smali"
+[ -f "$wresm" ] || fail "WebResourceError.smali not in the built classes.dex — onReceivedError would throw NoClassDefFoundError"
+grep -qF '.method constructor <init>(ILjava/lang/CharSequence;)V' "$wresm" || fail "dexed WebResourceError lost the (ILjava/lang/CharSequence;)V constructor src/framework.rs builds"
+wrrsm="$work/smali-check/android/webkit/EclipseWebResourceRequest.smali"
+[ -f "$wrrsm" ] || fail "EclipseWebResourceRequest.smali not in the built classes.dex"
+grep -qF '.implements Landroid/webkit/WebResourceRequest;' "$wrrsm" || fail "dexed EclipseWebResourceRequest does not implement WebResourceRequest"
+grep -qF '.method constructor <init>(Ljava/lang/String;Ljava/lang/String;ZZ)V' "$wrrsm" || fail "dexed EclipseWebResourceRequest lost the (Ljava/lang/String;Ljava/lang/String;ZZ)V constructor src/framework.rs builds"
 
 pcsm="$work/smali-check/android/view/PixelCopy.smali"
 pcrsm="$work/smali-check/android/view/PixelCopy\$1.smali"
@@ -620,34 +641,34 @@ dsm="$work/smali/android/view/Display.smali"
 ! grep -qF 'getSupportedRefreshRates()[F' "$dsm" || fail "Display.smali already declares getSupportedRefreshRates — installed Display drifted; update patch-framework.sh"
 n="$(grep -cF '.field public static window_width:I' "$dsm")" || true
 [ "$n" = "1" ] || fail "Display.smali window_width field anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
-display_count() {
-    NEEDLE="$1" perl -0777 -ne 'print scalar(() = /\Q$ENV{NEEDLE}\E/g)' "$dsm"
+smali_count() {
+    NEEDLE="$2" perl -0777 -ne 'print scalar(() = /\Q$ENV{NEEDLE}\E/g)' "$1"
 }
-replace_upstream_display_method() {
-    local upstream="$1" patched="$2" method="$3" n
-    n="$(display_count "$upstream")"
-    [ "$n" = "1" ] || fail "Display.smali $method is not the upstream body (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
-    ANCHOR="$upstream" PATCHED="$patched" perl -0777 -pi -e 's{\Q$ENV{ANCHOR}\E}{$ENV{PATCHED}}' "$dsm"
-    n="$(display_count "$patched")"
-    [ "$n" = "1" ] || fail "Display.smali $method insert found $n times (expected 1)"
+replace_upstream_method() {
+    local smali="$1" upstream="$2" patched="$3" method="$4" n
+    n="$(smali_count "$smali" "$upstream")"
+    [ "$n" = "1" ] || fail "${smali##*/} $method is not the upstream body (found $n, expected 1) — installed framework drifted; update patch-framework.sh"
+    ANCHOR="$upstream" PATCHED="$patched" perl -0777 -pi -e 's{\Q$ENV{ANCHOR}\E}{$ENV{PATCHED}}' "$smali"
+    n="$(smali_count "$smali" "$patched")"
+    [ "$n" = "1" ] || fail "${smali##*/} $method insert found $n times (expected 1)"
 }
 UPSTREAM_DISPLAY_CLINIT=$'.method static constructor <clinit>()V\n    .registers 1\n\n    const/16 v0, 0x3c0\n\n    sput v0, Landroid/view/Display;->window_width:I\n\n    const/16 v0, 0x21c\n\n    sput v0, Landroid/view/Display;->window_height:I\n\n    return-void\n.end method\n'
 DISPLAY_CLINIT=$'.method static constructor <clinit>()V\n    .registers 4\n\n    const/16 v0, 0x3c0\n\n    sput v0, Landroid/view/Display;->window_width:I\n\n    const/16 v0, 0x21c\n\n    sput v0, Landroid/view/Display;->window_height:I\n\n    const/4 v0, 0x2\n\n    new-array v0, v0, [F\n\n    const/high16 v1, 0x42700000\n\n    const/4 v2, 0x0\n\n    aput v1, v0, v2\n\n    const/4 v3, 0x1\n\n    aput v1, v0, v3\n\n    sput-object v0, Landroid/view/Display;->refresh_rates:[F\n\n    return-void\n.end method\n'
-replace_upstream_display_method "$UPSTREAM_DISPLAY_CLINIT" "$DISPLAY_CLINIT" '<clinit> window-size initializer'
+replace_upstream_method "$dsm" "$UPSTREAM_DISPLAY_CLINIT" "$DISPLAY_CLINIT" '<clinit> window-size initializer'
 perl -0pi -e 's{(\.field public static window_width:I\n)}{$1\n.field public static volatile refresh_rates:[F\n}' "$dsm"
 UPSTREAM_GET_REFRESH_RATE_PATTERN='\.method public getRefreshRate\(\)F\n    \.registers 2\n\n    const/high16 v0, 0x42700000[^\n]*\n\n    return v0\n\.end method\n'
 n="$(PATTERN="$UPSTREAM_GET_REFRESH_RATE_PATTERN" perl -0777 -ne 'print scalar(() = /$ENV{PATTERN}/g)' "$dsm")"
 [ "$n" = "1" ] || fail "Display.smali getRefreshRate is not the upstream constant 60 Hz body (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
 DISPLAY_REFRESH_RATE_METHODS=$'.method public getRefreshRate()F\n    .registers 3\n\n    sget-object v0, Landroid/view/Display;->refresh_rates:[F\n\n    const/4 v1, 0x0\n\n    aget v0, v0, v1\n\n    return v0\n.end method\n\n.method public getSupportedRefreshRates()[F\n    .registers 4\n\n    sget-object v0, Landroid/view/Display;->refresh_rates:[F\n\n    const/4 v1, 0x1\n\n    array-length v2, v0\n\n    invoke-static {v0, v1, v2}, Ljava/util/Arrays;->copyOfRange([FII)[F\n\n    move-result-object v0\n\n    return-object v0\n.end method\n\n.method public static setRefreshRates(F[F)V\n    .registers 6\n\n    array-length v0, p1\n\n    add-int/lit8 v1, v0, 0x1\n\n    new-array v1, v1, [F\n\n    const/4 v2, 0x0\n\n    aput p0, v1, v2\n\n    const/4 v3, 0x1\n\n    invoke-static {p1, v2, v1, v3, v0}, Ljava/lang/System;->arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V\n\n    sput-object v1, Landroid/view/Display;->refresh_rates:[F\n\n    return-void\n.end method\n'
 PATTERN="$UPSTREAM_GET_REFRESH_RATE_PATTERN" PATCHED="$DISPLAY_REFRESH_RATE_METHODS" perl -0777 -pi -e 's{$ENV{PATTERN}}{$ENV{PATCHED}}' "$dsm"
-n="$(display_count "$DISPLAY_REFRESH_RATE_METHODS")"
+n="$(smali_count "$dsm" "$DISPLAY_REFRESH_RATE_METHODS")"
 [ "$n" = "1" ] || fail "Display.smali refresh-rate methods insert found $n times (expected 1)"
 UPSTREAM_GET_MODE=$'.method public getMode()Landroid/view/Display$Mode;\n    .registers 2\n\n    new-instance v0, Landroid/view/Display$Mode;\n\n    invoke-direct {v0}, Landroid/view/Display$Mode;-><init>()V\n\n    return-object v0\n.end method\n'
 DISPLAY_GET_MODE=$'.method public getMode()Landroid/view/Display$Mode;\n    .registers 7\n\n    sget-object v0, Landroid/view/Display;->refresh_rates:[F\n\n    array-length v1, v0\n\n    const/4 v2, 0x0\n\n    aget v3, v0, v2\n\n    const/4 v2, 0x1\n\n    :find_current_mode\n    if-ge v2, v1, :current_mode_found\n\n    aget v4, v0, v2\n\n    cmpl-float v5, v4, v3\n\n    if-eqz v5, :current_mode_found\n\n    add-int/lit8 v2, v2, 0x1\n\n    goto :find_current_mode\n\n    :current_mode_found\n    new-instance v0, Landroid/view/Display$Mode;\n\n    sget v1, Landroid/view/Display;->window_width:I\n\n    sget v4, Landroid/view/Display;->window_height:I\n\n    invoke-direct {v0, v2, v1, v4, v3}, Landroid/view/Display$Mode;-><init>(IIIF)V\n\n    return-object v0\n.end method\n'
-replace_upstream_display_method "$UPSTREAM_GET_MODE" "$DISPLAY_GET_MODE" 'getMode'
+replace_upstream_method "$dsm" "$UPSTREAM_GET_MODE" "$DISPLAY_GET_MODE" 'getMode'
 UPSTREAM_GET_SUPPORTED_MODES=$'.method public getSupportedModes()[Landroid/view/Display$Mode;\n    .registers 4\n\n    const/4 v0, 0x1\n\n    new-array v0, v0, [Landroid/view/Display$Mode;\n\n    const/4 v1, 0x0\n\n    invoke-virtual {p0}, Landroid/view/Display;->getMode()Landroid/view/Display$Mode;\n\n    move-result-object v2\n\n    aput-object v2, v0, v1\n\n    return-object v0\n.end method\n'
 DISPLAY_GET_SUPPORTED_MODES=$'.method public getSupportedModes()[Landroid/view/Display$Mode;\n    .registers 10\n\n    sget-object v0, Landroid/view/Display;->refresh_rates:[F\n\n    array-length v1, v0\n\n    add-int/lit8 v2, v1, -0x1\n\n    new-array v2, v2, [Landroid/view/Display$Mode;\n\n    sget v3, Landroid/view/Display;->window_width:I\n\n    sget v4, Landroid/view/Display;->window_height:I\n\n    const/4 v5, 0x1\n\n    :next_supported_mode\n    if-ge v5, v1, :supported_modes_done\n\n    aget v6, v0, v5\n\n    new-instance v7, Landroid/view/Display$Mode;\n\n    invoke-direct {v7, v5, v3, v4, v6}, Landroid/view/Display$Mode;-><init>(IIIF)V\n\n    add-int/lit8 v8, v5, -0x1\n\n    aput-object v7, v2, v8\n\n    add-int/lit8 v5, v5, 0x1\n\n    goto :next_supported_mode\n\n    :supported_modes_done\n    return-object v2\n.end method\n'
-replace_upstream_display_method "$UPSTREAM_GET_SUPPORTED_MODES" "$DISPLAY_GET_SUPPORTED_MODES" 'getSupportedModes'
+replace_upstream_method "$dsm" "$UPSTREAM_GET_SUPPORTED_MODES" "$DISPLAY_GET_SUPPORTED_MODES" 'getSupportedModes'
 for display_needle in \
     '.field public static volatile refresh_rates:[F' \
     '.method public getRefreshRate()F' \
@@ -776,6 +797,41 @@ wssm="$work/smali/android/webkit/WebSettings.smali"
 [ -f "$wssm" ] || fail "WebSettings.smali not found after baksmali"
 ! grep -qF 'native_evaluateJavascript' "$wvsm" || fail "WebView.smali already carries native_evaluateJavascript — drifted; update patch-framework.sh"
 ! grep -qF 'canGoBack()Z' "$wvsm" || fail "WebView.smali already declares canGoBack — installed framework drifted; update patch-framework.sh"
+for wv_member in \
+    'getUrl()Ljava/lang/String;' \
+    'reload()V' \
+    'removeJavascriptInterface(Ljava/lang/String;)V' \
+    'internalProgressChanged(' \
+    'internalLoadResource(' \
+    'internalReceivedError(' \
+    'internalShouldOverrideUrlLoading(' \
+    'webChromeClient:' \
+    '>settings:' \
+    'private settings:'
+do
+    ! grep -qF -- "$wv_member" "$wvsm" || fail "WebView.smali already declares $wv_member — installed WebView drifted; update patch-framework.sh"
+done
+n="$(grep -cxF '.field private webViewClient:Landroid/webkit/WebViewClient;' "$wvsm")" || true
+[ "$n" = "1" ] || fail "WebView.smali webViewClient field anchor not unique (found $n, expected 1) — installed WebView drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.field private webViewClient:Landroid/webkit/WebViewClient;\n)}{$1\n.field private webChromeClient:Landroid/webkit/WebChromeClient;\n\n.field private settings:Landroid/webkit/WebSettings;\n}' "$wvsm"
+grep -qxF '.field private webChromeClient:Landroid/webkit/WebChromeClient;' "$wvsm" || fail "WebView.smali webChromeClient field insert failed"
+grep -qxF '.field private settings:Landroid/webkit/WebSettings;' "$wvsm" || fail "WebView.smali settings field insert failed"
+replace_upstream_method "$wvsm" \
+    $'.method public setWebChromeClient(Landroid/webkit/WebChromeClient;)V\n    .registers 2\n\n    return-void\n.end method\n' \
+    $'.method public setWebChromeClient(Landroid/webkit/WebChromeClient;)V\n    .registers 2\n\n    iput-object p1, p0, Landroid/webkit/WebView;->webChromeClient:Landroid/webkit/WebChromeClient;\n\n    return-void\n.end method\n' \
+    'setWebChromeClient'
+replace_upstream_method "$wvsm" \
+    $'.method public getSettings()Landroid/webkit/WebSettings;\n    .registers 2\n\n    new-instance v0, Landroid/webkit/WebSettings;\n\n    invoke-direct {v0}, Landroid/webkit/WebSettings;-><init>()V\n\n    return-object v0\n.end method\n' \
+    $'.method public getSettings()Landroid/webkit/WebSettings;\n    .registers 4\n\n    iget-object v0, p0, Landroid/webkit/WebView;->settings:Landroid/webkit/WebSettings;\n\n    if-nez v0, :cond_eclipse_settings_ready\n\n    new-instance v0, Landroid/webkit/WebSettings;\n\n    invoke-direct {v0}, Landroid/webkit/WebSettings;-><init>()V\n\n    iget-wide v1, p0, Landroid/view/View;->widget:J\n\n    iput-wide v1, v0, Landroid/webkit/WebSettings;->widget:J\n\n    iput-object v0, p0, Landroid/webkit/WebView;->settings:Landroid/webkit/WebSettings;\n\n    :cond_eclipse_settings_ready\n    return-object v0\n.end method\n' \
+    'getSettings'
+replace_upstream_method "$wvsm" \
+    $'.method public stopLoading()V\n    .registers 1\n\n    return-void\n.end method\n' \
+    $'.method public stopLoading()V\n    .registers 3\n\n    iget-wide v0, p0, Landroid/view/View;->widget:J\n\n    invoke-direct {p0, v0, v1}, Landroid/webkit/WebView;->native_stopLoading(J)V\n\n    return-void\n.end method\n' \
+    'stopLoading'
+replace_upstream_method "$wvsm" \
+    $'.method public destroy()V\n    .registers 1\n\n    return-void\n.end method\n' \
+    $'.method public destroy()V\n    .registers 3\n\n    iget-wide v0, p0, Landroid/view/View;->widget:J\n\n    invoke-direct {p0, v0, v1}, Landroid/webkit/WebView;->native_destroy(J)V\n\n    return-void\n.end method\n' \
+    'destroy'
 
 grep -qF 'const-string v2, " - not implemented yet"' "$wvsm" || fail "WebView.smali loadUrl no longer carries the javascript: println (installed shape drifted; update patch-framework.sh)"
 perl -0pi -e 's{\.method public loadUrl\(Ljava/lang/String;\)V.*?\.end method\n}{.method public loadUrl(Ljava/lang/String;)V\n    .registers 7\n\n    const-string v0, "javascript:"\n\n    invoke-virtual {p1, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z\n\n    move-result v0\n\n    iget-wide v1, p0, Landroid/view/View;->widget:J\n\n    if-eqz v0, :cond_eclipse_loadurl_normal\n\n    const/16 v3, 0xb\n\n    invoke-virtual {p1, v3}, Ljava/lang/String;->substring(I)Ljava/lang/String;\n\n    move-result-object v3\n\n    const/4 v4, 0x0\n\n    invoke-direct {p0, v1, v2, v3, v4}, Landroid/webkit/WebView;->native_evaluateJavascript(JLjava/lang/String;Landroid/webkit/ValueCallback;)V\n\n    return-void\n\n    :cond_eclipse_loadurl_normal\n    invoke-direct {p0, v1, v2, p1}, Landroid/webkit/WebView;->native_loadUrl(JLjava/lang/String;)V\n\n    return-void\n.end method\n}s' "$wvsm"
@@ -811,10 +867,102 @@ cat >> "$wvsm" <<'ECLIPSE_WV_HISTORY'
 
     return-void
 .end method
+
+.method public getUrl()Ljava/lang/String;
+    .registers 3
+
+    iget-wide v0, p0, Landroid/view/View;->widget:J
+
+    invoke-direct {p0, v0, v1}, Landroid/webkit/WebView;->native_getUrl(J)Ljava/lang/String;
+
+    move-result-object v0
+
+    return-object v0
+.end method
+
+.method public reload()V
+    .registers 3
+
+    iget-wide v0, p0, Landroid/view/View;->widget:J
+
+    invoke-direct {p0, v0, v1}, Landroid/webkit/WebView;->native_reload(J)V
+
+    return-void
+.end method
+
+.method public removeJavascriptInterface(Ljava/lang/String;)V
+    .registers 4
+
+    iget-wide v0, p0, Landroid/view/View;->widget:J
+
+    invoke-direct {p0, v0, v1, p1}, Landroid/webkit/WebView;->native_removeJavascriptInterface(JLjava/lang/String;)V
+
+    return-void
+.end method
+
+.method internalProgressChanged(I)V
+    .registers 3
+
+    iget-object v0, p0, Landroid/webkit/WebView;->webChromeClient:Landroid/webkit/WebChromeClient;
+
+    if-eqz v0, :cond_eclipse_progress_done
+
+    invoke-virtual {v0, p0, p1}, Landroid/webkit/WebChromeClient;->onProgressChanged(Landroid/webkit/WebView;I)V
+
+    :cond_eclipse_progress_done
+    return-void
+.end method
+
+.method internalLoadResource(Ljava/lang/String;)V
+    .registers 3
+
+    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;
+
+    if-eqz v0, :cond_eclipse_resource_done
+
+    invoke-virtual {v0, p0, p1}, Landroid/webkit/WebViewClient;->onLoadResource(Landroid/webkit/WebView;Ljava/lang/String;)V
+
+    :cond_eclipse_resource_done
+    return-void
+.end method
+
+.method internalReceivedError(Landroid/webkit/WebResourceRequest;Landroid/webkit/WebResourceError;)V
+    .registers 4
+
+    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;
+
+    if-eqz v0, :cond_eclipse_error_done
+
+    invoke-virtual {v0, p0, p1, p2}, Landroid/webkit/WebViewClient;->onReceivedError(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;Landroid/webkit/WebResourceError;)V
+
+    :cond_eclipse_error_done
+    return-void
+.end method
+
+.method internalShouldOverrideUrlLoading(Landroid/webkit/WebResourceRequest;)Z
+    .registers 3
+
+    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;
+
+    if-eqz v0, :cond_eclipse_policy_engine
+
+    invoke-virtual {v0, p0, p1}, Landroid/webkit/WebViewClient;->shouldOverrideUrlLoading(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;)Z
+
+    move-result v0
+
+    return v0
+
+    :cond_eclipse_policy_engine
+    const/4 v0, 0x0
+
+    return v0
+.end method
 ECLIPSE_WV_HISTORY
 
 grep -qF -- '->native_canGoBack(J)Z' "$wvsm" || fail "WebView canGoBack native route insert failed"
 grep -qF -- '->native_goBack(J)V' "$wvsm" || fail "WebView goBack native route insert failed"
+grep -qF -- '->native_getUrl(J)Ljava/lang/String;' "$wvsm" || fail "WebView getUrl native route insert failed"
+grep -qF -- '->onProgressChanged(Landroid/webkit/WebView;I)V' "$wvsm" || fail "WebView progress dispatch insert failed"
 
 cat >> "$wvsm" <<'ECLIPSE_WV_NATIVES'
 
@@ -830,36 +978,54 @@ cat >> "$wvsm" <<'ECLIPSE_WV_NATIVES'
 
 .method private native native_goBack(J)V
 .end method
+
+.method private native native_reload(J)V
+.end method
+
+.method private native native_stopLoading(J)V
+.end method
+
+.method private native native_getUrl(J)Ljava/lang/String;
+.end method
+
+.method private native native_removeJavascriptInterface(JLjava/lang/String;)V
+.end method
+
+.method private native native_destroy(J)V
+.end method
 ECLIPSE_WV_NATIVES
 
 grep -qF 'const-string v0, "GDPR VIOLATION"' "$wssm" || fail "WebSettings.smali no longer returns \"GDPR VIOLATION\" (installed shape drifted; update patch-framework.sh)"
+! grep -qF 'userAgent:' "$wssm" || fail "WebSettings.smali already declares a userAgent field — drifted; update patch-framework.sh"
 ECLIPSE_UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Eclipse-WebView/152.0.6'
 
-ECLIPSE_UA="$ECLIPSE_UA" perl -0pi -e 'my $ua=$ENV{ECLIPSE_UA}; s{\.method public getUserAgentString\(\)Ljava/lang/String;.*?\.end method\n}{".method public getUserAgentString()Ljava/lang/String;\n    .registers 2\n\n    invoke-direct {p0}, Landroid/webkit/WebSettings;->native_getUserAgentString()Ljava/lang/String;\n\n    move-result-object v0\n\n    if-nez v0, :cond_eclipse_ua_app\n\n    const-string v0, \"$ua\"\n\n    :cond_eclipse_ua_app\n    return-object v0\n.end method\n"}se' "$wssm"
-grep -qF -- '->native_getUserAgentString()Ljava/lang/String;' "$wssm" || fail "WebSettings getUserAgentString native-body insert failed (drift?)"
+ECLIPSE_UA="$ECLIPSE_UA" perl -0pi -e 'my $ua=$ENV{ECLIPSE_UA}; s{\.method public getUserAgentString\(\)Ljava/lang/String;.*?\.end method\n}{".method public getUserAgentString()Ljava/lang/String;\n    .registers 3\n\n    iget-object v0, p0, Landroid/webkit/WebSettings;->userAgent:Ljava/lang/String;\n\n    if-eqz v0, :cond_eclipse_ua_default\n\n    invoke-virtual {v0}, Ljava/lang/String;->isEmpty()Z\n\n    move-result v1\n\n    if-eqz v1, :cond_eclipse_ua_app\n\n    :cond_eclipse_ua_default\n    const-string v0, \"$ua\"\n\n    :cond_eclipse_ua_app\n    return-object v0\n.end method\n"}se' "$wssm"
+grep -qF -- '->userAgent:Ljava/lang/String;' "$wssm" || fail "WebSettings getUserAgentString per-WebView insert failed (drift?)"
 ECLIPSE_UA="$ECLIPSE_UA" perl -0pi -e 'my $ua=$ENV{ECLIPSE_UA}; s{\.method public static getDefaultUserAgent\(Landroid/content/Context;\)Ljava/lang/String;.*?\.end method\n}{".method public static getDefaultUserAgent(Landroid/content/Context;)Ljava/lang/String;\n    .registers 2\n\n    const-string v0, \"$ua\"\n\n    return-object v0\n.end method\n"}se' "$wssm"
 grep -qF 'Eclipse-WebView/152.0.6' "$wssm" || fail "WebSettings honest-UA insert failed (drift?)"
 ! grep -qF 'GDPR VIOLATION' "$wssm" || fail "WebSettings still returns \"GDPR VIOLATION\" (honest-UA fix incomplete)"
 
 ! grep -qF 'native_setUserAgentString' "$wssm" || fail "WebSettings.smali already carries native_setUserAgentString — drifted; update patch-framework.sh"
+! grep -qF 'widget:J' "$wssm" || fail "WebSettings.smali already declares a widget field — drifted; update patch-framework.sh"
 n="$(grep -cF '.method public setUserAgentString(Ljava/lang/String;)V' "$wssm")" || true
 [ "$n" = "1" ] || fail "WebSettings.smali setUserAgentString anchor not unique (found $n, expected 1) — installed WebSettings drifted; update patch-framework.sh"
 
 ANCHOR_UAS=$'.method public setUserAgentString(Ljava/lang/String;)V\n    .registers 2\n\n    return-void\n.end method'
 ANCHOR_UAS="$ANCHOR_UAS" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_UAS}) >= 0) ? 0 : 1)' "$wssm" || fail "WebSettings.smali setUserAgentString body changed from the expected empty no-op — installed WebSettings drifted; update patch-framework.sh"
 
-perl -0pi -e 's{\.method public setUserAgentString\(Ljava/lang/String;\)V.*?\.end method\n}{.method public setUserAgentString(Ljava/lang/String;)V\n    .registers 2\n\n    invoke-direct {p0, p1}, Landroid/webkit/WebSettings;->native_setUserAgentString(Ljava/lang/String;)V\n\n    return-void\n.end method\n}s' "$wssm"
-grep -qF -- '->native_setUserAgentString(Ljava/lang/String;)V' "$wssm" || fail "WebSettings setUserAgentString native-body insert failed (drift?)"
+perl -0pi -e 's{\.method public setUserAgentString\(Ljava/lang/String;\)V.*?\.end method\n}{.method public setUserAgentString(Ljava/lang/String;)V\n    .registers 4\n\n    iput-object p1, p0, Landroid/webkit/WebSettings;->userAgent:Ljava/lang/String;\n\n    iget-wide v0, p0, Landroid/webkit/WebSettings;->widget:J\n\n    invoke-direct {p0, v0, v1, p1}, Landroid/webkit/WebSettings;->native_setUserAgentString(JLjava/lang/String;)V\n\n    return-void\n.end method\n}s' "$wssm"
+grep -qF -- '->native_setUserAgentString(JLjava/lang/String;)V' "$wssm" || fail "WebSettings setUserAgentString native-body insert failed (drift?)"
 
 ANCHOR_UAS="$ANCHOR_UAS" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_UAS}) >= 0) ? 1 : 0)' "$wssm" || fail "WebSettings.setUserAgentString is still the empty no-op — the app's UA would be silently discarded again (§6 2026-07-16 💥)"
 
 cat >> "$wssm" <<'ECLIPSE_WS_NATIVES'
 
 
-.method private native native_setUserAgentString(Ljava/lang/String;)V
-.end method
+.field widget:J
 
-.method private native native_getUserAgentString()Ljava/lang/String;
+.field private userAgent:Ljava/lang/String;
+
+.method private native native_setUserAgentString(JLjava/lang/String;)V
 .end method
 ECLIPSE_WS_NATIVES
 
@@ -867,14 +1033,18 @@ n="$(grep -cF '.method internalLoadChanged(ILjava/lang/String;)V' "$wvsm")" || t
 [ "$n" = "1" ] || fail "WebView.smali internalLoadChanged anchor not unique (found $n, expected 1) — installed WebView drifted; update patch-framework.sh"
 ANCHOR_ILC=$'.method internalLoadChanged(ILjava/lang/String;)V\n    .registers 4\n\n    if-nez p1, :cond_c\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    if-eqz v0, :cond_c\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    invoke-virtual {v0, p0, p2}, Landroid/webkit/WebViewClient;->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;)V\n\n    :cond_b\n    :goto_b\n    return-void\n\n    :cond_c\n    const/4 v0, 0x3\n\n    if-ne p1, v0, :cond_b\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    if-eqz v0, :cond_b\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    invoke-virtual {v0, p0, p2}, Landroid/webkit/WebViewClient;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V\n\n    goto :goto_b\n.end method'
 ANCHOR_ILC="$ANCHOR_ILC" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_ILC}) >= 0) ? 0 : 1)' "$wvsm" || fail "WebView.smali internalLoadChanged body changed from the expected 2-arg shape — installed WebView drifted; update patch-framework.sh"
-perl -0pi -e 's{\.method internalLoadChanged\(ILjava/lang/String;\)V.*?\.end method\n}{.method internalLoadChanged(ILjava/lang/String;)V\n    .registers 5\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    if-eqz v0, :cond_eclipse_ilc_done\n\n    if-nez p1, :cond_eclipse_ilc_finished\n\n    const/4 v1, 0x0\n\n    invoke-virtual {v0, p0, p2, v1}, Landroid/webkit/WebViewClient;->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V\n\n    return-void\n\n    :cond_eclipse_ilc_finished\n    const/4 v1, 0x3\n\n    if-ne p1, v1, :cond_eclipse_ilc_done\n\n    invoke-virtual {v0, p0, p2}, Landroid/webkit/WebViewClient;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V\n\n    :cond_eclipse_ilc_done\n    return-void\n.end method\n}s' "$wvsm"
+perl -0pi -e 's{\.method internalLoadChanged\(ILjava/lang/String;\)V.*?\.end method\n}{.method internalLoadChanged(ILjava/lang/String;)V\n    .registers 5\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    if-eqz v0, :cond_eclipse_ilc_done\n\n    if-nez p1, :cond_eclipse_ilc_committed\n\n    const/4 v1, 0x0\n\n    invoke-virtual {v0, p0, p2, v1}, Landroid/webkit/WebViewClient;->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V\n\n    return-void\n\n    :cond_eclipse_ilc_committed\n    const/4 v1, 0x2\n\n    if-ne p1, v1, :cond_eclipse_ilc_finished\n\n    invoke-virtual {v0, p0, p2}, Landroid/webkit/WebViewClient;->onPageCommitVisible(Landroid/webkit/WebView;Ljava/lang/String;)V\n\n    return-void\n\n    :cond_eclipse_ilc_finished\n    const/4 v1, 0x3\n\n    if-ne p1, v1, :cond_eclipse_ilc_done\n\n    invoke-virtual {v0, p0, p2}, Landroid/webkit/WebViewClient;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V\n\n    :cond_eclipse_ilc_done\n    return-void\n.end method\n}s' "$wvsm"
 grep -qF -- '->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V' "$wvsm" || fail "WebView.smali internalLoadChanged 3-arg onPageStarted dispatch insert failed (drift?)"
 ! grep -qF -- '->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;)V' "$wvsm" || fail "WebView.smali still dispatches the 2-arg onPageStarted (M6 3-arg dispatch incomplete)"
+grep -qF -- '->onPageCommitVisible(Landroid/webkit/WebView;Ljava/lang/String;)V' "$wvsm" || fail "WebView.smali internalLoadChanged onPageCommitVisible dispatch insert failed (drift?)"
 
 wvcsm="$work/smali/android/webkit/WebViewClient.smali"
 [ -f "$wvcsm" ] || fail "WebViewClient.smali not found after baksmali"
 ! grep -qF 'Landroid/graphics/Bitmap;)V' "$wvcsm" || fail "WebViewClient.smali already declares a Bitmap-arg method (3-arg onPageStarted?) — installed WebViewClient drifted; update patch-framework.sh"
 ! grep -qF 'shouldOverrideUrlLoading' "$wvcsm" || fail "WebViewClient.smali already declares shouldOverrideUrlLoading — installed WebViewClient drifted; update patch-framework.sh"
+for wvc_method in onPageCommitVisible onLoadResource onReceivedError; do
+    ! grep -qF "$wvc_method" "$wvcsm" || fail "WebViewClient.smali already declares $wvc_method — installed WebViewClient drifted; update patch-framework.sh"
+done
 cat >> "$wvcsm" <<'ECLIPSE_WVC_METHODS'
 
 
@@ -902,9 +1072,108 @@ cat >> "$wvcsm" <<'ECLIPSE_WVC_METHODS'
 
     return v0
 .end method
+
+.method public shouldOverrideUrlLoading(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;)Z
+    .registers 4
+
+    invoke-interface {p2}, Landroid/webkit/WebResourceRequest;->getUrl()Landroid/net/Uri;
+
+    move-result-object v0
+
+    invoke-virtual {v0}, Landroid/net/Uri;->toString()Ljava/lang/String;
+
+    move-result-object v0
+
+    invoke-virtual {p0, p1, v0}, Landroid/webkit/WebViewClient;->shouldOverrideUrlLoading(Landroid/webkit/WebView;Ljava/lang/String;)Z
+
+    move-result v0
+
+    return v0
+.end method
+
+.method public onPageCommitVisible(Landroid/webkit/WebView;Ljava/lang/String;)V
+    .registers 3
+
+    return-void
+.end method
+
+.method public onLoadResource(Landroid/webkit/WebView;Ljava/lang/String;)V
+    .registers 3
+
+    return-void
+.end method
+
+.method public onReceivedError(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;Landroid/webkit/WebResourceError;)V
+    .registers 7
+
+    invoke-interface {p2}, Landroid/webkit/WebResourceRequest;->isForMainFrame()Z
+
+    move-result v0
+
+    if-eqz v0, :cond_eclipse_error_subframe
+
+    invoke-virtual {p3}, Landroid/webkit/WebResourceError;->getErrorCode()I
+
+    move-result v0
+
+    invoke-virtual {p3}, Landroid/webkit/WebResourceError;->getDescription()Ljava/lang/CharSequence;
+
+    move-result-object v1
+
+    invoke-interface {v1}, Ljava/lang/CharSequence;->toString()Ljava/lang/String;
+
+    move-result-object v1
+
+    invoke-interface {p2}, Landroid/webkit/WebResourceRequest;->getUrl()Landroid/net/Uri;
+
+    move-result-object v2
+
+    invoke-virtual {v2}, Landroid/net/Uri;->toString()Ljava/lang/String;
+
+    move-result-object v2
+
+    invoke-virtual {p0, p1, v0, v1, v2}, Landroid/webkit/WebViewClient;->onReceivedError(Landroid/webkit/WebView;ILjava/lang/String;Ljava/lang/String;)V
+
+    :cond_eclipse_error_subframe
+    return-void
+.end method
+
+.method public onReceivedError(Landroid/webkit/WebView;ILjava/lang/String;Ljava/lang/String;)V
+    .registers 5
+
+    return-void
+.end method
 ECLIPSE_WVC_METHODS
 grep -qF -- 'onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V' "$wvcsm" || fail "WebViewClient 3-arg onPageStarted insert failed (drift?)"
 grep -qF -- 'shouldOverrideUrlLoading(Landroid/webkit/WebView;Ljava/lang/String;)Z' "$wvcsm" || fail "WebViewClient shouldOverrideUrlLoading insert failed (drift?)"
+grep -qF -- 'shouldOverrideUrlLoading(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;)Z' "$wvcsm" || fail "WebViewClient request shouldOverrideUrlLoading insert failed (drift?)"
+grep -qF -- 'onReceivedError(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;Landroid/webkit/WebResourceError;)V' "$wvcsm" || fail "WebViewClient onReceivedError insert failed (drift?)"
+
+for overlay_class in WebResourceError EclipseWebResourceRequest; do
+    [ ! -e "$work/smali/android/webkit/$overlay_class.smali" ] || fail "the installed framework already declares android.webkit.$overlay_class — the overlay copy would shadow it; update patch-framework.sh"
+done
+wrr_stock="$work/smali/android/webkit/WebResourceRequest.smali"
+[ -f "$wrr_stock" ] || fail "WebResourceRequest.smali not found after baksmali"
+wrr_expected=$'.method public abstract getMethod()Ljava/lang/String;\n.method public abstract getRequestHeaders()Ljava/util/Map;\n.method public abstract getUrl()Landroid/net/Uri;\n.method public abstract hasGesture()Z\n.method public abstract isForMainFrame()Z\n.method public abstract isRedirect()Z'
+wrr_methods="$(grep '^\.method' "$wrr_stock" | LC_ALL=C sort)"
+[ "$wrr_methods" = "$wrr_expected" ] || fail "WebResourceRequest.smali no longer declares exactly the six methods EclipseWebResourceRequest implements — installed WebResourceRequest drifted; update patch-framework.sh"
+uri_stock="$work/smali/android/net/Uri.smali"
+[ -f "$uri_stock" ] || fail "Uri.smali not found after baksmali"
+grep -qxF '.method public static parse(Ljava/lang/String;)Landroid/net/Uri;' "$uri_stock" || fail "Uri.smali lost the static parse(String) EclipseWebResourceRequest calls — installed Uri drifted; update patch-framework.sh"
+
+wccsm="$work/smali/android/webkit/WebChromeClient.smali"
+[ -f "$wccsm" ] || fail "WebChromeClient.smali not found after baksmali"
+n="$(grep -c '^\.method' "$wccsm")" || true
+[ "$n" = "1" ] || fail "WebChromeClient.smali declares $n methods (expected only its constructor) — installed WebChromeClient drifted; update patch-framework.sh"
+cat >> "$wccsm" <<'ECLIPSE_WCC_METHODS'
+
+.method public onProgressChanged(Landroid/webkit/WebView;I)V
+    .registers 3
+
+    return-void
+.end method
+ECLIPSE_WCC_METHODS
+grep -qF '.method public onProgressChanged(Landroid/webkit/WebView;I)V' "$wccsm" || fail "WebChromeClient onProgressChanged insert failed"
 
 jpm="$work/smali/android/app/job/JobParameters.smali"
 [ -f "$jpm" ] || fail "JobParameters.smali not found after baksmali"
@@ -1015,6 +1284,7 @@ cp "$csm" "$work/smali-view/android/webkit/CookieManager.smali"
 cp "$wvsm" "$work/smali-view/android/webkit/WebView.smali"
 cp "$wssm" "$work/smali-view/android/webkit/WebSettings.smali"
 cp "$wvcsm" "$work/smali-view/android/webkit/WebViewClient.smali"
+cp "$wccsm" "$work/smali-view/android/webkit/WebChromeClient.smali"
 cp "$jpm" "$work/smali-view/android/app/job/JobParameters.smali"
 cp "$psm" "$work/smali-view/android/graphics/Paint.smali"
 mkdir -p "$work/smali-view/android/widget"
@@ -1254,6 +1524,28 @@ display_output="$(env \
 [ "$display_output" = 'display-refresh-rates-ok' ] \
     || fail "display refresh-rate regression probe returned '$display_output'"
 
+webview_probe="$here/tests/WebViewCallbacksProbe.java"
+[ -f "$webview_probe" ] || fail "WebView callback regression probe missing at $webview_probe"
+mkdir -p "$work/webview-probe/classes" "$work/webview-probe/cache" "$work/webview-probe/data"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -implicit:none \
+    -sourcepath "$here/src:$here/stubs" -d "$work/webview-probe/classes" "$webview_probe"
+"$DX" --dex --output="$work/webview-probe/probe.jar" "$work/webview-probe/classes"
+webview_boot_class_path="$boot_class_path:$work/jar/api-impl.jar:$work/webview-probe/probe.jar"
+webview_boot_class_path_locations="$boot_class_path_locations:/system/framework/api-impl.jar:/system/framework/probe.jar"
+webview_output="$(env \
+    ANDROID_DATA="$work/webview-probe/data" \
+    XDG_CACHE_HOME="$work/webview-probe/cache" \
+    BOOTCLASSPATH="$webview_boot_class_path" \
+    "$DALVIKVM" \
+    -Ximage:"$work/art/oat/boot.art" \
+    -Xbootclasspath:"$webview_boot_class_path" \
+    -Xbootclasspath-locations:"$webview_boot_class_path_locations" \
+    -Ximage-compiler-option --no-generate-debug-info \
+    -Ximage-compiler-option --no-generate-mini-debug-info \
+    android.webkit.WebViewCallbacksProbe)"
+[ "$webview_output" = 'webview-callbacks-ok' ] \
+    || fail "WebView callback regression probe returned '$webview_output'"
+
 mkdir -p "$OUT"
 cp "$work/jar/api-impl.jar" "$OUT/api-impl.jar"
 ln -sfn "$ORIG_FW/framework-res.apk" "$OUT/framework-res.apk"
@@ -1274,5 +1566,5 @@ classes_dex_size="$(stat -c '%s' "$work/jar/classes.dex")"
 classes2_dex_size="$(stat -c '%s' "$work/jar/classes2.dex")"
 classes3_dex_size="$(stat -c '%s' "$work/jar/classes3.dex")"
 echo "    classes.dex (javac-patched): $classes_dex_size bytes; classes2.dex (smali Android API gaps, including LocationManager): $classes2_dex_size bytes; classes3.dex (stock): $classes3_dex_size bytes"
-echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, date-time, display refresh-rate, and wolfSSL contracts verified"
+echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, date-time, display refresh-rate, WebView callback, and wolfSSL contracts verified"
 echo "    use it with: export ECLIPSE_ANDROID_FRAMEWORK_DIR=\"$OUT\""

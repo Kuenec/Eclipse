@@ -20,10 +20,9 @@ directories = "6"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 sha2 = "0.11"
 ring = "0.17"
+aes = "0.9"
 
 crc32fast = "1"
-
-httpdate = "1.0.3"
 
 libloading = "0.8"
 jni-sys = "0.4"

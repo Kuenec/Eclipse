@@ -23,7 +23,7 @@ Eclipse runs Roblox's official Android x86-64 client natively on Linux, with a s
 flatpak install --user https://kuenec.github.io/Eclipse/io.github.kuenec.Eclipse.flatpakref
 ```
 
-You need an x86-64 Linux desktop (Wayland or X11) and a Vulkan driver. Eclipse updates with `flatpak update`. A [standalone bundle](https://github.com/Kuenec/Eclipse/releases/latest) is also available.
+You need an x86-64 Linux desktop (Wayland or X11) and a Vulkan driver. Eclipse takes about 100 MB on top of the shared GNOME runtime and updates with `flatpak update`. A [standalone bundle](https://github.com/Kuenec/Eclipse/releases/latest) is also available; it needs GTK 4.10+ and WebKitGTK 6.0 (2.42+) from your distribution for sign-in and web pages.
 
 ## Features
 
@@ -44,6 +44,8 @@ Start **Eclipse** from your app menu. From a terminal, use `flatpak run io.githu
 | `update` | Check for a newer Roblox now |
 | `install <files>` | Install Roblox from your own `base.apk` + `split_config.x86_64.apk`, or an `.apks`/`.xapk` bundle |
 | `config` | Show the settings file path and the values in effect |
+
+Sign-in and other Roblox web pages open in their own window.
 
 ## Settings
 
@@ -83,6 +85,7 @@ flowchart LR
 - **Something failed?** The log of the last launch is in `~/.var/app/io.github.kuenec.Eclipse/data/eclipse/app-data/logs/eclipse.log`.
 - **More detail:** `flatpak run --env=RUST_LOG=debug io.github.kuenec.Eclipse run`
 - **Signature error:** the files are not Roblox's official release. Install a clean copy.
+- **Logged out after updating from 0.1.4 or older?** Eclipse carries your login over from the old web engine once. If it could not, the log says why; sign in again.
 - **Uninstall everything:** `flatpak uninstall --user --delete-data io.github.kuenec.Eclipse`
 
 When reporting a bug, include your distro, desktop, GPU and driver, and the log. Never attach APKs, cookies or account data.

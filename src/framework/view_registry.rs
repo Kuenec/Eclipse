@@ -102,6 +102,12 @@ pub struct ViewState {
     pub editor_action_listener: Option<Global<JObject<'static>>>,
 
     pub frame: Option<[i32; 4]>,
+
+    pub parent: Option<ViewHandle>,
+
+    pub visible: bool,
+
+    pub window_root: bool,
 }
 
 struct Slot {
@@ -113,6 +119,29 @@ struct Slot {
 struct Registry {
     slots: Vec<Slot>,
     free: Vec<u32>,
+}
+
+impl Registry {
+    fn live(&self, handle: ViewHandle) -> Option<&ViewState> {
+        let (index, generation) = unpack(handle);
+        let slot = self.slots.get(index as usize)?;
+        if slot.generation != generation {
+            return None;
+        }
+        slot.state.as_ref()
+    }
+
+    fn live_mut(&mut self, handle: ViewHandle) -> Result<&mut ViewState, ViewRegistryError> {
+        let (index, generation) = unpack(handle);
+        let slot = self
+            .slots
+            .get_mut(index as usize)
+            .ok_or(ViewRegistryError::OutOfRange)?;
+        if slot.generation != generation {
+            return Err(ViewRegistryError::StaleHandle);
+        }
+        slot.state.as_mut().ok_or(ViewRegistryError::StaleHandle)
+    }
 }
 
 fn pack(index: u32, generation: u32) -> ViewHandle {
@@ -143,6 +172,9 @@ pub fn allocate(class_name: &str) -> Result<ViewHandle, ViewRegistryError> {
         text_watchers: Vec::new(),
         editor_action_listener: None,
         frame: None,
+        parent: None,
+        visible: true,
+        window_root: false,
     };
     let mut reg = lock()?;
     if let Some(index) = reg.free.pop() {
@@ -166,17 +198,8 @@ pub fn with_view<R>(
     handle: ViewHandle,
     f: impl FnOnce(&mut ViewState) -> R,
 ) -> Result<R, ViewRegistryError> {
-    let (index, generation) = unpack(handle);
     let mut reg = lock()?;
-    let slot = reg
-        .slots
-        .get_mut(index as usize)
-        .ok_or(ViewRegistryError::OutOfRange)?;
-    if slot.generation != generation {
-        return Err(ViewRegistryError::StaleHandle);
-    }
-    let state = slot.state.as_mut().ok_or(ViewRegistryError::StaleHandle)?;
-    Ok(f(state))
+    Ok(f(reg.live_mut(handle)?))
 }
 
 pub fn free(handle: ViewHandle) -> Result<(), ViewRegistryError> {
@@ -206,6 +229,64 @@ pub fn set_background_color(handle: ViewHandle, argb: i32) -> Result<(), ViewReg
 
 pub fn set_frame(handle: ViewHandle, frame: [i32; 4]) -> Result<(), ViewRegistryError> {
     with_view(handle, move |v| v.frame = Some(frame))
+}
+
+pub fn set_visible(handle: ViewHandle, visible: bool) -> Result<(), ViewRegistryError> {
+    with_view(handle, move |v| v.visible = visible)
+}
+
+pub fn mark_window_root(handle: ViewHandle) -> Result<(), ViewRegistryError> {
+    with_view(handle, |v| v.window_root = true)
+}
+
+pub fn release_window_root(handle: ViewHandle) -> Result<(), ViewRegistryError> {
+    with_view(handle, |v| v.window_root = false)
+}
+
+pub fn attach_child(
+    parent: ViewHandle,
+    child: ViewHandle,
+    index: Option<usize>,
+) -> Result<(), ViewRegistryError> {
+    let mut reg = lock()?;
+    reg.live_mut(child)?;
+    let siblings = &mut reg.live_mut(parent)?.children;
+    let position = index.map_or(siblings.len(), |index| index.min(siblings.len()));
+    siblings.insert(position, child);
+    reg.live_mut(child)?.parent = Some(parent);
+    Ok(())
+}
+
+pub fn detach_child(parent: ViewHandle, child: ViewHandle) -> Result<(), ViewRegistryError> {
+    let mut reg = lock()?;
+    reg.live_mut(parent)?.children.retain(|&c| c != child);
+    if let Ok(state) = reg.live_mut(child) {
+        if state.parent == Some(parent) {
+            state.parent = None;
+        }
+    }
+    Ok(())
+}
+
+pub fn is_shown(handle: ViewHandle) -> bool {
+    const MAX_DEPTH: usize = 256;
+    let Ok(reg) = lock() else {
+        return false;
+    };
+    let mut current = handle;
+    for _ in 0..MAX_DEPTH {
+        let Some(state) = reg.live(current) else {
+            return false;
+        };
+        if !state.visible {
+            return false;
+        }
+        match state.parent {
+            Some(parent) => current = parent,
+            None => return state.window_root,
+        }
+    }
+    false
 }
 
 pub fn set_jobject(handle: ViewHandle, jobject: ViewObject) -> Result<(), ViewRegistryError> {
@@ -274,50 +355,6 @@ pub fn focused_view() -> ViewHandle {
 
 pub fn is_focused(handle: ViewHandle) -> bool {
     handle != 0 && handle == focused_view()
-}
-
-pub fn absolute_frame(handle: ViewHandle) -> Option<(i32, i32, u32, u32)> {
-    const MAX_DEPTH: u32 = 256;
-    if handle == 0 {
-        return None;
-    }
-    let root = active_root();
-    if root == 0 {
-        return None;
-    }
-    let reg = lock().ok()?;
-
-    let mut stack: Vec<(ViewHandle, i32, i32, u32)> = vec![(root, 0, 0, 0)];
-    while let Some((h, ox, oy, depth)) = stack.pop() {
-        if depth >= MAX_DEPTH {
-            continue;
-        }
-        let (index, generation) = unpack(h);
-        let Some(slot) = reg.slots.get(index as usize) else {
-            continue;
-        };
-        if slot.generation != generation {
-            continue;
-        }
-        let Some(state) = slot.state.as_ref() else {
-            continue;
-        };
-        if h == handle {
-            let [l, t, r, b] = state.frame?;
-            if r <= l || b <= t {
-                return None;
-            }
-            return Some((ox + l, oy + t, (r - l) as u32, (b - t) as u32));
-        }
-        let (cx, cy) = match state.frame {
-            Some([l, t, _, _]) => (ox + l, oy + t),
-            None => (ox, oy),
-        };
-        for &child in state.children.iter().rev() {
-            stack.push((child, cx, cy, depth + 1));
-        }
-    }
-    None
 }
 
 fn find_in_subtree_where(
@@ -586,78 +623,56 @@ mod tests {
     }
 
     #[test]
-    fn absolute_frame_sums_ancestor_origins_and_rejects_unreachable_views() {
-        let child = allocate("android.webkit.WebView").expect("alloc child");
-        set_frame(child, [5, 7, 105, 57]).expect("frame child");
-        let root = allocate("android.widget.FrameLayout").expect("alloc root");
-        set_frame(root, [10, 20, 800, 600]).expect("frame root");
-        with_view(root, |s| s.children.push(child)).expect("wire child");
-        let orphan = allocate("android.view.View").expect("alloc orphan");
-        set_frame(orphan, [1, 1, 2, 2]).expect("frame orphan");
-        let frameless = allocate("android.view.View").expect("alloc frameless");
-        with_view(root, |s| s.children.push(frameless)).expect("wire frameless");
+    fn a_view_is_shown_only_while_it_and_every_ancestor_are_visible_under_a_window_root() {
+        let root = allocate("com.android.internal.policy.DecorView").expect("alloc root");
+        let fragment = allocate("android.widget.FrameLayout").expect("alloc fragment");
+        let web = allocate("android.webkit.WebView").expect("alloc web");
+        assert!(!is_shown(web), "a view outside any window is not shown");
 
-        set_active_root(root);
+        attach_child(root, fragment, None).expect("attach fragment");
+        attach_child(fragment, web, Some(7)).expect("attach web");
+        assert_eq!(with_view(fragment, |v| v.children.clone()), Ok(vec![web]));
+        assert!(!is_shown(web), "a tree that no window holds is not shown");
 
-        assert_eq!(absolute_frame(child), Some((15, 27, 100, 50)));
+        mark_window_root(root).expect("mark root");
+        assert!(is_shown(web));
+        release_window_root(root).expect("release root");
+        assert!(!is_shown(web), "a WebView in a closed window is not shown");
+        mark_window_root(root).expect("mark root again");
+        assert!(is_shown(web));
 
-        assert_eq!(absolute_frame(root), Some((10, 20, 790, 580)));
+        set_visible(fragment, false).expect("hide fragment");
+        assert!(!is_shown(web), "a hidden ancestor hides the WebView");
+        set_visible(fragment, true).expect("show fragment");
+        set_visible(web, false).expect("hide web");
+        assert!(!is_shown(web));
+        set_visible(web, true).expect("show web");
+        assert!(is_shown(web));
 
-        assert_eq!(absolute_frame(orphan), None);
+        let other = allocate("android.widget.LinearLayout").expect("alloc other");
+        attach_child(other, web, None).expect("move web");
+        detach_child(fragment, web).expect("detach from the old parent");
+        assert_eq!(
+            with_view(web, |v| v.parent),
+            Ok(Some(other)),
+            "detaching from a former parent keeps the current one"
+        );
+        detach_child(other, web).expect("detach web");
+        assert_eq!(with_view(web, |v| v.parent), Ok(None));
+        assert!(!is_shown(web), "a detached view is not shown");
+        attach_child(fragment, web, None).expect("reattach");
+        assert!(is_shown(web));
 
-        assert_eq!(absolute_frame(frameless), None);
-
-        assert_eq!(absolute_frame(0), None);
-        set_active_root(0);
-        for h in [child, root, orphan, frameless] {
+        free(fragment).expect("free fragment");
+        assert!(!is_shown(web), "a view whose parent was freed is not shown");
+        assert_eq!(
+            attach_child(root, fragment, None),
+            Err(ViewRegistryError::StaleHandle)
+        );
+        for h in [root, web, other] {
             free(h).expect("free");
         }
-    }
-
-    #[test]
-    fn subtree_contains_matches_self_direct_and_deep_and_rejects_non_members_and_stale() {
-        let deep = allocate("android.webkit.WebView").expect("alloc deep");
-        let mid = allocate("android.widget.FrameLayout").expect("alloc mid");
-        with_view(mid, |s| s.children.push(deep)).expect("wire deep");
-        let root = allocate("android.widget.LinearLayout").expect("alloc root");
-        with_view(root, |s| s.children.push(mid)).expect("wire mid");
-        let outsider = allocate("android.view.View").expect("alloc outsider");
-
-        assert!(subtree_contains(root, root), "a view contains itself");
-        assert!(subtree_contains(root, mid), "direct child");
-        assert!(subtree_contains(root, deep), "deep descendant");
-        assert!(
-            !subtree_contains(root, outsider),
-            "non-member is not contained"
-        );
-        assert!(
-            !subtree_contains(root, 0),
-            "the reserved null handle is never a member"
-        );
-        assert!(
-            !subtree_contains(0, deep),
-            "the reserved null root contains nothing"
-        );
-
-        free(deep).expect("free deep");
-        assert!(
-            !subtree_contains(root, deep),
-            "a stale needle handle must not match"
-        );
-
-        with_view(mid, |s| s.children.push(root)).expect("introduce cycle");
-        assert!(
-            subtree_contains(root, mid),
-            "a cyclic registry still terminates and finds a live member"
-        );
-        assert!(
-            !subtree_contains(root, outsider),
-            "a cyclic registry still terminates for a non-member"
-        );
-
-        for h in [mid, root, outsider] {
-            free(h).expect("free");
-        }
+        assert!(!is_shown(web) && !is_shown(0));
     }
 
     #[test]

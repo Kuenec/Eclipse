@@ -1272,31 +1272,20 @@ fn preload_app_native_libs(
 }
 
 struct WebViewTestReport {
-    upcalls_ok: u32,
+    load_upcalls: u32,
     started_ms: u128,
     finished_ms: u128,
-    http: i32,
-    frame_w: u32,
-    frame_h: u32,
-    distinct: usize,
 }
 
 impl std::fmt::Display for WebViewTestReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "WebView engine pipeline OK: internalLoadChanged upcalls {}/2 (state 0 @ {}ms, \
-             state 3 @ {}ms, http {}), frame {}x{} {} distinct pixels, bridge round-trip OK, \
-             evaluateJavascript OK, honest UA OK, cookie set/get OK, cookie callback OK, \
-             cookie flush OK, \
-             ViewClosed, helper exit 0, bound=5",
-            self.upcalls_ok,
-            self.started_ms,
-            self.finished_ms,
-            self.http,
-            self.frame_w,
-            self.frame_h,
-            self.distinct
+            "WebView engine pipeline OK: internalLoadChanged upcalls {}/3 (state 0 @ {}ms, \
+             state 3 @ {}ms), page URL OK, bridge round-trip OK, evaluateJavascript OK, honest \
+             UA OK, cookie set/get OK, cookie callback OK, cookie flush OK, ViewClosed, helper \
+             exit 0",
+            self.load_upcalls, self.started_ms, self.finished_ms
         )
     }
 }
@@ -1354,7 +1343,6 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     const START_DEADLINE: Duration = Duration::from_secs(30);
     const FINISH_DEADLINE: Duration = Duration::from_secs(90);
     const UPCALL_DEADLINE: Duration = Duration::from_secs(10);
-    const INK_DEADLINE: Duration = Duration::from_secs(20);
     const LEG_DEADLINE: Duration = Duration::from_secs(15);
     const CLOSE_DEADLINE: Duration = Duration::from_secs(15);
 
@@ -1366,8 +1354,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         (false, false) => {
             return Err(
                 "no display detected: neither WAYLAND_DISPLAY nor DISPLAY is set — the \
-                        CEF helper needs a Wayland or X11 session (its own select_ozone would \
-                        refuse with the same error)"
+                 WebKitGTK helper needs a Wayland or X11 session"
                     .into(),
             )
         }
@@ -1406,7 +1393,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         || client::failed_reason().map(|r| format!("web engine helper unavailable: {r}"));
     let start = Instant::now();
     let mut started_ms: Option<u128> = None;
-    let (finished_ms, http) = loop {
+    let finished_ms = loop {
         if let Some(reason) = fail_reason() {
             return Err(reason.into());
         }
@@ -1419,12 +1406,12 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
                     start.elapsed().as_millis()
                 );
             }
-            if let Some(http) = obs.finished_http {
+            if obs.finished {
                 println!(
-                    "# load-state 3 observed @ {} ms http={http}",
+                    "# load-state 3 observed @ {} ms",
                     start.elapsed().as_millis()
                 );
-                break (start.elapsed().as_millis(), http);
+                break start.elapsed().as_millis();
             }
         }
         if started_ms.is_none() && start.elapsed() > START_DEADLINE {
@@ -1438,45 +1425,25 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     let started_ms = started_ms.ok_or("load-finished arrived without load-started")?;
 
     let upcall_deadline = Instant::now() + UPCALL_DEADLINE;
-    let upcalls_ok = loop {
-        let ok = client::load_observed(handle)
-            .map(|o| o.upcalls_ok)
+    let load_upcalls = loop {
+        let delivered = client::load_observed(handle)
+            .map(|o| o.load_upcalls)
             .unwrap_or(0);
-        if ok >= 2 {
-            break ok;
+        let page_url = client::url(handle);
+        if delivered >= 3 && page_url.as_deref() == Some(target_url.as_str()) {
+            break delivered;
         }
         if Instant::now() > upcall_deadline {
             return Err(format!(
-                "only {ok}/2 internalLoadChanged upcalls completed within 10 s of load-finish"
+                "within 10 s of load-finish only {delivered}/3 internalLoadChanged upcalls \
+                 completed and WebView.getUrl reported the loaded page: {}",
+                page_url.as_deref() == Some(target_url.as_str())
             )
             .into());
         }
         pump_tick(&vm, 50);
     };
-
-    let ink_deadline = Instant::now() + INK_DEADLINE;
-    let (frame_w, frame_h, distinct) = loop {
-        if let Some(reason) = fail_reason() {
-            return Err(reason.into());
-        }
-        let census = client::with_latest_frame(handle, |stage| {
-            let mut distinct = std::collections::HashSet::new();
-            for px in stage.bytes.as_chunks::<4>().0 {
-                distinct.insert(u32::from_ne_bytes([px[0], px[1], px[2], px[3]]));
-            }
-            (stage.width, stage.height, distinct.len())
-        });
-        if let Some((w, h, count)) = census {
-            if count > 1 {
-                println!("# staged frame {w}x{h} distinct_pixels={count}");
-                break (w, h, count);
-            }
-        }
-        if Instant::now() > ink_deadline {
-            return Err("no staged frame with nonzero ink within 20 s of load-finish".into());
-        }
-        pump_tick(&vm, 50);
-    };
+    println!("# page URL OK (WebView.getUrl follows the engine)");
 
     let eval_and_wait = |script: &str| -> Option<String> {
         if framework::webview_evaluate(&vm, handle, script).is_err() {
@@ -1574,11 +1541,11 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     }
     println!("# cookie callback OK (real Boolean.TRUE, not fabricated)");
     framework::cookie_manager_flush(&vm).map_err(|e| format!("CookieManager.flush failed: {e}"))?;
-    println!("# cookie flush OK (CEF persistent-store completion boundary returned)");
+    println!("# cookie flush OK (the engine saved its session cookies)");
 
     client::close_view(handle).map_err(|e| format!("CloseView send failed: {e}"))?;
     let close_deadline = Instant::now() + CLOSE_DEADLINE;
-    while client::view_is_tracked(handle) {
+    while client::view_close_pending(handle) {
         if let Some(reason) = fail_reason() {
             return Err(reason.into());
         }
@@ -1597,13 +1564,9 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         .into());
     }
     Ok(WebViewTestReport {
-        upcalls_ok,
+        load_upcalls,
         started_ms,
         finished_ms,
-        http,
-        frame_w,
-        frame_h,
-        distinct,
     })
 }
 

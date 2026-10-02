@@ -16,10 +16,16 @@ finish-args:
   - --filesystem=xdg-download:ro
 cleanup:
   - /include
+  - /bin/android-translation-layer
+  - /bin/dalvikvm
   - /bin/dx
+  - /bin/wolfssl-config
   - '*.a'
   - '*.la'
+  - /lib/art/libandroidfw.so
+  - /lib/libandroid.so*
   - /lib/libopenxr_loader.so*
+  - /lib/libportal.so*
   - /lib/libportal-*
   - /lib/cmake
   - /lib/girepository-1.0
@@ -27,6 +33,10 @@ cleanup:
   - /lib/java/core-junit_classes.jar
   - /lib/java/junit-runner_classes.jar
   - /lib/java/dx.jar
+  - /lib/java/dex/android_translation_layer/api-impl.jar
+  - /lib/java/dex/android_translation_layer/gstub.jar
+  - /lib/java/dex/android_translation_layer/natives/libtranslation_layer_main.so
+  - /lib/java/dex/art/*.jar
   - /lib/pkgconfig
   - /share/doc
   - /share/gir-1.0
@@ -151,24 +161,6 @@ modules:
       - mkdir -p /app/share/java_home/lib/security
       - install -D /usr/lib/sdk/openjdk17/jvm/openjdk-17/lib/security/cacerts /app/share/ssl/certs/java/cacerts
 
-  - name: libopensles-standalone
-    buildsystem: meson
-    build-options:
-      append-path: /usr/lib/sdk/openjdk17/bin
-      env:
-        JAVA_HOME: /usr/lib/sdk/openjdk17/jvm/openjdk-17
-    sources:
-      - type: git
-        url: https://gitlab.com/android_translation_layer/libopensles-standalone
-        commit: bdb857a4baadbc8c036db85a5da26c5269a751c5
-
-  - name: zypak
-    sources:
-      - type: git
-        url: https://github.com/refi64/zypak
-        tag: v2025.09
-        commit: 693a71c5ffa80ec9c9ce2ae03b1ccc493c698e53
-
   - name: eclipse-framework-overlay
     buildsystem: simple
     build-options:
@@ -222,7 +214,7 @@ modules:
         ANDROID_ROOT="$root" BOOTCLASSPATH="$bcp" dex2oat -j1 --dex-file="$fw/api-impl.jar"
         --oat-file="$fw/oat/x86_64/api-impl.odex" --class-loader-context='PCL[]'
         --boot-image="$art/oat/boot.art" --host --instruction-set-features="$isa" &&
-        chmod +x "$art/oat/x86_64/boot.oat" &&
+        chmod +x "$art"/oat/x86_64/*.oat "$fw/oat/x86_64/api-impl.odex" &&
         BOOTCLASSPATH="$bcp" FRAMEWORK="$fw" tools/framework-overlay/probe-app-dexopt.sh
 
   - name: eclipse
@@ -244,39 +236,14 @@ modules:
           - vendor
           - repo
           - crates/eclipse-webview/target
-          - crates/eclipse-webview-spike/cef-dist
-          - crates/eclipse-webview-spike/target
           - crates/libm-shim/target
       - cargo-sources.json
-      - type: archive
-        url: https://cef-builds.spotifycdn.com/cef_binary_152.0.6%2Bg708dc14%2Bchromium-152.0.7977.83_linux64_minimal.tar.bz2
-        sha256: daf8c2b6e63787d6a91d666205a8a4521419937eabaf47723738c86aea7135bd
-        dest: vendor/cef/linux-x86_64
-      - type: file
-        url: https://cef-builds.spotifycdn.com/cef_binary_152.0.6%2Bg708dc14%2Bchromium-152.0.7977.83_linux64_minimal.tar.bz2
-        sha256: daf8c2b6e63787d6a91d666205a8a4521419937eabaf47723738c86aea7135bd
-        dest: vendor/cef
-        dest-filename: cef_binary_152.0.6+g708dc14+chromium-152.0.7977.83_linux64_minimal.tar.bz2
-      - type: inline
-        dest: vendor/cef/linux-x86_64
-        dest-filename: archive.json
-        contents: '{"type":"minimal","name":"cef_binary_152.0.6+g708dc14+chromium-152.0.7977.83_linux64_minimal.tar.bz2","sha1":"9711b86c105fb590da576fe5a829802f1a79d520"}'
-      - type: shell
-        commands:
-          - mv vendor/cef/linux-x86_64/Release/* vendor/cef/linux-x86_64/Resources/* vendor/cef/linux-x86_64/
-          - rmdir vendor/cef/linux-x86_64/Release vendor/cef/linux-x86_64/Resources
-      - type: script
-        dest-filename: eclipse-webview-zypak
-        commands:
-          - export ZYPAK_CEF_LIBRARY_PATH=/app/lib/eclipse/libcef.so
-          - exec zypak-wrapper /app/lib/eclipse/eclipse-webview-bin "$@"
     build-commands:
-      - OUT="$PWD/dist/eclipse" tools/webview-dist/package-webview.sh
-      - install -d /app/lib/eclipse /app/bin
-      - cp -a dist/eclipse/. /app/lib/eclipse/
-      - rm /app/lib/eclipse/.eclipse-webview-payload
-      - mv /app/lib/eclipse/eclipse-webview /app/lib/eclipse/eclipse-webview-bin
-      - install -Dm755 eclipse-webview-zypak /app/lib/eclipse/eclipse-webview
+      - cargo build --release --locked
+      - cargo build --release --locked --manifest-path crates/eclipse-webview/Cargo.toml
+      - install -Dm755 target/release/eclipse /app/lib/eclipse/eclipse
+      - install -Dm755 crates/eclipse-webview/target/release/eclipse-webview /app/lib/eclipse/eclipse-webview
+      - install -d /app/bin
       - ln -s ../lib/eclipse/eclipse /app/bin/eclipse
       - install -Dm644 packaging/flatpak/io.github.kuenec.Eclipse.desktop /app/share/applications/io.github.kuenec.Eclipse.desktop
       - install -Dm644 packaging/flatpak/io.github.kuenec.Eclipse.UrlHandler.desktop /app/share/applications/io.github.kuenec.Eclipse.UrlHandler.desktop

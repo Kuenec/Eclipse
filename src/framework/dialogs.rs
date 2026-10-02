@@ -2,12 +2,13 @@ use std::panic::AssertUnwindSafe;
 
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JObject, JObjectArray, JString};
+use jni::refs::Global;
 use jni::strings::JNIStr;
 use jni::sys::{jboolean, jint, jlong};
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
-use super::{checked, view_registry, window_registry, FrameworkError};
+use super::{checked, show_window_root, view_registry, window_registry, FrameworkError};
 use crate::runtime::Vm;
 
 pub(super) const DIALOG_CLASS: &JNIStr = jni_str!("android/app/Dialog");
@@ -117,14 +118,37 @@ extern "system" fn dialog_native_set_content_view<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-fn set_dialog_root(
+pub(super) fn set_dialog_root(
     dialog: window_registry::WindowHandle,
     root: Option<view_registry::ViewHandle>,
 ) -> Result<(), window_registry::WindowRegistryError> {
-    window_registry::with_window(dialog, |window| {
-        window.dialog.is_some().then(|| window.root_view = root)
+    let shown_root = window_registry::with_window(dialog, |window| {
+        let shown = window.dialog.as_ref()?.shown.is_some();
+        let previous = std::mem::replace(&mut window.root_view, root);
+        Some(shown.then_some(previous))
     })?
-    .ok_or(window_registry::WindowRegistryError::NotADialog)
+    .ok_or(window_registry::WindowRegistryError::NotADialog)?;
+    if let Some(previous) = shown_root.filter(|&previous| previous != root) {
+        show_window_root(previous, false);
+        show_window_root(root, true);
+        crate::webview::client::refresh_visibility();
+    }
+    Ok(())
+}
+
+fn set_shown(
+    dialog: window_registry::WindowHandle,
+    shown: Option<Global<JObject<'static>>>,
+) -> Result<(), window_registry::WindowRegistryError> {
+    let showing = shown.is_some();
+    let root = window_registry::with_window(dialog, |window| {
+        window.dialog.as_mut()?.shown = shown;
+        Some(window.root_view)
+    })?
+    .ok_or(window_registry::WindowRegistryError::NotADialog)?;
+    show_window_root(root, showing);
+    crate::webview::client::refresh_visibility();
+    Ok(())
 }
 
 extern "system" fn dialog_native_show<'local>(
@@ -134,7 +158,7 @@ extern "system" fn dialog_native_show<'local>(
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let shown = env.new_global_ref(&this)?;
-        match window_registry::with_dialog(dialog, |state| state.shown = Some(shown)) {
+        match set_shown(dialog, Some(shown)) {
             Ok(()) => tracing::info!(
                 target: "android.app.Dialog",
                 dialog,
@@ -153,7 +177,7 @@ extern "system" fn dialog_native_close<'local>(
     dialog: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        match window_registry::with_dialog(dialog, |state| state.shown = None) {
+        match set_shown(dialog, None) {
             Ok(()) => tracing::info!(
                 target: "android.app.Dialog",
                 dialog,
@@ -433,6 +457,81 @@ mod tests {
                 Ok(Some(decor))
             );
             view_registry::free(decor).expect("free decor");
+        });
+    }
+
+    fn dialog_with_web_view(env: &mut Env, dialog_object: &JObject) -> (jlong, jlong, jlong) {
+        let dialog = dialog_native_init(
+            fake_jvm::native_env(),
+            env.new_local_ref(dialog_object).expect("receiver"),
+        );
+        let decor = view_registry::allocate("android.widget.FrameLayout").expect("decor");
+        let web = view_registry::allocate("android.webkit.WebView").expect("WebView");
+        view_registry::attach_child(decor, web, None).expect("attach WebView");
+        (dialog, decor, web)
+    }
+
+    #[test]
+    fn a_web_view_in_a_dialog_is_shown_only_while_the_dialog_shows() {
+        fake_jvm::with_env(|env| {
+            let dialog_object = fake_jvm::new_object(env);
+            let (dialog, decor, web) = dialog_with_web_view(env, &dialog_object);
+            super::super::window_set_widget_as_root(
+                fake_jvm::native_env(),
+                JObject::null(),
+                dialog,
+                decor,
+            );
+            let before_show = view_registry::is_shown(web);
+            dialog_native_show(
+                fake_jvm::native_env(),
+                env.new_local_ref(&dialog_object).expect("receiver"),
+                dialog,
+            );
+            let while_shown = view_registry::is_shown(web);
+            dialog_native_close(fake_jvm::native_env(), JObject::null(), dialog);
+            let after_close = view_registry::is_shown(web);
+
+            assert_eq!(
+                (before_show, while_shown, after_close),
+                (false, true, false),
+                "a dialog's WebView has a window only between Dialog.show and Dialog.dismiss"
+            );
+            for view in [web, decor] {
+                view_registry::free(view).expect("free view");
+            }
+            window_registry::free(dialog).expect("free dialog");
+        });
+    }
+
+    #[test]
+    fn a_web_view_set_into_a_shown_dialog_is_shown_with_it() {
+        fake_jvm::with_env(|env| {
+            let dialog_object = fake_jvm::new_object(env);
+            let (dialog, decor, web) = dialog_with_web_view(env, &dialog_object);
+            dialog_native_show(
+                fake_jvm::native_env(),
+                env.new_local_ref(&dialog_object).expect("receiver"),
+                dialog,
+            );
+            super::super::window_set_widget_as_root(
+                fake_jvm::native_env(),
+                JObject::null(),
+                dialog,
+                decor,
+            );
+            let shown = view_registry::is_shown(web);
+            dialog_native_close(fake_jvm::native_env(), JObject::null(), dialog);
+
+            assert!(
+                shown,
+                "content set after Dialog.show is shown while the dialog shows"
+            );
+            assert!(!view_registry::is_shown(web));
+            for view in [web, decor] {
+                view_registry::free(view).expect("free view");
+            }
+            window_registry::free(dialog).expect("free dialog");
         });
     }
 

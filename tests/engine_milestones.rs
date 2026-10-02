@@ -186,7 +186,7 @@ fn gl_test_anw_binds_real_wsi_handle() {
 }
 
 #[test]
-fn webview_test_fires_load_upcalls_and_stages_frames() {
+fn webview_test_drives_load_upcalls_the_bridge_and_cookies() {
     if !roblox_apk_present() {
         eprintln!(
             "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK to an APK file or to a directory \
@@ -196,7 +196,8 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
     }
     if !display_available() {
         eprintln!(
-            "SKIP: no display server (WAYLAND_DISPLAY/DISPLAY unset) — the CEF helper needs one"
+            "SKIP: no display server (WAYLAND_DISPLAY/DISPLAY unset) — the WebKitGTK helper \
+             needs one"
         );
         return;
     }
@@ -211,14 +212,8 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
     let out = run_eclipse("__webview-test", &[], ENGINE_LIMIT);
     let text = combined(&out);
 
-    if !out.status.success()
-        && (text.contains(eclipse::webview::client::HELPER_NOT_FOUND_MARKER)
-            || text.contains(eclipse::webview::client::NO_DISPLAY_MARKER)
-            || text.contains(eclipse::webview::client::SANDBOX_UNAVAILABLE_MARKER))
-    {
-        eprintln!(
-            "SKIP: eclipse-webview helper/CEF unavailable on this host (env limitation)\n{text}"
-        );
+    if !out.status.success() && text.contains(eclipse::webview::client::HELPER_NOT_FOUND_MARKER) {
+        eprintln!("SKIP: no eclipse-webview helper on this host (env limitation)\n{text}");
         return;
     }
 
@@ -229,10 +224,11 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
     );
 
     assert!(
-        text.contains("WebView engine pipeline OK:") && text.contains("upcalls 2/2"),
+        text.contains("WebView engine pipeline OK:") && text.contains("upcalls 3/3"),
         "missing the WebView pipeline success marker (natives→socket→helper→upcall regression?).\n{text}"
     );
     for needle in [
+        "page URL OK",
         "bridge round-trip OK",
         "evaluateJavascript OK",
         "honest UA OK",
@@ -242,43 +238,32 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
     ] {
         assert!(
             text.contains(needle),
-            "missing the M4 marker substring {needle:?} (bridge/eval/UA/cookie regression?).\n{text}"
+            "missing the marker substring {needle:?} (URL/bridge/eval/UA/cookie regression?).\n{text}"
         );
     }
     assert!(
-        text.contains("bound=7"),
-        "the WebView native registration count regressed (expected the live bound=7 line — load, \
-         history, evaluateJavascript, and addJavascriptInterface natives).\n{text}"
+        text.contains("bound=12"),
+        "the WebView native registration count regressed (expected the live bound=12 line — \
+         load, history, reload, stopLoading, getUrl, destroy, evaluateJavascript and the \
+         JavaScript bridge natives).\n{text}"
     );
-
-    for needle in [
-        "ozone platform selected explicitly: ",
-        "sandbox mode selected: ",
-        "webview host-lib probe: ",
-        "render path: ",
-    ] {
-        assert!(
-            text.contains(needle),
-            "missing the M5 detection line {needle:?} (detect-don't-assume regression?).\n{text}"
-        );
-    }
 }
 
 #[test]
-fn root_lockfile_stays_cef_free() {
+fn root_lockfile_stays_free_of_the_web_engine() {
     let lock_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock");
     let lock = std::fs::read_to_string(lock_path)
         .unwrap_or_else(|e| panic!("cannot read {lock_path}: {e}"));
     for package in [
-        "name = \"cef\"",
-        "name = \"cef-dll-sys\"",
-        "name = \"download-cef\"",
-        "name = \"export-cef-dir\"",
+        "name = \"gtk4\"",
+        "name = \"javascriptcore6\"",
+        "name = \"webkit6\"",
+        "name = \"webkit6-sys\"",
     ] {
         assert!(
             !lock.contains(package),
-            "the root Cargo.lock gained a CEF package entry ({package}) — the engine must stay \
-             confined to the workspace-detached crates/eclipse-webview helper"
+            "the root Cargo.lock gained a web engine package entry ({package}) — the engine must \
+             stay confined to the workspace-detached crates/eclipse-webview helper"
         );
     }
 }
@@ -437,10 +422,12 @@ fn framework_overlay_preserves_webview_back_history_contract() {
         "->native_canGoBack(J)Z",
         ".method public goBack()V",
         "->native_goBack(J)V",
+        ".method public getUrl()Ljava/lang/String;",
+        "->native_getUrl(J)Ljava/lang/String;",
     ] {
         assert!(
             generator.contains(needle),
-            "framework overlay lost WebView history contract fragment {needle:?}; Roblox Back would throw or remain inside Chromium"
+            "framework overlay lost WebView history contract fragment {needle:?}; Roblox Back would throw or stay inside the WebView"
         );
     }
 }

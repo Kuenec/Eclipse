@@ -93,7 +93,7 @@ struct GameWindow<'vm> {
 
     engine_reflect_done: bool,
 
-    webview_pointer_down: bool,
+    web_view_window: WebViewWindow,
 
     runtime_shutdown_started: bool,
 
@@ -367,6 +367,7 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         use crate::loader::native_provider::{classify_winit_event, host_input_should_wake};
 
+        self.sync_web_view_window();
         if self.dialogs.owns(id) {
             if let Some(vm) = self.vm {
                 self.dialogs.window_event(vm, id, event);
@@ -445,77 +446,22 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
                     (cursor.0 - old_x, cursor.1 - old_y)
                 });
 
-                if self.handed_off {
-                    let wv = crate::webview::client::active_view();
-                    let routed = wv != 0
-                        && match webview_relative_point(wv, position.x, position.y) {
-                            Some((rx, ry, true)) => {
-                                crate::webview::client::send_mouse_move(wv, rx, ry);
-                                true
-                            }
-                            _ => false,
-                        };
-                    if !routed {
-                        self.queue_pointer_motion(PendingPointerMotion::Free(PointerMotion {
-                            position: cursor,
-                            dx,
-                            dy,
-                        }));
-                    }
+                if self.handed_off && self.web_view_window == WebViewWindow::Hidden {
+                    self.queue_pointer_motion(PendingPointerMotion::Free(PointerMotion {
+                        position: cursor,
+                        dx,
+                        dy,
+                    }));
                 }
             }
             WindowEvent::MouseInput { state, button, .. } if self.handed_off => {
-                if button == MouseButton::Left {
-                    match state {
-                        ElementState::Pressed => {
-                            let wv = crate::webview::client::active_view();
-                            let routed = wv != 0
-                                && match self.cursor.and_then(|(px, py)| {
-                                    webview_relative_point(wv, f64::from(px), f64::from(py))
-                                }) {
-                                    Some((rx, ry, true)) => {
-                                        self.webview_pointer_down = true;
-                                        crate::webview::client::send_mouse_click(wv, rx, ry, true);
-                                        true
-                                    }
-                                    _ => false,
-                                };
-                            if !routed {
-                                self.engine_primary_press();
-                            }
-                        }
-                        ElementState::Released => {
-                            if self.webview_pointer_down {
-                                self.webview_pointer_down = false;
-                                let wv = crate::webview::client::active_view();
-                                if wv != 0 {
-                                    let (px, py) = self.cursor.unwrap_or((0.0, 0.0));
-                                    if let Some((rx, ry, _inside)) =
-                                        webview_relative_point(wv, f64::from(px), f64::from(py))
-                                    {
-                                        crate::webview::client::send_mouse_click(wv, rx, ry, false);
-                                    }
-                                }
-                            } else {
-                                self.engine_primary_release();
-                            }
-                        }
+                match self.web_view_window.button_route(button, state) {
+                    HostInputRoute::Engine => self.engine_mouse_button(button, state),
+                    HostInputRoute::ActivityBack => self.activity_back(),
+                    HostInputRoute::RaiseWebView => {
+                        crate::webview::client::request_activation_of_shown_view();
                     }
-                } else if crate::webview::client::active_view() != 0
-                    && active_webview_button_route(button) == ActiveWebViewButtonRoute::ActivityBack
-                {
-                    if state == ElementState::Pressed {
-                        self.activity_back();
-                    }
-                } else {
-                    self.engine_aux_mouse_button(button, state == ElementState::Pressed);
-                    let reasons = self.pointer_lock_reasons.after_mouse_button(
-                        button,
-                        state,
-                        self.touch_mode,
-                        crate::webview::client::active_view() != 0,
-                    );
-                    self.update_pointer_lock(reasons);
+                    HostInputRoute::ToggleFullscreen | HostInputRoute::Withheld => {}
                 }
             }
             WindowEvent::MouseInput {
@@ -529,59 +475,37 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
 
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
 
-            WindowEvent::KeyboardInput { event, .. } if is_fullscreen_key(&event.logical_key) => {
-                if event.state == ElementState::Pressed && !event.repeat {
-                    self.toggle_fullscreen();
-                }
-            }
-
-            WindowEvent::KeyboardInput { event, .. } if self.handed_off => {
-                let wv = crate::webview::client::active_view();
-                if wv != 0 && !self.engine_holds_released_key(&event) {
-                    match active_webview_key_route(&event.logical_key) {
-                        ActiveWebViewKeyRoute::ActivityBack => {
-                            if event.state == ElementState::Pressed {
-                                self.activity_back();
-                            }
-                        }
-                        ActiveWebViewKeyRoute::Chromium => route_key_to_webview(wv, &event),
+            WindowEvent::KeyboardInput { event, .. } => {
+                match self
+                    .web_view_window
+                    .key_route(&event.logical_key, key_edge(&event))
+                {
+                    HostInputRoute::ToggleFullscreen => self.toggle_fullscreen(),
+                    HostInputRoute::Engine if self.handed_off => self.engine_key(&event),
+                    HostInputRoute::ActivityBack => self.activity_back(),
+                    HostInputRoute::RaiseWebView => {
+                        crate::webview::client::request_activation_of_shown_view();
                     }
-                } else {
-                    self.engine_key(&event);
+                    HostInputRoute::Engine | HostInputRoute::Withheld => {}
                 }
             }
 
             WindowEvent::Ime(ime) if self.handed_off => self.text_field_ime(ime),
 
-            WindowEvent::MouseWheel { delta, .. } if self.handed_off => {
-                let wv = crate::webview::client::active_view();
-                let routed = wv != 0
-                    && match self.cursor.and_then(|(px, py)| {
-                        webview_relative_point(wv, f64::from(px), f64::from(py))
-                    }) {
-                        Some((rx, ry, true)) => {
-                            let dy = match delta {
-                                winit::event::MouseScrollDelta::LineDelta(_, y) => {
-                                    (y * 40.0) as i32
-                                }
-                                winit::event::MouseScrollDelta::PixelDelta(p) => p.y as i32,
-                            };
-                            if dy != 0 {
-                                crate::webview::client::send_mouse_wheel(wv, rx, ry, dy);
-                            }
-                            true
-                        }
-                        _ => false,
-                    };
-                if !routed {
-                    let d = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
-                    };
-                    if d != 0.0 {
-                        self.engine_scroll(d);
-                    }
+            WindowEvent::MouseWheel { delta, .. }
+                if self.handed_off && self.web_view_window == WebViewWindow::Hidden =>
+            {
+                let d = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+                };
+                if d != 0.0 {
+                    self.engine_scroll(d);
                 }
+            }
+
+            WindowEvent::ActivationTokenDone { token, .. } => {
+                crate::webview::client::activate(token.into_raw());
             }
             _ => {}
         }
@@ -671,25 +595,26 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
         }
         self.maybe_synthetic_engine_tap();
 
-        let webview_active = crate::webview::client::active_view() != 0;
+        self.sync_web_view_window();
+        let web_view_hidden = self.web_view_window == WebViewWindow::Hidden;
+        if crate::webview::client::take_activation_request() {
+            self.request_web_view_activation();
+        }
         let text_box = if self.handed_off {
             crate::framework::focused_text_box(vm)
         } else {
             None
         };
-        self.sync_ime(ime_request(text_box.filter(|_| !webview_active)));
+        self.sync_ime(ime_request(text_box.filter(|_| web_view_hidden)));
         if let Some(text) = crate::framework::take_pending_host_clipboard_text() {
             self.store_clipboard_text(text);
         }
 
-        if self.handed_off && webview_active {
-            crate::webview::client::update_composited_rect();
-        }
         if self.handed_off {
             self.poll_pointer_lock();
         }
         crate::framework::set_engine_present_wakes_main_loop(
-            self.handed_off && !webview_active && self.engine_center_queryable(),
+            self.handed_off && web_view_hidden && self.engine_center_queryable(),
         );
         self.sync_host_cursor();
         let now = std::time::Instant::now();
@@ -792,29 +717,86 @@ fn host_clipboard(window: &Window) -> Option<crate::clipboard::HostClipboard> {
     }
 }
 
-fn webview_relative_point(view: i64, px: f64, py: f64) -> Option<(i32, i32, bool)> {
-    let rect = crate::webview::client::composited_screen_rect(view)?;
-    Some(relative_point_in(rect, px, py))
-}
-
-fn relative_point_in(rect: (i32, i32, u32, u32), px: f64, py: f64) -> (i32, i32, bool) {
-    let (x, y, w, h) = rect;
-    let rx = px as i32 - x;
-    let ry = py as i32 - y;
-    let inside = rx >= 0 && ry >= 0 && (rx as u32) < w && (ry as u32) < h;
-    (rx, ry, inside)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebViewWindow {
+    Hidden,
+    Shown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ActiveWebViewKeyRoute {
+enum HostInputRoute {
+    Engine,
+    ToggleFullscreen,
     ActivityBack,
-    Chromium,
+    RaiseWebView,
+    Withheld,
 }
 
-fn is_fullscreen_key(key: &winit::keyboard::Key) -> bool {
+impl WebViewWindow {
+    fn current() -> Self {
+        if crate::webview::client::view_window_visible() {
+            Self::Shown
+        } else {
+            Self::Hidden
+        }
+    }
+
+    fn key_route(self, key: &winit::keyboard::Key, edge: crate::input::KeyEdge) -> HostInputRoute {
+        use crate::input::KeyEdge;
+        use winit::keyboard::{Key, NamedKey};
+        match (self, key, edge) {
+            (Self::Hidden, Key::Named(NamedKey::F11), KeyEdge::Press) => {
+                HostInputRoute::ToggleFullscreen
+            }
+            (Self::Hidden, Key::Named(NamedKey::F11), _) => HostInputRoute::Withheld,
+            (Self::Hidden, _, _) => HostInputRoute::Engine,
+            (Self::Shown, Key::Named(NamedKey::Escape), KeyEdge::Press) => {
+                HostInputRoute::ActivityBack
+            }
+            (Self::Shown, key, KeyEdge::Press) if !is_modifier_key(key) => {
+                HostInputRoute::RaiseWebView
+            }
+            (Self::Shown, _, _) => HostInputRoute::Withheld,
+        }
+    }
+
+    fn button_route(self, button: MouseButton, state: ElementState) -> HostInputRoute {
+        match (self, button, state) {
+            (Self::Hidden, _, _) => HostInputRoute::Engine,
+            (Self::Shown, MouseButton::Back, ElementState::Pressed) => HostInputRoute::ActivityBack,
+            (Self::Shown, _, ElementState::Pressed) => HostInputRoute::RaiseWebView,
+            (Self::Shown, _, ElementState::Released) => HostInputRoute::Withheld,
+        }
+    }
+
+    fn pointer_lock_reasons(self, game: impl FnOnce() -> PointerLockReasons) -> PointerLockReasons {
+        match self {
+            Self::Hidden => game(),
+            Self::Shown => PointerLockReasons::default(),
+        }
+    }
+}
+
+fn is_modifier_key(key: &winit::keyboard::Key) -> bool {
+    use winit::keyboard::{Key, NamedKey};
     matches!(
         key,
-        winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11)
+        Key::Named(
+            NamedKey::Alt
+                | NamedKey::AltGraph
+                | NamedKey::CapsLock
+                | NamedKey::Control
+                | NamedKey::Fn
+                | NamedKey::FnLock
+                | NamedKey::NumLock
+                | NamedKey::ScrollLock
+                | NamedKey::Shift
+                | NamedKey::Symbol
+                | NamedKey::SymbolLock
+                | NamedKey::Meta
+                | NamedKey::Hyper
+                | NamedKey::Super
+        )
     )
 }
 
@@ -912,27 +894,6 @@ fn key_edge(event: &winit::event::KeyEvent) -> crate::input::KeyEdge {
     }
 }
 
-fn active_webview_key_route(key: &winit::keyboard::Key) -> ActiveWebViewKeyRoute {
-    use winit::keyboard::{Key, NamedKey};
-    match key {
-        Key::Named(NamedKey::Escape) => ActiveWebViewKeyRoute::ActivityBack,
-        _ => ActiveWebViewKeyRoute::Chromium,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ActiveWebViewButtonRoute {
-    ActivityBack,
-    Engine,
-}
-
-fn active_webview_button_route(button: MouseButton) -> ActiveWebViewButtonRoute {
-    match button {
-        MouseButton::Back => ActiveWebViewButtonRoute::ActivityBack,
-        _ => ActiveWebViewButtonRoute::Engine,
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostCursor {
     Shown,
@@ -942,9 +903,12 @@ enum HostCursor {
 fn host_cursor(
     handed_off: bool,
     touch_mode: crate::config::TouchMode,
-    over_webview: bool,
+    web_view_window: WebViewWindow,
 ) -> HostCursor {
-    if handed_off && touch_mode == crate::config::TouchMode::Off && !over_webview {
+    if handed_off
+        && touch_mode == crate::config::TouchMode::Off
+        && web_view_window == WebViewWindow::Hidden
+    {
         HostCursor::Hidden
     } else {
         HostCursor::Shown
@@ -967,11 +931,10 @@ impl PointerLockReasons {
         button: MouseButton,
         state: ElementState,
         touch_mode: crate::config::TouchMode,
-        webview_active: bool,
     ) -> Self {
         let right_drag = match (button, state) {
             (MouseButton::Right, ElementState::Pressed) => {
-                self.right_drag || (touch_mode == crate::config::TouchMode::Off && !webview_active)
+                self.right_drag || touch_mode == crate::config::TouchMode::Off
             }
             (MouseButton::Right, ElementState::Released) => false,
             _ => self.right_drag,
@@ -1130,51 +1093,38 @@ fn grab_host_pointer(window: &Window) -> Result<PointerGrab, ExternalError> {
     }
 }
 
-fn route_key_to_webview(view: i64, event: &winit::event::KeyEvent) {
-    use winit::keyboard::{Key, NamedKey};
-    if event.state != ElementState::Pressed {
-        return;
-    }
-    let vk = match &event.logical_key {
-        Key::Named(NamedKey::Enter) => Some(0x0D),
-        Key::Named(NamedKey::Backspace) => Some(0x08),
-        Key::Named(NamedKey::Tab) => Some(0x09),
-        Key::Named(NamedKey::Escape) => Some(0x1B),
-        Key::Named(NamedKey::ArrowLeft) => Some(0x25),
-        Key::Named(NamedKey::ArrowUp) => Some(0x26),
-        Key::Named(NamedKey::ArrowRight) => Some(0x27),
-        Key::Named(NamedKey::ArrowDown) => Some(0x28),
-        _ => None,
-    };
-    if let Some(code) = vk {
-        crate::webview::client::send_key(view, 0, code, 0);
-        crate::webview::client::send_key(view, 1, code, 0);
-        return;
-    }
-    let Some(text) = event.text.as_ref() else {
-        return;
-    };
-    if text.chars().next().is_none_or(char::is_control) {
-        return;
-    }
-    let Some(unit) = text.encode_utf16().next() else {
-        return;
-    };
-    crate::webview::client::send_key(view, 0, 0, 0);
-    crate::webview::client::send_key(view, 2, 0, unit);
-    crate::webview::client::send_key(view, 1, 0, 0);
-}
-
 impl GameWindow<'_> {
     fn activity_back(&self) {
         let Some(vm) = self.vm else {
-            tracing::warn!("active WebView Back input has no JavaVM");
+            tracing::warn!("WebView window Back input has no JavaVM");
             return;
         };
         match crate::framework::dispatch_back_to_active_activity(vm) {
             Ok(true) => {}
-            Ok(false) => tracing::warn!("active WebView Back input has no live Android Activity"),
-            Err(error) => tracing::warn!(%error, "active WebView Back dispatch failed"),
+            Ok(false) => tracing::warn!("WebView window Back input has no live Android Activity"),
+            Err(error) => tracing::warn!(%error, "WebView window Back dispatch failed"),
+        }
+    }
+
+    fn sync_web_view_window(&mut self) {
+        let current = WebViewWindow::current();
+        if (self.web_view_window, current) == (WebViewWindow::Hidden, WebViewWindow::Shown) {
+            self.release_engine_input_for_focus_loss();
+        }
+        self.web_view_window = current;
+    }
+
+    fn request_web_view_activation(&self) {
+        use winit::platform::startup_notify::WindowExtStartupNotify as _;
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        if let Err(error) = window.request_activation_token() {
+            tracing::info!(
+                %error,
+                "the compositor offers no activation token; the WebView window opens without \
+                 taking focus"
+            );
         }
     }
 
@@ -1205,7 +1155,6 @@ impl GameWindow<'_> {
                 tracing::warn!(error = %e, "window resize: surfaceChanged dispatch failed (ignored)")
             }
         }
-        crate::framework::resize_active_web_view();
     }
 
     fn publish_engine_display_refresh_rates(&mut self) {
@@ -1481,6 +1430,21 @@ impl GameWindow<'_> {
         }
     }
 
+    fn engine_mouse_button(&mut self, button: MouseButton, state: ElementState) {
+        if button == MouseButton::Left {
+            match state {
+                ElementState::Pressed => self.engine_primary_press(),
+                ElementState::Released => self.engine_primary_release(),
+            }
+            return;
+        }
+        self.engine_aux_mouse_button(button, state == ElementState::Pressed);
+        let reasons = self
+            .pointer_lock_reasons
+            .after_mouse_button(button, state, self.touch_mode);
+        self.update_pointer_lock(reasons);
+    }
+
     fn engine_aux_mouse_button(&mut self, button: MouseButton, pressed: bool) {
         if self.touch_mode != crate::config::TouchMode::Off {
             return;
@@ -1503,14 +1467,12 @@ impl GameWindow<'_> {
     }
 
     fn poll_pointer_lock(&mut self) {
-        let reasons = if crate::webview::client::active_view() != 0 {
-            PointerLockReasons::default()
-        } else {
-            PointerLockReasons {
+        let reasons = self
+            .web_view_window
+            .pointer_lock_reasons(|| PointerLockReasons {
                 engine_center: self.query_engine_center(),
                 ..self.pointer_lock_reasons
-            }
-        };
+            });
         self.update_pointer_lock(reasons);
     }
 
@@ -1612,13 +1574,7 @@ impl GameWindow<'_> {
     }
 
     fn sync_host_cursor(&mut self) {
-        let webview = crate::webview::client::active_view();
-        let over_webview = webview != 0
-            && self
-                .cursor
-                .and_then(|(px, py)| webview_relative_point(webview, f64::from(px), f64::from(py)))
-                .is_some_and(|(_, _, inside)| inside);
-        let cursor = host_cursor(self.handed_off, self.touch_mode, over_webview);
+        let cursor = host_cursor(self.handed_off, self.touch_mode, self.web_view_window);
         if cursor == self.host_cursor {
             return;
         }
@@ -1627,12 +1583,6 @@ impl GameWindow<'_> {
         };
         window.set_cursor_visible(cursor == HostCursor::Shown);
         self.host_cursor = cursor;
-    }
-
-    fn engine_holds_released_key(&self, event: &winit::event::KeyEvent) -> bool {
-        event.state == ElementState::Released
-            && engine_scan_code(event.physical_key)
-                .is_some_and(|scan_code| self.engine_held.holds_key(scan_code))
     }
 
     fn engine_key(&mut self, event: &winit::event::KeyEvent) {
@@ -2093,7 +2043,7 @@ pub fn run_windowed(
         engine_typed2_at: None,
         engine_synthetic_submit_done: false,
         engine_reflect_done: false,
-        webview_pointer_down: false,
+        web_view_window: WebViewWindow::Hidden,
         runtime_shutdown_started: false,
         modifiers: winit::keyboard::ModifiersState::default(),
         published_display_refresh_profile: None,
@@ -6484,33 +6434,149 @@ mod tests {
         assert_eq!(winit_keycode(&Key::Named(NamedKey::Insert)), Some(124));
     }
 
-    #[test]
-    fn escape_bypasses_chromium_for_activity_back_navigation() {
+    const KEY_EDGES: [crate::input::KeyEdge; 3] = [
+        crate::input::KeyEdge::Press,
+        crate::input::KeyEdge::Repeat,
+        crate::input::KeyEdge::Release,
+    ];
+
+    const MOUSE_BUTTONS: [MouseButton; 6] = [
+        MouseButton::Left,
+        MouseButton::Right,
+        MouseButton::Middle,
+        MouseButton::Back,
+        MouseButton::Forward,
+        MouseButton::Other(9),
+    ];
+
+    fn sample_keys() -> [winit::keyboard::Key; 4] {
         use winit::keyboard::{Key, NamedKey};
 
-        assert_eq!(
-            active_webview_key_route(&Key::Named(NamedKey::Escape)),
-            ActiveWebViewKeyRoute::ActivityBack
-        );
+        [
+            Key::Named(NamedKey::Escape),
+            Key::Named(NamedKey::Enter),
+            Key::Named(NamedKey::Space),
+            Key::Character("w".into()),
+        ]
     }
 
     #[test]
-    fn mouse_back_button_bypasses_the_engine_for_activity_back_navigation() {
+    fn while_a_web_view_window_shows_escape_is_android_back_and_other_presses_raise_it() {
+        use crate::input::KeyEdge;
+        use winit::keyboard::{Key, NamedKey};
+
+        let escape = Key::Named(NamedKey::Escape);
         assert_eq!(
-            active_webview_button_route(MouseButton::Back),
-            ActiveWebViewButtonRoute::ActivityBack
+            WebViewWindow::Shown.key_route(&escape, KeyEdge::Press),
+            HostInputRoute::ActivityBack
         );
-        for button in [
-            MouseButton::Right,
-            MouseButton::Middle,
-            MouseButton::Forward,
-            MouseButton::Other(9),
-        ] {
+        for edge in [KeyEdge::Repeat, KeyEdge::Release] {
             assert_eq!(
-                active_webview_button_route(button),
-                ActiveWebViewButtonRoute::Engine
+                WebViewWindow::Shown.key_route(&escape, edge),
+                HostInputRoute::Withheld,
+                "holding Escape sends Android Back once, not once per key repeat"
             );
         }
+        let others = sample_keys()
+            .into_iter()
+            .filter(|key| *key != escape)
+            .chain([Key::Named(NamedKey::F11)]);
+        for key in others {
+            assert_eq!(
+                WebViewWindow::Shown.key_route(&key, KeyEdge::Press),
+                HostInputRoute::RaiseWebView,
+                "a key pressed on the game window brings the WebView window back: {key:?}"
+            );
+            for edge in [KeyEdge::Repeat, KeyEdge::Release] {
+                assert_eq!(
+                    WebViewWindow::Shown.key_route(&key, edge),
+                    HostInputRoute::Withheld
+                );
+            }
+        }
+        for modifier in [
+            NamedKey::Alt,
+            NamedKey::Super,
+            NamedKey::Control,
+            NamedKey::Shift,
+        ] {
+            assert_eq!(
+                WebViewWindow::Shown.key_route(&Key::Named(modifier), KeyEdge::Press),
+                HostInputRoute::Withheld,
+                "a modifier that starts a desktop shortcut such as Alt+Tab raises nothing: \
+                 {modifier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn while_a_web_view_window_shows_back_is_android_back_and_other_clicks_raise_it() {
+        assert_eq!(
+            WebViewWindow::Shown.button_route(MouseButton::Back, ElementState::Pressed),
+            HostInputRoute::ActivityBack
+        );
+        assert_eq!(
+            WebViewWindow::Shown.button_route(MouseButton::Back, ElementState::Released),
+            HostInputRoute::Withheld
+        );
+        for button in MOUSE_BUTTONS
+            .into_iter()
+            .filter(|button| *button != MouseButton::Back)
+        {
+            assert_eq!(
+                WebViewWindow::Shown.button_route(button, ElementState::Pressed),
+                HostInputRoute::RaiseWebView,
+                "a click on the game window brings the WebView window back: {button:?}"
+            );
+            assert_eq!(
+                WebViewWindow::Shown.button_route(button, ElementState::Released),
+                HostInputRoute::Withheld
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_web_view_window_keys_and_buttons_reach_the_engine() {
+        for key in sample_keys() {
+            for edge in KEY_EDGES {
+                assert_eq!(
+                    WebViewWindow::Hidden.key_route(&key, edge),
+                    HostInputRoute::Engine
+                );
+            }
+        }
+        for button in MOUSE_BUTTONS {
+            for state in [ElementState::Pressed, ElementState::Released] {
+                assert_eq!(
+                    WebViewWindow::Hidden.button_route(button, state),
+                    HostInputRoute::Engine
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_shown_web_view_window_releases_the_pointer_lock_without_asking_the_engine() {
+        let wanted = PointerLockReasons {
+            right_drag: true,
+            engine_center: true,
+        };
+        let now = std::time::Instant::now();
+
+        let shown = WebViewWindow::Shown
+            .pointer_lock_reasons(|| panic!("the engine is asked for its mouse lock"));
+        assert_eq!(shown, PointerLockReasons::default());
+        assert_eq!(
+            pointer_lock_step(HELD_AT_ANCHOR, shown, now),
+            PointerLockStep::Release
+        );
+
+        let hidden = WebViewWindow::Hidden.pointer_lock_reasons(|| wanted);
+        assert_eq!(hidden, wanted);
+        assert_eq!(
+            pointer_lock_step(PointerLock::Free, hidden, now),
+            PointerLockStep::Acquire
+        );
     }
 
     const HELD_AT_ANCHOR: PointerLock = PointerLock::Held {
@@ -6537,7 +6603,6 @@ mod tests {
             MouseButton::Right,
             ElementState::Pressed,
             TouchMode::Off,
-            false,
         );
         assert_eq!(pressed, RIGHT_DRAG);
         assert_eq!(
@@ -6545,16 +6610,11 @@ mod tests {
             PointerLockStep::Acquire
         );
 
-        for (touch_mode, webview_active) in [
-            (TouchMode::Off, true),
-            (TouchMode::On, false),
-            (TouchMode::FakeOff, false),
-        ] {
+        for touch_mode in [TouchMode::On, TouchMode::FakeOff] {
             let reasons = PointerLockReasons::default().after_mouse_button(
                 MouseButton::Right,
                 ElementState::Pressed,
                 touch_mode,
-                webview_active,
             );
             assert_eq!(reasons, PointerLockReasons::default());
             assert_eq!(
@@ -6578,7 +6638,7 @@ mod tests {
             ] {
                 for state in [ElementState::Pressed, ElementState::Released] {
                     assert_eq!(
-                        reasons.after_mouse_button(button, state, TouchMode::Off, false),
+                        reasons.after_mouse_button(button, state, TouchMode::Off),
                         reasons
                     );
                 }
@@ -6595,7 +6655,6 @@ mod tests {
             MouseButton::Right,
             ElementState::Released,
             TouchMode::Off,
-            true,
         );
         assert_eq!(released, PointerLockReasons::default());
         assert_eq!(
@@ -6607,12 +6666,8 @@ mod tests {
             right_drag: true,
             engine_center: true,
         };
-        let released = both.after_mouse_button(
-            MouseButton::Right,
-            ElementState::Released,
-            TouchMode::Off,
-            false,
-        );
+        let released =
+            both.after_mouse_button(MouseButton::Right, ElementState::Released, TouchMode::Off);
         assert_eq!(released, ENGINE_CENTER);
         assert_eq!(
             pointer_lock_step(HELD_AT_ANCHOR, released, now),
@@ -6744,26 +6799,6 @@ mod tests {
         held.press_key(slash);
         assert_eq!(held.release_key(53), Some(slash));
         assert_eq!(held.release_key(53), None);
-    }
-
-    #[test]
-    fn a_right_press_over_an_active_webview_still_needs_a_focus_loss_release() {
-        use crate::config::TouchMode;
-
-        assert_eq!(
-            active_webview_button_route(MouseButton::Right),
-            ActiveWebViewButtonRoute::Engine
-        );
-        let reasons = PointerLockReasons::default().after_mouse_button(
-            MouseButton::Right,
-            ElementState::Pressed,
-            TouchMode::Off,
-            true,
-        );
-        assert_eq!(reasons, PointerLockReasons::default());
-        let mut held = EngineHeldInput::default();
-        held.press_button(desktop_mouse_button(MouseButton::Right).expect("right button"));
-        assert_eq!(held.buttons, vec![1]);
     }
 
     #[test]
@@ -6966,22 +7001,52 @@ mod tests {
     fn host_cursor_hides_over_the_engine_surface_like_the_null_pointer_icon() {
         use crate::config::TouchMode;
 
-        assert_eq!(host_cursor(true, TouchMode::Off, false), HostCursor::Hidden);
-        assert_eq!(host_cursor(true, TouchMode::Off, true), HostCursor::Shown);
-        assert_eq!(host_cursor(false, TouchMode::Off, false), HostCursor::Shown);
+        assert_eq!(
+            host_cursor(true, TouchMode::Off, WebViewWindow::Hidden),
+            HostCursor::Hidden
+        );
+        assert_eq!(
+            host_cursor(true, TouchMode::Off, WebViewWindow::Shown),
+            HostCursor::Shown
+        );
+        assert_eq!(
+            host_cursor(false, TouchMode::Off, WebViewWindow::Hidden),
+            HostCursor::Shown
+        );
         for touch_mode in [TouchMode::On, TouchMode::FakeOff] {
-            assert_eq!(host_cursor(true, touch_mode, false), HostCursor::Shown);
-            assert_eq!(host_cursor(true, touch_mode, true), HostCursor::Shown);
+            for window in [WebViewWindow::Hidden, WebViewWindow::Shown] {
+                assert_eq!(host_cursor(true, touch_mode, window), HostCursor::Shown);
+            }
         }
     }
 
     #[test]
-    fn f11_toggles_borderless_fullscreen_and_no_other_key_does() {
+    fn f11_toggles_borderless_fullscreen_only_without_a_web_view_window() {
+        use crate::input::KeyEdge;
         use winit::keyboard::{Key, NamedKey};
 
-        assert!(is_fullscreen_key(&Key::Named(NamedKey::F11)));
-        assert!(!is_fullscreen_key(&Key::Named(NamedKey::F10)));
-        assert!(!is_fullscreen_key(&Key::Character("f".into())));
+        let f11 = Key::Named(NamedKey::F11);
+        assert_eq!(
+            WebViewWindow::Hidden.key_route(&f11, KeyEdge::Press),
+            HostInputRoute::ToggleFullscreen
+        );
+        for edge in [KeyEdge::Repeat, KeyEdge::Release] {
+            assert_eq!(
+                WebViewWindow::Hidden.key_route(&f11, edge),
+                HostInputRoute::Withheld
+            );
+        }
+        assert_eq!(
+            WebViewWindow::Shown.key_route(&f11, KeyEdge::Press),
+            HostInputRoute::RaiseWebView,
+            "a fullscreen game would cover the WebView window"
+        );
+        for key in [Key::Named(NamedKey::F10), Key::Character("f".into())] {
+            assert_eq!(
+                WebViewWindow::Hidden.key_route(&key, KeyEdge::Press),
+                HostInputRoute::Engine
+            );
+        }
         assert_eq!(next_fullscreen(None), Some(Fullscreen::Borderless(None)));
         assert_eq!(next_fullscreen(Some(Fullscreen::Borderless(None))), None);
     }
@@ -8044,41 +8109,6 @@ mod tests {
             let words = read_spirv(spv).unwrap_or_else(|e| panic!("{name} SPIR-V invalid: {e}"));
             assert!(!words.is_empty(), "{name} SPIR-V is empty");
         }
-    }
-
-    #[test]
-    fn a_centre_click_routes_into_a_webview_that_has_no_measured_frame_rect() {
-        let drawn = crate::loader::vk_overlay::resolve_webview_rect(None, 800, 600, 800, 600)
-            .expect("the composite draws the centered fallback when no frame rect is cached");
-
-        assert_eq!(drawn, (0, 0, 800, 600));
-
-        const VIEW: i64 = 0x5eed_1234;
-        crate::webview::client::publish_composited_screen_rect(
-            VIEW,
-            (drawn.0 as i32, drawn.1 as i32, drawn.2, drawn.3),
-        );
-
-        let (rx, ry, inside) = webview_relative_point(VIEW, 400.0, 300.0)
-            .expect("the hit-test must see the rect the compositor drew");
-        assert!(
-            inside,
-            "a click on the drawn page must route to the WebView, never fall through to the engine"
-        );
-        assert_eq!(
-            (rx, ry),
-            (400, 300),
-            "view-relative coords of the window centre"
-        );
-
-        assert!(webview_relative_point(VIEW + 1, 400.0, 300.0).is_none());
-
-        assert!(!relative_point_in(drawn_i32(drawn), 900.0, 300.0).2);
-        assert!(!relative_point_in(drawn_i32(drawn), -1.0, 300.0).2);
-    }
-
-    fn drawn_i32(r: (u32, u32, u32, u32)) -> (i32, i32, u32, u32) {
-        (r.0 as i32, r.1 as i32, r.2, r.3)
     }
 }
 
