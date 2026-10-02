@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use super::res_config::ResConfig;
+
 const RES_STRING_POOL_TYPE: u16 = 0x0001;
 const RES_TABLE_TYPE: u16 = 0x0002;
 const RES_TABLE_PACKAGE_TYPE: u16 = 0x0200;
@@ -91,6 +93,8 @@ pub struct ResolvedValue {
     pub key_index: u32,
 
     pub is_complex: bool,
+
+    pub density: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,43 +133,82 @@ pub struct ResTable<'a> {
 }
 
 impl<'a> ResTable<'a> {
-    pub fn resource_value(&self, resource_id: u32) -> Option<ResolvedValue> {
+    pub fn resource_value(&self, resource_id: u32, config: &ResConfig) -> Option<ResolvedValue> {
         let package_id = (resource_id >> 24) as u8;
         let type_id = ((resource_id >> 16) & 0xff) as u8;
         let entry_id = (resource_id & 0xffff) as u16;
-        self.resolve(package_id, type_id, entry_id)
+        self.resolve(package_id, type_id, entry_id, config)
     }
 
-    pub fn resolve(&self, package_id: u8, type_id: u8, entry_id: u16) -> Option<ResolvedValue> {
-        let package = self.packages.iter().find(|p| p.id == package_id)?;
-        for &(start, end) in &package.type_chunks {
-            let chunk = self.buf.get(start..end)?;
-
-            if read_u8(chunk, CHUNK_HEADER_SIZE).ok()? != type_id {
-                continue;
-            }
-            if let Some(value) = resolve_in_type_chunk(chunk, entry_id) {
-                return Some(value);
-            }
-        }
-        None
+    pub fn resolve(
+        &self,
+        package_id: u8,
+        type_id: u8,
+        entry_id: u16,
+        config: &ResConfig,
+    ) -> Option<ResolvedValue> {
+        self.best_entry(package_id, type_id, config, |chunk| {
+            resolve_in_type_chunk(chunk, entry_id)
+        })
+        .map(|(value, chosen)| ResolvedValue {
+            density: chosen.density,
+            ..value
+        })
     }
 
-    pub fn resolve_style(&self, resource_id: u32) -> Option<ResolvedStyle> {
+    pub fn key_index(&self, resource_id: u32) -> Option<u32> {
         let package_id = (resource_id >> 24) as u8;
         let type_id = ((resource_id >> 16) & 0xff) as u8;
         let entry_id = (resource_id & 0xffff) as u16;
         let package = self.packages.iter().find(|p| p.id == package_id)?;
+        package.type_chunks.iter().find_map(|&(start, end)| {
+            let chunk = self.buf.get(start..end)?;
+            if read_u8(chunk, CHUNK_HEADER_SIZE).ok()? != type_id {
+                return None;
+            }
+            resolve_in_type_chunk(chunk, entry_id).map(|value| value.key_index)
+        })
+    }
+
+    pub fn resolve_style(&self, resource_id: u32, config: &ResConfig) -> Option<ResolvedStyle> {
+        let package_id = (resource_id >> 24) as u8;
+        let type_id = ((resource_id >> 16) & 0xff) as u8;
+        let entry_id = (resource_id & 0xffff) as u16;
+        self.best_entry(package_id, type_id, config, |chunk| {
+            resolve_style_in_type_chunk(chunk, entry_id)
+        })
+        .map(|(style, _)| style)
+    }
+
+    fn best_entry<T>(
+        &self,
+        package_id: u8,
+        type_id: u8,
+        config: &ResConfig,
+        entry: impl Fn(&[u8]) -> Option<T>,
+    ) -> Option<(T, ResConfig)> {
+        let package = self.packages.iter().find(|p| p.id == package_id)?;
+        let mut best: Option<(T, ResConfig)> = None;
         for &(start, end) in &package.type_chunks {
             let chunk = self.buf.get(start..end)?;
             if read_u8(chunk, CHUNK_HEADER_SIZE).ok()? != type_id {
                 continue;
             }
-            if let Some(style) = resolve_style_in_type_chunk(chunk, entry_id) {
-                return Some(style);
+            let chunk_config = type_chunk_config(chunk);
+            if !chunk_config.matches(config) {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_some_and(|(_, best_config)| !chunk_config.is_better_than(best_config, config))
+            {
+                continue;
+            }
+            if let Some(found) = entry(chunk) {
+                best = Some((found, chunk_config));
             }
         }
-        None
+        best
     }
 
     pub fn value_string(&self, index: u32) -> Result<Option<String>, ArscError> {
@@ -376,6 +419,13 @@ fn pool_range_in_chunk(pkg: &ChunkRef, rel: usize) -> Result<Option<(usize, usiz
     Ok(Some((pool.start, pool.end)))
 }
 
+fn type_chunk_config(chunk: &[u8]) -> ResConfig {
+    let header_size = read_u16(chunk, 2).map_or(0, usize::from);
+    chunk
+        .get(TYPE_HEADER_MIN..header_size)
+        .map_or_else(ResConfig::default, ResConfig::parse)
+}
+
 fn resolve_in_type_chunk(chunk: &[u8], entry_id: u16) -> Option<ResolvedValue> {
     let header_size = read_u16(chunk, 2).ok()? as usize;
     if header_size < TYPE_HEADER_MIN {
@@ -408,6 +458,7 @@ fn resolve_in_type_chunk(chunk: &[u8], entry_id: u16) -> Option<ResolvedValue> {
             data: 0,
             key_index,
             is_complex: true,
+            density: 0,
         });
     }
 
@@ -424,6 +475,7 @@ fn resolve_in_type_chunk(chunk: &[u8], entry_id: u16) -> Option<ResolvedValue> {
         data,
         key_index,
         is_complex: false,
+        density: 0,
     })
 }
 
@@ -722,7 +774,7 @@ mod tests {
         assert_eq!(color, "color");
 
         let v = table
-            .resource_value(0x7f01_0000)
+            .resource_value(0x7f01_0000, &ResConfig::default())
             .expect("0x7f010000 resolves");
         assert!(!v.is_complex);
         assert_eq!(v.type_, 0x1c, "expected TYPE_INT_COLOR_ARGB8");
@@ -736,7 +788,7 @@ mod tests {
 
         let app_name_id = find_entry(&table, 0x7f, 6, "app_name").expect("app_name present");
         let sv = table
-            .resource_value(app_name_id)
+            .resource_value(app_name_id, &ResConfig::default())
             .expect("app_name resolves");
         assert_eq!(sv.type_, 0x03, "expected TYPE_STRING");
         let s = table
@@ -748,7 +800,7 @@ mod tests {
 
     fn find_entry(table: &ResTable, pkg: u8, type_id: u8, key: &str) -> Option<u32> {
         for entry in 0u16..0x1000 {
-            if let Some(v) = table.resolve(pkg, type_id, entry) {
+            if let Some(v) = table.resolve(pkg, type_id, entry, &ResConfig::default()) {
                 if let Ok(Some(name)) = table.key_name(pkg, v.key_index) {
                     if name == key {
                         return Some(
@@ -835,18 +887,32 @@ mod tests {
         let table = parse_arsc(&bytes).expect("parse fixture");
         assert_eq!(table.package_ids(), vec![0x7f]);
 
-        let v = table.resource_value(0x7f01_0000).expect("entry 0 resolves");
+        let v = table
+            .resource_value(0x7f01_0000, &ResConfig::default())
+            .expect("entry 0 resolves");
         assert!(!v.is_complex);
         assert_eq!(v.type_, 0x10, "TYPE_INT_DEC");
         assert_eq!(v.data, 42);
         assert_eq!(v.key_index, 0);
 
         assert!(
-            table.resource_value(0x7e01_0000).is_none(),
+            table
+                .resource_value(0x7e01_0000, &ResConfig::default())
+                .is_none(),
             "unknown package"
         );
-        assert!(table.resource_value(0x7f02_0000).is_none(), "unknown type");
-        assert!(table.resource_value(0x7f01_0001).is_none(), "unknown entry");
+        assert!(
+            table
+                .resource_value(0x7f02_0000, &ResConfig::default())
+                .is_none(),
+            "unknown type"
+        );
+        assert!(
+            table
+                .resource_value(0x7f01_0001, &ResConfig::default())
+                .is_none(),
+            "unknown entry"
+        );
     }
 
     fn build_style_fixture() -> Vec<u8> {
@@ -924,10 +990,14 @@ mod tests {
         let bytes = build_style_fixture();
         let table = parse_arsc(&bytes).expect("parse style fixture");
 
-        let v = table.resource_value(0x7f08_0000).expect("entry resolves");
+        let v = table
+            .resource_value(0x7f08_0000, &ResConfig::default())
+            .expect("entry resolves");
         assert!(v.is_complex, "a style entry must surface as complex");
 
-        let style = table.resolve_style(0x7f08_0000).expect("style resolves");
+        let style = table
+            .resolve_style(0x7f08_0000, &ResConfig::default())
+            .expect("style resolves");
         assert_eq!(style.parent_id, 0x7f08_000a, "parent style id");
         assert_eq!(style.entries.len(), 2);
         assert_eq!(style.entries[0].attr_id, 0x7f01_0058);
@@ -940,11 +1010,18 @@ mod tests {
         let simple_bytes = build_fixture();
         let simple = parse_arsc(&simple_bytes).expect("parse simple fixture");
         assert!(
-            simple.resolve_style(0x7f01_0000).is_none(),
+            simple
+                .resolve_style(0x7f01_0000, &ResConfig::default())
+                .is_none(),
             "a simple value entry is not a style bag"
         );
 
-        assert!(simple.resolve_style(0x7f08_0000).is_none(), "unknown style");
+        assert!(
+            simple
+                .resolve_style(0x7f08_0000, &ResConfig::default())
+                .is_none(),
+            "unknown style"
+        );
     }
 
     #[test]
@@ -964,7 +1041,7 @@ mod tests {
             };
             for eid in 0u16..256 {
                 let resid = (u32::from(pkg_id) << 24) | (u32::from(tid) << 16) | u32::from(eid);
-                let Some(rv) = table.resource_value(resid) else {
+                let Some(rv) = table.resource_value(resid, &ResConfig::default()) else {
                     continue;
                 };
                 if let Ok(Some(entry_name)) = table.key_name(pkg_id, rv.key_index) {
@@ -1020,7 +1097,7 @@ mod tests {
         let mut found = false;
         for entry in 0u16..0x1000 {
             let id = (0x7fu32 << 24) | (u32::from(tid) << 16) | u32::from(entry);
-            if let Some(style) = table.resolve_style(id) {
+            if let Some(style) = table.resolve_style(id, &ResConfig::default()) {
                 if !style.entries.is_empty() || style.parent_id != 0 {
                     found = true;
                     break;
@@ -1189,9 +1266,11 @@ mod tests {
 
         let parsed = parse_arsc(&table);
         if let Ok(t) = parsed {
-            assert!(t.resolve(0x7f, 1, 0).is_none());
-            assert!(t.resolve(0x7f, 1, 0xFFFF).is_none());
-            assert!(t.resolve_style(0x7f01_0000).is_none());
+            assert!(t.resolve(0x7f, 1, 0, &ResConfig::default()).is_none());
+            assert!(t.resolve(0x7f, 1, 0xFFFF, &ResConfig::default()).is_none());
+            assert!(t
+                .resolve_style(0x7f01_0000, &ResConfig::default())
+                .is_none());
         }
     }
 
@@ -1213,7 +1292,10 @@ mod tests {
         let pkg = build_package_with_type(&type_chunk);
         let table = build_table(&pkg);
         if let Ok(t) = parse_arsc(&table) {
-            assert!(t.resolve(0x7f, 1, 0).is_none(), "offset past data ⇒ None");
+            assert!(
+                t.resolve(0x7f, 1, 0, &ResConfig::default()).is_none(),
+                "offset past data ⇒ None"
+            );
         }
     }
 
@@ -1241,7 +1323,10 @@ mod tests {
         let pkg = build_package_with_type(&type_chunk);
         let table = build_table(&pkg);
         if let Ok(t) = parse_arsc(&table) {
-            assert!(t.resolve(0x7f, 1, 0).is_none(), "entry size < 8 ⇒ None");
+            assert!(
+                t.resolve(0x7f, 1, 0, &ResConfig::default()).is_none(),
+                "entry size < 8 ⇒ None"
+            );
         }
     }
 
@@ -1278,7 +1363,7 @@ mod tests {
         let table = build_table(&pkg);
         let t = parse_arsc(&table).expect("parse hostile-bag table");
         let style = t
-            .resolve_style(0x7f08_0000)
+            .resolve_style(0x7f08_0000, &ResConfig::default())
             .expect("style entry resolves (bounded)");
 
         assert_eq!(
@@ -1320,10 +1405,23 @@ mod tests {
     fn unknown_package_type_entry_ids_resolve_to_none() {
         let bytes = build_fixture();
         let t = parse_arsc(&bytes).expect("parse fixture");
-        assert!(t.resolve(0x01, 1, 0).is_none(), "unknown package id");
-        assert!(t.resolve(0x7f, 0xff, 0).is_none(), "unknown type id");
-        assert!(t.resolve(0x7f, 1, 0xffff).is_none(), "unknown entry id");
-        assert!(t.resolve_style(0x0108_0000).is_none(), "unknown style pkg");
+        assert!(
+            t.resolve(0x01, 1, 0, &ResConfig::default()).is_none(),
+            "unknown package id"
+        );
+        assert!(
+            t.resolve(0x7f, 0xff, 0, &ResConfig::default()).is_none(),
+            "unknown type id"
+        );
+        assert!(
+            t.resolve(0x7f, 1, 0xffff, &ResConfig::default()).is_none(),
+            "unknown entry id"
+        );
+        assert!(
+            t.resolve_style(0x0108_0000, &ResConfig::default())
+                .is_none(),
+            "unknown style pkg"
+        );
 
         assert!(t.type_name(0x01, 1).unwrap().is_none());
         assert!(t.key_name(0x01, 0).unwrap().is_none());
@@ -1362,6 +1460,192 @@ mod tests {
         assert_eq!(pool.get(0).unwrap().as_deref(), Some("\u{1F504}"));
     }
 
+    fn config_bytes(language: &[u8; 2], country: &[u8; 2], density: u16) -> Vec<u8> {
+        let mut config = vec![0u8; 64];
+        config[..4].copy_from_slice(&64u32.to_le_bytes());
+        config[8..10].copy_from_slice(language);
+        config[10..12].copy_from_slice(country);
+        config[14..16].copy_from_slice(&density.to_le_bytes());
+        config
+    }
+
+    fn build_configured_fixture(configs: &[(Vec<u8>, u32)]) -> Vec<u8> {
+        let mut pool = Vec::new();
+        push_u16(&mut pool, RES_STRING_POOL_TYPE);
+        push_u16(&mut pool, 28);
+        push_u32(&mut pool, 28);
+        push_u32(&mut pool, 0);
+        push_u32(&mut pool, 0);
+        push_u32(&mut pool, 0);
+        push_u32(&mut pool, 28);
+        push_u32(&mut pool, 0);
+
+        let mut type_chunks = Vec::new();
+        for (config, value) in configs {
+            let header_size = TYPE_HEADER_MIN + config.len();
+            let entries_start = header_size + 4;
+            let mut chunk = Vec::new();
+            push_u16(&mut chunk, RES_TABLE_TYPE_TYPE);
+            push_u16(&mut chunk, header_size as u16);
+            push_u32(&mut chunk, (entries_start + 16) as u32);
+            chunk.push(1);
+            chunk.push(0);
+            push_u16(&mut chunk, 0);
+            push_u32(&mut chunk, 1);
+            push_u32(&mut chunk, entries_start as u32);
+            chunk.extend_from_slice(config);
+            push_u32(&mut chunk, 0);
+            push_u16(&mut chunk, 8);
+            push_u16(&mut chunk, 0);
+            push_u32(&mut chunk, 0);
+            push_u16(&mut chunk, 8);
+            chunk.push(0);
+            chunk.push(0x10);
+            push_u32(&mut chunk, *value);
+            type_chunks.extend_from_slice(&chunk);
+        }
+
+        let mut pkg = Vec::new();
+        push_u16(&mut pkg, RES_TABLE_PACKAGE_TYPE);
+        push_u16(&mut pkg, PACKAGE_HEADER_MIN as u16);
+        push_u32(&mut pkg, (PACKAGE_HEADER_MIN + type_chunks.len()) as u32);
+        push_u32(&mut pkg, 0x7f);
+        pkg.resize(pkg.len() + 256, 0);
+        push_u32(&mut pkg, 0);
+        push_u32(&mut pkg, 0);
+        push_u32(&mut pkg, 0);
+        push_u32(&mut pkg, 0);
+        pkg.extend_from_slice(&type_chunks);
+
+        let mut table = Vec::new();
+        push_u16(&mut table, RES_TABLE_TYPE);
+        push_u16(&mut table, TABLE_HEADER_SIZE as u16);
+        push_u32(
+            &mut table,
+            (TABLE_HEADER_SIZE + pool.len() + pkg.len()) as u32,
+        );
+        push_u32(&mut table, 1);
+        table.extend_from_slice(&pool);
+        table.extend_from_slice(&pkg);
+        table
+    }
+
+    fn requested(locale: &str, density: u16) -> ResConfig {
+        let mut config = ResConfig {
+            density,
+            ..ResConfig::default()
+        };
+        config.set_locale(locale);
+        config
+    }
+
+    #[test]
+    fn lookups_choose_the_entry_of_the_best_matching_configuration() {
+        let bytes = build_configured_fixture(&[
+            (config_bytes(&[0, 0], &[0, 0], 0), 1),
+            (config_bytes(b"de", &[0, 0], 0), 2),
+            (config_bytes(b"de", b"AT", 0), 3),
+        ]);
+        let table = parse_arsc(&bytes).expect("parse configured fixture");
+        let value = |locale: &str| {
+            table
+                .resource_value(0x7f01_0000, &requested(locale, 0))
+                .map(|value| value.data)
+        };
+        assert_eq!(value("de-DE"), Some(2));
+        assert_eq!(value("de-AT"), Some(3));
+        assert_eq!(value("en-US"), Some(1));
+        assert_eq!(value(""), Some(1));
+    }
+
+    #[test]
+    fn density_only_resources_pick_the_best_bucket_and_report_its_density() {
+        let bytes = build_configured_fixture(&[
+            (config_bytes(&[0, 0], &[0, 0], 160), 1),
+            (config_bytes(&[0, 0], &[0, 0], 320), 2),
+            (config_bytes(&[0, 0], &[0, 0], 480), 3),
+        ]);
+        let table = parse_arsc(&bytes).expect("parse density fixture");
+        let chosen = |density| {
+            table
+                .resource_value(0x7f01_0000, &requested("", density))
+                .map(|value| (value.data, value.density))
+        };
+        assert_eq!(chosen(0), Some((1, 160)));
+        assert_eq!(chosen(240), Some((2, 320)));
+        assert_eq!(chosen(640), Some((3, 480)));
+    }
+
+    #[test]
+    fn the_official_roblox_resources_follow_the_requested_configuration() {
+        let Some(paths) = crate::apk::ApkSetPaths::from_env().expect("ECLIPSE_ROBLOX_APK usable")
+        else {
+            eprintln!("SKIP: set ECLIPSE_ROBLOX_APK to resolve the official resources.arsc");
+            return;
+        };
+        let bytes = Apk::open(&paths.base)
+            .and_then(|mut apk| apk.read_entry("resources.arsc"))
+            .expect("read the official resources.arsc");
+        let table = parse_arsc(&bytes).expect("parse the official resources.arsc");
+        let string_id = table
+            .find_resource_id(
+                None,
+                "string",
+                "AccountIdentity_AgeCheck_Action_AgeVerificationUndo",
+            )
+            .expect("the age-check undo string exists");
+        let text = |config: &ResConfig| {
+            let value = table.resource_value(string_id, config).expect("resolves");
+            table
+                .value_string(value.data)
+                .expect("decodes")
+                .expect("present")
+        };
+        assert_eq!(text(&requested("en-US", 160)), "Reset");
+        assert_eq!(text(&requested("de-DE", 160)), "Zurücksetzen");
+
+        let regional_text = |name: &str, locale: &str| {
+            let id = table
+                .find_resource_id(None, "string", name)
+                .unwrap_or_else(|| panic!("the {name} string exists"));
+            let value = table
+                .resource_value(id, &requested(locale, 160))
+                .expect("resolves");
+            table
+                .value_string(value.data)
+                .expect("decodes")
+                .expect("present")
+        };
+        assert_eq!(
+            regional_text("bottomsheet_action_collapse", "es-MX"),
+            "Contraer la hoja inferior"
+        );
+        assert_eq!(
+            regional_text("bottomsheet_action_collapse", "es-ES"),
+            "Ocultar la hoja inferior"
+        );
+        assert_eq!(
+            regional_text("abc_menu_space_shortcut_label", "zh-MO"),
+            "空白鍵"
+        );
+        assert_eq!(
+            regional_text("fingerprint_error_user_canceled", "en-NZ"),
+            "Fingerprint operation cancelled by user."
+        );
+
+        let sw500 = table
+            .find_resource_id(None, "bool", "sw500dp")
+            .expect("the sw500dp bool exists");
+        let tablet = ResConfig {
+            smallest_screen_width_dp: 600,
+            ..requested("en-US", 160)
+        };
+        let is_true =
+            |config: &ResConfig| table.resource_value(sw500, config).expect("resolves").data != 0;
+        assert!(!is_true(&requested("en-US", 160)));
+        assert!(is_true(&tablet));
+    }
+
     #[test]
     fn every_value_string_of_the_official_roblox_resources_decodes() {
         let Some(paths) = crate::apk::ApkSetPaths::from_env().expect("ECLIPSE_ROBLOX_APK usable")
@@ -1390,8 +1674,8 @@ mod tests {
 
         for len in 0..=base.len() {
             if let Ok(table) = parse_arsc(&base[..len]) {
-                let _ = table.resource_value(0x7f01_0000);
-                let _ = table.resolve_style(0x7f08_0000);
+                let _ = table.resource_value(0x7f01_0000, &ResConfig::default());
+                let _ = table.resolve_style(0x7f08_0000, &ResConfig::default());
                 let _ = table.type_name(0x7f, 1);
             }
         }
@@ -1403,8 +1687,9 @@ mod tests {
                 buf[off] = val;
                 if let Ok(table) = parse_arsc(&buf) {
                     for entry in 0u16..8 {
-                        let _ = table.resolve(0x7f, 1, entry);
-                        let _ = table.resolve_style(0x7f08_0000 | u32::from(entry));
+                        let _ = table.resolve(0x7f, 1, entry, &ResConfig::default());
+                        let _ = table
+                            .resolve_style(0x7f08_0000 | u32::from(entry), &ResConfig::default());
                     }
                     let _ = table.type_name(0x7f, 1);
                     let _ = table.key_name(0x7f, 0);

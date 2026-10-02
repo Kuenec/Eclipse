@@ -576,11 +576,11 @@ impl Screen {
     }
 }
 
-fn scaled(value: i32, scale: f64) -> i32 {
+pub(super) fn scaled(value: i32, scale: f64) -> i32 {
     (f64::from(value) * scale).round() as i32
 }
 
-fn node(
+pub(super) fn node(
     class: &str,
     text: Option<String>,
     depth: u32,
@@ -599,7 +599,7 @@ fn node(
     }
 }
 
-fn displayable(text: &str, atlas: &GlyphAtlas) -> String {
+pub(super) fn displayable(text: &str, atlas: &GlyphAtlas) -> String {
     let mut shown = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -616,7 +616,7 @@ fn displayable(text: &str, atlas: &GlyphAtlas) -> String {
     shown
 }
 
-fn wrap(text: &str, measure: TextMeasure<'_>, width: f32) -> Vec<String> {
+pub(super) fn wrap(text: &str, measure: TextMeasure<'_>, width: f32) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in text.split(' ').filter(|word| !word.is_empty()) {

@@ -1187,11 +1187,11 @@ fn boot_and_play(
     eclipse::runtime::whitelist_bionic_library_path(&fw, Some(&app_lib_dir))?;
     println!("bionic linker search path whitelisted (dl_parse_library_path) ✓");
 
-    println!("# Registering engine-JNI_OnLoad-reachable framework natives (Log + Process)…");
+    println!("# Registering engine-JNI_OnLoad-reachable framework natives (Log + Process + SystemClock)…");
     eclipse::framework::register_engine_preload_natives(&vm)?;
     println!("engine-preload framework natives registered ✓");
 
-    let _preloaded_libs = preload_app_native_libs(apks.native_libs(), &app_lib_dir, &vm)?;
+    let _preloaded_libs = preload_app_native_libs(apks.native_libs(), &app_lib_dir)?;
     host.refresh()?;
 
     println!("# Driving the framework lifecycle (JNI; steps 1–7 to Activity.onResume / RESUMED)…");
@@ -1231,18 +1231,15 @@ fn boot_and_play(
 fn preload_app_native_libs(
     apk: &eclipse::apk::Apk,
     app_lib_dir: &std::path::Path,
-    vm: &eclipse::runtime::Vm,
 ) -> Result<Vec<eclipse::loader::engine::PreloadedLib>, Box<dyn std::error::Error>> {
     use eclipse::apk::{ENGINE_LIB, TARGET_ABI};
 
     let mut log = std::io::stdout();
-    let java_vm = unsafe { jni::vm::JavaVM::from_raw(vm.as_raw()) };
     let mut loaded: Vec<eclipse::loader::engine::PreloadedLib> = Vec::new();
 
     println!("# Pre-loading the native engine via Eclipse's Rust loader (NOT the apkenv linker)…");
-    let engine =
-        eclipse::loader::engine::load_app_native_lib(app_lib_dir, ENGINE_LIB, &java_vm, &mut log)?
-            .ok_or("libroblox.so unexpectedly deduped on first load")?;
+    let engine = eclipse::loader::engine::load_app_native_lib(app_lib_dir, ENGINE_LIB, &mut log)?
+        .ok_or("libroblox.so unexpectedly deduped on first load")?;
     report_preloaded(&engine);
     loaded.push(engine);
 
@@ -1255,12 +1252,7 @@ fn preload_app_native_libs(
         if filename == ENGINE_LIB {
             continue;
         }
-        match eclipse::loader::engine::load_app_native_lib(
-            app_lib_dir,
-            filename,
-            &java_vm,
-            &mut log,
-        ) {
+        match eclipse::loader::engine::load_app_native_lib(app_lib_dir, filename, &mut log) {
             Ok(Some(lib)) => {
                 report_preloaded(&lib);
                 loaded.push(lib);
@@ -1621,10 +1613,11 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
     } else {
         "no ctors".to_string()
     };
-    let onload = match lib.jni_onload_version {
-        Some(v) if v < 0 => format!("JNI_OnLoad error {v:#x}"),
-        Some(v) => format!("JNI_OnLoad → {v:#x}"),
-        None => "lazy natives (no JNI_OnLoad)".to_string(),
+    let onload = match lib.jni_onload {
+        eclipse::loader::engine::JniOnLoad::DeferredToLoadLibrary => {
+            "JNI_OnLoad runs at System.loadLibrary"
+        }
+        eclipse::loader::engine::JniOnLoad::Absent => "no JNI_OnLoad",
     };
     println!("  {} ✓ ({ctors}; {onload})", lib.soname);
 }

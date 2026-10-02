@@ -276,18 +276,6 @@ pub fn is_focused(handle: ViewHandle) -> bool {
     handle != 0 && handle == focused_view()
 }
 
-pub fn find_by_class(name: &str) -> Option<ViewHandle> {
-    let reg = lock().ok()?;
-    for (index, slot) in reg.slots.iter().enumerate() {
-        if let Some(state) = slot.state.as_ref() {
-            if state.class_name == name {
-                return Some(pack(index as u32, slot.generation));
-            }
-        }
-    }
-    None
-}
-
 pub fn absolute_frame(handle: ViewHandle) -> Option<(i32, i32, u32, u32)> {
     const MAX_DEPTH: u32 = 256;
     if handle == 0 {
@@ -332,13 +320,14 @@ pub fn absolute_frame(handle: ViewHandle) -> Option<(i32, i32, u32, u32)> {
     None
 }
 
-pub fn subtree_contains(root: ViewHandle, needle: ViewHandle) -> bool {
-    if root == 0 || needle == 0 {
-        return false;
+fn find_in_subtree_where(
+    root: ViewHandle,
+    matches: impl Fn(ViewHandle, &ViewState) -> bool,
+) -> Option<ViewHandle> {
+    if root == 0 {
+        return None;
     }
-    let Ok(reg) = lock() else {
-        return false;
-    };
+    let reg = lock().ok()?;
     let mut visited: std::collections::HashSet<ViewHandle> = std::collections::HashSet::new();
     let mut stack: Vec<ViewHandle> = vec![root];
     while let Some(h) = stack.pop() {
@@ -356,14 +345,20 @@ pub fn subtree_contains(root: ViewHandle, needle: ViewHandle) -> bool {
             continue;
         };
 
-        if h == needle {
-            return true;
+        if matches(h, state) {
+            return Some(h);
         }
-        for &child in &state.children {
-            stack.push(child);
-        }
+        stack.extend(state.children.iter().rev());
     }
-    false
+    None
+}
+
+pub fn subtree_contains(root: ViewHandle, needle: ViewHandle) -> bool {
+    needle != 0 && find_in_subtree_where(root, |h, _| h == needle).is_some()
+}
+
+pub fn find_in_subtree(root: ViewHandle, class_name: &str) -> Option<ViewHandle> {
+    find_in_subtree_where(root, |_, state| state.class_name == class_name)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -386,9 +381,12 @@ pub struct RenderNode {
 }
 
 pub fn snapshot_tree() -> Vec<RenderNode> {
+    snapshot_subtree(active_root())
+}
+
+pub fn snapshot_subtree(root: ViewHandle) -> Vec<RenderNode> {
     const MAX_DEPTH: u32 = 256;
 
-    let root = active_root();
     if root == 0 {
         return Vec::new();
     }
@@ -671,33 +669,34 @@ mod tests {
     }
 
     #[test]
-    fn find_by_class_locates_the_right_handle_and_is_none_for_absent_class() {
-        let surface =
-            allocate("eclipse.test.FindByClassSurface").expect("allocate first test peer");
-        let other = allocate("eclipse.test.FindByClassOther").expect("allocate second test peer");
+    fn find_in_subtree_returns_the_first_preorder_match_under_the_root_only() {
+        let first = allocate("eclipse.test.Surface").expect("alloc first");
+        let second = allocate("eclipse.test.Surface").expect("alloc second");
+        let branch = allocate("android.widget.FrameLayout").expect("alloc branch");
+        with_view(branch, |s| s.children.push(first)).expect("wire first");
+        let root = allocate("android.widget.LinearLayout").expect("alloc root");
+        with_view(root, |s| {
+            s.children.push(branch);
+            s.children.push(second);
+        })
+        .expect("wire children");
+        let outside = allocate("eclipse.test.Outside").expect("alloc outside");
+
+        assert_eq!(find_in_subtree(root, "eclipse.test.Surface"), Some(first));
+        assert_eq!(find_in_subtree(branch, "eclipse.test.Surface"), Some(first));
+        assert_eq!(find_in_subtree(root, "eclipse.test.Outside"), None);
+        assert_eq!(find_in_subtree(0, "eclipse.test.Surface"), None);
+
+        free(first).expect("free first");
         assert_eq!(
-            find_by_class("eclipse.test.FindByClassSurface"),
-            Some(surface),
-            "find_by_class returns the handle of the matching live entry"
-        );
-        assert_eq!(
-            find_by_class("eclipse.test.FindByClassOther"),
-            Some(other),
-            "find_by_class distinguishes the second class"
-        );
-        assert_eq!(
-            find_by_class("eclipse.test.FindByClassNone"),
-            None,
-            "an absent class yields None, never a wrong/aliased handle"
+            find_in_subtree(root, "eclipse.test.Surface"),
+            Some(second),
+            "a freed view is skipped"
         );
 
-        free(surface).expect("free first test peer");
-        assert_eq!(
-            find_by_class("eclipse.test.FindByClassSurface"),
-            None,
-            "a freed entry is not returned by find_by_class"
-        );
-        free(other).expect("free second test peer");
+        for h in [second, branch, root, outside] {
+            free(h).expect("free");
+        }
     }
 
     #[test]

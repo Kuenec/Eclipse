@@ -13,6 +13,7 @@ use winit::platform::startup_notify::WindowAttributesExtStartupNotify as _;
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{ActivationToken, CursorGrabMode, Fullscreen, Window, WindowId};
 
+mod dialog_window;
 pub mod launch_window;
 
 const CLEAR_COLOR: [f32; 4] = [0.149, 0.408, 0.722, 1.0];
@@ -42,9 +43,11 @@ const TEXT_PAD_X: f32 = 12.0;
 struct GameWindow<'vm> {
     title: String,
 
-    window: Option<Window>,
-
     renderer: Option<VulkanRenderer>,
+
+    engine_window: Option<crate::egl_engine::EngineNativeWindow>,
+
+    window: Option<Window>,
 
     create_error: Option<OsError>,
 
@@ -59,8 +62,6 @@ struct GameWindow<'vm> {
     primary_press: Option<(ViewHandle, f32, f32)>,
 
     synthetic_tap_done: bool,
-
-    engine_window: Option<crate::egl_engine::EngineNativeWindow>,
 
     handed_off: bool,
 
@@ -126,6 +127,8 @@ struct GameWindow<'vm> {
 
     clipboard: Option<crate::clipboard::HostClipboard>,
     activation_token: Option<ActivationToken>,
+
+    dialogs: dialog_window::DialogWindows,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -361,8 +364,15 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
         self.publish_engine_display_refresh_rates();
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         use crate::loader::native_provider::{classify_winit_event, host_input_should_wake};
+
+        if self.dialogs.owns(id) {
+            if let Some(vm) = self.vm {
+                self.dialogs.window_event(vm, id, event);
+            }
+            return;
+        }
 
         let input = classify_winit_event(&event);
         if self.handed_off && host_input_should_wake(input) {
@@ -592,6 +602,10 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
                 )
             }
         };
+        match crate::framework::window_registry::showing_dialogs() {
+            Ok(showing) => self.dialogs.sync(event_loop, &showing),
+            Err(e) => tracing::error!(error = %e, "the showing dialogs could not be read"),
+        }
 
         let mut surface_probe_failed = false;
         if !self.handed_off && self.engine_window.is_some() {
@@ -635,6 +649,24 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
                 tracing::info!(
                     "engine claimed the surface (ANativeWindow_fromSurface returned Eclipse's WSI window)"
                 );
+            }
+        }
+        if self.handed_off
+            && !self.runtime_shutdown_started
+            && crate::framework::engine_surface_view_replaced()
+        {
+            let (w, h) = crate::loader::ndk_registry::engine_window_geometry().unwrap_or((1, 1));
+            match crate::framework::dispatch_surface_lifecycle(vm, w, h) {
+                Ok(true) => tracing::info!(
+                    width = w,
+                    height = h,
+                    "the replacement engine SurfaceView received surfaceCreated + surfaceChanged"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "replacement engine SurfaceView lifecycle dispatch failed (retry)"
+                ),
             }
         }
         self.maybe_synthetic_engine_tap();
@@ -2079,6 +2111,7 @@ pub fn run_windowed(
         ime_area_support: ImeAreaSupport::TopLeftSpot,
         clipboard: None,
         activation_token,
+        dialogs: dialog_window::DialogWindows::default(),
     };
     let run = event_loop.run_app_on_demand(&mut app);
 

@@ -309,15 +309,21 @@ fn call_jni_onload(
 }
 
 struct ProcessLifetimeEngine {
-    _engine: ManuallyDrop<LoadedEngine>,
+    engine: ManuallyDrop<LoadedEngine>,
 }
 
 impl ProcessLifetimeEngine {
     fn new(engine: LoadedEngine) -> Self {
         Self {
-            _engine: ManuallyDrop::new(engine),
+            engine: ManuallyDrop::new(engine),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JniOnLoad {
+    DeferredToLoadLibrary,
+    Absent,
 }
 
 #[must_use]
@@ -326,15 +332,119 @@ pub struct PreloadedLib {
 
     pub constructors_run: usize,
 
-    pub jni_onload_version: Option<jint>,
+    pub jni_onload: JniOnLoad,
+}
 
-    _engine: ProcessLifetimeEngine,
+enum JniInitState {
+    Pending(ProcessLifetimeEngine),
+    Initializing(std::thread::ThreadId),
+    Initialized,
+    Failed(String),
+}
+
+struct JniInit {
+    names: Vec<String>,
+    state: JniInitState,
+}
+
+static JNI_INITS: Mutex<Vec<JniInit>> = Mutex::new(Vec::new());
+
+static JNI_INIT_SETTLED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn defer_jni_init(names: Vec<String>, engine: ProcessLifetimeEngine) {
+    JNI_INITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(JniInit {
+            names,
+            state: JniInitState::Pending(engine),
+        });
+}
+
+pub fn initialize_preloaded_lib(
+    name: &str,
+    java_vm: &JavaVM,
+    log: &mut impl Write,
+) -> Result<(), String> {
+    let current = std::thread::current().id();
+    let mut inits = JNI_INITS.lock().unwrap_or_else(|e| e.into_inner());
+    let (index, engine) = loop {
+        let Some(index) = inits
+            .iter()
+            .position(|init| init.names.iter().any(|known| known == name))
+        else {
+            return Ok(());
+        };
+        match &inits[index].state {
+            JniInitState::Pending(_) => {
+                let state =
+                    std::mem::replace(&mut inits[index].state, JniInitState::Initializing(current));
+                let JniInitState::Pending(engine) = state else {
+                    unreachable!("the state was matched as pending under the lock");
+                };
+                break (index, engine);
+            }
+            JniInitState::Initializing(owner) if *owner == current => return Ok(()),
+            JniInitState::Initializing(_) => {
+                inits = JNI_INIT_SETTLED
+                    .wait(inits)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            JniInitState::Initialized => return Ok(()),
+            JniInitState::Failed(error) => return Err(error.clone()),
+        }
+    };
+    drop(inits);
+
+    let result = run_jni_init(&engine.engine, java_vm, log);
+
+    let mut inits = JNI_INITS.lock().unwrap_or_else(|e| e.into_inner());
+    inits[index].state = match &result {
+        Ok(()) => JniInitState::Initialized,
+        Err(error) => JniInitState::Failed(error.clone()),
+    };
+    JNI_INIT_SETTLED.notify_all();
+    result
+}
+
+fn jni_onload_result(soname: &str, version: jint) -> Result<(), String> {
+    match version {
+        JNI_VERSION_1_2 | JNI_VERSION_1_4 | JNI_VERSION_1_6 => Ok(()),
+        jni_sys::JNI_ERR => Err(format!("JNI_ERR returned from JNI_OnLoad in \"{soname}\"")),
+        version => Err(format!(
+            "Bad JNI version returned from JNI_OnLoad in \"{soname}\": {version}"
+        )),
+    }
+}
+
+fn run_jni_init(
+    engine: &LoadedEngine,
+    java_vm: &JavaVM,
+    log: &mut impl Write,
+) -> Result<(), String> {
+    if let Some(addr) = engine.jni_onload_addr() {
+        let version = call_jni_onload(engine, addr, java_vm, log);
+        jni_onload_result(&engine.soname, version)?;
+    }
+    let bound = super::jni_register::register_all_preloaded_natives(
+        java_vm,
+        &engine.java_native_exports(),
+        &engine.soname,
+        log,
+    );
+    if bound == 0 {
+        super::jni_register::register_preloaded_natives(
+            java_vm,
+            |name| engine.resolve_export(name),
+            log,
+        );
+    }
+    Ok(())
 }
 
 pub fn load_app_native_lib(
     lib_dir: &Path,
     filename: &str,
-    java_vm: &JavaVM,
     log: &mut impl Write,
 ) -> Result<Option<PreloadedLib>, EngineLoadError> {
     super::native_provider::bind_art_signal_chain().map_err(EngineLoadError::SignalChain)?;
@@ -350,38 +460,26 @@ pub fn load_app_native_lib(
     let Some((engine, constructors_run)) = link_and_construct(lib_dir, filename, log)? else {
         return Ok(None);
     };
+    Ok(Some(preload(filename, engine, constructors_run)))
+}
 
-    let jni_onload_version = if let Some(addr) = engine.jni_onload_addr() {
-        Some(call_jni_onload(&engine, addr, java_vm, log))
+fn preload(filename: &str, engine: LoadedEngine, constructors_run: usize) -> PreloadedLib {
+    let jni_onload = if engine.jni_onload_addr().is_some() {
+        JniOnLoad::DeferredToLoadLibrary
     } else {
-        let _ = writeln!(
-            log,
-            "engine-load: {} exports no JNI_OnLoad (lazy-native lib — ART binds Java_* on demand)",
-            engine.soname
-        );
-        None
+        JniOnLoad::Absent
     };
-
-    let bound = super::jni_register::register_all_preloaded_natives(
-        java_vm,
-        &engine.java_native_exports(),
-        &engine.soname,
-        log,
-    );
-    if bound == 0 {
-        super::jni_register::register_preloaded_natives(
-            java_vm,
-            |name| engine.resolve_export(name),
-            log,
-        );
+    let soname = engine.soname.clone();
+    let mut names = vec![soname.clone()];
+    if filename != soname {
+        names.push(filename.to_owned());
     }
-
-    Ok(Some(PreloadedLib {
-        soname: engine.soname.clone(),
+    defer_jni_init(names, ProcessLifetimeEngine::new(engine));
+    PreloadedLib {
+        soname,
         constructors_run,
-        jni_onload_version,
-        _engine: ProcessLifetimeEngine::new(engine),
-    }))
+        jni_onload,
+    }
 }
 
 fn link_and_construct(
@@ -646,16 +744,37 @@ mod tests {
     }
 
     #[test]
-    fn preloaded_lib_fields_express_the_optional_paths() {
-        fn classify(constructors_run: usize, jni_onload_version: Option<jint>) -> &'static str {
-            match (constructors_run, jni_onload_version) {
-                (0, None) => "lazy-native",
-                (_, Some(_)) => "engine-class",
-                (_, None) => "ctors-only",
-            }
-        }
-        assert_eq!(classify(0, None), "lazy-native");
-        assert_eq!(classify(3427, Some(JNI_VERSION_1_6)), "engine-class");
-        assert_eq!(classify(2, None), "ctors-only");
+    fn preloading_leaves_jni_onload_for_system_load_library() {
+        const UD2: [u8; 2] = [0x0F, 0x0B];
+        let filename = "libengine-test-deferred-onload.so";
+        let lib_dir = temp_dir("engine-deferred-onload");
+        let mut so = build_so(filename, &[], Some(JNI_ONLOAD_SYMBOL), None);
+        so[0x1500..0x1502].copy_from_slice(&UD2);
+        write_so(&lib_dir, filename, &so);
+
+        let (engine, constructors_run) =
+            link_and_construct(&lib_dir, filename, &mut std::io::sink())
+                .expect("map the JNI fixture")
+                .expect("first load is not deduped");
+        let lib = preload(filename, engine, constructors_run);
+
+        assert_eq!(lib.jni_onload, JniOnLoad::DeferredToLoadLibrary);
+        std::fs::remove_dir_all(&lib_dir).ok();
+    }
+
+    #[test]
+    fn jni_onload_results_follow_art() {
+        assert_eq!(jni_onload_result("libx.so", JNI_VERSION_1_6), Ok(()));
+        assert_eq!(jni_onload_result("libx.so", JNI_VERSION_1_4), Ok(()));
+        assert_eq!(
+            jni_onload_result("libx.so", jni_sys::JNI_ERR),
+            Err("JNI_ERR returned from JNI_OnLoad in \"libx.so\"".to_owned())
+        );
+        assert_eq!(
+            jni_onload_result("libx.so", JNI_VERSION_1_8),
+            Err(format!(
+                "Bad JNI version returned from JNI_OnLoad in \"libx.so\": {JNI_VERSION_1_8}"
+            ))
+        );
     }
 }
