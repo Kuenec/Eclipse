@@ -312,6 +312,27 @@ static INSTANCE: AtomicU64 = AtomicU64::new(0);
 static PHYSICAL_DEVICE: AtomicU64 = AtomicU64::new(0);
 static QUEUE_FAMILY: AtomicU32 = AtomicU32::new(u32::MAX);
 
+const OVERLAY_COPY_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::TRANSFER_SRC.as_raw() | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
+);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SwapchainCopies {
+    #[default]
+    Unsupported,
+    Supported,
+}
+
+impl SwapchainCopies {
+    fn of(usage: vk::ImageUsageFlags) -> Self {
+        if usage.contains(OVERLAY_COPY_USAGE) {
+            Self::Supported
+        } else {
+            Self::Unsupported
+        }
+    }
+}
+
 pub(crate) fn set_instance(instance: vk::Instance) {
     INSTANCE.store(instance.as_raw(), Ordering::Relaxed);
 }
@@ -365,6 +386,8 @@ struct OverlayState {
     height: u32,
 
     images: Vec<u64>,
+
+    copies: SwapchainCopies,
 }
 
 static STATE: Mutex<OverlayState> = Mutex::new(OverlayState {
@@ -376,6 +399,7 @@ static STATE: Mutex<OverlayState> = Mutex::new(OverlayState {
     width: 0,
     height: 0,
     images: Vec::new(),
+    copies: SwapchainCopies::Unsupported,
 });
 
 fn pfn_to_addr(p: vk::PFN_vkVoidFunction) -> u64 {
@@ -694,13 +718,26 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
         let _swapchain = swapchain_lock();
         return unsafe { host(device, p_create_info, p_allocator, p_swapchain) };
     };
-    let info = match super::vulkan_wsi::swapchain_present_mode(
-        requested.surface,
-        requested.present_mode,
-    ) {
-        Ok(present_mode) => requested.present_mode(present_mode),
+    let present_mode = match unsafe {
+        super::vulkan_wsi::swapchain_present_mode(requested.surface, requested.present_mode)
+    } {
+        Ok(present_mode) => present_mode,
         Err(r) => return r,
     };
+    let image_usage = match unsafe {
+        super::vulkan_wsi::swapchain_usage_with(
+            vk::PhysicalDevice::from_raw(PHYSICAL_DEVICE.load(Ordering::Relaxed)),
+            requested.surface,
+            requested.image_usage,
+            OVERLAY_COPY_USAGE,
+        )
+    } {
+        Ok(image_usage) => image_usage,
+        Err(r) => return r,
+    };
+    let info = requested
+        .present_mode(present_mode)
+        .image_usage(image_usage);
 
     let _swapchain = swapchain_lock();
     let r = unsafe { host(device, &info, p_allocator, p_swapchain) };
@@ -714,6 +751,7 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
             st.width = info.image_extent.width;
             st.height = info.image_extent.height;
             st.images.clear();
+            st.copies = SwapchainCopies::of(info.image_usage);
         }
         tracing::info!(
             format = info.image_format.as_raw(),
@@ -721,6 +759,7 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
             height = info.image_extent.height,
             requested_present_mode = ?requested.present_mode,
             present_mode = ?info.present_mode,
+            image_usage = ?info.image_usage,
             "vk-overlay: captured engine swapchain"
         );
     }
@@ -3545,14 +3584,24 @@ unsafe fn present_with_overlay(
     }
 
     let pi = unsafe { &*p_present_info };
-    let our_sc = match STATE.lock() {
-        Ok(s) => s.swapchain,
-        Err(_) => 0,
+    let (our_sc, copies) = match STATE.lock() {
+        Ok(s) => (s.swapchain, s.copies),
+        Err(_) => (0, SwapchainCopies::Unsupported),
     };
 
     let Some(image_index) = (unsafe { locate_image_index(pi, our_sc) }) else {
         return unsafe { host(queue, p_present_info) };
     };
+    if copies == SwapchainCopies::Unsupported {
+        static COPIES_WARNED: AtomicBool = AtomicBool::new(false);
+        if !COPIES_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "vk-overlay: the host surface does not allow copies into the engine swapchain, \
+                 so focused text and WebViews are not drawn over it"
+            );
+        }
+        return unsafe { host(queue, p_present_info) };
+    }
 
     let (extent, image_raw, format_raw, device_raw, image_count) = match STATE.lock() {
         Ok(st) => (
@@ -4401,6 +4450,7 @@ mod tests {
         std::sync::atomic::AtomicBool::new(false);
     static STUB_CREATED_PRESENT_MODE: AtomicU32 = AtomicU32::new(u32::MAX);
     static STUB_CREATED_WIDTH: AtomicU32 = AtomicU32::new(0);
+    static STUB_CREATED_USAGE: AtomicU32 = AtomicU32::new(0);
 
     unsafe extern "system" fn stub_function() {}
 
@@ -4430,6 +4480,7 @@ mod tests {
         let info = unsafe { &*info };
         STUB_CREATED_PRESENT_MODE.store(info.present_mode.as_raw() as u32, Ordering::SeqCst);
         STUB_CREATED_WIDTH.store(info.image_extent.width, Ordering::SeqCst);
+        STUB_CREATED_USAGE.store(info.image_usage.as_raw(), Ordering::SeqCst);
         unsafe { *swapchain = vk::SwapchainKHR::from_raw(CREATED_SWAPCHAIN) };
         vk::Result::SUCCESS
     }
@@ -4557,6 +4608,91 @@ mod tests {
         assert!(
             locked,
             "retiring oldSwapchain is serialized with the WebView presenter"
+        );
+    }
+
+    unsafe extern "system" fn stub_surface_supporting_copies(
+        _physical_device: vk::PhysicalDevice,
+        _surface: vk::SurfaceKHR,
+        caps: *mut vk::SurfaceCapabilitiesKHR,
+    ) -> vk::Result {
+        unsafe {
+            *caps = vk::SurfaceCapabilitiesKHR::default()
+                .supported_usage_flags(vk::ImageUsageFlags::COLOR_ATTACHMENT | OVERLAY_COPY_USAGE)
+        };
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn stub_surface_without_copies(
+        _physical_device: vk::PhysicalDevice,
+        _surface: vk::SurfaceKHR,
+        caps: *mut vk::SurfaceCapabilitiesKHR,
+    ) -> vk::Result {
+        unsafe {
+            *caps = vk::SurfaceCapabilitiesKHR::default()
+                .supported_usage_flags(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        };
+        vk::Result::SUCCESS
+    }
+
+    fn host_swapchain_usage(
+        capabilities: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
+    ) -> (vk::ImageUsageFlags, SwapchainCopies) {
+        super::super::vulkan_wsi::use_host_surface_capabilities_for_test(Some(capabilities));
+        STUB_CREATED_USAGE.store(0, Ordering::SeqCst);
+        let info = vk::SwapchainCreateInfoKHR::default()
+            .surface(vk::SurfaceKHR::from_raw(ENGINE_SURFACE))
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
+        let mut swapchain = vk::SwapchainKHR::null();
+        let created = unsafe {
+            eclipse_vk_create_swapchain_khr(
+                vk::Device::null(),
+                &info,
+                std::ptr::null(),
+                &mut swapchain,
+            )
+        };
+        super::super::vulkan_wsi::use_host_surface_capabilities_for_test(None);
+        assert_eq!(created, vk::Result::SUCCESS);
+        let copies = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .copies;
+        (
+            vk::ImageUsageFlags::from_raw(STUB_CREATED_USAGE.load(Ordering::SeqCst)),
+            copies,
+        )
+    }
+
+    #[test]
+    fn engine_swapchains_allow_the_overlay_copies_where_the_surface_supports_them() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_create =
+            HOST_CREATE_SWAPCHAIN.swap(stub_create_swapchain as *const () as u64, Ordering::SeqCst);
+        let saved_physical = PHYSICAL_DEVICE.swap(0x7, Ordering::SeqCst);
+
+        let supported = host_swapchain_usage(stub_surface_supporting_copies);
+        let unsupported = host_swapchain_usage(stub_surface_without_copies);
+
+        set_state(0, Vec::new());
+        PHYSICAL_DEVICE.store(saved_physical, Ordering::SeqCst);
+        HOST_CREATE_SWAPCHAIN.store(saved_create, Ordering::SeqCst);
+
+        assert_eq!(
+            supported,
+            (
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | OVERLAY_COPY_USAGE,
+                SwapchainCopies::Supported
+            ),
+            "the text overlay copies out of and back into the engine's images"
+        );
+        assert_eq!(
+            unsupported,
+            (
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                SwapchainCopies::Unsupported
+            ),
+            "usage the surface does not support never reaches the host, and the overlay skips it"
         );
     }
 

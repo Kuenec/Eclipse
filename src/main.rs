@@ -1081,7 +1081,7 @@ impl Host<'_> {
                 )
             }
             None => eclipse::graphics::run_windowed(
-                &mut eclipse::graphics::host_event_loop()?,
+                eclipse::graphics::host_event_loop()?,
                 None,
                 title,
                 Some(vm),

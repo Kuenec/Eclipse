@@ -179,7 +179,7 @@ pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_pres
     }
 }
 
-pub(crate) fn swapchain_present_mode(
+pub(crate) unsafe fn swapchain_present_mode(
     surface: vk::SurfaceKHR,
     requested: vk::PresentModeKHR,
 ) -> Result<vk::PresentModeKHR, vk::Result> {
@@ -194,6 +194,31 @@ pub(crate) fn swapchain_present_mode(
             Ok(host_swapchain_present_mode(requested, &host))
         }
         _ => Ok(requested),
+    }
+}
+
+pub(crate) unsafe fn swapchain_usage_with(
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+    requested: vk::ImageUsageFlags,
+    wanted: vk::ImageUsageFlags,
+) -> Result<vk::ImageUsageFlags, vk::Result> {
+    let host = HOST_PDSC.load(Ordering::Relaxed);
+    if host == 0 || physical_device == vk::PhysicalDevice::null() {
+        return Ok(requested);
+    }
+    let query = unsafe {
+        std::mem::transmute::<usize, vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
+            host as usize,
+        )
+    };
+    let mut caps = vk::SurfaceCapabilitiesKHR::default();
+    match unsafe { query(physical_device, surface, &mut caps) } {
+        vk::Result::SUCCESS if caps.supported_usage_flags.contains(wanted) => {
+            Ok(requested | wanted)
+        }
+        vk::Result::SUCCESS => Ok(requested),
+        r => Err(r),
     }
 }
 

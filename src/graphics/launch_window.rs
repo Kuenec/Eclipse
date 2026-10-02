@@ -16,7 +16,7 @@ use winit::platform::startup_notify::{
     self, EventLoopExtStartupNotify as _, WindowAttributesExtStartupNotify as _,
     WindowExtStartupNotify as _,
 };
-use winit::platform::wayland::WindowAttributesExtWayland as _;
+use winit::platform::wayland::{ActiveEventLoopExtWayland as _, WindowAttributesExtWayland as _};
 use winit::window::{ActivationToken, Window, WindowId};
 
 use super::{GlyphAtlas, GraphicsError, HostEventLoop, TextMeasure, VulkanRenderer};
@@ -56,7 +56,7 @@ impl std::fmt::Display for WindowClosed {
 impl std::error::Error for WindowClosed {}
 
 pub struct LaunchWindow {
-    event_loop: HostEventLoop,
+    event_loop: &'static mut HostEventLoop,
     screen: StatusScreen,
     pumping: bool,
 }
@@ -89,7 +89,11 @@ impl LaunchWindow {
                 self.screen.apply_all(updates);
                 return Ok(());
             }
-            self.pump(Some(POLL_INTERVAL));
+            if self.pumping {
+                self.pump(Some(POLL_INTERVAL));
+            } else {
+                std::thread::sleep(POLL_INTERVAL);
+            }
         }
     }
 
@@ -139,6 +143,9 @@ impl LaunchWindow {
         if let Err(error) = self.event_loop.run_app_on_demand(&mut self.screen) {
             tracing::warn!(%error, "the window that shows why Roblox could not start failed");
         }
+        if let Some(log) = self.screen.log_of_unseen_failure() {
+            eprintln!("{LOG_HINT} {}", log.display());
+        }
     }
 
     fn pump(&mut self, timeout: Option<Duration>) {
@@ -146,6 +153,22 @@ impl LaunchWindow {
             PumpStatus::Continue => true,
             PumpStatus::Exit(_) => false,
         };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowMapping {
+    OnCreate,
+    OnFirstFrame,
+}
+
+impl WindowMapping {
+    fn of(event_loop: &ActiveEventLoop) -> Self {
+        if event_loop.is_wayland() {
+            Self::OnFirstFrame
+        } else {
+            Self::OnCreate
+        }
     }
 }
 
@@ -249,6 +272,29 @@ impl StatusScreen {
         self.window = None;
     }
 
+    fn renderer_unavailable(&mut self, error: &GraphicsError, mapping: WindowMapping) {
+        match mapping {
+            WindowMapping::OnCreate => {
+                tracing::warn!(%error, "the launch window cannot draw; its title shows the status");
+            }
+            WindowMapping::OnFirstFrame => {
+                tracing::warn!(
+                    %error,
+                    "the launch window cannot draw, and Wayland shows no window before its first \
+                     frame; the status goes only to the terminal and the log"
+                );
+                self.end();
+            }
+        }
+    }
+
+    fn log_of_unseen_failure(&self) -> Option<&Path> {
+        if self.session == Session::Dismissed && self.create_error.is_none() {
+            return None;
+        }
+        self.content.error.as_ref()?.log.as_deref()
+    }
+
     fn rescale(&mut self, scale: f64) {
         if scale == self.scale {
             return;
@@ -266,7 +312,14 @@ impl StatusScreen {
         let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
             return;
         };
-        let extent = renderer.swapchain_extent;
+        let extent = match renderer.current_extent(window) {
+            Ok(Some(extent)) => extent,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "drawing the launch status failed");
+                return;
+            }
+        };
         let nodes = match renderer.text.as_ref() {
             Some(text) => self.content.nodes(&text.atlas, extent, self.scale),
             None => Vec::new(),
@@ -301,9 +354,11 @@ impl ApplicationHandler<MainLooperWake> for StatusScreen {
         };
         match VulkanRenderer::new(&window) {
             Ok(renderer) => self.renderer = Some(renderer),
-            Err(error) => {
-                tracing::warn!(%error, "the launch window cannot draw; its title shows the status")
-            }
+            Err(error) => self.renderer_unavailable(&error, WindowMapping::of(event_loop)),
+        }
+        if self.session != Session::Showing {
+            event_loop.exit();
+            return;
         }
         let scale = window.scale_factor();
         self.window = Some(window);
@@ -731,6 +786,42 @@ mod tests {
             assert_eq!(track.layout.width, 1600 - 2 * padding, "{scale}");
             assert_eq!(track.layout.height, scaled(BAR_HEIGHT, scale), "{scale}");
         }
+    }
+
+    #[test]
+    fn a_window_that_cannot_map_without_drawing_ends_instead_of_waiting_for_a_close() {
+        let error = GraphicsError::Vulkan("no physical device".to_owned());
+        let mut screen = StatusScreen::new("Eclipse");
+        screen.renderer_unavailable(&error, WindowMapping::OnFirstFrame);
+        assert_eq!(screen.session, Session::Ending);
+
+        let mut screen = StatusScreen::new("Eclipse");
+        screen.renderer_unavailable(&error, WindowMapping::OnCreate);
+        assert_eq!(screen.session, Session::Showing);
+    }
+
+    #[test]
+    fn a_failure_no_window_showed_names_its_log_for_the_terminal() {
+        let failure = Failure {
+            message: "Roblox is not installed".to_owned(),
+            log: Some(PathBuf::from("/data/logs/eclipse.log")),
+        };
+
+        let mut unmapped = StatusScreen::new("Eclipse");
+        unmapped.content.error = Some(failure.clone());
+        unmapped.renderer_unavailable(
+            &GraphicsError::Vulkan("no physical device".to_owned()),
+            WindowMapping::OnFirstFrame,
+        );
+        assert_eq!(
+            unmapped.log_of_unseen_failure(),
+            Some(Path::new("/data/logs/eclipse.log"))
+        );
+
+        let mut closed = StatusScreen::new("Eclipse");
+        closed.content.error = Some(failure);
+        closed.session = Session::Dismissed;
+        assert_eq!(closed.log_of_unseen_failure(), None);
     }
 
     #[test]
