@@ -325,7 +325,7 @@ impl Linker {
                 error,
             })?;
 
-            let relas = img.relocations().map_err(|error| LinkError::DynStrings {
+            let relas = img.relocations().map_err(|error| LinkError::Parse {
                 object: soname.clone(),
                 error,
             })?;
@@ -1172,7 +1172,6 @@ pub(crate) mod tests {
         let span = obj.mapped.span() as u64;
 
         let page = host_page_size();
-        let min_vaddr = img.loads.iter().map(|s| s.vaddr).min().expect("loads");
         let max_end = img
             .loads
             .iter()
@@ -1181,8 +1180,8 @@ pub(crate) mod tests {
             .expect("loads");
         assert_eq!(
             span,
-            max_end.div_ceil(page) * page - min_vaddr / page * page,
-            "the mapping spans exactly the page-rounded PT_LOAD extent"
+            max_end.div_ceil(page) * page,
+            "the reservation starts at vaddr 0 and ends at the page-rounded end of the last PT_LOAD"
         );
 
         for seg in &img.loads {

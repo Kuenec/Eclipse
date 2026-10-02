@@ -78,6 +78,7 @@ impl EclipseNativeProvider {
         p.register("__umask_chk", eclipse_umask_chk as *const () as u64);
 
         p.register("__errno", eclipse_errno as *const () as u64);
+        p.register("__assert", eclipse_assert as *const () as u64);
         p.register("__assert2", eclipse_assert2 as *const () as u64);
         p.register(
             "__gnu_strerror_r",
@@ -120,6 +121,7 @@ impl EclipseNativeProvider {
         p.register("vfprintf", eclipse_vfprintf as *const () as u64);
 
         p.register("sigaction", eclipse_sigaction as *const () as u64);
+        p.register("signal", eclipse_signal as *const () as u64);
         p.register("sigemptyset", eclipse_sigemptyset as *const () as u64);
         p.register("sigaddset", eclipse_sigaddset as *const () as u64);
         p.register("sigfillset", eclipse_sigfillset as *const () as u64);
@@ -666,6 +668,21 @@ extern "C" fn eclipse_errno() -> *mut c_int {
     unsafe { libc::__errno_location() }
 }
 
+unsafe extern "C" fn eclipse_assert(
+    file: *const c_char,
+    line: c_int,
+    failed_expr: *const c_char,
+) -> ! {
+    let file = unsafe { cstr_opt(file) }.unwrap_or_default();
+    let expr = unsafe { cstr_opt(failed_expr) }.unwrap_or_default();
+    emit_log(
+        ANDROID_LOG_FATAL,
+        "assert",
+        &format!("{file}:{line}: assertion \"{expr}\" failed"),
+    );
+    std::process::abort();
+}
+
 unsafe extern "C" fn eclipse_assert2(
     file: *const c_char,
     line: c_int,
@@ -793,23 +810,78 @@ fn einval() -> c_int {
     -1
 }
 
+type SigchainSigaction =
+    unsafe extern "C" fn(c_int, *const libc::sigaction, *mut libc::sigaction) -> c_int;
+
+type SigchainSignal = unsafe extern "C" fn(c_int, libc::sighandler_t) -> libc::sighandler_t;
+
+type SigchainSigprocmask =
+    unsafe extern "C" fn(c_int, *const libc::sigset_t, *mut libc::sigset_t) -> c_int;
+
+struct ArtSignalChain {
+    sigaction: SigchainSigaction,
+    signal: SigchainSignal,
+    sigprocmask: SigchainSigprocmask,
+}
+
+static ART_SIGNAL_CHAIN: OnceLock<ArtSignalChain> = OnceLock::new();
+
+fn art_sigchain_symbol(name: &std::ffi::CStr) -> Result<*mut c_void, String> {
+    let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    if sym.is_null() {
+        return Err(format!(
+            "ART's libsigchain exports no {}: {}",
+            name.to_string_lossy(),
+            last_dl_error()
+        ));
+    }
+    Ok(sym)
+}
+
+pub(super) fn bind_art_signal_chain() -> Result<(), String> {
+    if ART_SIGNAL_CHAIN.get().is_some() {
+        return Ok(());
+    }
+    let sigaction = art_sigchain_symbol(c"sigchain_sigaction")?;
+    let signal = art_sigchain_symbol(c"sigchain_signal")?;
+    let sigprocmask = art_sigchain_symbol(c"sigchain_sigprocmask")?;
+    let chain = unsafe {
+        ArtSignalChain {
+            sigaction: std::mem::transmute::<*mut c_void, SigchainSigaction>(sigaction),
+            signal: std::mem::transmute::<*mut c_void, SigchainSignal>(signal),
+            sigprocmask: std::mem::transmute::<*mut c_void, SigchainSigprocmask>(sigprocmask),
+        }
+    };
+    let _ = ART_SIGNAL_CHAIN.set(chain);
+    Ok(())
+}
+
+unsafe fn chained_sigprocmask(
+    how: c_int,
+    set: *const libc::sigset_t,
+    oldset: *mut libc::sigset_t,
+) -> c_int {
+    match ART_SIGNAL_CHAIN.get() {
+        Some(chain) => unsafe { (chain.sigprocmask)(how, set, oldset) },
+        None => unsafe { libc::sigprocmask(how, set, oldset) },
+    }
+}
+
+unsafe extern "C" fn eclipse_signal(
+    signum: c_int,
+    handler: libc::sighandler_t,
+) -> libc::sighandler_t {
+    match ART_SIGNAL_CHAIN.get() {
+        Some(chain) => unsafe { (chain.signal)(signum, handler) },
+        None => unsafe { libc::signal(signum, handler) },
+    }
+}
+
 unsafe extern "C" fn eclipse_sigaction(
     signum: c_int,
     act: *const BionicSigaction,
     oldact: *mut BionicSigaction,
 ) -> c_int {
-    let tapped = TAPPED_SIGNAL.load(Ordering::Acquire);
-    if tapped != 0 && signum == tapped {
-        return unsafe {
-            tap_chain_register(
-                &TAP_CHAIN_POOL,
-                &TAP_CHAIN_POOL_NEXT,
-                &TAP_CHAIN,
-                act,
-                oldact,
-            )
-        };
-    }
     let g_act = if act.is_null() {
         None
     } else {
@@ -823,19 +895,18 @@ unsafe extern "C" fn eclipse_sigaction(
     };
 
     let mut g_old: libc::sigaction = unsafe { std::mem::zeroed() };
+    let new_action = g_act
+        .as_ref()
+        .map_or(std::ptr::null(), |g| g as *const libc::sigaction);
+    let old_action = if oldact.is_null() {
+        std::ptr::null_mut()
+    } else {
+        &mut g_old
+    };
 
-    let ret = unsafe {
-        libc::sigaction(
-            signum,
-            g_act
-                .as_ref()
-                .map_or(std::ptr::null(), |g| g as *const libc::sigaction),
-            if oldact.is_null() {
-                std::ptr::null_mut()
-            } else {
-                &mut g_old
-            },
-        )
+    let ret = match ART_SIGNAL_CHAIN.get() {
+        Some(chain) => unsafe { (chain.sigaction)(signum, new_action, old_action) },
+        None => unsafe { libc::sigaction(signum, new_action, old_action) },
     };
     if ret == 0 && !oldact.is_null() {
         unsafe {
@@ -887,7 +958,7 @@ unsafe extern "C" fn eclipse_sigprocmask(
     let mut g_old: libc::sigset_t = unsafe { std::mem::zeroed() };
 
     let ret = unsafe {
-        libc::sigprocmask(
+        chained_sigprocmask(
             how,
             g_set
                 .as_ref()
@@ -919,7 +990,7 @@ unsafe extern "C" fn eclipse_pthread_sigmask(
     let mut g_old: libc::sigset_t = unsafe { std::mem::zeroed() };
 
     let ret = unsafe {
-        libc::pthread_sigmask(
+        chained_sigprocmask(
             how,
             g_set
                 .as_ref()
@@ -931,63 +1002,21 @@ unsafe extern "C" fn eclipse_pthread_sigmask(
             },
         )
     };
-    if ret == 0 && !oldset.is_null() {
+    if ret != 0 {
+        return unsafe { *libc::__errno_location() };
+    }
+    if !oldset.is_null() {
         unsafe { *oldset = bionic_sigset_from_glibc(&g_old) };
     }
-    ret
+    0
 }
 
 static TAPPED_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 static TAP_CHAIN: AtomicPtr<BionicSigaction> = AtomicPtr::new(std::ptr::null_mut());
 
-const TAP_CHAIN_POOL_LEN: usize = 8;
-
-struct TapChainPool([UnsafeCell<BionicSigaction>; TAP_CHAIN_POOL_LEN]);
-
-impl TapChainPool {
-    const fn new() -> Self {
-        Self(
-            [const {
-                UnsafeCell::new(BionicSigaction {
-                    sa_flags: 0,
-                    handler: 0,
-                    sa_mask: 0,
-                    sa_restorer: 0,
-                })
-            }; TAP_CHAIN_POOL_LEN],
-        )
-    }
-}
-
-unsafe impl Sync for TapChainPool {}
-
-static TAP_CHAIN_POOL: TapChainPool = TapChainPool::new();
-
-static TAP_CHAIN_POOL_NEXT: AtomicUsize = AtomicUsize::new(0);
-
-fn tap_chain_publish(
-    pool: &TapChainPool,
-    next: &AtomicUsize,
-    slot: &AtomicPtr<BionicSigaction>,
-    b: BionicSigaction,
-) -> bool {
-    let idx = next.fetch_add(1, Ordering::Relaxed);
-    let Some(cell) = pool.0.get(idx) else {
-        const MSG: &[u8] =
-            b"eclipse early-fault tap: chain pool exhausted; keeping previous chain occupant\n";
-
-        unsafe { libc::write(2, MSG.as_ptr().cast::<c_void>(), MSG.len()) };
-        return false;
-    };
-
-    unsafe { cell.get().write(b) };
-    slot.store(cell.get(), Ordering::Release);
-    true
-}
-
-fn tap_chain_store(b: BionicSigaction) -> bool {
-    tap_chain_publish(&TAP_CHAIN_POOL, &TAP_CHAIN_POOL_NEXT, &TAP_CHAIN, b)
+fn tap_chain_store(action: BionicSigaction) {
+    TAP_CHAIN.store(Box::into_raw(Box::new(action)), Ordering::Release);
 }
 
 static TAP_HANDLER_TID: AtomicI64 = AtomicI64::new(0);
@@ -1015,42 +1044,6 @@ static ENGINE_RANGE_SPAN: AtomicU64 = AtomicU64::new(0);
 
 const SEGV_MAPERR: c_int = 1;
 const SEGV_ACCERR: c_int = 2;
-
-unsafe fn tap_chain_register(
-    pool: &TapChainPool,
-    next: &AtomicUsize,
-    slot: &AtomicPtr<BionicSigaction>,
-    act: *const BionicSigaction,
-    oldact: *mut BionicSigaction,
-) -> c_int {
-    if !oldact.is_null() {
-        let prev = slot.load(Ordering::Acquire);
-        let out = if prev.is_null() {
-            BionicSigaction {
-                sa_flags: 0,
-                handler: 0,
-                sa_mask: 0,
-                sa_restorer: 0,
-            }
-        } else {
-            unsafe { *prev }
-        };
-
-        unsafe { *oldact = out };
-    }
-    if !act.is_null() {
-        let mut b = unsafe { *act };
-
-        b.sa_flags &= !SA_RESTORER_FLAG;
-        b.sa_restorer = 0;
-
-        if !tap_chain_publish(pool, next, slot, b) {
-            unsafe { *libc::__errno_location() = libc::ENOMEM };
-            return -1;
-        }
-    }
-    0
-}
 
 fn tap_restore_default(signo: c_int) {
     unsafe {
@@ -1244,9 +1237,7 @@ pub(super) fn install_early_fault_tap(signum: c_int) -> Result<(), String> {
     }
 
     let seed = bionic_action_from_glibc(&queried);
-    if !tap_chain_store(seed) {
-        return Err("early-fault tap: chain pool exhausted before seeding".to_string());
-    }
+    tap_chain_store(seed);
 
     let (ret, old) = unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -1263,8 +1254,8 @@ pub(super) fn install_early_fault_tap(signum: c_int) -> Result<(), String> {
     }
 
     let displaced = bionic_action_from_glibc(&old);
-    if displaced != seed && !tap_chain_store(displaced) {
-        return Err("early-fault tap: chain pool exhausted on re-seed".to_string());
+    if displaced != seed {
+        tap_chain_store(displaced);
     }
 
     TAPPED_SIGNAL.store(signum, Ordering::Release);
@@ -1463,13 +1454,26 @@ pub fn install_guarded_altstack() -> Result<GuardedAltstack, String> {
 static ECLIPSE_STACK_CHK_GUARD: AtomicUsize = AtomicUsize::new(0);
 
 fn eclipse_stack_chk_guard_addr() -> u64 {
-    let _ = ECLIPSE_STACK_CHK_GUARD.compare_exchange(
-        0,
-        0xff0a_55c3_0000_0000usize,
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-    );
+    if ECLIPSE_STACK_CHK_GUARD.load(Ordering::SeqCst) == 0 {
+        let _ = ECLIPSE_STACK_CHK_GUARD.compare_exchange(
+            0,
+            process_stack_chk_guard(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
     std::ptr::addr_of!(ECLIPSE_STACK_CHK_GUARD) as u64
+}
+
+fn process_stack_chk_guard() -> usize {
+    let at_random = unsafe { libc::getauxval(libc::AT_RANDOM) } as *const [u8; 8];
+    assert!(
+        !at_random.is_null(),
+        "the kernel supplied no AT_RANDOM auxiliary vector entry to seed __stack_chk_guard"
+    );
+    let guard = usize::from_ne_bytes(unsafe { at_random.read_unaligned() }) & !0xff;
+    assert_ne!(guard, 0, "AT_RANDOM produced an all-zero __stack_chk_guard");
+    guard
 }
 
 const SF_FILE_STRIDE: usize = 152;
@@ -3103,11 +3107,11 @@ mod tests {
 
         assert_eq!(
             p.len(),
-            137 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+            139 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT
                 + super::super::bionic_locale::LOCALE_NATIVE_COUNT
                 + super::super::aaudio::AAUDIO_NATIVE_COUNT,
-            "6 liblog + 17 bionic-libc + 25 bionic-stdio + 7 bionic-signal + 2 link-map \
+            "6 liblog + 18 bionic-libc + 25 bionic-stdio + 8 bionic-signal + 2 link-map \
              introspection + 4 netdb resolver-ABI + 1 EGL display interception + 3 Vulkan WSI \
              interception + 3 dlfcn + 28 ndk-android + 33 media-ndk + 8 OpenSL ES + 26 AAudio + \
              53 pthread + 6 sysconf system-query + 1 locale natives registered"
@@ -3130,6 +3134,7 @@ mod tests {
             "__FD_ISSET_chk",
             "__umask_chk",
             "__errno",
+            "__assert",
             "__assert2",
             "__gnu_strerror_r",
             "strerror_r",
@@ -3162,6 +3167,7 @@ mod tests {
             "fscanf",
             "vfprintf",
             "sigaction",
+            "signal",
             "sigemptyset",
             "sigaddset",
             "sigfillset",
@@ -3929,7 +3935,7 @@ mod tests {
     }
 
     #[test]
-    fn early_fault_tap_intercepts_registration_and_chains() {
+    fn early_fault_tap_installs_first_and_chains_to_the_seeded_action() {
         let sig = libc::SIGWINCH;
 
         let mut snapshot: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -3938,15 +3944,9 @@ mod tests {
             assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut snapshot), 0);
         }
 
-        let cursor_before = TAP_CHAIN_POOL_NEXT.load(Ordering::SeqCst);
         assert!(
             install_early_fault_tap(libc::SIGKILL).is_err(),
             "the kernel must reject installing over SIGKILL"
-        );
-        assert_eq!(
-            TAP_CHAIN_POOL_NEXT.load(Ordering::SeqCst),
-            cursor_before + 1,
-            "the chain seed is claimed BEFORE the kernel install"
         );
         assert!(
             !TAP_CHAIN.load(Ordering::Acquire).is_null(),
@@ -3955,17 +3955,17 @@ mod tests {
         assert_eq!(
             TAPPED_SIGNAL.load(Ordering::SeqCst),
             0,
-            "a failed install never opens the seam gate"
+            "a failed install never marks the signal tapped"
         );
 
-        let cursor_pre_install = TAP_CHAIN_POOL_NEXT.load(Ordering::SeqCst);
+        let mut seeded: libc::sigaction = unsafe { std::mem::zeroed() };
+        seeded.sa_sigaction = tap_test_chain_handler as *const () as usize;
+        seeded.sa_flags = libc::SA_SIGINFO;
+        unsafe {
+            assert_eq!(libc::sigaction(sig, &seeded, std::ptr::null_mut()), 0);
+        }
+
         install_early_fault_tap(sig).expect("tap install");
-
-        assert_eq!(
-            TAP_CHAIN_POOL_NEXT.load(Ordering::SeqCst),
-            cursor_pre_install + 1,
-            "a quiescent install claims exactly one pool cell (no spurious re-seed)"
-        );
 
         let mut kernel: libc::sigaction = unsafe { std::mem::zeroed() };
 
@@ -3978,54 +3978,10 @@ mod tests {
         );
         assert_ne!(kernel.sa_flags & libc::SA_SIGINFO, 0, "SA_SIGINFO is set");
 
-        let mut old = BionicSigaction {
-            sa_flags: 0,
-            handler: usize::MAX,
-            sa_mask: !0,
-            sa_restorer: usize::MAX,
-        };
-
-        unsafe {
-            assert_eq!(eclipse_sigaction(sig, std::ptr::null(), &mut old), 0);
-        }
         assert_eq!(
-            old.handler, snapshot.sa_sigaction,
+            unsafe { (*TAP_CHAIN.load(Ordering::Acquire)).handler },
+            tap_test_chain_handler as *const () as usize,
             "the chain slot holds the pre-tap disposition"
-        );
-        assert_eq!(
-            old.sa_restorer, 0,
-            "glibc's restorer never crosses the seam"
-        );
-
-        let act = BionicSigaction {
-            sa_flags: libc::SA_SIGINFO,
-            handler: tap_test_chain_handler as *const () as usize,
-            sa_mask: 0,
-            sa_restorer: 0,
-        };
-        let mut old2 = old;
-
-        unsafe {
-            assert_eq!(eclipse_sigaction(sig, &act, &mut old2), 0);
-        }
-        assert_eq!(old2.handler, old.handler, "previous occupant round-trips");
-
-        let mut kernel2: libc::sigaction = unsafe { std::mem::zeroed() };
-
-        unsafe {
-            assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut kernel2), 0);
-        }
-        assert_eq!(
-            kernel2.sa_sigaction, early_fault_tap_handler as *const () as usize,
-            "the kernel slot is STILL the tap — the engine registration never reached the kernel"
-        );
-
-        let chain_ptr = TAP_CHAIN.load(Ordering::Acquire) as usize;
-        let pool_start = TAP_CHAIN_POOL.0.as_ptr() as usize;
-        let pool_end = pool_start + std::mem::size_of_val(&TAP_CHAIN_POOL.0);
-        assert!(
-            (pool_start..pool_end).contains(&chain_ptr),
-            "the chain slot points into the static pool, never the heap"
         );
 
         unsafe {
@@ -4034,7 +3990,7 @@ mod tests {
         assert_eq!(
             TAP_TEST_RECEIVED.load(Ordering::SeqCst),
             sig as usize,
-            "kernel → tap → chained engine handler delivered end-to-end"
+            "kernel → tap → seeded handler delivered end-to-end"
         );
         assert_eq!(
             TAP_HANDLER_TID.load(Ordering::SeqCst),
@@ -4055,16 +4011,12 @@ mod tests {
                 }
             }
         }
-        let park_act = BionicSigaction {
+        tap_chain_store(BionicSigaction {
             sa_flags: libc::SA_SIGINFO,
             handler: tap_test_parking_chain_handler as *const () as usize,
             sa_mask: 0,
             sa_restorer: 0,
-        };
-
-        unsafe {
-            assert_eq!(eclipse_sigaction(sig, &park_act, std::ptr::null_mut()), 0);
-        }
+        });
         let parker = std::thread::spawn(move || {
             unsafe { libc::raise(sig) };
         });
@@ -4080,10 +4032,10 @@ mod tests {
 
         let entries_while_parked = TAP_TEST_CHAIN_ENTRIES.load(Ordering::SeqCst);
 
-        let mut kernel3: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut kernel_after: libc::sigaction = unsafe { std::mem::zeroed() };
 
         unsafe {
-            assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut kernel3), 0);
+            assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut kernel_after), 0);
         }
         TAP_TEST_PARK_RELEASED.store(true, Ordering::SeqCst);
         parker.join().expect("parker thread");
@@ -4096,7 +4048,7 @@ mod tests {
             "a concurrent different-tid delivery chains instead of dying to SIG_DFL"
         );
         assert_eq!(
-            kernel3.sa_sigaction, early_fault_tap_handler as *const () as usize,
+            kernel_after.sa_sigaction, early_fault_tap_handler as *const () as usize,
             "the kernel slot survives a concurrent delivery (never restored to SIG_DFL)"
         );
         assert_eq!(
@@ -4104,16 +4056,6 @@ mod tests {
             0,
             "the owner released the latch after the parked run"
         );
-
-        unsafe {
-            assert_eq!(eclipse_sigaction(sig, &old, std::ptr::null_mut()), 0);
-        }
-        let mut requeried = act;
-
-        unsafe {
-            assert_eq!(eclipse_sigaction(sig, std::ptr::null(), &mut requeried), 0);
-        }
-        assert_eq!(requeried.handler, old.handler, "the chain slot reverts");
 
         TAPPED_SIGNAL.store(0, Ordering::SeqCst);
         TAP_CHAIN.store(std::ptr::null_mut(), Ordering::SeqCst);
@@ -4123,78 +4065,247 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tap_chain_pool_publishes_in_place_and_keeps_last_occupant_on_exhaustion() {
-        let pool = TapChainPool::new();
-        let next = AtomicUsize::new(0);
-        let slot: AtomicPtr<BionicSigaction> = AtomicPtr::new(std::ptr::null_mut());
-        let pool_start = pool.0.as_ptr() as usize;
-        let pool_end = pool_start + std::mem::size_of_val(&pool.0);
-        let mk = |handler: usize| BionicSigaction {
-            sa_flags: libc::SA_SIGINFO,
-            handler,
-            sa_mask: 0,
-            sa_restorer: 0,
-        };
+    const ART_SIGNAL_CHAIN_CHILD: &str = "ECLIPSE_TEST_ART_SIGNAL_CHAIN_CHILD";
 
-        let mut published = Vec::new();
-        for k in 0..TAP_CHAIN_POOL_LEN {
-            assert!(tap_chain_publish(&pool, &next, &slot, mk(0x1000 + k)));
-            let p = slot.load(Ordering::Acquire);
+    #[test]
+    fn engine_signal_calls_go_through_art_sigchain_behind_its_special_handlers() {
+        if std::env::var_os(ART_SIGNAL_CHAIN_CHILD).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("the test harness executable must have a path"),
+            )
+            .args([
+                "--exact",
+                "loader::native_provider::tests::engine_signal_calls_go_through_art_sigchain_behind_its_special_handlers",
+                "--test-threads=1",
+            ])
+            .env(ART_SIGNAL_CHAIN_CHILD, "1")
+            .output()
+            .expect("the ART signal chain child must start");
+            let report = String::from_utf8_lossy(&output.stdout);
             assert!(
-                (pool_start..pool_end).contains(&(p as usize)),
-                "published pointer must be a pool cell, never a heap allocation"
+                output.status.success() && report.contains("1 passed"),
+                "status={:?}, stdout={report}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
             );
-            assert!(!published.contains(&(p as usize)), "cells are claim-once");
-            published.push(p as usize);
-
-            assert_eq!(unsafe { (*p).handler }, 0x1000 + k);
+            return;
         }
 
-        let last = slot.load(Ordering::Acquire);
-        assert!(!tap_chain_publish(&pool, &next, &slot, mk(0xdead)));
-        assert_eq!(
-            slot.load(Ordering::Acquire),
-            last,
-            "exhaustion keeps the last occupant"
-        );
+        const CLAIMED: c_int = libc::SIGUSR2;
+        static ART_CLAIMS: AtomicBool = AtomicBool::new(false);
+        static ART_RUNS: AtomicUsize = AtomicUsize::new(0);
+        static USER_HANDLER: AtomicUsize = AtomicUsize::new(libc::SIG_DFL);
+        static USER_SIGINFO: AtomicBool = AtomicBool::new(false);
+        static ENGINE_RUNS: AtomicUsize = AtomicUsize::new(0);
+        static ENGINE_PLAIN_RUNS: AtomicUsize = AtomicUsize::new(0);
 
-        assert_eq!(
-            unsafe { (*last).handler },
-            0x1000 + (TAP_CHAIN_POOL_LEN - 1)
-        );
-    }
+        extern "C" fn art_signal_chain_handler(
+            signo: c_int,
+            info: *mut libc::siginfo_t,
+            ctx: *mut c_void,
+        ) {
+            ART_RUNS.fetch_add(1, Ordering::SeqCst);
+            if ART_CLAIMS.load(Ordering::SeqCst) {
+                return;
+            }
+            let handler = USER_HANDLER.load(Ordering::SeqCst);
+            if USER_SIGINFO.load(Ordering::SeqCst) {
+                let f: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
+                    unsafe { std::mem::transmute::<usize, _>(handler) };
+                f(signo, info, ctx);
+            } else {
+                let f: extern "C" fn(c_int) = unsafe { std::mem::transmute::<usize, _>(handler) };
+                f(signo);
+            }
+        }
+        unsafe extern "C" fn fake_sigchain_sigaction(
+            signo: c_int,
+            new: *const libc::sigaction,
+            old: *mut libc::sigaction,
+        ) -> c_int {
+            if signo != CLAIMED {
+                return unsafe { libc::sigaction(signo, new, old) };
+            }
+            if let Some(old) = unsafe { old.as_mut() } {
+                *old = unsafe { std::mem::zeroed() };
+                old.sa_sigaction = USER_HANDLER.load(Ordering::SeqCst);
+                if USER_SIGINFO.load(Ordering::SeqCst) {
+                    old.sa_flags = libc::SA_SIGINFO;
+                }
+            }
+            if let Some(new) = unsafe { new.as_ref() } {
+                USER_HANDLER.store(new.sa_sigaction, Ordering::SeqCst);
+                USER_SIGINFO.store(new.sa_flags & libc::SA_SIGINFO != 0, Ordering::SeqCst);
+            }
+            0
+        }
+        unsafe extern "C" fn fake_sigchain_signal(
+            signo: c_int,
+            handler: libc::sighandler_t,
+        ) -> libc::sighandler_t {
+            if signo != CLAIMED {
+                return unsafe { libc::signal(signo, handler) };
+            }
+            USER_SIGINFO.store(false, Ordering::SeqCst);
+            USER_HANDLER.swap(handler, Ordering::SeqCst)
+        }
+        unsafe extern "C" fn fake_sigchain_sigprocmask(
+            how: c_int,
+            set: *const libc::sigset_t,
+            old: *mut libc::sigset_t,
+        ) -> c_int {
+            let Some(set) = (unsafe { set.as_ref() }) else {
+                return unsafe { libc::sigprocmask(how, std::ptr::null(), old) };
+            };
+            let mut allowed = *set;
+            unsafe {
+                libc::sigdelset(&mut allowed, CLAIMED);
+                libc::sigprocmask(how, &allowed, old)
+            }
+        }
+        extern "C" fn engine_handler(
+            _signo: c_int,
+            _info: *mut libc::siginfo_t,
+            _ctx: *mut c_void,
+        ) {
+            ENGINE_RUNS.fetch_add(1, Ordering::SeqCst);
+        }
+        extern "C" fn engine_plain_handler(_signo: c_int) {
+            ENGINE_PLAIN_RUNS.fetch_add(1, Ordering::SeqCst);
+        }
+        fn kernel_handler() -> usize {
+            let mut kernel: libc::sigaction = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigaction(CLAIMED, std::ptr::null(), &mut kernel) },
+                0
+            );
+            kernel.sa_sigaction
+        }
 
-    #[test]
-    fn tap_chain_register_reports_enomem_when_the_pool_is_exhausted() {
-        let pool = TapChainPool::new();
-        let next = AtomicUsize::new(0);
-        let slot: AtomicPtr<BionicSigaction> = AtomicPtr::new(std::ptr::null_mut());
-        let mk = |handler: usize| BionicSigaction {
+        let mut claim: libc::sigaction = unsafe { std::mem::zeroed() };
+        claim.sa_sigaction = art_signal_chain_handler as *const () as usize;
+        claim.sa_flags = libc::SA_SIGINFO;
+        assert_eq!(
+            unsafe { libc::sigaction(CLAIMED, &claim, std::ptr::null_mut()) },
+            0
+        );
+        assert!(ART_SIGNAL_CHAIN
+            .set(ArtSignalChain {
+                sigaction: fake_sigchain_sigaction,
+                signal: fake_sigchain_signal,
+                sigprocmask: fake_sigchain_sigprocmask,
+            })
+            .is_ok());
+        install_early_fault_tap(CLAIMED).expect("tap install");
+        let tap = early_fault_tap_handler as *const () as usize;
+        assert_eq!(kernel_handler(), tap);
+
+        let env = super::super::bionic_env::BionicEnv::with_host_baseline(false, true);
+        let addr = |name: &str| {
+            env.scope()
+                .resolve(name)
+                .unwrap_or_else(|| panic!("{name} must resolve"))
+                .addr as usize
+        };
+        let sigaction: unsafe extern "C" fn(
+            c_int,
+            *const BionicSigaction,
+            *mut BionicSigaction,
+        ) -> c_int = unsafe { std::mem::transmute(addr("sigaction")) };
+        let signal: unsafe extern "C" fn(c_int, libc::sighandler_t) -> libc::sighandler_t =
+            unsafe { std::mem::transmute(addr("signal")) };
+        let sigprocmask: unsafe extern "C" fn(
+            c_int,
+            *const BionicSigsetT,
+            *mut BionicSigsetT,
+        ) -> c_int = unsafe { std::mem::transmute(addr("sigprocmask")) };
+        let pthread_sigmask: unsafe extern "C" fn(
+            c_int,
+            *const BionicSigsetT,
+            *mut BionicSigsetT,
+        ) -> c_int = unsafe { std::mem::transmute(addr("pthread_sigmask")) };
+
+        let engine = BionicSigaction {
             sa_flags: libc::SA_SIGINFO,
-            handler,
+            handler: engine_handler as *const () as usize,
             sa_mask: 0,
             sa_restorer: 0,
         };
+        let mut previous = BionicSigaction {
+            sa_flags: -1,
+            handler: usize::MAX,
+            sa_mask: 0,
+            sa_restorer: 0,
+        };
+        assert_eq!(unsafe { sigaction(CLAIMED, &engine, &mut previous) }, 0);
+        assert_eq!(previous.handler, libc::SIG_DFL);
+        assert_eq!(
+            USER_HANDLER.load(Ordering::SeqCst),
+            engine.handler,
+            "sigchain keeps the engine's handler as its user action"
+        );
+        assert_eq!(kernel_handler(), tap, "the tap stays first in the kernel");
+        assert_eq!(
+            unsafe { (*TAP_CHAIN.load(Ordering::Acquire)).handler },
+            art_signal_chain_handler as *const () as usize,
+            "the tap still chains to ART's signal chain"
+        );
 
-        for k in 0..TAP_CHAIN_POOL_LEN {
-            let act = mk(0x1000 + k);
-            let ret =
-                unsafe { tap_chain_register(&pool, &next, &slot, &act, std::ptr::null_mut()) };
-            assert_eq!(ret, 0, "registration {k} fits in the pool");
-        }
-        let last = slot.load(Ordering::Acquire);
+        ART_CLAIMS.store(true, Ordering::SeqCst);
+        unsafe { libc::raise(CLAIMED) };
+        assert_eq!(
+            (
+                ART_RUNS.load(Ordering::SeqCst),
+                ENGINE_RUNS.load(Ordering::SeqCst)
+            ),
+            (1, 0),
+            "a signal ART handles never reaches the engine's handler"
+        );
+        ART_CLAIMS.store(false, Ordering::SeqCst);
+        unsafe { libc::raise(CLAIMED) };
+        assert_eq!(
+            (
+                ART_RUNS.load(Ordering::SeqCst),
+                ENGINE_RUNS.load(Ordering::SeqCst)
+            ),
+            (2, 1),
+            "a signal ART declines reaches the engine's handler"
+        );
 
-        let act = mk(0xdead);
-        let mut old = mk(0);
-        unsafe { *libc::__errno_location() = 0 };
-        let ret = unsafe { tap_chain_register(&pool, &next, &slot, &act, &mut old) };
+        let replaced = unsafe {
+            signal(
+                CLAIMED,
+                engine_plain_handler as *const () as libc::sighandler_t,
+            )
+        };
+        assert_eq!(replaced, engine.handler);
+        assert_eq!(
+            kernel_handler(),
+            tap,
+            "signal() leaves the kernel slot alone"
+        );
+        unsafe { libc::raise(CLAIMED) };
+        assert_eq!(ENGINE_PLAIN_RUNS.load(Ordering::SeqCst), 1);
 
-        assert_eq!(ret, -1, "a dropped registration must not report success");
-        assert_eq!(unsafe { *libc::__errno_location() }, libc::ENOMEM);
-        assert_eq!(old.handler, 0x1000 + TAP_CHAIN_POOL_LEN - 1);
-        assert_eq!(slot.load(Ordering::Acquire), last);
-        assert_eq!(unsafe { (*last).handler }, 0x1000 + TAP_CHAIN_POOL_LEN - 1);
+        let claimed_bit: BionicSigsetT = 1 << (CLAIMED - 1);
+        assert_eq!(
+            unsafe { sigprocmask(libc::SIG_BLOCK, &claimed_bit, std::ptr::null_mut()) },
+            0
+        );
+        assert_eq!(
+            unsafe { pthread_sigmask(libc::SIG_BLOCK, &claimed_bit, std::ptr::null_mut()) },
+            0
+        );
+        let mut blocked: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut blocked) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::sigismember(&blocked, CLAIMED) },
+            0,
+            "the engine cannot block a signal ART claimed"
+        );
     }
 
     #[test]
@@ -4422,6 +4533,12 @@ mod tests {
         let val = ECLIPSE_STACK_CHK_GUARD.load(Ordering::SeqCst);
         assert_ne!(val, 0, "the guard word is initialized non-zero");
         assert_eq!(val & 0xff, 0, "SSP convention: the guard's low byte is 0");
+        let at_random = unsafe { libc::getauxval(libc::AT_RANDOM) } as *const [u8; 8];
+        let seeded = usize::from_ne_bytes(unsafe { at_random.read_unaligned() }) & !0xff;
+        assert_eq!(
+            val, seeded,
+            "the guard is the per-process AT_RANDOM canary, as bionic seeds it"
+        );
     }
 
     #[test]
@@ -4844,6 +4961,56 @@ mod tests {
         unsafe { eclipse_aasset_close(asset) };
         ndk_registry::asset_managers().remove(mgr_h).ok();
         std::fs::remove_file(&apk).ok();
+    }
+
+    const BIONIC_ASSERT_CHILD: &str = "ECLIPSE_TEST_BIONIC_ASSERT_CHILD";
+
+    #[test]
+    fn bionic_assert_logs_its_message_and_aborts() {
+        if std::env::var_os(BIONIC_ASSERT_CHILD).is_some() {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) }, 0);
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .init();
+            let env = super::super::bionic_env::BionicEnv::with_host_baseline(false, true);
+            let addr = env
+                .scope()
+                .resolve("__assert")
+                .expect("__assert must resolve")
+                .addr;
+            let bionic_assert: unsafe extern "C" fn(*const c_char, c_int, *const c_char) =
+                unsafe { std::mem::transmute(addr as usize) };
+            unsafe { bionic_assert(c"Engine.cpp".as_ptr(), 302, c"ready".as_ptr()) };
+            return;
+        }
+        use std::os::unix::process::ExitStatusExt as _;
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the test harness executable must have a path"),
+        )
+        .args([
+            "--exact",
+            "loader::native_provider::tests::bionic_assert_logs_its_message_and_aborts",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(BIONIC_ASSERT_CHILD, "1")
+        .output()
+        .expect("the bionic __assert child must start");
+        let log = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "status={:?}, stderr={log}",
+            output.status
+        );
+        assert!(
+            log.contains("Engine.cpp:302: assertion \"ready\" failed"),
+            "stderr={log}"
+        );
     }
 
     const PUBLISHED_LOCALE_CHILD: &str = "ECLIPSE_TEST_PUBLISHED_LOCALE_CHILD";

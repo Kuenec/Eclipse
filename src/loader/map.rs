@@ -4,7 +4,7 @@ use rustix::mm::{
     madvise, mmap_anonymous, mprotect, munmap, Advice, MapFlags, MprotectFlags, ProtFlags,
 };
 
-use super::elf::{ElfImage, LoadSegment, RelroSegment, PF_R, PF_W, PF_X};
+use super::elf::{ElfError, ElfImage, LoadSegment, RelroSegment, PF_R, PF_W, PF_X};
 use super::reloc::{self, RelocError, RelocImage, SymbolResolver};
 use super::resolve::{Scope, ScopedResolver};
 use super::tls::{TlsLayout, TlsResolver};
@@ -23,7 +23,15 @@ pub enum MapError {
 
     Reloc(RelocError),
 
-    UnsupportedRelocation { r_type: u32, offset: u64 },
+    UnsupportedRelocation {
+        r_type: u32,
+        offset: u64,
+    },
+
+    RelocationDecode {
+        table: &'static str,
+        error: ElfError,
+    },
 }
 
 impl std::fmt::Display for MapError {
@@ -46,6 +54,9 @@ impl std::fmt::Display for MapError {
                 f,
                 "relocation type {r_type} at {offset:#x} is not supported by the engine loader"
             ),
+            Self::RelocationDecode { table, error } => {
+                write!(f, "decoding the {table} relocation table failed: {error}")
+            }
         }
     }
 }
@@ -142,8 +153,6 @@ pub struct MappedObject {
     span: usize,
 
     static_tls_offset: i64,
-
-    region_start: u64,
 }
 
 unsafe impl Send for MappedObject {}
@@ -159,7 +168,6 @@ impl MappedObject {
             return Err(MapError::NoLoadSegments);
         }
 
-        let min_vaddr = img.loads.iter().map(|s| s.vaddr).min().expect("non-empty");
         let mut max_end: u64 = 0;
         for s in &img.loads {
             if s.file_size > s.mem_size {
@@ -171,12 +179,7 @@ impl MappedObject {
                 .ok_or(MapError::SpanOverflow("vaddr + memsz"))?;
             max_end = max_end.max(end);
         }
-        let region_start = page_floor(min_vaddr, page_size);
-        let region_end =
-            page_ceil(max_end, page_size).ok_or(MapError::SpanOverflow("memsz ceil"))?;
-        let span_u64 = region_end
-            .checked_sub(region_start)
-            .ok_or(MapError::SpanOverflow("region end - start"))?;
+        let span_u64 = page_ceil(max_end, page_size).ok_or(MapError::SpanOverflow("memsz ceil"))?;
         let span =
             usize::try_from(span_u64).map_err(|_| MapError::SpanOverflow("span as usize"))?;
         if span == 0 {
@@ -200,25 +203,28 @@ impl MappedObject {
             let _ = unsafe { madvise(ptr, span, Advice::LinuxHugepage) };
         }
 
-        let load_base = (base.as_ptr() as u64).wrapping_sub(region_start);
+        let load_base = base.as_ptr() as u64;
 
         let mut obj = MappedObject {
             base,
             span,
             static_tls_offset: 0,
-            region_start,
         };
 
         for seg in &img.loads {
-            obj.populate_segment(file, seg, region_start, page_size)?;
+            obj.populate_segment(file, seg, page_size)?;
         }
 
         let relas = img
             .relocations()
-            .map_err(|_| MapError::SpanOverflow("relocations decode"))?;
-        let relr = img
-            .relr()
-            .map_err(|_| MapError::SpanOverflow("relr decode"))?;
+            .map_err(|error| MapError::RelocationDecode {
+                table: "RELA",
+                error,
+            })?;
+        let relr = img.relr().map_err(|error| MapError::RelocationDecode {
+            table: "RELR",
+            error,
+        })?;
 
         let mut stats = MapStats {
             segments_mapped: img.loads.len(),
@@ -259,7 +265,7 @@ impl MappedObject {
         }
 
         for seg in &img.loads {
-            obj.protect_segment(seg, region_start, page_size)?;
+            obj.protect_segment(seg, page_size)?;
         }
 
         Ok((obj, stats))
@@ -271,17 +277,12 @@ impl MappedObject {
         scope: &Scope,
         page_size: u64,
     ) -> Result<SymbolRelocStats, MapError> {
-        let min_vaddr = img
-            .loads
-            .iter()
-            .map(|s| s.vaddr)
-            .min()
-            .ok_or(MapError::NoLoadSegments)?;
-        let region_start = page_floor(min_vaddr, page_size);
-
         let relas = img
             .relocations()
-            .map_err(|_| MapError::SpanOverflow("relocations decode"))?;
+            .map_err(|error| MapError::RelocationDecode {
+                table: "RELA",
+                error,
+            })?;
         let mut symbol_relas: Vec<reloc::Rela> = Vec::new();
         let mut stats = SymbolRelocStats::default();
         for r in &relas {
@@ -305,16 +306,11 @@ impl MappedObject {
         }
 
         let resolver = ScopedResolver::new(scope, &img.dynsyms);
-        let load_base = self.load_base().wrapping_sub(region_start);
+        let load_base = self.load_base();
         let tls_off = self.static_tls_offset;
 
         for seg in &img.loads {
-            self.mprotect_segment_pages(
-                seg,
-                region_start,
-                page_size,
-                ProtFlags::READ | ProtFlags::WRITE,
-            )?;
+            self.mprotect_segment_pages(seg, page_size, ProtFlags::READ | ProtFlags::WRITE)?;
         }
 
         let resolved_nonnull = {
@@ -334,7 +330,7 @@ impl MappedObject {
         };
         stats.resolved_nonnull = resolved_nonnull;
 
-        self.restore_protection(img, region_start, page_size)?;
+        self.restore_protection(img, page_size)?;
 
         Ok(stats)
     }
@@ -345,17 +341,12 @@ impl MappedObject {
         scope: &Scope,
         page_size: u64,
     ) -> Result<PartialSymbolStats, MapError> {
-        let min_vaddr = img
-            .loads
-            .iter()
-            .map(|s| s.vaddr)
-            .min()
-            .ok_or(MapError::NoLoadSegments)?;
-        let region_start = page_floor(min_vaddr, page_size);
-
         let relas = img
             .relocations()
-            .map_err(|_| MapError::SpanOverflow("relocations decode"))?;
+            .map_err(|error| MapError::RelocationDecode {
+                table: "RELA",
+                error,
+            })?;
 
         let resolver = ScopedResolver::new(scope, &img.dynsyms);
         let mut to_apply: Vec<reloc::Rela> = Vec::new();
@@ -398,16 +389,11 @@ impl MappedObject {
         }
         stats.unresolved = unresolved_names.into_iter().collect();
 
-        let load_base = self.load_base().wrapping_sub(region_start);
+        let load_base = self.load_base();
         let tls_off = self.static_tls_offset;
 
         for seg in &img.loads {
-            self.mprotect_segment_pages(
-                seg,
-                region_start,
-                page_size,
-                ProtFlags::READ | ProtFlags::WRITE,
-            )?;
+            self.mprotect_segment_pages(seg, page_size, ProtFlags::READ | ProtFlags::WRITE)?;
         }
         {
             let bytes = unsafe { self.image_bytes() };
@@ -416,7 +402,7 @@ impl MappedObject {
                 reloc::apply_one(&mut image, &resolver, r)?;
             }
         }
-        self.restore_protection(img, region_start, page_size)?;
+        self.restore_protection(img, page_size)?;
 
         Ok(stats)
     }
@@ -429,17 +415,12 @@ impl MappedObject {
         own_tp_offset: Option<i64>,
         page_size: u64,
     ) -> Result<TlsRelocStats, MapError> {
-        let min_vaddr = img
-            .loads
-            .iter()
-            .map(|s| s.vaddr)
-            .min()
-            .ok_or(MapError::NoLoadSegments)?;
-        let region_start = page_floor(min_vaddr, page_size);
-
         let relas = img
             .relocations()
-            .map_err(|_| MapError::SpanOverflow("relocations decode"))?;
+            .map_err(|error| MapError::RelocationDecode {
+                table: "RELA",
+                error,
+            })?;
         let mut tls_relas: Vec<reloc::Rela> = Vec::new();
         let mut stats = TlsRelocStats::default();
         for r in &relas {
@@ -459,15 +440,10 @@ impl MappedObject {
         }
 
         let resolver = TlsResolver::new(inner, &img.dynsyms, layout, own_tp_offset);
-        let load_base = self.load_base().wrapping_sub(region_start);
+        let load_base = self.load_base();
 
         for seg in &img.loads {
-            self.mprotect_segment_pages(
-                seg,
-                region_start,
-                page_size,
-                ProtFlags::READ | ProtFlags::WRITE,
-            )?;
+            self.mprotect_segment_pages(seg, page_size, ProtFlags::READ | ProtFlags::WRITE)?;
         }
 
         {
@@ -476,7 +452,7 @@ impl MappedObject {
             reloc::apply_rela(&mut image, &resolver, &tls_relas)?;
         }
 
-        self.restore_protection(img, region_start, page_size)?;
+        self.restore_protection(img, page_size)?;
 
         Ok(stats)
     }
@@ -497,22 +473,12 @@ impl MappedObject {
         &mut self,
         file: &[u8],
         seg: &LoadSegment,
-        region_start: u64,
         page_size: u64,
     ) -> Result<(), MapError> {
-        let seg_off_in_region = seg
-            .vaddr
-            .checked_sub(region_start)
-            .ok_or(MapError::SpanOverflow("vaddr - region_start"))?;
-        let seg_off = usize::try_from(seg_off_in_region)
+        let seg_off = usize::try_from(seg.vaddr)
             .map_err(|_| MapError::SpanOverflow("segment offset as usize"))?;
 
-        self.mprotect_segment_pages(
-            seg,
-            region_start,
-            page_size,
-            ProtFlags::READ | ProtFlags::WRITE,
-        )?;
+        self.mprotect_segment_pages(seg, page_size, ProtFlags::READ | ProtFlags::WRITE)?;
 
         let filesz = usize::try_from(seg.file_size)
             .map_err(|_| MapError::SpanOverflow("filesz as usize"))?;
@@ -541,14 +507,9 @@ impl MappedObject {
         Ok(())
     }
 
-    fn restore_protection(
-        &self,
-        img: &ElfImage<'_>,
-        region_start: u64,
-        page_size: u64,
-    ) -> Result<(), MapError> {
+    fn restore_protection(&self, img: &ElfImage<'_>, page_size: u64) -> Result<(), MapError> {
         for seg in &img.loads {
-            self.protect_segment(seg, region_start, page_size)?;
+            self.protect_segment(seg, page_size)?;
         }
         if let Some(relro) = img.relro {
             self.apply_relro(&relro, page_size)?;
@@ -556,20 +517,14 @@ impl MappedObject {
         Ok(())
     }
 
-    fn protect_segment(
-        &self,
-        seg: &LoadSegment,
-        region_start: u64,
-        page_size: u64,
-    ) -> Result<(), MapError> {
+    fn protect_segment(&self, seg: &LoadSegment, page_size: u64) -> Result<(), MapError> {
         let prot = prot_of(seg.flags);
-        self.mprotect_segment_pages(seg, region_start, page_size, prot)
+        self.mprotect_segment_pages(seg, page_size, prot)
     }
 
     fn mprotect_segment_pages(
         &self,
         seg: &LoadSegment,
-        region_start: u64,
         page_size: u64,
         prot: ProtFlags,
     ) -> Result<(), MapError> {
@@ -584,10 +539,7 @@ impl MappedObject {
         if seg_end <= seg_start {
             return Ok(());
         }
-        let off_in_region = seg_start
-            .checked_sub(region_start)
-            .ok_or(MapError::SpanOverflow("seg_start - region_start"))?;
-        let off = usize::try_from(off_in_region)
+        let off = usize::try_from(seg_start)
             .map_err(|_| MapError::SpanOverflow("protect offset as usize"))?;
         let len = usize::try_from(seg_end - seg_start)
             .map_err(|_| MapError::SpanOverflow("protect len as usize"))?;
@@ -616,10 +568,7 @@ impl MappedObject {
         if prot_end <= prot_start {
             return Ok(());
         }
-        let off_in_region = prot_start
-            .checked_sub(self.region_start)
-            .ok_or(MapError::SpanOverflow("relro start - region_start"))?;
-        let off = usize::try_from(off_in_region)
+        let off = usize::try_from(prot_start)
             .map_err(|_| MapError::SpanOverflow("relro offset as usize"))?;
         let len = usize::try_from(prot_end - prot_start)
             .map_err(|_| MapError::SpanOverflow("relro len as usize"))?;
@@ -1090,6 +1039,93 @@ mod tests {
 
         obj.relocate_symbols_partial(&img, &Scope::new(), PAGE)
             .expect("R_X86_64_NONE is a no-op");
+    }
+
+    #[test]
+    fn relocation_decode_failures_keep_the_decoder_error() {
+        const DT_ANDROID_RELA: i64 = 0x6000_0011;
+        const DT_ANDROID_RELASZ: i64 = 0x6000_0012;
+        const APS2_OFF: u64 = 0x400;
+        const DT_NULL_SLOT: usize = 11;
+
+        let mut buf = build_two_segment_fixture();
+        buf[APS2_OFF as usize..APS2_OFF as usize + 4].copy_from_slice(b"APS1");
+        put_dyn(&mut buf, DT_NULL_SLOT, DT_ANDROID_RELA, APS2_OFF);
+        put_dyn(&mut buf, DT_NULL_SLOT + 1, DT_ANDROID_RELASZ, 8);
+        put_dyn(&mut buf, DT_NULL_SLOT + 2, DT_NULL, 0);
+        let img = ElfImage::parse(&buf).expect("fixture parses");
+
+        let err = MappedObject::map_and_relocate(&img, &buf, PAGE)
+            .err()
+            .expect("a bad APS2 stream must fail the load");
+        assert!(
+            err.to_string().contains("bad APS2 magic"),
+            "unexpected message: {err}"
+        );
+        assert!(matches!(
+            err,
+            MapError::RelocationDecode {
+                table: "RELA",
+                error: ElfError::BadAndroidMagic(_),
+            }
+        ));
+
+        let mut buf = build_two_segment_fixture();
+        put_dyn(&mut buf, 3, DT_RELR, 0x9000);
+        let img = ElfImage::parse(&buf).expect("fixture parses");
+        let err = MappedObject::map_and_relocate(&img, &buf, PAGE)
+            .err()
+            .expect("an unmapped DT_RELR must fail the load");
+        assert!(matches!(
+            err,
+            MapError::RelocationDecode {
+                table: "RELR",
+                error: ElfError::UnmappedVaddr(0x9000),
+            }
+        ));
+    }
+
+    #[test]
+    fn nonzero_first_load_vaddr_places_everything_at_bias_plus_vaddr() {
+        const SHIFT: u64 = 0x10000;
+        let mut buf = build_two_segment_fixture();
+        for ph in 0..3 {
+            let off = PH_OFF + ph * PHDR_SIZE + 16;
+            let vaddr = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+            put_u64(&mut buf, off, vaddr + SHIFT);
+        }
+        for (slot, tag, vaddr) in [
+            (0, DT_RELA, RELA_OFF),
+            (3, DT_RELR, RELR_OFF),
+            (6, DT_SYMTAB, SYM_OFF),
+            (8, DT_STRTAB, STR_OFF),
+            (10, DT_HASH, HASH_OFF),
+        ] {
+            put_dyn(&mut buf, slot, tag, vaddr + SHIFT);
+        }
+        put_u64(&mut buf, RELA_OFF as usize, RELA_TARGET + SHIFT);
+        put_u64(&mut buf, RELA_OFF as usize + 16, SHIFT + RELA_ADDEND as u64);
+        put_u64(&mut buf, RELR_OFF as usize, RELR_TARGET + SHIFT);
+        put_u64(&mut buf, RELR_TARGET as usize, SHIFT + RELR_SEED);
+        let img = ElfImage::parse(&buf).expect("shifted fixture parses");
+        assert_eq!(img.loads[0].vaddr, SHIFT);
+
+        let (mut obj, stats) =
+            MappedObject::map_and_relocate(&img, &buf, PAGE).expect("map+relocate");
+        assert_eq!((stats.relative_applied, stats.relr_applied), (1, 1));
+        obj.relocate_symbols(&img, &Scope::new(), PAGE)
+            .expect("symbol relocation");
+
+        let bias = obj.load_base();
+        let word = |vaddr: u64| unsafe { ((bias + vaddr) as *const u64).read() };
+        assert_eq!(word(SHIFT + TEXT_MARK_OFF as u64), TEXT_MARK);
+        assert_eq!(word(SHIFT + RELA_TARGET), bias + SHIFT + RELA_ADDEND as u64);
+        assert_eq!(word(SHIFT + RELR_TARGET), bias + SHIFT + RELR_SEED);
+        assert_eq!(
+            obj.read_u64((SHIFT + RELA_TARGET) as usize)
+                .expect("read by vaddr"),
+            bias + SHIFT + RELA_ADDEND as u64
+        );
     }
 
     #[test]
