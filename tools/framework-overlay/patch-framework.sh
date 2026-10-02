@@ -13,6 +13,7 @@ CORE_ALL_CLASSES="${CORE_ALL_CLASSES:-$ART_DIR/../../core-all_classes.jar}"
 R8_JAR="${R8_JAR:-$repo/vendor/toolchain/r8/r8-8.13.23.jar}"
 R8_SHA256='e3cdcb003d9beca956209ad6b9e9df31f26b732bfaed9c7c8674e903ca9f3b81'
 WOLFSSL_SOURCE="${WOLFSSL_SOURCE:-$repo/vendor/atl/thirdparty/art_standalone/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLImplementSSLSession.java}"
+ZONEINFO_DIR="${ZONEINFO_DIR:-/usr/share/zoneinfo}"
 
 ART_BOOT_JARS=(
     core-oj-hostdex.jar
@@ -62,7 +63,7 @@ require_executable "$JAVAC" "javac not found (set JAVAC, or vendor a JDK at vend
 require_executable "$JAR" "jar not found (set JAR, or vendor a JDK at vendor/toolchain/jdk-*/)"
 require_executable "$DX" "dx not found (set DX or install the Android dx tool)"
 if "$JAVAC" --release 8 -version >/dev/null 2>&1; then
-    JAVAC_8_FLAGS=(--release 8)
+    JAVAC_8_FLAGS=(--release 8 -Xlint:-options)
 else
     javac_version="$("$JAVAC" -version 2>&1)"
     case "$javac_version" in
@@ -74,6 +75,7 @@ fi
 [ -f "$ORIG_FW/api-impl.jar" ] || fail "stock framework not found at $ORIG_FW (set ORIG_FW; install android-translation-layer)"
 [ -f "$CORE_ALL_CLASSES" ] || fail "ART core class archive not found at $CORE_ALL_CLASSES (set CORE_ALL_CLASSES)"
 [ -f "$R8_JAR" ] || fail "R8 8.13.23 not found at $R8_JAR (set R8_JAR)"
+[ -f "$ZONEINFO_DIR/tzdata.zi" ] || fail "IANA zoneinfo with tzdata.zi not found at $ZONEINFO_DIR (set ZONEINFO_DIR)"
 r8_sha256="$(sha256sum "$R8_JAR" | awk '{print $1}')"
 [ "$r8_sha256" = "$R8_SHA256" ] || fail "R8 checksum mismatch at $R8_JAR (expected $R8_SHA256, got $r8_sha256)"
 R8_JAVA="${R8_JAVA:-$(find_r8_java)}"
@@ -615,6 +617,22 @@ ANCHOR_PC="$ANCHOR_PC" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_PC}) >= 0) ? 
 perl -0pi -e 's{\.method protected onPostCreate\(Landroid/os/Bundle;\)V\n    \.registers 4\n\n    const-string v0, "Activity"\n\n    const-string v1, "- onPostCreate - yay!"\n\n    invoke-static \{v0, v1\}, Landroid/util/Slog;->i\(Ljava/lang/String;Ljava/lang/String;\)I\n\n    return-void\n\.end method}{.method protected onPostCreate(Landroid/os/Bundle;)V\n    .registers 4\n\n    const-string v0, "Activity"\n\n    const-string v1, "- onPostCreate - yay!"\n\n    invoke-static \{v0, v1\}, Landroid/util/Slog;->i(Ljava/lang/String;Ljava/lang/String;)I\n\n    iget-object v0, p0, Landroid/app/Activity;->fragments:Ljava/util/List;\n\n    invoke-interface \{v0\}, Ljava/util/List;->iterator()Ljava/util/Iterator;\n\n    move-result-object v1\n\n    :goto_pc\n    invoke-interface \{v1\}, Ljava/util/Iterator;->hasNext()Z\n\n    move-result v0\n\n    if-eqz v0, :cond_pc\n\n    invoke-interface \{v1\}, Ljava/util/Iterator;->next()Ljava/lang/Object;\n\n    move-result-object v0\n\n    check-cast v0, Landroid/app/Fragment;\n\n    invoke-virtual \{v0, p1\}, Landroid/app/Fragment;->onActivityCreated(Landroid/os/Bundle;)V\n\n    goto :goto_pc\n\n    :cond_pc\n    return-void\n.end method}s' "$asm"
 grep -qF 'invoke-virtual {v0, p1}, Landroid/app/Fragment;->onActivityCreated(Landroid/os/Bundle;)V' "$asm" || fail "Activity.smali onPostCreate dispatch insert failed (drift?)"
 
+prd_sm="$here/smali/android/app/PermissionResultDelivery.smali"
+[ -f "$prd_sm" ] || fail "PermissionResultDelivery.smali missing at $prd_sm"
+n="$(grep -cF '.method public requestPermissions([Ljava/lang/String;I)V' "$asm")" || true
+[ "$n" = "1" ] || fail "Activity.smali requestPermissions anchor not unique (found $n, expected 1) — installed Activity drifted; update patch-framework.sh"
+! grep -qF 'onRequestPermissionsResult(I[Ljava/lang/String;[I)V' "$asm" || fail "Activity.smali already declares onRequestPermissionsResult — installed Activity drifted; update patch-framework.sh"
+perl -0pi -e '
+    s{\.method public requestPermissions\(\[Ljava/lang/String;I\)V\n.*?\.end method\n}{
+        index($&, q{const-string v2, "): not handled"}) >= 0
+            or die "requestPermissions body changed";
+        ".method public requestPermissions([Ljava/lang/String;I)V\n    .registers 3\n\n    invoke-static {p0, p1, p2}, Landroid/app/PermissionResultDelivery;->post(Landroid/app/Activity;[Ljava/lang/String;I)V\n\n    return-void\n.end method\n\n.method public onRequestPermissionsResult(I[Ljava/lang/String;[I)V\n    .registers 4\n\n    return-void\n.end method\n"
+    }se;
+' "$asm" || fail "Activity.requestPermissions no longer only logs 'not handled' — installed Activity drifted; update patch-framework.sh"
+grep -qF 'invoke-static {p0, p1, p2}, Landroid/app/PermissionResultDelivery;->post(Landroid/app/Activity;[Ljava/lang/String;I)V' "$asm" || fail "Activity.smali requestPermissions answer insert failed (drift?)"
+grep -qF '.method public onRequestPermissionsResult(I[Ljava/lang/String;[I)V' "$asm" || fail "Activity.smali onRequestPermissionsResult insert failed (drift?)"
+! grep -qF '): not handled' "$asm" || fail "Activity.requestPermissions still only logs 'not handled' — permission requests would never be answered"
+
 lmsm="$work/smali/android/location/LocationManager.smali"
 [ -f "$lmsm" ] || fail "LocationManager.smali not found after baksmali"
 n="$(grep -cF '.method public getAllProviders()Ljava/util/List;' "$lmsm")" || true
@@ -903,6 +921,7 @@ cp "$dsm" "$work/smali-view/android/view/Display.smali"
 cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
 cp "$here/smali/android/view/Display\$Mode.smali" "$work/smali-view/android/view/"
 cp "$asm" "$work/smali-view/android/app/Activity.smali"
+cp "$prd_sm" "$work/smali-view/android/app/"
 cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
 cp "$lmsm" "$work/smali-view/android/location/LocationManager.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
@@ -968,6 +987,50 @@ for core_jar in core-oj-hostdex.jar core-libart-hostdex.jar; do
     cp "$core_work/output/classes.dex" "$core_work/update/classes.dex"
     (cd "$core_work/update" && "$JAR" uf "$work/art/$core_jar" classes.dex)
 done
+
+mkdir -p "$work/tzdata-compactor" "$work/art/zoneinfo"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/tzdata-compactor" "$here/TzdataCompactor.java"
+"$JAVA" -cp "$work/tzdata-compactor" TzdataCompactor "$ZONEINFO_DIR" "$work/art/zoneinfo/tzdata"
+
+libart_work="$work/core-libart-time-zone"
+mkdir -p "$libart_work/update"
+unzip -p "$work/art/core-libart-hostdex.jar" classes.dex > "$libart_work/classes.dex"
+"$JAVA" -jar "$BAKSMALI_JAR" disassemble "$libart_work/classes.dex" -o "$libart_work/smali" >/dev/null
+tz_files_sm="$libart_work/smali/libcore/util/TimeZoneDataFiles.smali"
+tz_getter_dir="$libart_work/smali/org/apache/harmony/luni/internal/util"
+tz_getter_sm="$tz_getter_dir/TimezoneGetter.smali"
+[ -f "$tz_files_sm" ] || fail "TimeZoneDataFiles.smali not found in core-libart-hostdex.jar"
+[ -f "$tz_getter_sm" ] || fail "TimezoneGetter.smali not found in core-libart-hostdex.jar"
+perl -0pi -e '
+    s{(\.method public static getSystemTimeZoneFile\(Ljava/lang/String;\)Ljava/lang/String;\n.*?\.end method\n)}{
+        my $body = $1;
+        $body =~ s{const-string v1, "ANDROID_ROOT"\n\n    invoke-static \{v1\}, Ljava/lang/System;->getenv\(Ljava/lang/String;\)Ljava/lang/String;}{const-string v1, "eclipse.zoneinfo_dir"\n\n    invoke-static {v1}, Ljava/lang/System;->getProperty(Ljava/lang/String;)Ljava/lang/String;}
+            or die "getSystemTimeZoneFile no longer reads ANDROID_ROOT";
+        $body =~ s{const-string v1, "/usr/share/zoneinfo/"}{const-string v1, "/"}
+            or die "getSystemTimeZoneFile no longer appends /usr/share/zoneinfo/";
+        $body
+    }se or die "getSystemTimeZoneFile not found";
+' "$tz_files_sm" || fail "libcore TimeZoneDataFiles.getSystemTimeZoneFile drifted; update patch-framework.sh"
+grep -qF 'const-string v1, "eclipse.zoneinfo_dir"' "$tz_files_sm" || fail "TimeZoneDataFiles zoneinfo-directory insert failed (drift?)"
+grep -qxF '.field private static instance:Lorg/apache/harmony/luni/internal/util/TimezoneGetter;' "$tz_getter_sm" || fail "TimezoneGetter lost its instance field — core-libart drifted; update patch-framework.sh"
+! grep -qF '<clinit>' "$tz_getter_sm" || fail "TimezoneGetter already has a static initializer — core-libart drifted; update patch-framework.sh"
+cat >> "$tz_getter_sm" <<'ECLIPSE_TIMEZONE_GETTER'
+
+.method static constructor <clinit>()V
+    .registers 1
+
+    new-instance v0, Lorg/apache/harmony/luni/internal/util/UserTimezoneGetter;
+
+    invoke-direct {v0}, Lorg/apache/harmony/luni/internal/util/UserTimezoneGetter;-><init>()V
+
+    sput-object v0, Lorg/apache/harmony/luni/internal/util/TimezoneGetter;->instance:Lorg/apache/harmony/luni/internal/util/TimezoneGetter;
+
+    return-void
+.end method
+ECLIPSE_TIMEZONE_GETTER
+cp "$here/smali/org/apache/harmony/luni/internal/util/UserTimezoneGetter.smali" "$tz_getter_dir/"
+"$JAVA" -jar "$SMALI_JAR" assemble --api 26 "$libart_work/smali" -o "$libart_work/update/classes.dex" >/dev/null
+(cd "$libart_work/update" && "$JAR" uf "$work/art/core-libart-hostdex.jar" classes.dex)
 
 unzip -p "$work/art/wolfssljni-hostdex.jar" classes.dex > "$work/wolf-classes.dex"
 "$JAVA" -jar "$BAKSMALI_JAR" disassemble "$work/wolf-classes.dex" -o "$work/wolf-smali" >/dev/null
@@ -1048,6 +1111,29 @@ probe_output="$(env \
 [ "$probe_output" = '2026-08-30 13:00:00' ] \
     || fail "date-time formatter regression probe returned '$probe_output'"
 
+time_zone_probe="$here/tests/TimeZoneProbe.java"
+[ -f "$time_zone_probe" ] || fail "time-zone regression probe missing at $time_zone_probe"
+mkdir -p "$work/time-zone-probe/classes" "$work/time-zone-probe/cache" "$work/time-zone-probe/data"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/time-zone-probe/classes" "$time_zone_probe"
+"$DX" --dex --output="$work/time-zone-probe/probe.jar" "$work/time-zone-probe/classes"
+time_zone_boot_class_path="$boot_class_path:$work/time-zone-probe/probe.jar"
+time_zone_boot_class_path_locations="$boot_class_path_locations:/system/framework/probe.jar"
+time_zone_output="$(env \
+    ANDROID_DATA="$work/time-zone-probe/data" \
+    XDG_CACHE_HOME="$work/time-zone-probe/cache" \
+    BOOTCLASSPATH="$time_zone_boot_class_path" \
+    "$DALVIKVM" \
+    -Ximage:"$work/art/oat/boot.art" \
+    -Xbootclasspath:"$time_zone_boot_class_path" \
+    -Xbootclasspath-locations:"$time_zone_boot_class_path_locations" \
+    -Ximage-compiler-option --no-generate-debug-info \
+    -Ximage-compiler-option --no-generate-mini-debug-info \
+    -Declipse.zoneinfo_dir="$work/art/zoneinfo" \
+    -Duser.timezone=America/Los_Angeles \
+    TimeZoneProbe)"
+[ "$time_zone_output" = 'time-zone-ok' ] \
+    || fail "time-zone regression probe returned '$time_zone_output'"
+
 keygen_probe="$here/tests/KeyGenParameterSpecProbe.java"
 [ -f "$keygen_probe" ] || fail "key-generation regression probe missing at $keygen_probe"
 mkdir -p "$work/keygen-probe/classes"
@@ -1098,6 +1184,8 @@ rm -f "$art_ready"
 for art_jar in "${ART_BOOT_JARS[@]}"; do
     cp "$work/art/$art_jar" "$OUT/art/$art_jar"
 done
+mkdir -p "$OUT/art/zoneinfo"
+cp "$work/art/zoneinfo/tzdata" "$OUT/art/zoneinfo/tzdata"
 printf '%s\n' 'eclipse-art-overlay-v1' > "$art_ready"
 
 echo "OK: patched framework overlay installed at $OUT"

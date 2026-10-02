@@ -56,7 +56,7 @@ configs = [source for source in merged if source.get("dest-filename") == "config
 if len(configs) != 1:
     sys.exit(f"the lockfiles need {len(configs)} different cargo source configs; expected one")
 merged.remove(configs[0])
-merged.append(configs[0])
+merged.append({**configs[0], "dest-filename": "config.toml"})
 
 with open(out, "w", encoding="utf-8") as handle:
     json.dump(merged, handle, indent=4)

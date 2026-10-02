@@ -1,3 +1,7 @@
 self-hosted-runner:
   labels:
     - eclipse-e2e
+paths:
+  .github/workflows/flatpak.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'
