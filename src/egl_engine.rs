@@ -7,7 +7,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, Raw
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::window::{Window, WindowAttributes, WindowId};
 
 type EglApi = egl::EGL1_4;
 
@@ -72,6 +72,8 @@ pub enum EglError {
 
     Present(egl::Error),
 
+    SwapInterval(egl::Error),
+
     UnsupportedDisplay,
 
     WaylandEgl(String),
@@ -88,6 +90,7 @@ impl fmt::Display for EglError {
             Self::Context(e) => write!(f, "EGL context creation failed: {e}"),
             Self::Surface(e) => write!(f, "eglCreateWindowSurface failed: {e}"),
             Self::Present(e) => write!(f, "EGL make-current/swap failed: {e}"),
+            Self::SwapInterval(e) => write!(f, "eglSwapInterval(0) failed: {e}"),
             Self::UnsupportedDisplay => {
                 f.write_str("unsupported display server (need Wayland or X11)")
             }
@@ -506,6 +509,10 @@ impl Gles2 {
 pub fn render_test_frames(surface: &EngineGlSurface, frames: u32) -> Result<(), EglError> {
     let gl = surface.gl();
     let geo = surface.geometry();
+    surface
+        .egl
+        .swap_interval(surface.display, 0)
+        .map_err(EglError::SwapInterval)?;
 
     const VERT_SRC: &[u8] =
         b"attribute vec2 aPos;\nvoid main(){gl_Position=vec4(aPos,0.0,1.0);}\n\0";
@@ -609,6 +616,14 @@ const _: u8 = GL_FALSE;
 
 const GL_TEST_FRAMES: u32 = 5;
 
+const GL_TEST_WINDOW: &str = "__gl-test (engine GLES2/EGL)";
+
+const GL_TEST_ANW_WINDOW: &str = "__gl-test-anw (engine WSI bind: ANativeWindow → host EGL)";
+
+fn test_window(subject: &str) -> WindowAttributes {
+    Window::default_attributes().with_title(crate::window_title(subject))
+}
+
 #[derive(Debug)]
 pub struct GlTestReport {
     pub geometry: WindowGeometry,
@@ -636,7 +651,7 @@ struct GlTestApp {
 
 impl ApplicationHandler for GlTestApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let attrs = Window::default_attributes().with_title("Eclipse __gl-test (engine GLES2/EGL)");
+        let attrs = test_window(GL_TEST_WINDOW);
         match event_loop.create_window(attrs) {
             Ok(window) => {
                 let size = window.inner_size();
@@ -764,8 +779,7 @@ impl GlAnwTestApp {
 
 impl ApplicationHandler for GlAnwTestApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let attrs = Window::default_attributes()
-            .with_title("Eclipse __gl-test-anw (engine WSI bind: ANativeWindow → host EGL)");
+        let attrs = test_window(GL_TEST_ANW_WINDOW);
         match event_loop.create_window(attrs) {
             Ok(window) => {
                 let size = window.inner_size();
@@ -860,6 +874,14 @@ mod tests {
             2,
             "must request a GLES2 (client version 2) context"
         );
+    }
+
+    #[test]
+    fn gl_test_windows_carry_the_title_prefix_of_every_eclipse_window() {
+        for subject in [GL_TEST_WINDOW, GL_TEST_ANW_WINDOW] {
+            let title = test_window(subject).title;
+            assert_eq!(title, format!("Eclipse — {subject}"));
+        }
     }
 
     #[test]

@@ -1,6 +1,8 @@
 pub mod apk;
 pub mod audio;
 pub mod bionic;
+#[cfg(test)]
+mod bounded_child;
 mod clipboard;
 pub mod config;
 pub mod diagnostics;
@@ -24,3 +26,7 @@ pub mod webview;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const APP_ID: &str = "io.github.kuenec.Eclipse";
+
+pub fn window_title(subject: &str) -> String {
+    format!("Eclipse — {subject}")
+}

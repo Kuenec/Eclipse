@@ -61,7 +61,7 @@ ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 
-rustix = { version = "1", default-features = false, features = ["fs"] }
+rustix = { version = "1", default-features = false, features = ["fs", "time"] }
 
 [build-dependencies]
 

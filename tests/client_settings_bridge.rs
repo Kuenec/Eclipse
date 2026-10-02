@@ -1,5 +1,11 @@
+#[path = "../src/bounded_child.rs"]
+mod bounded_child;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
+
+const RUN_LIMIT: Duration = Duration::from_secs(60);
 
 const BRIDGE_INACTIVE: &str = "client-settings bridge did not load";
 const SEARCH_PATH_SEPARATOR: &str = "contains a colon or semicolon";
@@ -39,7 +45,7 @@ fn run_missing_apk(root: &Path, app_data: &Path, redirect_active: bool) -> Outpu
     } else {
         command.env_remove("ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE");
     }
-    command.output().expect("spawn eclipse run")
+    bounded_child::output(&mut command, RUN_LIMIT)
 }
 
 #[test]

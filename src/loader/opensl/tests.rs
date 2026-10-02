@@ -1036,6 +1036,8 @@ fn a_host_output_that_cannot_open_reports_the_cpal_cause() {
 
 const HOST_OUTPUT_CHILD: &str = "ECLIPSE_TEST_HOST_OUTPUT_CHILD";
 
+const HOST_OUTPUT_CHILD_LIMIT: Duration = Duration::from_secs(60);
+
 enum HostOutput {
     Missing,
     Null,
@@ -1054,14 +1056,15 @@ fn on_host_output(output: HostOutput, test: &str, body: impl FnOnce()) {
         ),
     };
     let filter = format!("loader::opensl::tests::{test}");
-    let child = std::process::Command::new(
-        std::env::current_exe().expect("the test harness executable must have a path"),
-    )
-    .args(["--exact", filter.as_str(), "--test-threads=1"])
-    .env(HOST_OUTPUT_CHILD, "1")
-    .env("ALSA_CONFIG_PATH", alsa_config)
-    .output()
-    .expect("the host output child must start");
+    let child = crate::bounded_child::output(
+        std::process::Command::new(
+            std::env::current_exe().expect("the test harness executable must have a path"),
+        )
+        .args(["--exact", filter.as_str(), "--test-threads=1"])
+        .env(HOST_OUTPUT_CHILD, "1")
+        .env("ALSA_CONFIG_PATH", alsa_config),
+        HOST_OUTPUT_CHILD_LIMIT,
+    );
     let stdout = String::from_utf8_lossy(&child.stdout);
     assert!(
         child.status.success() && stdout.contains("1 passed"),

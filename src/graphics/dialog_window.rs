@@ -63,7 +63,7 @@ impl DialogContent {
         } else {
             &self.title
         };
-        format!("Eclipse — {title}")
+        crate::window_title(title)
     }
 
     fn nodes(

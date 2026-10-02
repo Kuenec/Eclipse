@@ -1,6 +1,14 @@
+#[path = "../src/bounded_child.rs"]
+mod bounded_child;
+
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::time::Duration;
+
+const DIAGNOSTIC_LIMIT: Duration = Duration::from_secs(60);
+
+const ENGINE_LIMIT: Duration = Duration::from_secs(300);
 
 fn roblox_apk_present() -> bool {
     eclipse::apk::ApkSetPaths::from_env()
@@ -35,12 +43,13 @@ fn display_available() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some()
 }
 
-fn run_eclipse(subcommand: &str, args: &[&OsStr]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_eclipse"))
-        .arg(subcommand)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn eclipse {subcommand}: {e}"))
+fn run_eclipse(subcommand: &str, args: &[&OsStr], limit: Duration) -> Output {
+    bounded_child::output(
+        Command::new(env!("CARGO_BIN_EXE_eclipse"))
+            .arg(subcommand)
+            .args(args),
+        limit,
+    )
 }
 
 fn combined(out: &Output) -> String {
@@ -56,6 +65,26 @@ fn gl_env_unavailable(output: &str) -> bool {
         || output.contains("no available configs")
 }
 
+struct HarnessLibDir(PathBuf);
+
+impl HarnessLibDir {
+    fn create() -> Self {
+        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("run-libroblox-init-{}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create the harness lib dir");
+        Self(path)
+    }
+}
+
+impl Drop for HarnessLibDir {
+    fn drop(&mut self) {
+        let removed = std::fs::remove_dir_all(&self.0);
+        if !std::thread::panicking() {
+            removed.expect("remove the harness lib dir");
+        }
+    }
+}
+
 #[test]
 fn run_libroblox_init_runs_every_constructor() {
     if !roblox_apk_present() {
@@ -66,11 +95,13 @@ fn run_libroblox_init_runs_every_constructor() {
         return;
     }
 
-    let lib_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("run-libroblox-init-{}", std::process::id()));
-    std::fs::create_dir_all(&lib_dir).expect("create the harness lib dir");
-    let out = run_eclipse("__run-libroblox-init", &[lib_dir.as_os_str()]);
-    std::fs::remove_dir_all(&lib_dir).expect("remove the harness lib dir");
+    let lib_dir = HarnessLibDir::create();
+    let out = run_eclipse(
+        "__run-libroblox-init",
+        &[lib_dir.0.as_os_str()],
+        ENGINE_LIMIT,
+    );
+    drop(lib_dir);
     let text = combined(&out);
 
     assert!(
@@ -103,7 +134,7 @@ fn gl_test_renders_engine_surface_with_zero_gl_errors() {
         return;
     }
 
-    let out = run_eclipse("__gl-test", &[]);
+    let out = run_eclipse("__gl-test", &[], DIAGNOSTIC_LIMIT);
     let text = combined(&out);
 
     if !out.status.success() && gl_env_unavailable(&text) {
@@ -132,7 +163,7 @@ fn gl_test_anw_binds_real_wsi_handle() {
         return;
     }
 
-    let out = run_eclipse("__gl-test-anw", &[]);
+    let out = run_eclipse("__gl-test-anw", &[], DIAGNOSTIC_LIMIT);
     let text = combined(&out);
 
     if !out.status.success() && gl_env_unavailable(&text) {
@@ -177,7 +208,7 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
         return;
     }
 
-    let out = run_eclipse("__webview-test", &[]);
+    let out = run_eclipse("__webview-test", &[], ENGINE_LIMIT);
     let text = combined(&out);
 
     if !out.status.success()
@@ -548,7 +579,7 @@ fn framework_overlay_ships_tzdata_and_the_host_default_time_zone() {
 
 #[test]
 fn input_test_delivers_ident_then_looper_wake() {
-    let out = run_eclipse("__input-test", &[]);
+    let out = run_eclipse("__input-test", &[], DIAGNOSTIC_LIMIT);
     let text = combined(&out);
 
     assert!(

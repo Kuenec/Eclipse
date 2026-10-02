@@ -868,7 +868,7 @@ impl Launch {
 }
 
 fn window_title() -> String {
-    format!("Eclipse — {}", eclipse::apk::ROBLOX_PACKAGE)
+    eclipse::window_title(eclipse::apk::ROBLOX_PACKAGE)
 }
 
 fn show_error_window(message: &str, log: Option<&Path>) {
@@ -1221,7 +1221,7 @@ fn boot_and_play(
 
     println!("# Opening the host window (winit; close it to exit)…");
     host.run_game(
-        &format!("Eclipse — {}", manifest.package),
+        &eclipse::window_title(&manifest.package),
         &vm,
         config.touch_mode,
     )?;
