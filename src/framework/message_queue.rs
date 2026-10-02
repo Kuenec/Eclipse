@@ -107,7 +107,7 @@ fn state(handle: i64) -> Option<Arc<QueueState>> {
 pub(super) fn create(role: QueueRole) -> Option<i64> {
     static NEXT_HANDLE: AtomicI64 = AtomicI64::new(FIRST_HANDLE);
     let handle = NEXT_HANDLE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .ok()?;

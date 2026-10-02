@@ -59,7 +59,7 @@ fn text_face(
         })
     };
     mapped_spec(font_enum, mappings)
-        .and_then(&face)
+        .and_then(face)
         .or_else(|| face(unmapped_spec(font_enum)))
 }
 
