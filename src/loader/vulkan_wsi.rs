@@ -42,11 +42,15 @@ pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capa
         let host_fn: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR =
             std::mem::transmute(host as usize as *const ());
         let r = host_fn(physical_device, surface, p_caps);
-        if r == vk::Result::SUCCESS {
-            fix_undefined_extent(&mut *p_caps);
+        if r != vk::Result::SUCCESS {
+            return r;
         }
-        r
+        fix_undefined_extent(&mut *p_caps);
     }
+    if super::vk_overlay::take_out_of_date_surface(surface) {
+        return vk::Result::ERROR_SURFACE_LOST_KHR;
+    }
+    vk::Result::SUCCESS
 }
 
 pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capabilities2_khr(
@@ -191,6 +195,13 @@ pub(crate) fn swapchain_present_mode(
         }
         _ => Ok(requested),
     }
+}
+
+#[cfg(test)]
+pub(super) fn use_host_surface_capabilities_for_test(
+    query: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
+) {
+    HOST_PDSC.store(query.map_or(0, |f| f as usize as u64), Ordering::SeqCst);
 }
 
 #[cfg(test)]
