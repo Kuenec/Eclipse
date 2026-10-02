@@ -15,6 +15,8 @@ updates:
     ignore:
       - dependency-name: libloading
         versions: [">= 0.9"]
+      - dependency-name: smithay-clipboard
+        versions: [">= 0.7.3"]
 
   - package-ecosystem: cargo
     directory: /crates/libm-shim
