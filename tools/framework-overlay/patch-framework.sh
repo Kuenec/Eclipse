@@ -548,6 +548,63 @@ perl -0pi -e 's{(\.method public setOnCapturedPointerListener\(Landroid/view/Vie
 grep -qF 'setAutofillHints([Ljava/lang/String;)V' "$vsm" || fail "View.smali setAutofillHints insert failed (drift?)"
 grep -qF 'setImportantForAutofill(I)V' "$vsm" || fail "View.smali setImportantForAutofill insert failed (drift?)"
 
+etsm="$work/smali/android/widget/EditText.smali"
+[ -f "$etsm" ] || fail "EditText.smali not found after baksmali of the installed framework"
+grep -qF 'iget-wide v0, p0, Landroid/widget/EditText;->widget:J' "$etsm" || fail "EditText.smali no longer reads its widget handle — installed EditText drifted; update patch-framework.sh"
+for edit_text_method in 'getSelectionStart' 'getSelectionEnd' 'setSelection'; do
+    ! grep -qF "$edit_text_method" "$etsm" || fail "EditText.smali already declares $edit_text_method — installed EditText drifted; update patch-framework.sh"
+done
+cat >> "$etsm" <<'ECLIPSE_EDIT_TEXT_SELECTION'
+
+
+.method public getSelectionStart()I
+    .registers 3
+
+    iget-wide v0, p0, Landroid/widget/EditText;->widget:J
+
+    invoke-direct {p0, v0, v1}, Landroid/widget/EditText;->native_getSelectionStart(J)I
+
+    move-result v0
+
+    return v0
+.end method
+
+.method public getSelectionEnd()I
+    .registers 3
+
+    iget-wide v0, p0, Landroid/widget/EditText;->widget:J
+
+    invoke-direct {p0, v0, v1}, Landroid/widget/EditText;->native_getSelectionEnd(J)I
+
+    move-result v0
+
+    return v0
+.end method
+
+.method public setSelection(I)V
+    .registers 4
+
+    iget-wide v0, p0, Landroid/widget/EditText;->widget:J
+
+    invoke-direct {p0, v0, v1, p1}, Landroid/widget/EditText;->native_setSelection(JI)V
+
+    return-void
+.end method
+
+.method private native native_getSelectionStart(J)I
+.end method
+
+.method private native native_getSelectionEnd(J)I
+.end method
+
+.method private native native_setSelection(JI)V
+.end method
+ECLIPSE_EDIT_TEXT_SELECTION
+for edit_text_method in '.method public getSelectionStart()I' '.method public getSelectionEnd()I' '.method public setSelection(I)V'; do
+    n="$(grep -cF "$edit_text_method" "$etsm")" || true
+    [ "$n" = "1" ] || fail "EditText.smali selection override '$edit_text_method' found $n times (expected 1)"
+done
+
 dsm="$work/smali/android/view/Display.smali"
 [ -f "$dsm" ] || fail "Display.smali not found after baksmali"
 ! grep -qF 'refresh_rate' "$dsm" || fail "Display.smali already declares refresh-rate state — installed Display drifted; update patch-framework.sh"
@@ -938,6 +995,8 @@ cp "$wssm" "$work/smali-view/android/webkit/WebSettings.smali"
 cp "$wvcsm" "$work/smali-view/android/webkit/WebViewClient.smali"
 cp "$jpm" "$work/smali-view/android/app/job/JobParameters.smali"
 cp "$psm" "$work/smali-view/android/graphics/Paint.smali"
+mkdir -p "$work/smali-view/android/widget"
+cp "$etsm" "$work/smali-view/android/widget/EditText.smali"
 "$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
 
 cp "$work/stock-classes.dex" "$work/jar/classes3.dex"

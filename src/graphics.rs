@@ -1675,6 +1675,10 @@ impl GameWindow<'_> {
         let Some(window) = self.window.as_ref() else {
             return;
         };
+        if crate::framework::take_host_ime_reset() && self.ime != HostIme::Disallowed {
+            window.set_ime_allowed(false);
+            self.ime = HostIme::Disallowed;
+        }
         for call in ime_calls(self.ime, wanted) {
             match call {
                 ImeCall::Allow(allowed) => window.set_ime_allowed(allowed),
