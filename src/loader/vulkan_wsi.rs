@@ -47,7 +47,7 @@ pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capa
         }
         fix_undefined_extent(&mut *p_caps);
     }
-    if super::vk_overlay::take_out_of_date_surface(surface) {
+    if super::vk_overlay::take_pending_rebuild(surface) {
         return vk::Result::ERROR_SURFACE_LOST_KHR;
     }
     vk::Result::SUCCESS
