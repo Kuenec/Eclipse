@@ -316,6 +316,39 @@ pub(crate) fn set_instance(instance: vk::Instance) {
     INSTANCE.store(instance.as_raw(), Ordering::Relaxed);
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SwapchainFit {
+    #[default]
+    Unproven,
+    Optimal,
+    RebuildPending,
+    SuboptimalAccepted,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HostReport {
+    FramePresented,
+    Suboptimal,
+    OutOfDate,
+}
+
+impl SwapchainFit {
+    fn after(self, report: HostReport) -> Self {
+        match (self, report) {
+            (_, HostReport::OutOfDate) | (Self::Optimal, HostReport::Suboptimal) => {
+                Self::RebuildPending
+            }
+            (Self::Unproven, HostReport::FramePresented) => Self::Optimal,
+            (Self::Unproven, HostReport::Suboptimal) => Self::SuboptimalAccepted,
+            (
+                Self::Optimal | Self::RebuildPending | Self::SuboptimalAccepted,
+                HostReport::FramePresented,
+            )
+            | (Self::RebuildPending | Self::SuboptimalAccepted, HostReport::Suboptimal) => self,
+        }
+    }
+}
+
 #[derive(Default)]
 struct OverlayState {
     device: u64,
@@ -324,7 +357,7 @@ struct OverlayState {
 
     surface: u64,
 
-    out_of_date: bool,
+    fit: SwapchainFit,
 
     format: i32,
 
@@ -338,7 +371,7 @@ static STATE: Mutex<OverlayState> = Mutex::new(OverlayState {
     device: 0,
     swapchain: 0,
     surface: 0,
-    out_of_date: false,
+    fit: SwapchainFit::Unproven,
     format: 0,
     width: 0,
     height: 0,
@@ -502,43 +535,52 @@ unsafe fn acquire_like_android(
     let result = host_acquire();
     match result {
         vk::Result::SUCCESS => result,
-        vk::Result::SUBOPTIMAL_KHR => vk::Result::SUCCESS,
+        vk::Result::SUBOPTIMAL_KHR => {
+            note_host_report(swapchain, HostReport::Suboptimal);
+            vk::Result::SUCCESS
+        }
         failed => {
             if let (Some(index), Some(slot)) = (engine_index, unsafe { p_image_index.as_mut() }) {
                 *slot = index;
             }
             if failed == vk::Result::ERROR_OUT_OF_DATE_KHR {
-                note_out_of_date(swapchain);
+                note_host_report(swapchain, HostReport::OutOfDate);
             }
             failed
         }
     }
 }
 
-fn note_out_of_date(swapchain: vk::SwapchainKHR) {
+fn note_host_report(swapchain: vk::SwapchainKHR, report: HostReport) {
     let mut st = STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if st.swapchain == 0 || st.swapchain != swapchain.as_raw() || st.out_of_date {
+    if st.swapchain == 0 || st.swapchain != swapchain.as_raw() {
         return;
     }
-    st.out_of_date = true;
-    tracing::info!(
-        swapchain = format_args!("{:#x}", st.swapchain),
-        "vk-overlay: the host reports the engine swapchain out of date; its next surface \
-         capability query reports the surface lost so the engine rebuilds the swapchain"
-    );
+    let fit = st.fit.after(report);
+    if fit == SwapchainFit::RebuildPending && st.fit != SwapchainFit::RebuildPending {
+        tracing::info!(
+            swapchain = format_args!("{:#x}", st.swapchain),
+            ?report,
+            "vk-overlay: the host reports the engine swapchain unfit; its next surface \
+             capability query reports the surface lost so the engine rebuilds the swapchain"
+        );
+    }
+    st.fit = fit;
 }
 
-pub(crate) fn take_out_of_date_surface(surface: vk::SurfaceKHR) -> bool {
+pub(crate) fn take_pending_rebuild(surface: vk::SurfaceKHR) -> bool {
     let mut st = STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let lost = st.swapchain != 0 && st.out_of_date && st.surface == surface.as_raw();
-    if lost {
-        st.out_of_date = false;
+    let pending = st.swapchain != 0
+        && st.fit == SwapchainFit::RebuildPending
+        && st.surface == surface.as_raw();
+    if pending {
+        st.fit = SwapchainFit::SuboptimalAccepted;
     }
-    lost
+    pending
 }
 
 unsafe extern "system" fn eclipse_vk_acquire_next_image2_khr(
@@ -667,7 +709,7 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
         if let Ok(mut st) = STATE.lock() {
             st.swapchain = swapchain.as_raw();
             st.surface = info.surface.as_raw();
-            st.out_of_date = false;
+            st.fit = SwapchainFit::Unproven;
             st.format = info.image_format.as_raw();
             st.width = info.image_extent.width;
             st.height = info.image_extent.height;
@@ -3633,9 +3675,15 @@ unsafe extern "system" fn eclipse_vk_queue_present_khr(
             crate::webview::client::active_view(),
         )
     };
-    if result == vk::Result::ERROR_OUT_OF_DATE_KHR {
+    let report = match result {
+        vk::Result::SUCCESS => Some(HostReport::FramePresented),
+        vk::Result::SUBOPTIMAL_KHR => Some(HostReport::Suboptimal),
+        vk::Result::ERROR_OUT_OF_DATE_KHR => Some(HostReport::OutOfDate),
+        _ => None,
+    };
+    if let Some(report) = report {
         for &swapchain in unsafe { presented_swapchains(p_present_info) } {
-            note_out_of_date(swapchain);
+            note_host_report(swapchain, report);
         }
     }
     result
@@ -3655,6 +3703,7 @@ unsafe fn presented_swapchains<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicI32;
 
     #[test]
     fn web_present_queue_is_reserved_only_when_the_family_has_a_spare_queue() {
@@ -4516,19 +4565,27 @@ mod tests {
     const RETIRED_SWAPCHAIN: u64 = 0x52;
     const CREATED_SWAPCHAIN: u64 = 0xB;
     const OUT_OF_DATE_AFTER_PULL_SWAPCHAIN: u64 = 0x53;
-    const SUBOPTIMAL_IMAGE: u32 = 2;
+    const ACQUIRED_IMAGE: u32 = 2;
+
+    static STUB_ENGINE_ACQUIRE: AtomicI32 = AtomicI32::new(0);
+    static STUB_ENGINE_PRESENT: AtomicI32 = AtomicI32::new(0);
 
     fn stub_host_acquire(swapchain: vk::SwapchainKHR, image_index: *mut u32) -> vk::Result {
         match swapchain.as_raw() {
             SUBOPTIMAL_SWAPCHAIN => {
-                unsafe { *image_index = SUBOPTIMAL_IMAGE };
+                unsafe { *image_index = ACQUIRED_IMAGE };
                 vk::Result::SUBOPTIMAL_KHR
             }
-            OUT_OF_DATE_SWAPCHAIN | RETIRED_SWAPCHAIN | CREATED_SWAPCHAIN => {
-                vk::Result::ERROR_OUT_OF_DATE_KHR
+            OUT_OF_DATE_SWAPCHAIN | RETIRED_SWAPCHAIN => vk::Result::ERROR_OUT_OF_DATE_KHR,
+            CREATED_SWAPCHAIN => {
+                let reported = vk::Result::from_raw(STUB_ENGINE_ACQUIRE.load(Ordering::SeqCst));
+                if matches!(reported, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR) {
+                    unsafe { *image_index = ACQUIRED_IMAGE };
+                }
+                reported
             }
             OUT_OF_DATE_AFTER_PULL_SWAPCHAIN => {
-                unsafe { *image_index = SUBOPTIMAL_IMAGE };
+                unsafe { *image_index = ACQUIRED_IMAGE };
                 vk::Result::ERROR_OUT_OF_DATE_KHR
             }
             _ => vk::Result::ERROR_SURFACE_LOST_KHR,
@@ -4593,7 +4650,7 @@ mod tests {
 
         assert_eq!(
             suboptimal,
-            [(vk::Result::SUCCESS, SUBOPTIMAL_IMAGE); 2],
+            [(vk::Result::SUCCESS, ACQUIRED_IMAGE); 2],
             "an image acquired from a suboptimal swapchain reaches the engine as a plain success"
         );
         assert_eq!(
@@ -4645,11 +4702,11 @@ mod tests {
         vk::Result::SUCCESS
     }
 
-    unsafe extern "system" fn stub_out_of_date_present(
+    unsafe extern "system" fn stub_engine_present(
         _queue: vk::Queue,
         _info: *const vk::PresentInfoKHR<'_>,
     ) -> vk::Result {
-        vk::Result::ERROR_OUT_OF_DATE_KHR
+        vk::Result::from_raw(STUB_ENGINE_PRESENT.load(Ordering::SeqCst))
     }
 
     fn engine_swapchain_on(surface: u64) -> vk::SwapchainKHR {
@@ -4688,11 +4745,11 @@ mod tests {
         (queried, caps)
     }
 
-    struct OutOfDateHost {
+    struct ScriptedHost {
         saved: [(&'static AtomicU64, u64); 5],
     }
 
-    impl OutOfDateHost {
+    impl ScriptedHost {
         fn install() -> Self {
             let stub = |slot: &'static AtomicU64, f: *const ()| {
                 (slot, slot.swap(f as u64, Ordering::SeqCst))
@@ -4700,19 +4757,29 @@ mod tests {
             super::super::vulkan_wsi::use_host_surface_capabilities_for_test(Some(
                 stub_surface_capabilities,
             ));
-            Self {
+            let host = Self {
                 saved: [
                     stub(&HOST_ACQUIRE_NEXT_IMAGE, stub_acquire_image as *const ()),
                     stub(&HOST_ACQUIRE_NEXT_IMAGE2, stub_acquire_image2 as *const ()),
                     stub(&HOST_CREATE_SWAPCHAIN, stub_create_swapchain as *const ()),
                     stub(&HOST_DESTROY_SWAPCHAIN, stub_destroy_swapchain as *const ()),
-                    stub(&HOST_QUEUE_PRESENT, stub_out_of_date_present as *const ()),
+                    stub(&HOST_QUEUE_PRESENT, stub_engine_present as *const ()),
                 ],
-            }
+            };
+            host.reports(
+                vk::Result::ERROR_OUT_OF_DATE_KHR,
+                vk::Result::ERROR_OUT_OF_DATE_KHR,
+            );
+            host
+        }
+
+        fn reports(&self, acquire: vk::Result, present: vk::Result) {
+            STUB_ENGINE_ACQUIRE.store(acquire.as_raw(), Ordering::SeqCst);
+            STUB_ENGINE_PRESENT.store(present.as_raw(), Ordering::SeqCst);
         }
     }
 
-    impl Drop for OutOfDateHost {
+    impl Drop for ScriptedHost {
         fn drop(&mut self) {
             for (slot, saved) in self.saved {
                 slot.store(saved, Ordering::SeqCst);
@@ -4725,7 +4792,7 @@ mod tests {
     #[test]
     fn an_out_of_date_engine_swapchain_reports_its_surface_lost_to_the_next_query() {
         let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _host = OutOfDateHost::install();
+        let _host = ScriptedHost::install();
         let swapchain = engine_swapchain_on(ENGINE_SURFACE);
 
         let retired = engine_acquires(RETIRED_SWAPCHAIN);
@@ -4772,7 +4839,7 @@ mod tests {
     #[test]
     fn an_out_of_date_present_reports_the_surface_lost_unless_the_engine_dropped_the_swapchain() {
         let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _host = OutOfDateHost::install();
+        let _host = ScriptedHost::install();
 
         let dropped = engine_swapchain_on(ENGINE_SURFACE);
         let dropped_present = engine_presents(dropped);
@@ -4796,6 +4863,189 @@ mod tests {
             after_present,
             vk::Result::ERROR_SURFACE_LOST_KHR,
             "an out-of-date present makes the engine rebuild its swapchain"
+        );
+    }
+
+    #[test]
+    fn acquire_failures_other_than_out_of_date_leave_the_surface_alone() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let host = ScriptedHost::install();
+        let swapchain = engine_swapchain_on(ENGINE_SURFACE);
+        let failures = [
+            vk::Result::ERROR_SURFACE_LOST_KHR,
+            vk::Result::TIMEOUT,
+            vk::Result::NOT_READY,
+        ];
+
+        let answers = failures.map(|failure| {
+            host.reports(failure, vk::Result::SUCCESS);
+            let acquired = engine_acquires(swapchain.as_raw());
+            let (queried, _) = engine_queries_surface(ENGINE_SURFACE);
+            (acquired, queried)
+        });
+
+        assert_eq!(
+            answers,
+            failures.map(|failure| ([(failure, u32::MAX); 2], vk::Result::SUCCESS)),
+            "the engine sees each failure as the host reported it, and its surface still answers \
+             normally, because only an out-of-date swapchain needs a rebuild"
+        );
+    }
+
+    fn engine_frame_on(swapchain: vk::SwapchainKHR) -> ([(vk::Result, u32); 2], vk::Result) {
+        (
+            engine_acquires(swapchain.as_raw()),
+            engine_presents(swapchain),
+        )
+    }
+
+    #[test]
+    fn a_swapchain_that_turns_suboptimal_asks_the_engine_for_one_rebuild() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let host = ScriptedHost::install();
+        let swapchain = engine_swapchain_on(ENGINE_SURFACE);
+
+        host.reports(vk::Result::SUCCESS, vk::Result::SUCCESS);
+        let optimal = [engine_frame_on(swapchain), engine_frame_on(swapchain)];
+        let (while_optimal, _) = engine_queries_surface(ENGINE_SURFACE);
+        host.reports(vk::Result::SUBOPTIMAL_KHR, vk::Result::SUCCESS);
+        let suboptimal = engine_frame_on(swapchain);
+        let (first, _) = engine_queries_surface(ENGINE_SURFACE);
+        host.reports(vk::Result::SUCCESS, vk::Result::SUCCESS);
+        let _optimal_again = [engine_frame_on(swapchain), engine_frame_on(swapchain)];
+        host.reports(vk::Result::SUBOPTIMAL_KHR, vk::Result::SUCCESS);
+        let _suboptimal_again = [engine_frame_on(swapchain), engine_frame_on(swapchain)];
+        let (second, _) = engine_queries_surface(ENGINE_SURFACE);
+
+        let frame = (
+            [(vk::Result::SUCCESS, ACQUIRED_IMAGE); 2],
+            vk::Result::SUCCESS,
+        );
+        assert_eq!(optimal, [frame; 2]);
+        assert_eq!(
+            suboptimal, frame,
+            "the engine acquires its image from a suboptimal swapchain as on Android"
+        );
+        assert_eq!(
+            [while_optimal, first, second],
+            [
+                vk::Result::SUCCESS,
+                vk::Result::ERROR_SURFACE_LOST_KHR,
+                vk::Result::SUCCESS,
+            ],
+            "a swapchain that turns suboptimal after optimal frames makes the engine rebuild it \
+             once, so the host can allocate buffers that fit the surface, and never again while \
+             the engine keeps it, even after more optimal frames, so the engine cannot rebuild \
+             in a loop"
+        );
+    }
+
+    #[test]
+    fn a_swapchain_suboptimal_from_its_first_frame_never_asks_for_a_rebuild() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let host = ScriptedHost::install();
+        let swapchain = engine_swapchain_on(ENGINE_SURFACE);
+
+        host.reports(vk::Result::SUBOPTIMAL_KHR, vk::Result::SUCCESS);
+        let _born_suboptimal = engine_frame_on(swapchain);
+        host.reports(vk::Result::SUCCESS, vk::Result::SUCCESS);
+        let _optimal = [engine_frame_on(swapchain), engine_frame_on(swapchain)];
+        host.reports(vk::Result::SUBOPTIMAL_KHR, vk::Result::SUBOPTIMAL_KHR);
+        let _suboptimal_again = engine_frame_on(swapchain);
+        let (queried, _) = engine_queries_surface(ENGINE_SURFACE);
+
+        assert_eq!(
+            queried,
+            vk::Result::SUCCESS,
+            "a swapchain the host reports suboptimal from its first frame never asks for a \
+             rebuild, so the engine cannot rebuild in a loop"
+        );
+    }
+
+    #[test]
+    fn a_suboptimal_present_after_an_optimal_frame_asks_the_engine_for_a_rebuild() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let host = ScriptedHost::install();
+        let swapchain = engine_swapchain_on(ENGINE_SURFACE);
+
+        host.reports(vk::Result::SUCCESS, vk::Result::SUCCESS);
+        let _optimal = engine_frame_on(swapchain);
+        host.reports(vk::Result::SUCCESS, vk::Result::SUBOPTIMAL_KHR);
+        let presented = engine_frame_on(swapchain);
+        let (queried, _) = engine_queries_surface(ENGINE_SURFACE);
+
+        assert_eq!(
+            presented,
+            (
+                [(vk::Result::SUCCESS, ACQUIRED_IMAGE); 2],
+                vk::Result::SUBOPTIMAL_KHR
+            ),
+            "the engine sees a suboptimal present as Android reports it"
+        );
+        assert_eq!(
+            queried,
+            vk::Result::ERROR_SURFACE_LOST_KHR,
+            "a driver that reports suboptimal only from present still gets a rebuilt swapchain"
+        );
+    }
+
+    fn presented_optimally(host: &ScriptedHost, swapchain: vk::SwapchainKHR) {
+        host.reports(vk::Result::SUCCESS, vk::Result::SUCCESS);
+        let _optimal = engine_frame_on(swapchain);
+    }
+
+    fn suboptimal_from_creation(host: &ScriptedHost, swapchain: vk::SwapchainKHR) {
+        host.reports(vk::Result::SUBOPTIMAL_KHR, vk::Result::SUBOPTIMAL_KHR);
+        let _suboptimal = engine_frame_on(swapchain);
+    }
+
+    fn rebuild_asked_for_turning_suboptimal(host: &ScriptedHost, swapchain: vk::SwapchainKHR) {
+        presented_optimally(host, swapchain);
+        host.reports(vk::Result::SUBOPTIMAL_KHR, vk::Result::SUCCESS);
+        let _suboptimal = engine_frame_on(swapchain);
+        let _rebuild_asked = engine_queries_surface(ENGINE_SURFACE);
+    }
+
+    fn out_of_date_on_acquire(host: &ScriptedHost, swapchain: vk::SwapchainKHR) {
+        host.reports(
+            vk::Result::ERROR_OUT_OF_DATE_KHR,
+            vk::Result::ERROR_OUT_OF_DATE_KHR,
+        );
+        let _out_of_date = engine_acquires(swapchain.as_raw());
+    }
+
+    fn out_of_date_on_present(host: &ScriptedHost, swapchain: vk::SwapchainKHR) {
+        host.reports(vk::Result::SUCCESS, vk::Result::ERROR_OUT_OF_DATE_KHR);
+        let _out_of_date = engine_frame_on(swapchain);
+    }
+
+    #[test]
+    fn an_out_of_date_swapchain_is_rebuilt_whatever_the_host_reported_before() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let host = ScriptedHost::install();
+        let histories: [fn(&ScriptedHost, vk::SwapchainKHR); 3] = [
+            presented_optimally,
+            suboptimal_from_creation,
+            rebuild_asked_for_turning_suboptimal,
+        ];
+        let failures: [fn(&ScriptedHost, vk::SwapchainKHR); 2] =
+            [out_of_date_on_acquire, out_of_date_on_present];
+
+        let answers = histories.map(|history| {
+            failures.map(|failure| {
+                let swapchain = engine_swapchain_on(ENGINE_SURFACE);
+                history(&host, swapchain);
+                failure(&host, swapchain);
+                engine_queries_surface(ENGINE_SURFACE).0
+            })
+        });
+
+        assert_eq!(
+            answers,
+            [[vk::Result::ERROR_SURFACE_LOST_KHR; 2]; 3],
+            "an out-of-date swapchain cannot present, so the engine rebuilds it whether the game \
+             was running on it when a monitor changed, it was suboptimal from creation, or it \
+             already asked for a rebuild"
         );
     }
 
