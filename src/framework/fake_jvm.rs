@@ -8,7 +8,7 @@ use jni::objects::JObject;
 use jni::sys::{
     jboolean, jclass, jint, jmethodID, jobject, jstring, jthrowable, jvalue, jweak, JNIEnv,
     JNIInvokeInterface_, JNIInvokeInterface__1_2, JNINativeInterface_, JNINativeInterface__1_6,
-    JavaVM, JNI_OK, JNI_VERSION_1_6,
+    JNINativeMethod, JavaVM, JNI_OK, JNI_VERSION_1_6,
 };
 use jni::{Env, EnvUnowned, Outcome};
 
@@ -38,6 +38,7 @@ struct Heap {
     objects: Vec<ObjectEntry>,
     methods: Vec<String>,
     hooks: HashMap<(usize, String), Hook>,
+    natives: HashMap<(String, String, String), usize>,
 }
 
 impl Heap {
@@ -309,6 +310,29 @@ unsafe extern "system" fn call_static_object_method_a(
     }
 }
 
+unsafe extern "system" fn register_natives(
+    _env: *mut JNIEnv,
+    class: jclass,
+    methods: *const JNINativeMethod,
+    count: jint,
+) -> jint {
+    let mut heap = heap();
+    let class = heap.text(class).unwrap_or_default();
+    let count = usize::try_from(count).unwrap_or(0);
+    for method in unsafe { std::slice::from_raw_parts(methods, count) } {
+        let text = |chars: *const c_char| {
+            unsafe { CStr::from_ptr(chars) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        heap.natives.insert(
+            (class.clone(), text(method.name), text(method.signature)),
+            method.fnPtr as usize,
+        );
+    }
+    JNI_OK
+}
+
 unsafe extern "system" fn get_env(_vm: *mut JavaVM, env: *mut *mut c_void, _version: jint) -> jint {
     unsafe { *env = env_ptr().cast() };
     JNI_OK
@@ -413,6 +437,10 @@ fn env_ptr() -> *mut JNIEnv {
                 release_string_utf_chars as *const (),
             ),
             (offset_of!(Table, GetJavaVM), get_java_vm as *const ()),
+            (
+                offset_of!(Table, RegisterNatives),
+                register_natives as *const (),
+            ),
         ];
         for (offset, function) in functions {
             table[slot(offset)] = function as usize;
@@ -484,6 +512,17 @@ pub(super) fn collect(obj: &JObject) -> bool {
     true
 }
 
+pub(super) fn throw(class: &str) {
+    PENDING_EXCEPTION.with(|pending| *pending.borrow_mut() = Some(class.to_owned()));
+}
+
 pub(super) fn take_exception() -> Option<String> {
     PENDING_EXCEPTION.with(|pending| pending.borrow_mut().take())
+}
+
+pub(super) fn registered_native(class: &str, name: &str, sig: &str) -> Option<usize> {
+    heap()
+        .natives
+        .get(&(class.to_owned(), name.to_owned(), sig.to_owned()))
+        .copied()
 }

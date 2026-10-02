@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use jni::objects::JObject;
-use jni::refs::Global;
+use jni::refs::{Global, Weak};
 
 static WINDOWS: OnceLock<Mutex<Registry>> = OnceLock::new();
 
@@ -19,6 +19,8 @@ pub enum WindowRegistryError {
 
     StaleHandle,
 
+    NotADialog,
+
     Poisoned,
 }
 
@@ -31,6 +33,7 @@ impl fmt::Display for WindowRegistryError {
             Self::StaleHandle => {
                 f.write_str("window handle refers to a freed slot (stale generation)")
             }
+            Self::NotADialog => f.write_str("window handle names an activity window, not a dialog"),
             Self::Poisoned => f.write_str("window registry mutex was poisoned"),
         }
     }
@@ -43,6 +46,51 @@ pub struct WindowState {
     pub title: String,
 
     pub jobject: Option<Global<JObject<'static>>>,
+
+    pub root_view: Option<i64>,
+
+    pub dialog: Option<DialogState>,
+}
+
+#[derive(Debug)]
+pub struct DialogState {
+    pub owner: Weak<JObject<'static>>,
+
+    pub shown: Option<Global<JObject<'static>>>,
+
+    pub message: Option<String>,
+
+    pub buttons: [i64; 3],
+
+    pub items: Vec<String>,
+
+    pub items_listener: Option<Global<JObject<'static>>>,
+}
+
+impl DialogState {
+    pub fn new(owner: Weak<JObject<'static>>) -> Self {
+        Self {
+            owner,
+            shown: None,
+            message: None,
+            buttons: [0; 3],
+            items: Vec::new(),
+            items_listener: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogView {
+    pub handle: WindowHandle,
+
+    pub title: String,
+
+    pub message: Option<String>,
+
+    pub buttons: [i64; 3],
+
+    pub items: Vec<String>,
 
     pub root_view: Option<i64>,
 }
@@ -75,27 +123,87 @@ fn lock() -> Result<std::sync::MutexGuard<'static, Registry>, WindowRegistryErro
         .map_err(|_: PoisonError<_>| WindowRegistryError::Poisoned)
 }
 
-pub fn allocate() -> Result<WindowHandle, WindowRegistryError> {
+fn insert(state: WindowState) -> Result<WindowHandle, WindowRegistryError> {
     let mut reg = lock()?;
-    let handle = if let Some(index) = reg.free.pop() {
+    if let Some(index) = reg.free.pop() {
         let slot = &mut reg.slots[index as usize];
-        slot.state = Some(WindowState::default());
-        pack(index, slot.generation)
-    } else {
-        let index: u32 = reg
-            .slots
-            .len()
-            .try_into()
-            .map_err(|_| WindowRegistryError::OutOfRange)?;
-        reg.slots.push(Slot {
-            generation: 1,
-            state: Some(WindowState::default()),
-        });
-        pack(index, 1)
-    };
+        slot.state = Some(state);
+        return Ok(pack(index, slot.generation));
+    }
+    let index: u32 = reg
+        .slots
+        .len()
+        .try_into()
+        .map_err(|_| WindowRegistryError::OutOfRange)?;
+    reg.slots.push(Slot {
+        generation: 1,
+        state: Some(state),
+    });
+    Ok(pack(index, 1))
+}
 
+pub fn allocate() -> Result<WindowHandle, WindowRegistryError> {
+    let handle = insert(WindowState::default())?;
     ACTIVE_WINDOW.store(handle, Ordering::Release);
     Ok(handle)
+}
+
+pub fn allocate_dialog(owner: Weak<JObject<'static>>) -> Result<WindowHandle, WindowRegistryError> {
+    insert(WindowState {
+        dialog: Some(DialogState::new(owner)),
+        ..WindowState::default()
+    })
+}
+
+pub fn with_dialog<R>(
+    handle: WindowHandle,
+    f: impl FnOnce(&mut DialogState) -> R,
+) -> Result<R, WindowRegistryError> {
+    with_window(handle, |w| w.dialog.as_mut().map(f))?.ok_or(WindowRegistryError::NotADialog)
+}
+
+pub fn retain_dialogs(
+    mut keep: impl FnMut(&DialogState) -> bool,
+) -> Result<(), WindowRegistryError> {
+    let mut reg = lock()?;
+    let Registry { slots, free } = &mut *reg;
+    for (index, slot) in slots.iter_mut().enumerate() {
+        let dropped = slot
+            .state
+            .as_ref()
+            .and_then(|state| state.dialog.as_ref())
+            .is_some_and(|dialog| !keep(dialog));
+        if dropped {
+            slot.state = None;
+            slot.generation = slot.generation.saturating_add(1);
+            free.push(u32::try_from(index).map_err(|_| WindowRegistryError::OutOfRange)?);
+        }
+    }
+    Ok(())
+}
+
+pub fn showing_dialogs() -> Result<Vec<DialogView>, WindowRegistryError> {
+    let reg = lock()?;
+    Ok(reg
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            let state = slot.state.as_ref()?;
+            let dialog = state
+                .dialog
+                .as_ref()
+                .filter(|dialog| dialog.shown.is_some())?;
+            Some(DialogView {
+                handle: pack(u32::try_from(index).ok()?, slot.generation),
+                title: state.title.clone(),
+                message: dialog.message.clone(),
+                buttons: dialog.buttons,
+                items: dialog.items.clone(),
+                root_view: state.root_view,
+            })
+        })
+        .collect())
 }
 
 pub fn with_window<R>(

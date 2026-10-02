@@ -12,18 +12,22 @@ use jni::objects::{
 };
 use jni::refs::{Global, Reference, Weak};
 use jni::signature::{FieldSignature, JavaType, MethodSignature, Primitive};
-use jni::strings::JNIStr;
+use jni::strings::{JNIStr, JNIString};
 use jni::sys::{jboolean, jfloat, jint, jlong, jshort};
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::apk::res_config::ResConfig;
 use crate::apk::signature::SigningCertificateHistory;
 use crate::runtime::Vm;
 
+mod asset_configuration;
 pub mod asset_registry;
 pub mod bitmap_registry;
 pub mod canvas_registry;
+pub mod dialogs;
+mod external_uri;
 #[cfg(test)]
 mod fake_jvm;
 pub mod matrix_registry;
@@ -31,6 +35,7 @@ pub(crate) mod memory;
 mod message_queue;
 pub mod paint_registry;
 pub mod path_registry;
+mod preloaded_library;
 pub(crate) mod roblox_fonts;
 mod signing_certificates;
 pub mod sqlite;
@@ -298,6 +303,9 @@ const ASSET_MANAGER_RETRIEVE_ATTRIBUTES_SIG: &JNIStr = jni_str!("(J[IIJJ)Z");
 const ASSET_MANAGER_NEW_THEME_NAME: &JNIStr = jni_str!("newTheme");
 const ASSET_MANAGER_NEW_THEME_SIG: &JNIStr = jni_str!("()J");
 
+const ASSET_MANAGER_DELETE_THEME_NAME: &JNIStr = jni_str!("deleteTheme");
+const ASSET_MANAGER_DELETE_THEME_SIG: &JNIStr = jni_str!("(J)V");
+
 const ASSET_MANAGER_APPLY_THEME_STYLE_NAME: &JNIStr = jni_str!("applyThemeStyle");
 const ASSET_MANAGER_APPLY_THEME_STYLE_SIG: &JNIStr = jni_str!("(JIZ)V");
 
@@ -363,6 +371,10 @@ const STYLE_RESOURCE_ID: usize = 3;
 
 const XML_BLOCK_COOKIE: i32 = -1;
 
+const NO_ASSET_COOKIE: i32 = -1;
+
+const DATA_NULL_UNDEFINED: i32 = 0;
+
 const TYPE_NULL: i32 = 0;
 
 const TYPE_REFERENCE: u8 = 0x01;
@@ -400,14 +412,15 @@ fn arsc_pool_string(cookie: i32, index: u32) -> Option<String> {
 
 extern "system" fn asset_manager_init<'local>(
     mut env: EnvUnowned<'local>,
-    _this: JObject<'local>,
+    this: JObject<'local>,
     sdk_version: jint,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        asset_configuration::record(env, &this, asset_configuration::initial(sdk_version))?;
         tracing::debug!(
             target: "android.content.res.AssetManager",
             sdk_version,
-            "AssetManager.init: GTK-free no-op (native asset table deferred; mObject stays 0)"
+            "AssetManager.init: recorded the initial resource configuration"
         );
         Ok(())
     })
@@ -434,31 +447,62 @@ extern "system" fn asset_manager_set_apk_assets<'local>(
 
 extern "system" fn asset_manager_set_configuration<'local>(
     mut env: EnvUnowned<'local>,
-    _this: JObject<'local>,
+    this: JObject<'local>,
     mcc: jint,
     mnc: jint,
-    _locale: JObject<'local>,
-    _orientation: jint,
-    _touchscreen: jint,
-    _density: jint,
-    _keyboard: jint,
-    _keyboard_hidden: jint,
-    _navigation: jint,
-    _screen_width: jint,
-    _screen_height: jint,
-    _smallest_screen_width_dp: jint,
-    _screen_width_dp: jint,
-    _screen_height_dp: jint,
-    _screen_layout: jint,
-    _ui_mode: jint,
-    _major_version: jint,
+    locale: JString<'local>,
+    orientation: jint,
+    touchscreen: jint,
+    density: jint,
+    keyboard: jint,
+    keyboard_hidden: jint,
+    navigation: jint,
+    screen_width: jint,
+    screen_height: jint,
+    smallest_screen_width_dp: jint,
+    screen_width_dp: jint,
+    screen_height_dp: jint,
+    screen_layout: jint,
+    ui_mode: jint,
+    major_version: jint,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
-        tracing::debug!(
-            target: "android.content.res.AssetManager",
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let locale = if locale.is_null() {
+            None
+        } else {
+            Some(locale.try_to_string(env)?)
+        };
+        let config = asset_configuration::JavaConfiguration {
             mcc,
             mnc,
-            "AssetManager.setConfiguration: GTK-free no-op (no native asset table; mObject stays 0)"
+            locale: locale.as_deref(),
+            orientation,
+            touchscreen,
+            density,
+            keyboard,
+            keyboard_hidden,
+            navigation,
+            screen_width,
+            screen_height,
+            smallest_screen_width_dp,
+            screen_width_dp,
+            screen_height_dp,
+            screen_layout,
+            ui_mode,
+            sdk_version: major_version,
+        }
+        .to_res_config();
+        asset_configuration::record(env, &this, config)?;
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            locale = ?locale,
+            density,
+            screen_width_dp,
+            screen_height_dp,
+            smallest_screen_width_dp,
+            ui_mode,
+            sdk_version = major_version,
+            "AssetManager.setConfiguration: recorded the resource configuration"
         );
         Ok(())
     })
@@ -504,7 +548,7 @@ extern "system" fn asset_manager_open_xml_asset<'local>(
 
 extern "system" fn asset_manager_retrieve_attributes<'local>(
     mut env: EnvUnowned<'local>,
-    _this: JObject<'local>,
+    this: JObject<'local>,
     parse_state: jlong,
     attrs: JIntArray<'local>,
     parser: jint,
@@ -525,7 +569,8 @@ extern "system" fn asset_manager_retrieve_attributes<'local>(
         let start = jint::try_from(0).unwrap_or(0);
         attrs.get_region(env, start, &mut ids)?;
 
-        let entries = resolve_xml_attributes(parse_state, &ids);
+        let config = asset_configuration::of(env, &this);
+        let entries = resolve_xml_attributes(parse_state, &ids, &config);
         let changed = entries.iter().filter(|e| e.is_some()).count();
 
         fill_typed_array(out_values, out_indices, &entries);
@@ -557,7 +602,11 @@ struct TypedEntry {
     asset_cookie: i32,
 }
 
-fn resolve_xml_attributes(parse_state: jlong, ids: &[i32]) -> Vec<Option<TypedEntry>> {
+fn resolve_xml_attributes(
+    parse_state: jlong,
+    ids: &[i32],
+    config: &ResConfig,
+) -> Vec<Option<TypedEntry>> {
     xml_registry::with_block(parse_state, |block| {
         let element = block.current_element();
         ids.iter()
@@ -569,14 +618,18 @@ fn resolve_xml_attributes(parse_state: jlong, ids: &[i32]) -> Vec<Option<TypedEn
                     .attributes
                     .iter()
                     .find(|a| a.name_resource != 0 && a.name_resource == id_u32)?;
-                Some(resolve_inline_attr_value(attr.value_type, attr.value_data))
+                Some(resolve_inline_attr_value(
+                    attr.value_type,
+                    attr.value_data,
+                    config,
+                ))
             })
             .collect()
     })
     .unwrap_or_else(|_| vec![None; ids.len()])
 }
 
-fn resolve_inline_attr_value(value_type: u8, value_data: u32) -> TypedEntry {
+fn resolve_inline_attr_value(value_type: u8, value_data: u32, config: &ResConfig) -> TypedEntry {
     let mut cur_type = value_type;
     let mut cur_data = value_data;
 
@@ -591,7 +644,7 @@ fn resolve_inline_attr_value(value_type: u8, value_data: u32) -> TypedEntry {
         if cur_type != TYPE_REFERENCE || cur_data == 0 {
             break;
         }
-        match resolve_res_value(cur_data) {
+        match resolve_res_value(cur_data, config) {
             Some(v) => {
                 string_pool_cookie = arsc_cookie_for(cur_data);
                 cur_type = u8::try_from(v.type_).unwrap_or(0);
@@ -624,6 +677,7 @@ const MAX_THEME_PARENT_DEPTH: usize = 64;
 fn merge_theme_style(
     out: &mut std::collections::HashMap<i32, theme_registry::ThemeAttr>,
     style_res: u32,
+    config: &ResConfig,
 ) -> usize {
     let mut contributed = 0usize;
     let mut current = style_res;
@@ -638,7 +692,7 @@ fn merge_theme_style(
         let Ok(table) = crate::apk::arsc::parse_arsc(bytes) else {
             break;
         };
-        let Some(style) = table.resolve_style(current) else {
+        let Some(style) = table.resolve_style(current, config) else {
             break;
         };
         for entry in &style.entries {
@@ -667,6 +721,7 @@ const MAX_ATTR_RESOLVE_DEPTH: usize = 16;
 fn resolve_theme_attr(
     attrs: &std::collections::HashMap<i32, theme_registry::ThemeAttr>,
     attr_id: i32,
+    config: &ResConfig,
 ) -> Option<TypedEntry> {
     let mut cur = *attrs.get(&attr_id)?;
 
@@ -692,7 +747,7 @@ fn resolve_theme_attr(
                 if cur.data == 0 {
                     break;
                 }
-                match resolve_res_value(cur.data) {
+                match resolve_res_value(cur.data, config) {
                     Some(v) => {
                         string_pool_cookie = arsc_cookie_for(cur.data);
                         cur = theme_registry::ThemeAttr {
@@ -726,21 +781,25 @@ fn resolve_theme_attr(
     })
 }
 
-fn resolve_theme_attributes(theme: jlong, ids: &[i32]) -> Vec<Option<TypedEntry>> {
+fn resolve_theme_attributes(
+    theme: jlong,
+    ids: &[i32],
+    config: &ResConfig,
+) -> Vec<Option<TypedEntry>> {
     theme_registry::with_theme(theme, |t| {
         ids.iter()
-            .map(|&id| resolve_theme_attr(&t.attrs, id))
+            .map(|&id| resolve_theme_attr(&t.attrs, id, config))
             .collect()
     })
     .unwrap_or_else(|_| vec![None; ids.len()])
 }
 
-fn resolve_inline_theme_refs(theme: jlong, entries: &mut [Option<TypedEntry>]) {
+fn resolve_inline_theme_refs(theme: jlong, entries: &mut [Option<TypedEntry>], config: &ResConfig) {
     let _ = theme_registry::with_theme(theme, |t| {
         for slot in entries.iter_mut() {
             if let Some(entry) = slot {
                 if entry.value_type == i32::from(TYPE_ATTRIBUTE) {
-                    if let Some(resolved) = resolve_theme_attr(&t.attrs, entry.data) {
+                    if let Some(resolved) = resolve_theme_attr(&t.attrs, entry.data, config) {
                         *slot = Some(resolved);
                     }
                 }
@@ -749,21 +808,35 @@ fn resolve_inline_theme_refs(theme: jlong, entries: &mut [Option<TypedEntry>]) {
     });
 }
 
+fn typed_array_window(entry: Option<&TypedEntry>) -> [i32; STYLE_NUM_ENTRIES] {
+    let mut window = [0; STYLE_NUM_ENTRIES];
+    match entry {
+        Some(e) => {
+            window[STYLE_TYPE] = e.value_type;
+            window[STYLE_DATA] = e.data;
+            window[STYLE_ASSET_COOKIE] = e.asset_cookie;
+            window[STYLE_RESOURCE_ID] = e.resource_id;
+        }
+        None => {
+            window[STYLE_TYPE] = TYPE_NULL;
+            window[STYLE_DATA] = DATA_NULL_UNDEFINED;
+            window[STYLE_ASSET_COOKIE] = NO_ASSET_COOKIE;
+        }
+    }
+    window
+}
+
 fn fill_typed_array(out_values: jlong, out_indices: jlong, entries: &[Option<TypedEntry>]) {
     if out_values != 0 {
         let base = out_values as usize as *mut i32;
         for (attr, entry) in entries.iter().enumerate() {
-            let window = attr * STYLE_NUM_ENTRIES;
-            match entry {
-                Some(e) => unsafe {
-                    base.add(window + STYLE_TYPE).write(e.value_type);
-                    base.add(window + STYLE_DATA).write(e.data);
-                    base.add(window + STYLE_RESOURCE_ID).write(e.resource_id);
-                    base.add(window + STYLE_ASSET_COOKIE).write(e.asset_cookie);
-                },
-                None => {
-                    unsafe { base.add(window + STYLE_TYPE).write(TYPE_NULL) };
-                }
+            let window = typed_array_window(entry.as_ref());
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    window.as_ptr(),
+                    base.add(attr * STYLE_NUM_ENTRIES),
+                    STYLE_NUM_ENTRIES,
+                );
             }
         }
     }
@@ -776,7 +849,7 @@ fn fill_typed_array(out_values: jlong, out_indices: jlong, entries: &[Option<Typ
             if entry.is_some() {
                 count += 1;
 
-                let pos = i32::try_from(attr + 1).unwrap_or(i32::MAX);
+                let pos = i32::try_from(attr).unwrap_or(i32::MAX);
                 unsafe { base.add(count as usize).write(pos) };
             }
         }
@@ -812,17 +885,40 @@ extern "system" fn asset_manager_new_theme<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-extern "system" fn asset_manager_apply_theme_style<'local>(
+extern "system" fn asset_manager_delete_theme<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
+    theme: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if theme == 0 {
+            return Ok(());
+        }
+        if let Err(e) = theme_registry::free(theme) {
+            tracing::error!(
+                target: "android.content.res.AssetManager",
+                theme,
+                error = %e,
+                "AssetManager.deleteTheme: the theme handle was not live"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+extern "system" fn asset_manager_apply_theme_style<'local>(
+    mut env: EnvUnowned<'local>,
+    this: JObject<'local>,
     theme: jlong,
     style_res: jint,
     force: jboolean,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let config = asset_configuration::of(env, &this);
         let mut chain = std::collections::HashMap::new();
         let style_u32 = u32::from_ne_bytes(style_res.to_ne_bytes());
-        let resolved = merge_theme_style(&mut chain, style_u32);
+        let resolved = merge_theme_style(&mut chain, style_u32, &config);
 
         let merged = theme_registry::with_theme(theme, |t| {
             t.styles.push(style_res);
@@ -904,7 +1000,7 @@ extern "system" fn asset_manager_copy_theme<'local>(
 
 extern "system" fn asset_manager_apply_style<'local>(
     mut env: EnvUnowned<'local>,
-    _this: JObject<'local>,
+    this: JObject<'local>,
     theme: jlong,
     parser: jlong,
     _def_style_attr: jint,
@@ -919,15 +1015,16 @@ extern "system" fn asset_manager_apply_style<'local>(
         let mut entries = vec![None; n];
 
         if n != 0 {
+            let config = asset_configuration::of(env, &this);
             let mut ids = vec![0i32; n];
             attrs.get_region(env, 0, &mut ids)?;
             if parser != 0 {
-                entries = resolve_xml_attributes(parser, &ids);
+                entries = resolve_xml_attributes(parser, &ids, &config);
 
-                resolve_inline_theme_refs(theme, &mut entries);
+                resolve_inline_theme_refs(theme, &mut entries, &config);
             }
 
-            let theme_entries = resolve_theme_attributes(theme, &ids);
+            let theme_entries = resolve_theme_attributes(theme, &ids, &config);
             for (slot, theme_entry) in entries.iter_mut().zip(theme_entries) {
                 if slot.is_none() {
                     *slot = theme_entry;
@@ -1541,12 +1638,9 @@ fn resolve_resource_name(resid: u32) -> Option<String> {
 
     let package_id = (resid >> 24) as u8;
     let type_id = ((resid >> 16) & 0xff) as u8;
-    let resolved = table.resource_value(resid)?;
+    let key_index = table.key_index(resid)?;
     let type_name = table.type_name(package_id, type_id).ok().flatten()?;
-    let entry_name = table
-        .key_name(package_id, resolved.key_index)
-        .ok()
-        .flatten()?;
+    let entry_name = table.key_name(package_id, key_index).ok().flatten()?;
 
     match table.package_name(package_id) {
         Some(pkg) => Some(format!("{pkg}:{type_name}/{entry_name}")),
@@ -1557,13 +1651,14 @@ fn resolve_resource_name(resid: u32) -> Option<String> {
 struct ResolvedResValue {
     type_: i32,
     data: i32,
+    density: u16,
     string: Option<String>,
 }
 
-fn resolve_res_value(resid: u32) -> Option<ResolvedResValue> {
+fn resolve_res_value(resid: u32, config: &ResConfig) -> Option<ResolvedResValue> {
     let bytes = arsc_bytes_for(resid)?;
     let table = crate::apk::arsc::parse_arsc(bytes).ok()?;
-    let resolved = table.resource_value(resid)?;
+    let resolved = table.resource_value(resid, config)?;
 
     if resolved.is_complex {
         return None;
@@ -1576,13 +1671,14 @@ fn resolve_res_value(resid: u32) -> Option<ResolvedResValue> {
     Some(ResolvedResValue {
         type_: i32::from(resolved.type_),
         data: u32_to_i32(resolved.data),
+        density: resolved.density,
         string,
     })
 }
 
 extern "system" fn asset_manager_load_resource_value<'local>(
     mut env: EnvUnowned<'local>,
-    _this: JObject<'local>,
+    this: JObject<'local>,
     resid: jint,
     density: jshort,
     out_value: JObject<'local>,
@@ -1590,7 +1686,11 @@ extern "system" fn asset_manager_load_resource_value<'local>(
 ) -> jint {
     env.with_env(|env| -> jni::errors::Result<jint> {
         let resid_u32 = u32::from_ne_bytes(resid.to_ne_bytes());
-        let Some(resolved) = resolve_res_value(resid_u32) else {
+        let mut config = asset_configuration::of(env, &this);
+        if let Ok(density @ 1..) = u16::try_from(density) {
+            config.density = density;
+        }
+        let Some(resolved) = resolve_res_value(resid_u32, &config) else {
             tracing::warn!(
                 target: "android.content.res.AssetManager",
                 resid = format_args!("0x{resid_u32:08x}"),
@@ -1623,7 +1723,7 @@ extern "system" fn asset_manager_load_resource_value<'local>(
             &out_value,
             jni_str!("density"),
             &int_sig,
-            jint::from(density).into(),
+            jint::from(resolved.density).into(),
         )?;
 
         if let Some(s) = &resolved.string {
@@ -1653,7 +1753,7 @@ extern "system" fn asset_manager_load_resource_value<'local>(
 
 extern "system" fn asset_manager_load_theme_attribute_value<'local>(
     mut env: EnvUnowned<'local>,
-    _this: JObject<'local>,
+    this: JObject<'local>,
     theme: jlong,
     ident: jint,
     out_value: JObject<'local>,
@@ -1665,7 +1765,9 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
             return Ok(0);
         }
 
-        let entry = theme_registry::with_theme(theme, |t| resolve_theme_attr(&t.attrs, ident))
+        let config = asset_configuration::of(env, &this);
+        let entry =
+            theme_registry::with_theme(theme, |t| resolve_theme_attr(&t.attrs, ident, &config))
             .ok()
             .flatten();
         let Some(entry) = entry else {
@@ -1862,6 +1964,13 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
         },
         unsafe {
             NativeMethod::from_raw_parts(
+                ASSET_MANAGER_DELETE_THEME_NAME,
+                ASSET_MANAGER_DELETE_THEME_SIG,
+                asset_manager_delete_theme as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
                 ASSET_MANAGER_APPLY_THEME_STYLE_NAME,
                 ASSET_MANAGER_APPLY_THEME_STYLE_SIG,
                 asset_manager_apply_theme_style as *mut std::ffi::c_void,
@@ -1935,7 +2044,7 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/content/res/AssetManager",
-        "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative + retrieveAttributes + newTheme + applyThemeStyle + copyTheme + applyStyle + getResourceName + getResourcePackageName + getResourceIdentifier + openAsset + loadResourceValue + loadThemeAttributeValue"
+        "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative + retrieveAttributes + newTheme + deleteTheme + applyThemeStyle + copyTheme + applyStyle + getResourceName + getResourcePackageName + getResourceIdentifier + openAsset + loadResourceValue + loadThemeAttributeValue"
     );
     Ok(())
 }
@@ -2424,7 +2533,12 @@ const ELAPSED_REALTIME_NANOS_SIG: &JNIStr = jni_str!("()J");
 const UPTIME_MILLIS_NAME: &JNIStr = jni_str!("uptimeMillis");
 const UPTIME_MILLIS_SIG: &JNIStr = jni_str!("()J");
 
+const CURRENT_THREAD_TIME_MILLIS_NAME: &JNIStr = jni_str!("currentThreadTimeMillis");
+const CURRENT_THREAD_TIME_MILLIS_SIG: &JNIStr = jni_str!("()J");
+
 static MONOTONIC_ANCHOR: OnceLock<Instant> = OnceLock::new();
+
+const ATL_PROCESS_START_MILLIS: u64 = 1000;
 
 extern "system" fn system_clock_elapsed_realtime<'local>(
     mut env: EnvUnowned<'local>,
@@ -2450,23 +2564,31 @@ extern "system" fn system_clock_elapsed_realtime_nanos<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
+extern "system" fn system_clock_current_thread_time_millis<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        Ok(cpu_clock_millis(libc::CLOCK_THREAD_CPUTIME_ID))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+fn since_process_start() -> std::time::Duration {
+    std::time::Duration::from_millis(ATL_PROCESS_START_MILLIS)
+        + MONOTONIC_ANCHOR.get_or_init(Instant::now).elapsed()
+}
+
 fn monotonic_millis() -> jlong {
-    let elapsed_ms = MONOTONIC_ANCHOR
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_millis();
-    jlong::try_from(elapsed_ms).unwrap_or(jlong::MAX)
+    jlong::try_from(since_process_start().as_millis()).unwrap_or(jlong::MAX)
 }
 
 fn monotonic_nanos() -> jlong {
-    let elapsed_ns = MONOTONIC_ANCHOR
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_nanos();
-    jlong::try_from(elapsed_ns).unwrap_or(jlong::MAX)
+    jlong::try_from(since_process_start().as_nanos()).unwrap_or(jlong::MAX)
 }
 
 fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    MONOTONIC_ANCHOR.get_or_init(Instant::now);
     let class = env.find_class(SYSTEM_CLOCK_CLASS)?;
     let methods = [
         unsafe {
@@ -2490,12 +2612,19 @@ fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 system_clock_uptime_millis as *mut std::ffi::c_void,
             )
         },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                CURRENT_THREAD_TIME_MILLIS_NAME,
+                CURRENT_THREAD_TIME_MILLIS_SIG,
+                system_clock_current_thread_time_millis as *mut std::ffi::c_void,
+            )
+        },
     ];
 
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/SystemClock",
-        "registered Eclipse's non-GTK backing for elapsedRealtime, elapsedRealtimeNanos, and uptimeMillis"
+        "registered Eclipse's non-GTK backing for elapsedRealtime, elapsedRealtimeNanos, uptimeMillis, and currentThreadTimeMillis"
     );
     Ok(())
 }
@@ -2793,45 +2922,116 @@ pub const PROCESS_CLASS: &JNIStr = jni_str!("android/os/Process");
 
 const PROCESS_GET_ELAPSED_CPU_TIME_NAME: &JNIStr = jni_str!("getElapsedCpuTime");
 const PROCESS_GET_ELAPSED_CPU_TIME_SIG: &JNIStr = jni_str!("()J");
+const PROCESS_IS_64_BIT_NAME: &JNIStr = jni_str!("is64Bit");
+const PROCESS_IS_64_BIT_SIG: &JNIStr = jni_str!("()Z");
+const PROCESS_GET_THREAD_PRIORITY_NAME: &JNIStr = jni_str!("getThreadPriority");
+const PROCESS_GET_THREAD_PRIORITY_SIG: &JNIStr = jni_str!("(I)I");
+
+fn cpu_clock_millis(clock: libc::clockid_t) -> jlong {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+
+    let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
+    if rc != 0 {
+        return 0;
+    }
+
+    ts.tv_sec
+        .saturating_mul(1000)
+        .saturating_add(ts.tv_nsec / 1_000_000)
+}
 
 extern "system" fn process_get_elapsed_cpu_time<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> jlong {
     env.with_env(|_env| -> jni::errors::Result<jlong> {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-
-        let rc = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
-        if rc != 0 {
-            return Ok(0);
-        }
-
-        let ms = ts
-            .tv_sec
-            .saturating_mul(1000)
-            .saturating_add(ts.tv_nsec / 1_000_000);
-        Ok(ms)
+        Ok(cpu_clock_millis(libc::CLOCK_PROCESS_CPUTIME_ID))
     })
     .resolve::<LogErrorAndDefault>()
 }
 
+fn thread_priority(tid: jint) -> std::io::Result<jint> {
+    let who = libc::id_t::from_ne_bytes(tid.to_ne_bytes());
+    unsafe { *libc::__errno_location() = 0 };
+    let priority = unsafe { libc::getpriority(libc::PRIO_PROCESS, who) };
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(0) => Ok(priority),
+        _ => Err(error),
+    }
+}
+
+extern "system" fn process_get_thread_priority<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    tid: jint,
+) -> jint {
+    env.with_env(|env| -> jni::errors::Result<jint> {
+        let error = match thread_priority(tid) {
+            Ok(priority) => return Ok(priority),
+            Err(error) => error,
+        };
+        let (class, message) = match error.raw_os_error() {
+            Some(libc::ESRCH) => (
+                jni_str!("java/lang/IllegalArgumentException"),
+                format!("Given thread {tid} does not exist"),
+            ),
+            Some(libc::EPERM | libc::EACCES) => (
+                jni_str!("java/lang/SecurityException"),
+                format!("No permission to read the priority of {tid}"),
+            ),
+            _ => (
+                jni_str!("java/lang/RuntimeException"),
+                format!("getpriority({tid}) failed: {error}"),
+            ),
+        };
+        let _ = env.throw_new(class, JNIString::from(message));
+        Ok(0)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+extern "system" fn process_is_64_bit<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    env.with_env(|_env| -> jni::errors::Result<jboolean> { Ok(cfg!(target_pointer_width = "64")) })
+        .resolve::<LogErrorAndDefault>()
+}
+
 fn register_process_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(PROCESS_CLASS)?;
-    let methods = [unsafe {
-        NativeMethod::from_raw_parts(
-            PROCESS_GET_ELAPSED_CPU_TIME_NAME,
-            PROCESS_GET_ELAPSED_CPU_TIME_SIG,
-            process_get_elapsed_cpu_time as *mut std::ffi::c_void,
-        )
-    }];
+    let methods = [
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PROCESS_GET_ELAPSED_CPU_TIME_NAME,
+                PROCESS_GET_ELAPSED_CPU_TIME_SIG,
+                process_get_elapsed_cpu_time as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PROCESS_IS_64_BIT_NAME,
+                PROCESS_IS_64_BIT_SIG,
+                process_is_64_bit as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PROCESS_GET_THREAD_PRIORITY_NAME,
+                PROCESS_GET_THREAD_PRIORITY_SIG,
+                process_get_thread_priority as *mut std::ffi::c_void,
+            )
+        },
+    ];
 
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/Process",
-        "registered Eclipse's backing for getElapsedCpuTime (CLOCK_PROCESS_CPUTIME_ID → ms)"
+        "registered Eclipse's backing for getElapsedCpuTime (CLOCK_PROCESS_CPUTIME_ID → ms), is64Bit and getThreadPriority"
     );
     Ok(())
 }
@@ -2903,37 +3103,6 @@ fn register_input_method_manager_natives(env: &mut Env) -> Result<(), FrameworkE
     tracing::info!(
         class = "android/view/inputmethod/InputMethodManager",
         "registered Eclipse's non-GTK backing for nativeInit + nativeHideSoftInput + nativeShowSoftInput (no soft keyboard)"
-    );
-    Ok(())
-}
-
-pub const DIALOG_CLASS: &JNIStr = jni_str!("android/app/Dialog");
-
-const DIALOG_NATIVE_INIT_NAME: &JNIStr = jni_str!("nativeInit");
-const DIALOG_NATIVE_INIT_SIG: &JNIStr = jni_str!("()J");
-
-extern "system" fn dialog_native_init<'local>(
-    mut env: EnvUnowned<'local>,
-    _this: JObject<'local>,
-) -> jlong {
-    env.with_env(|_env| -> jni::errors::Result<jlong> { Ok(1) })
-        .resolve::<LogErrorAndDefault>()
-}
-
-fn register_dialog_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    let class = env.find_class(DIALOG_CLASS)?;
-    let methods = [unsafe {
-        NativeMethod::from_raw_parts(
-            DIALOG_NATIVE_INIT_NAME,
-            DIALOG_NATIVE_INIT_SIG,
-            dialog_native_init as *mut std::ffi::c_void,
-        )
-    }];
-
-    unsafe { env.register_native_methods(&class, &methods) }?;
-    tracing::info!(
-        class = "android/app/Dialog",
-        "registered Eclipse's non-GTK backing for nativeInit (no dialog system → 1 placeholder)"
     );
     Ok(())
 }
@@ -11286,6 +11455,14 @@ extern "system" fn window_set_jobject<'local>(
     window: JObject<'local>,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
+        if window_registry::with_dialog(ptr, |_| ()).is_ok() {
+            tracing::debug!(
+                target: "android.view.Window",
+                ptr,
+                "Window.set_jobject: a dialog window does not pin its Window object"
+            );
+            return Ok(());
+        }
         match env.new_global_ref(&window) {
             Ok(global) => match window_registry::set_jobject(ptr, global) {
                 Ok(()) => tracing::debug!(
@@ -11446,25 +11623,32 @@ extern "system" fn window_set_widget_as_root<'local>(
     widget: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        let view_ok = view_registry::with_view(widget, |_v| ()).is_ok();
-
-        view_registry::set_active_root(if view_ok { widget } else { 0 });
+        let root = view_registry::with_view(widget, |_v| ())
+            .is_ok()
+            .then_some(widget);
         match window_registry::with_window(native_window, |w| {
-            w.root_view = if view_ok { Some(widget) } else { None };
+            w.root_view = root;
+            w.dialog.is_none()
         }) {
-            Ok(()) => tracing::debug!(
-                target: "android.view.Window",
-                native_window,
-                widget,
-                view_ok,
-                "Window.set_widget_as_root: recorded content-root view handle (non-GTK)"
-            ),
+            Ok(activity_window) => {
+                if activity_window {
+                    view_registry::set_active_root(root.unwrap_or(0));
+                }
+                tracing::debug!(
+                    target: "android.view.Window",
+                    native_window,
+                    widget,
+                    view_ok = root.is_some(),
+                    activity_window,
+                    "Window.set_widget_as_root: recorded content-root view handle (non-GTK)"
+                );
+            }
             Err(e) => tracing::debug!(
                 target: "android.view.Window",
                 native_window,
                 widget,
                 error = %e,
-                "Window.set_widget_as_root: invalid window handle (ignored)"
+                "Window.set_widget_as_root: invalid window handle (active root unchanged)"
             ),
         }
         Ok(())
@@ -11738,19 +11922,10 @@ extern "system" fn activity_native_finish<'local>(
     native_window: jlong,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-
-        if let Err(e) = window_registry::with_window(native_window, |_| ()) {
-            tracing::warn!(
-                target: "android.app.Activity",
-                handle = native_window,
-                error = %e,
-                "Activity.nativeFinish: stale/invalid window handle (down-lifecycle skipped)"
-            );
-            return Ok(());
-        }
         if this.is_null() {
             tracing::warn!(
                 target: "android.app.Activity",
+                handle = native_window,
                 "Activity.nativeFinish: null receiver (ignored)"
             );
             return Ok(());
@@ -11771,7 +11946,14 @@ extern "system" fn activity_native_finish<'local>(
             "Activity.nativeFinish: driving the finishing activity down (onPause → onStop → onDestroy)"
         );
 
-        let _ = drive_activity_down_lifecycle(env, &this);
+        if let Err(error) = drive_activity_down_lifecycle(env, &this) {
+            tracing::error!(
+                target: "android.app.Activity",
+                class = %class_name,
+                error = %error,
+                "Activity.nativeFinish: driving the finishing activity down failed"
+            );
+        }
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
@@ -11911,12 +12093,19 @@ fn register_activity_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 activity_is_task_root as *mut std::ffi::c_void,
             )
         },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                external_uri::NATIVE_OPEN_URI_NAME,
+                external_uri::NATIVE_OPEN_URI_SIG,
+                external_uri::activity_native_open_uri as *mut std::ffi::c_void,
+            )
+        },
     ];
 
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/app/Activity",
-        "registered Eclipse's backing for nativeStartActivity + nativeFinish + nativeResumeActivity + isInMultiWindowMode + isTaskRoot"
+        "registered Eclipse's backing for nativeStartActivity + nativeFinish + nativeResumeActivity + isInMultiWindowMode + isTaskRoot + nativeOpenURI"
     );
     Ok(())
 }
@@ -12055,10 +12244,18 @@ extern "system" fn runtime_native_load<'local>(
             filename.try_to_string(env)?
         };
 
-        if !path.is_empty() && crate::loader::engine::is_preloaded(soname_from_load_path(&path)) {
+        let soname = soname_from_load_path(&path);
+        if !path.is_empty() && crate::loader::engine::is_preloaded(soname) {
+            if let Some(error) = preloaded_library::initialize_in_app_class_loader(env, soname)? {
+                tracing::error!(
+                    soname,
+                    "Runtime.nativeLoad: the preloaded library failed its JNI initialization"
+                );
+                return Ok(error);
+            }
             tracing::info!(
-                soname = soname_from_load_path(&path),
-                "Runtime.nativeLoad: already pre-loaded by Eclipse's Rust loader — reporting success (apkenv skipped)"
+                soname,
+                "Runtime.nativeLoad: preloaded by Eclipse's Rust loader; JNI_OnLoad and its natives are bound now, as on Android"
             );
             return Ok(JString::default());
         }
@@ -12182,14 +12379,17 @@ pub fn register_engine_preload_natives(vm: &Vm) -> Result<(), FrameworkError> {
 
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            register_log_natives(env)?;
-            register_process_natives(env)
-        })) {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| register_jni_onload_natives(env))) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
         }
     })
+}
+
+fn register_jni_onload_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    register_log_natives(env)?;
+    register_process_natives(env)?;
+    register_system_clock_natives(env)
 }
 
 fn prepare_main_looper_inner(env: &mut Env) -> Result<(), FrameworkError> {
@@ -12748,8 +12948,41 @@ pub struct EngineTouchOutcome {
     pub down_time_ms: i64,
 }
 
+static ENGINE_SURFACE_VIEW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+static RETIRED_ENGINE_SURFACE_VIEW: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
 pub fn engine_surface_view_handle() -> Option<view_registry::ViewHandle> {
-    view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS)
+    let handle = ENGINE_SURFACE_VIEW.load(std::sync::atomic::Ordering::Acquire);
+    (handle != 0).then_some(handle)
+}
+
+fn retired_engine_surface_view() -> Option<view_registry::ViewHandle> {
+    let handle = RETIRED_ENGINE_SURFACE_VIEW.load(std::sync::atomic::Ordering::Acquire);
+    (handle != 0).then_some(handle)
+}
+
+fn active_engine_surface_view() -> Option<view_registry::ViewHandle> {
+    view_registry::find_in_subtree(view_registry::active_root(), RBX_SURFACE_VIEW_CLASS)
+}
+
+fn replacement_engine_surface_view(
+    root: view_registry::ViewHandle,
+    current: Option<view_registry::ViewHandle>,
+    retired: Option<view_registry::ViewHandle>,
+) -> Option<view_registry::ViewHandle> {
+    view_registry::find_in_subtree(root, RBX_SURFACE_VIEW_CLASS)
+        .filter(|&next| Some(next) != current && Some(next) != retired)
+}
+
+pub fn engine_surface_view_replaced() -> bool {
+    replacement_engine_surface_view(
+        view_registry::active_root(),
+        engine_surface_view_handle(),
+        retired_engine_surface_view(),
+    )
+    .is_some()
 }
 
 const NATIVE_INPUT_INTERFACE_CLASS: &JNIStr =
@@ -12999,10 +13232,10 @@ fn touch_engine_surface(
     y: f32,
     down_time_ms: Option<i64>,
 ) -> Result<Option<EngineTouchOutcome>, FrameworkError> {
-    let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
+    let Some(handle) = engine_surface_view_handle() else {
         tracing::debug!(
             ?action,
-            "engine touch: RBXSurfaceView not registered yet (no-op)"
+            "engine touch: no RBXSurfaceView holds the engine surface yet (no-op)"
         );
         return Ok(None);
     };
@@ -13265,7 +13498,7 @@ pub fn engine_surface_callback_ready(vm: &Vm) -> Result<bool, FrameworkError> {
 }
 
 fn surface_callback_ready(env: &mut Env) -> Result<bool, FrameworkError> {
-    let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
+    let Some(handle) = active_engine_surface_view() else {
         return Ok(false);
     };
 
@@ -13327,7 +13560,11 @@ fn surface_lifecycle(
     width: i32,
     height: i32,
 ) -> Result<bool, FrameworkError> {
-    let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
+    let target = match event {
+        SurfaceLifecycle::CreatedAndChanged => active_engine_surface_view(),
+        SurfaceLifecycle::Changed => engine_surface_view_handle(),
+    };
+    let Some(handle) = target else {
         return Ok(false);
     };
 
@@ -13355,6 +13592,7 @@ fn surface_lifecycle(
             )?
             .v()
         })?;
+        ENGINE_SURFACE_VIEW.store(handle, std::sync::atomic::Ordering::Release);
     }
     checked(env, "SurfaceView.surfaceChanged", |env| {
         env.call_method(
@@ -13373,9 +13611,11 @@ fn surface_lifecycle(
 }
 
 fn destroy_engine_surface(env: &mut Env) -> Result<bool, FrameworkError> {
-    let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
+    let Some(handle) = engine_surface_view_handle() else {
         return Ok(false);
     };
+    ENGINE_SURFACE_VIEW.store(0, std::sync::atomic::Ordering::Release);
+    RETIRED_ENGINE_SURFACE_VIEW.store(handle, std::sync::atomic::Ordering::Release);
     let surface_view = match view_registry::local_jobject(env, handle) {
         Ok(Ok(Some(local))) => local,
         Ok(Ok(None)) => return Ok(false),
@@ -13563,6 +13803,8 @@ fn drive_lifecycle(
 
     signing_certificates::register_natives(env, signing_certificate_history)?;
 
+    preloaded_library::register_natives(env)?;
+
     register_log_natives(env)?;
 
     register_process_natives(env)?;
@@ -13599,7 +13841,7 @@ fn drive_lifecycle(
 
     register_clipboard_manager_natives(env)?;
 
-    register_dialog_natives(env)?;
+    dialogs::register_natives(env)?;
 
     register_window_natives(env)?;
 
@@ -13867,10 +14109,61 @@ fn drive_activity_down_lifecycle<'local>(
     env: &mut Env<'local>,
     activity: &JObject,
 ) -> Result<(), FrameworkError> {
-    call_activity_on_pause(env, activity, "nativeFinish Activity.onPause")?;
-    call_activity_on_stop(env, activity, "nativeFinish Activity.onStop")?;
-    call_activity_on_destroy(env, activity, "nativeFinish Activity.onDestroy")?;
+    let steps = [
+        call_activity_on_pause(env, activity, "nativeFinish Activity.onPause"),
+        destroy_engine_surface_of(env, activity),
+        call_activity_on_stop(env, activity, "nativeFinish Activity.onStop"),
+        call_activity_on_destroy(env, activity, "nativeFinish Activity.onDestroy"),
+    ];
+    steps.into_iter().collect()
+}
+
+fn destroy_engine_surface_of(env: &mut Env, activity: &JObject) -> Result<(), FrameworkError> {
+    if activity_hosts_engine_surface(env, activity)? {
+        destroy_engine_surface(env)?;
+    }
     Ok(())
+}
+
+fn activity_hosts_engine_surface(
+    env: &mut Env,
+    activity: &JObject,
+) -> Result<bool, FrameworkError> {
+    let Some(surface_view) = engine_surface_view_handle() else {
+        return Ok(false);
+    };
+    let window = checked(env, "nativeFinish Activity.getWindow", |env| {
+        env.call_method(
+            activity,
+            jni_str!("getWindow"),
+            jni_sig!("()Landroid/view/Window;"),
+            &[],
+        )?
+        .l()
+    })?;
+    if window.is_null() {
+        return Ok(false);
+    }
+    let decor = checked(env, "nativeFinish Window.getDecorView", |env| {
+        env.call_method(
+            &window,
+            jni_str!("getDecorView"),
+            jni_sig!("()Landroid/view/View;"),
+            &[],
+        )?
+        .l()
+    })?;
+    if decor.is_null() {
+        return Ok(false);
+    }
+    let widget_sig = unsafe {
+        FieldSignature::from_raw_parts(VIEW_WIDGET_FIELD_SIG, JavaType::Primitive(Primitive::Long))
+    };
+    let decor_widget = checked(env, "nativeFinish View.widget", |env| {
+        env.get_field(&decor, VIEW_WIDGET_FIELD_NAME, &widget_sig)?
+            .j()
+    })?;
+    Ok(view_registry::subtree_contains(decor_widget, surface_view))
 }
 
 fn call_activity_on_pause<'local>(
@@ -14077,9 +14370,19 @@ pub enum FrameworkError {
 
     OverlayPredatesSigningCertificates(jni::errors::Error),
 
+    OverlayPredatesPreloadedLibraries(jni::errors::Error),
+
     NativeLibraryDirNotUtf8(std::path::PathBuf),
 
     MainThreadLooper(std::io::Error),
+
+    DialogNotShowing(window_registry::WindowHandle),
+
+    DialogHasNoItems(window_registry::WindowHandle),
+
+    DialogItemOutOfRange(usize),
+
+    DialogViewGone(view_registry::ViewHandle),
 }
 
 impl fmt::Display for FrameworkError {
@@ -14106,6 +14409,11 @@ impl fmt::Display for FrameworkError {
                 "the Android framework overlay predates host-verified signing certificates \
                  ({e}); rebuild it with tools/framework-overlay/patch-framework.sh"
             ),
+            Self::OverlayPredatesPreloadedLibraries(e) => write!(
+                f,
+                "the Android framework overlay predates deferred native library \
+                 initialization ({e}); rebuild it with tools/framework-overlay/patch-framework.sh"
+            ),
             Self::NativeLibraryDirNotUtf8(dir) => write!(
                 f,
                 "the native library directory {} is not valid UTF-8, so \
@@ -14119,6 +14427,14 @@ impl fmt::Display for FrameworkError {
                     "creating the Android main thread's native ALooper failed: {e}"
                 )
             }
+            Self::DialogNotShowing(dialog) => write!(f, "dialog {dialog} is not showing"),
+            Self::DialogHasNoItems(dialog) => write!(f, "dialog {dialog} has no item list"),
+            Self::DialogItemOutOfRange(index) => {
+                write!(f, "dialog item {index} does not fit a Java int")
+            }
+            Self::DialogViewGone(view) => {
+                write!(f, "the dialog view {view} no longer has a Java object")
+            }
         }
     }
 }
@@ -14126,7 +14442,9 @@ impl fmt::Display for FrameworkError {
 impl std::error::Error for FrameworkError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Jni(e) | Self::OverlayPredatesSigningCertificates(e) => Some(e),
+            Self::Jni(e)
+            | Self::OverlayPredatesSigningCertificates(e)
+            | Self::OverlayPredatesPreloadedLibraries(e) => Some(e),
             Self::WindowRegistry(e) => Some(e),
             Self::ViewRegistry(e) => Some(e),
             Self::MainThreadLooper(e) => Some(e),
@@ -14135,7 +14453,11 @@ impl std::error::Error for FrameworkError {
             | Self::GlobalLayoutObserverRegistryPoisoned
             | Self::Panicked
             | Self::SigningCertificateHistoryConflict
-            | Self::NativeLibraryDirNotUtf8(_) => None,
+            | Self::NativeLibraryDirNotUtf8(_)
+            | Self::DialogNotShowing(_)
+            | Self::DialogHasNoItems(_)
+            | Self::DialogItemOutOfRange(_)
+            | Self::DialogViewGone(_) => None,
         }
     }
 }
@@ -15551,6 +15873,25 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_theme_handle_is_released() {
+        fake_jvm::with_env(register_asset_manager_natives).expect("register AssetManager");
+        let native =
+            fake_jvm::registered_native("android/content/res/AssetManager", "deleteTheme", "(J)V")
+                .expect("AssetManager.deleteTheme is bound");
+        let delete_theme: extern "system" fn(EnvUnowned<'static>, JObject<'static>, jlong) =
+            unsafe { std::mem::transmute(native) };
+
+        let theme = theme_registry::allocate().expect("allocate theme");
+        delete_theme(fake_jvm::native_env(), JObject::null(), theme);
+        assert_eq!(
+            theme_registry::with_theme(theme, |_| ()),
+            Err(theme_registry::ThemeRegistryError::StaleHandle)
+        );
+
+        delete_theme(fake_jvm::native_env(), JObject::null(), 0);
+    }
+
+    #[test]
     fn resolve_theme_attr_returns_concrete_values_and_none_for_missing() {
         use crate::framework::theme_registry::ThemeAttr;
         let mut attrs = std::collections::HashMap::new();
@@ -15564,7 +15905,8 @@ mod tests {
                 source_package: 0x7f,
             },
         );
-        let e = resolve_theme_attr(&attrs, win_action_bar).expect("present attr resolves");
+        let e = resolve_theme_attr(&attrs, win_action_bar, &ResConfig::default())
+            .expect("present attr resolves");
         assert_eq!(e.value_type, 0x12, "TYPE_INT_BOOLEAN preserved");
         assert_eq!(
             e.data,
@@ -15574,7 +15916,7 @@ mod tests {
         assert_eq!(e.resource_id, 0, "a concrete value has no resource id");
 
         assert!(
-            resolve_theme_attr(&attrs, u32_to_i32(0x7f01_9999)).is_none(),
+            resolve_theme_attr(&attrs, u32_to_i32(0x7f01_9999), &ResConfig::default()).is_none(),
             "an attribute absent from the theme must be None, not a fabricated value"
         );
     }
@@ -15602,7 +15944,8 @@ mod tests {
                 source_package: 0x7f,
             },
         );
-        let e = resolve_theme_attr(&attrs, alias).expect("indirection resolves");
+        let e =
+            resolve_theme_attr(&attrs, alias, &ResConfig::default()).expect("indirection resolves");
         assert_eq!(e.value_type, 0x10, "resolved to the target's concrete type");
         assert_eq!(e.data, 7, "resolved to the target's concrete data");
 
@@ -15617,7 +15960,8 @@ mod tests {
             },
         );
 
-        let e = resolve_theme_attr(&cyc, a).expect("cycle terminates with a value");
+        let e = resolve_theme_attr(&cyc, a, &ResConfig::default())
+            .expect("cycle terminates with a value");
         assert_eq!(e.value_type, i32::from(TYPE_ATTRIBUTE));
     }
 
@@ -15644,24 +15988,26 @@ mod tests {
                 source_package: 0x01,
             },
         );
-        let e = resolve_theme_attr(&attrs, app_attr).expect("app-table string resolves");
+        let e = resolve_theme_attr(&attrs, app_attr, &ResConfig::default())
+            .expect("app-table string resolves");
         assert_eq!(
             e.asset_cookie, ARSC_APP_COOKIE,
             "an app-table theme string must carry the app ARSC cookie (was -1 → the null-string bug)"
         );
-        let e = resolve_theme_attr(&attrs, fw_attr).expect("framework-table string resolves");
+        let e = resolve_theme_attr(&attrs, fw_attr, &ResConfig::default())
+            .expect("framework-table string resolves");
         assert_eq!(
             e.asset_cookie, ARSC_FRAMEWORK_COOKIE,
             "a framework-table theme string must carry the framework ARSC cookie"
         );
 
-        let inline = resolve_inline_attr_value(TYPE_STRING, 42);
+        let inline = resolve_inline_attr_value(TYPE_STRING, 42, &ResConfig::default());
         assert_eq!(
             inline.asset_cookie, XML_BLOCK_COOKIE,
             "an inline XmlBlock string keeps the XmlBlock cookie"
         );
 
-        let non_string = resolve_inline_attr_value(0x10, 5);
+        let non_string = resolve_inline_attr_value(0x10, 5, &ResConfig::default());
         assert_eq!(non_string.asset_cookie, 0);
     }
 
@@ -15806,13 +16152,13 @@ mod tests {
         })
         .expect("populate theme");
 
-        let out = resolve_theme_attributes(theme, &[attr_a, attr_b]);
+        let out = resolve_theme_attributes(theme, &[attr_a, attr_b], &ResConfig::default());
         assert_eq!(out.len(), 2);
         assert!(out[0].is_some(), "registered attr resolves");
         assert!(out[1].is_none(), "unset attr is None (→ TYPE_NULL default)");
 
         let bogus = i64::MAX;
-        let out = resolve_theme_attributes(bogus, &[attr_a, attr_b]);
+        let out = resolve_theme_attributes(bogus, &[attr_a, attr_b], &ResConfig::default());
         assert_eq!(out, vec![None, None]);
 
         theme_registry::free(theme).expect("free theme");
@@ -15851,7 +16197,7 @@ mod tests {
             }),
             None,
         ];
-        resolve_inline_theme_refs(theme, &mut entries);
+        resolve_inline_theme_refs(theme, &mut entries, &ResConfig::default());
 
         let resolved = entries[0].expect("the ?attr value resolved against the theme");
         assert_eq!(
@@ -15871,7 +16217,7 @@ mod tests {
             resource_id: u32_to_i32(0x7f01_9999),
             asset_cookie: 0,
         })];
-        resolve_inline_theme_refs(theme, &mut undefined);
+        resolve_inline_theme_refs(theme, &mut undefined, &ResConfig::default());
         assert_eq!(
             undefined[0].expect("slot present").value_type,
             i32::from(TYPE_ATTRIBUTE),
@@ -15921,7 +16267,8 @@ mod tests {
         })
         .expect("advance to include");
 
-        let out = resolve_xml_attributes(handle, &[u32_to_i32(0x0101_00d0), 0]);
+        let out =
+            resolve_xml_attributes(handle, &[u32_to_i32(0x0101_00d0), 0], &ResConfig::default());
         assert_eq!(out.len(), 2);
         let id_entry = out[0].expect("android:id resolves on the include tag");
         assert_eq!(
@@ -16124,51 +16471,74 @@ mod tests {
         assert_eq!(indices[0], -1, "outIndices underflow guard");
         assert_eq!(indices[idx_len + 1], -1, "outIndices overflow guard");
 
-        let written = [
-            STYLE_TYPE,
-            STYLE_DATA,
-            STYLE_ASSET_COOKIE,
-            STYLE_RESOURCE_ID,
-        ];
         for (attr, e) in [(0usize, &entries[0]), (2usize, &entries[2])] {
             let win = 1 + attr * STYLE_NUM_ENTRIES;
             let e = e.unwrap();
-            assert_eq!(values[win + STYLE_TYPE], e.value_type, "STYLE_TYPE @0");
-            assert_eq!(values[win + STYLE_DATA], e.data, "STYLE_DATA @1");
             assert_eq!(
-                values[win + STYLE_ASSET_COOKIE],
-                e.asset_cookie,
-                "STYLE_ASSET_COOKIE @2"
+                values[win..win + STYLE_NUM_ENTRIES],
+                [e.value_type, e.data, e.asset_cookie, e.resource_id, 0, 0, 0],
+                "a found entry fills its whole window"
             );
-            assert_eq!(
-                values[win + STYLE_RESOURCE_ID],
-                e.resource_id,
-                "STYLE_RESOURCE_ID @3"
-            );
-            for slot in 0..STYLE_NUM_ENTRIES {
-                if !written.contains(&slot) {
-                    assert_eq!(values[win + slot], -1, "unwritten slot untouched");
-                }
-            }
         }
 
         for attr in [1usize, 3usize] {
             let win = 1 + attr * STYLE_NUM_ENTRIES;
-            assert_eq!(values[win + STYLE_TYPE], TYPE_NULL, "absent → TYPE_NULL @0");
-            for slot in 0..STYLE_NUM_ENTRIES {
-                if slot != STYLE_TYPE {
-                    assert_eq!(values[win + slot], -1, "absent: other slots untouched");
-                }
-            }
+            assert_eq!(
+                values[win..win + STYLE_NUM_ENTRIES],
+                [TYPE_NULL, DATA_NULL_UNDEFINED, NO_ASSET_COOKIE, 0, 0, 0, 0],
+                "an absent entry is TYPE_NULL/DATA_NULL_UNDEFINED with no cookie"
+            );
         }
 
         assert_eq!(indices[1], 2, "outIndices[0] = number found");
-        assert_eq!(indices[2], 1, "first found at request position 1 (1-based)");
-        assert_eq!(
-            indices[3], 3,
-            "second found at request position 3 (1-based)"
-        );
+        assert_eq!(indices[2], 0, "first found at request position 0");
+        assert_eq!(indices[3], 2, "second found at request position 2");
         assert_eq!(indices[1 + 3], -1, "outIndices beyond count untouched");
+    }
+
+    #[test]
+    fn typed_array_get_index_addresses_the_found_attribute_window() {
+        let found = |value_type: u8, data: i32| {
+            Some(TypedEntry {
+                value_type: i32::from(value_type),
+                data,
+                resource_id: 0,
+                asset_cookie: XML_BLOCK_COOKIE,
+            })
+        };
+        let entries = [
+            None,
+            found(TYPE_STRING, 0x11),
+            None,
+            found(TYPE_REFERENCE, 0x7f03_0001),
+        ];
+        let n = entries.len();
+        let mut values = vec![0x5a5a_5a5ai32; n * STYLE_NUM_ENTRIES];
+        let mut indices = vec![0i32; n + 1];
+        fill_typed_array(
+            values.as_mut_ptr() as jlong,
+            indices.as_mut_ptr() as jlong,
+            &entries,
+        );
+
+        let count = usize::try_from(indices[0]).expect("count");
+        assert_eq!(count, 2);
+        for at in 0..count {
+            let index = usize::try_from(indices[1 + at]).expect("index");
+            assert!(
+                index < n,
+                "getIndex({at}) = {index} is outside the {n} attrs"
+            );
+            let expected = entries[index].expect("getIndex names a found attribute");
+            assert_eq!(
+                values[index * STYLE_NUM_ENTRIES + STYLE_TYPE],
+                expected.value_type
+            );
+            assert_eq!(
+                values[index * STYLE_NUM_ENTRIES + STYLE_DATA],
+                expected.data
+            );
+        }
     }
 
     #[test]
@@ -16705,6 +17075,17 @@ mod tests {
     }
 
     #[test]
+    fn activity_open_uri_is_bound_with_the_api_impl_signature() {
+        fake_jvm::with_env(register_activity_natives).expect("register Activity");
+        assert!(fake_jvm::registered_native(
+            "android/app/Activity",
+            "nativeOpenURI",
+            "(Ljava/lang/String;)V"
+        )
+        .is_some());
+    }
+
+    #[test]
     fn process_native_name_sig_and_class_match_api_impl_dex() {
         assert_eq!(PROCESS_CLASS.to_str(), "android/os/Process");
         assert_eq!(
@@ -16715,13 +17096,88 @@ mod tests {
     }
 
     #[test]
-    fn engine_preload_natives_entry_point_exists_and_covers_log_and_process() {
-        let entry: fn(&Vm) -> Result<(), FrameworkError> = register_engine_preload_natives;
+    fn process_is_64_bit_is_registered_and_reports_the_host_word_size() {
+        fake_jvm::with_env(register_process_natives).expect("register Process");
+        let native = fake_jvm::registered_native("android/os/Process", "is64Bit", "()Z")
+            .expect("Process.is64Bit is bound");
+        let is_64_bit: extern "system" fn(EnvUnowned<'static>, JClass<'static>) -> jboolean =
+            unsafe { std::mem::transmute(native) };
+        assert!(is_64_bit(fake_jvm::native_env(), JClass::null()));
+    }
 
-        assert!((entry as usize) != 0);
+    #[test]
+    fn process_get_thread_priority_reads_the_nice_value_and_rejects_missing_threads() {
+        fake_jvm::with_env(register_process_natives).expect("register Process");
+        let native = fake_jvm::registered_native("android/os/Process", "getThreadPriority", "(I)I")
+            .expect("Process.getThreadPriority is bound");
+        let get_thread_priority: extern "system" fn(
+            EnvUnowned<'static>,
+            JClass<'static>,
+            jint,
+        ) -> jint = unsafe { std::mem::transmute(native) };
 
-        assert_eq!(LOG_CLASS.to_str(), "android/util/Log");
-        assert_eq!(PROCESS_CLASS.to_str(), "android/os/Process");
+        let tid = unsafe { libc::gettid() };
+        let expected = unsafe { libc::getpriority(libc::PRIO_PROCESS, tid as libc::id_t) };
+        assert_eq!(
+            get_thread_priority(fake_jvm::native_env(), JClass::null(), tid),
+            expected
+        );
+        assert_eq!(fake_jvm::take_exception(), None);
+
+        get_thread_priority(fake_jvm::native_env(), JClass::null(), i32::MAX);
+        assert_eq!(
+            fake_jvm::take_exception().as_deref(),
+            Some("java/lang/IllegalArgumentException")
+        );
+    }
+
+    #[test]
+    fn system_clock_current_thread_time_millis_is_the_thread_cpu_clock() {
+        fake_jvm::with_env(register_system_clock_natives).expect("register SystemClock");
+        let native =
+            fake_jvm::registered_native("android/os/SystemClock", "currentThreadTimeMillis", "()J")
+                .expect("SystemClock.currentThreadTimeMillis is bound");
+        let current_thread_time_millis: extern "system" fn(
+            EnvUnowned<'static>,
+            JClass<'static>,
+        ) -> jlong = unsafe { std::mem::transmute(native) };
+
+        let before = cpu_clock_millis(libc::CLOCK_THREAD_CPUTIME_ID);
+        let reported = current_thread_time_millis(fake_jvm::native_env(), JClass::null());
+        let after = cpu_clock_millis(libc::CLOCK_THREAD_CPUTIME_ID);
+        assert!(
+            (before..=after).contains(&reported),
+            "{before} <= {reported} <= {after}"
+        );
+    }
+
+    #[test]
+    fn engine_preload_binds_every_framework_native_jni_onload_reaches() {
+        fake_jvm::with_env(register_jni_onload_natives).expect("register natives");
+        for (class, name, sig) in [
+            (
+                "android/util/Log",
+                "println_native",
+                "(IILjava/lang/String;Ljava/lang/String;)I",
+            ),
+            ("android/os/Process", "getElapsedCpuTime", "()J"),
+            ("android/os/SystemClock", "elapsedRealtime", "()J"),
+            ("android/os/SystemClock", "elapsedRealtimeNanos", "()J"),
+            ("android/os/SystemClock", "uptimeMillis", "()J"),
+        ] {
+            assert!(
+                fake_jvm::registered_native(class, name, sig).is_some(),
+                "{class}.{name}{sig} is bound before libroblox's JNI_OnLoad"
+            );
+        }
+    }
+
+    #[test]
+    fn android_clocks_never_precede_the_process_start_time() {
+        assert!(monotonic_millis() >= jlong::try_from(ATL_PROCESS_START_MILLIS).unwrap());
+        assert!(
+            monotonic_nanos() >= jlong::try_from(ATL_PROCESS_START_MILLIS * 1_000_000).unwrap()
+        );
     }
 
     #[test]
@@ -17976,7 +18432,7 @@ mod tests {
             "high-byte-0x01 id must be served by the framework table (package 0x01)"
         );
         let v = table
-            .resource_value(0x0101_0000)
+            .resource_value(0x0101_0000, &ResConfig::default())
             .expect("framework entry resolves");
         assert_eq!(
             v.data, 7,
@@ -18024,7 +18480,15 @@ mod tests {
             "{} has no classes.dex",
             framework.api_impl_jar.display()
         );
-        let strictly_registered: [(&JNIStr, &[&JNIStr]); 2] = [
+        let dialog_names: Vec<&JNIStr> = dialogs::DIALOG_NATIVES
+            .iter()
+            .map(|&(name, _)| name)
+            .collect();
+        let alert_dialog_names: Vec<&JNIStr> = dialogs::ALERT_DIALOG_NATIVES
+            .iter()
+            .map(|&(name, _)| name)
+            .collect();
+        let strictly_registered: [(&JNIStr, &[&JNIStr]); 8] = [
             (
                 CONNECTIVITY_MANAGER_CLASS,
                 &[
@@ -18045,6 +18509,27 @@ mod tests {
                     WINDOW_TAKE_INPUT_QUEUE_NAME,
                 ],
             ),
+            (
+                PROCESS_CLASS,
+                &[
+                    PROCESS_GET_ELAPSED_CPU_TIME_NAME,
+                    PROCESS_IS_64_BIT_NAME,
+                    PROCESS_GET_THREAD_PRIORITY_NAME,
+                ],
+            ),
+            (
+                SYSTEM_CLOCK_CLASS,
+                &[
+                    ELAPSED_REALTIME_NAME,
+                    ELAPSED_REALTIME_NANOS_NAME,
+                    UPTIME_MILLIS_NAME,
+                    CURRENT_THREAD_TIME_MILLIS_NAME,
+                ],
+            ),
+            (ACTIVITY_CLASS, &[external_uri::NATIVE_OPEN_URI_NAME]),
+            (ASSET_MANAGER_CLASS, &[ASSET_MANAGER_DELETE_THEME_NAME]),
+            (dialogs::DIALOG_CLASS, &dialog_names),
+            (dialogs::ALERT_DIALOG_CLASS, &alert_dialog_names),
         ];
         for (class, names) in strictly_registered {
             for name in names {
@@ -18193,6 +18678,27 @@ mod tests {
     }
 
     #[test]
+    fn set_widget_as_root_on_an_invalid_window_leaves_the_active_root_alone() {
+        let dialog_placeholder_window: jlong = 1;
+        let dialog_decor = view_registry::allocate("com.android.internal.policy.DecorView")
+            .expect("allocate dialog decor view");
+
+        window_set_widget_as_root(
+            fake_jvm::native_env(),
+            JObject::null(),
+            dialog_placeholder_window,
+            dialog_decor,
+        );
+
+        assert_ne!(
+            view_registry::active_root(),
+            dialog_decor,
+            "a content view set on an invalid window must not become the active root"
+        );
+        view_registry::free(dialog_decor).expect("free dialog decor view");
+    }
+
+    #[test]
     fn finished_activity_is_released_and_still_finishes_once() {
         let _lock = ACTIVITY_TRACKER_TEST_LOCK
             .lock()
@@ -18229,6 +18735,146 @@ mod tests {
                 "collected finished activities are pruned"
             );
         });
+    }
+
+    #[test]
+    fn recreate_finish_with_a_null_window_handle_drives_the_old_activity_down() {
+        let _lock = ACTIVITY_TRACKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fake_jvm::with_env(|env| {
+            let activity = fake_jvm::new_object(env);
+            track_activity(env, &activity);
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            for callback in ["onPause", "onStop", "onDestroy"] {
+                let calls = std::sync::Arc::clone(&calls);
+                fake_jvm::on_call(&activity, callback, move || {
+                    calls.lock().expect("calls").push(callback);
+                });
+            }
+            let receiver = env.new_local_ref(&activity).expect("receiver");
+
+            activity_native_finish(fake_jvm::native_env(), receiver, 0);
+
+            assert_eq!(
+                *calls.lock().expect("calls"),
+                ["onPause", "onStop", "onDestroy"],
+                "Activity.recreate's nativeFinish(0) drives the old activity down"
+            );
+            assert_eq!(
+                fake_jvm::strong_refs(&activity),
+                0,
+                "the recreated activity is no longer pinned as live"
+            );
+            assert!(
+                !mark_activity_finished_once(env, &activity),
+                "the old activity is recorded as finished"
+            );
+        });
+    }
+
+    #[test]
+    fn a_recreated_activity_tree_offers_its_new_engine_surface_view() {
+        let activity_tree = || {
+            let surface = view_registry::allocate(RBX_SURFACE_VIEW_CLASS).expect("surface view");
+            let decor = view_registry::allocate("android.widget.FrameLayout").expect("decor");
+            view_registry::with_view(decor, |state| state.children.push(surface)).expect("wire");
+            (decor, surface)
+        };
+        let (old_decor, old_surface) = activity_tree();
+        let (new_decor, new_surface) = activity_tree();
+        let splash_decor = view_registry::allocate("android.widget.FrameLayout").expect("splash");
+
+        assert_eq!(
+            replacement_engine_surface_view(new_decor, Some(old_surface), None),
+            Some(new_surface)
+        );
+        assert_eq!(
+            replacement_engine_surface_view(new_decor, None, Some(old_surface)),
+            Some(new_surface)
+        );
+        assert_eq!(
+            replacement_engine_surface_view(old_decor, Some(old_surface), None),
+            None
+        );
+        assert_eq!(
+            replacement_engine_surface_view(new_decor, Some(new_surface), Some(old_surface)),
+            None
+        );
+        assert_eq!(
+            replacement_engine_surface_view(splash_decor, Some(old_surface), None),
+            None
+        );
+
+        for handle in [old_decor, old_surface, new_decor, new_surface, splash_decor] {
+            view_registry::free(handle).expect("free");
+        }
+    }
+
+    static ENGINE_SURFACE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_finished_activity_is_not_handed_its_destroyed_engine_surface_again() {
+        let _lock = ENGINE_SURFACE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let surface = view_registry::allocate(RBX_SURFACE_VIEW_CLASS).expect("surface view");
+        let decor = view_registry::allocate("android.widget.FrameLayout").expect("decor");
+        view_registry::with_view(decor, |state| state.children.push(surface)).expect("wire");
+        ENGINE_SURFACE_VIEW.store(surface, std::sync::atomic::Ordering::Release);
+
+        let dispatched = fake_jvm::with_env(destroy_engine_surface).expect("surface teardown");
+
+        assert!(!dispatched, "the surface view has no Java peer to call");
+        assert_eq!(engine_surface_view_handle(), None);
+        assert_eq!(
+            replacement_engine_surface_view(
+                decor,
+                engine_surface_view_handle(),
+                retired_engine_surface_view()
+            ),
+            None,
+            "the finished activity's tree is not offered the surface again"
+        );
+
+        RETIRED_ENGINE_SURFACE_VIEW.store(0, std::sync::atomic::Ordering::Release);
+        for handle in [decor, surface] {
+            view_registry::free(handle).expect("free");
+        }
+    }
+
+    #[test]
+    fn a_failed_engine_surface_teardown_still_stops_and_destroys_the_activity() {
+        let _lock = ENGINE_SURFACE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let surface = view_registry::allocate(RBX_SURFACE_VIEW_CLASS).expect("surface view");
+        ENGINE_SURFACE_VIEW.store(surface, std::sync::atomic::Ordering::Release);
+
+        fake_jvm::with_env(|env| {
+            let activity = fake_jvm::new_object(env);
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            for callback in ["onPause", "onStop", "onDestroy"] {
+                let calls = std::sync::Arc::clone(&calls);
+                fake_jvm::on_call(&activity, callback, move || {
+                    calls.lock().expect("calls").push(callback);
+                });
+            }
+            fake_jvm::on_call(&activity, "getWindow", || {
+                fake_jvm::throw("java/lang/IllegalStateException");
+            });
+
+            let outcome = drive_activity_down_lifecycle(env, &activity);
+
+            assert!(outcome.is_err(), "the surface teardown failure is reported");
+            assert_eq!(
+                *calls.lock().expect("calls"),
+                ["onPause", "onStop", "onDestroy"]
+            );
+        });
+
+        ENGINE_SURFACE_VIEW.store(0, std::sync::atomic::Ordering::Release);
+        view_registry::free(surface).expect("free surface");
     }
 
     #[test]

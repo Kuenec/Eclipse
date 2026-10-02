@@ -6,7 +6,9 @@ pub mod axml;
 pub mod cache;
 mod file_reader;
 pub mod https;
+mod locale_data;
 pub mod play;
+pub mod res_config;
 pub mod signature;
 pub mod store;
 

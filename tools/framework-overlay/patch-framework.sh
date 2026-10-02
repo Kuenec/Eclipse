@@ -183,6 +183,10 @@ sc_src="$here/src/android/content/pm/SigningCertificates.java"
 [ -f "$sc_src" ] || fail "host signing-certificate bridge missing at $sc_src"
 grep -qF 'private static native byte[][] native_signingCertificateHistory();' "$sc_src" || fail "SigningCertificates.java lost its host-verified certificate native"
 
+pl_src="$here/src/android/os/PreloadedLibrary.java"
+[ -f "$pl_src" ] || fail "preloaded-library bridge missing at $pl_src"
+grep -qF 'public static native String initialize(String name);' "$pl_src" || fail "PreloadedLibrary.java lost its JNI_OnLoad trampoline native"
+
 r_src="$ATL_SRC/com/android/internal/R.java"
 [ -f "$r_src" ] || fail "vendored com/android/internal/R.java not found at $r_src (set ATL_SRC)"
 grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+id[[:space:]]*=[[:space:]]*0x010100d0;' "$r_src" || fail "vendored internal R.attr.id != 0x010100d0 — ATL source drifted; re-verify the overlay's inlined constants"
@@ -205,9 +209,10 @@ grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+th
     "$pc_src" \
     "$si_src" \
     "$sc_src" \
+    "$pl_src" \
     "$r_src"
 
-for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/app/KeyguardManager*.class' 'android/security/keystore/KeyGenParameterSpec*.class' 'android/content/pm/SigningInfo*.class' 'android/content/pm/SigningCertificates*.class'; do
+for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/app/KeyguardManager*.class' 'android/security/keystore/KeyGenParameterSpec*.class' 'android/content/pm/SigningInfo*.class' 'android/content/pm/SigningCertificates*.class' 'android/os/PreloadedLibrary*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     mapfile -t class_files < <(compgen -G "$work/classes/$pattern")
@@ -264,6 +269,10 @@ scsm="$work/smali-check/android/content/pm/SigningCertificates.smali"
 [ -f "$work/smali-check/android/content/pm/SigningInfo.smali" ] || fail "SigningInfo.smali not in the built classes.dex — the stock stub would answer null"
 grep -qF '.method private static native native_signingCertificateHistory()[[B' "$scsm" || fail "dexed SigningCertificates lost its host-verified certificate native"
 grep -qF '0x8000000' "$scsm" || fail "dexed SigningCertificates lost the inlined GET_SIGNING_CERTIFICATES constant (0x08000000)"
+
+plsm="$work/smali-check/android/os/PreloadedLibrary.smali"
+[ -f "$plsm" ] || fail "PreloadedLibrary.smali not in the built classes.dex"
+grep -qF '.method public static native initialize(Ljava/lang/String;)Ljava/lang/String;' "$plsm" || fail "dexed PreloadedLibrary lost its JNI_OnLoad trampoline native"
 
 kgpssm="$work/smali-check/android/security/keystore/KeyGenParameterSpec.smali"
 kgpsbsm="$work/smali-check/android/security/keystore/KeyGenParameterSpec\$Builder.smali"
@@ -967,6 +976,19 @@ n="$(ANCHOR="$ANCHOR_SYSTEM_CERTIFICATES" perl -0777 -ne 'print scalar(() = /\Q$
 [ "$n" = "1" ] || fail "ATLLoadedApp.getSystemApplication collectCertificates call found $n times (expected 1) — installed ATLLoadedApp drifted; update patch-framework.sh"
 ANCHOR="$ANCHOR_SYSTEM_CERTIFICATES" HOST="$HOST_SYSTEM_CERTIFICATES" perl -0777 -pi -e 's{\Q$ENV{ANCHOR}\E}{$ENV{HOST}}' "$atlsm"
 perl -0777 -ne 'exit(/\.method public static getSystemApplication\(\)(?:(?!\.end method).)*SigningCertificates;->collectHostVerified\(Landroid\/content\/pm\/PackageParser\$Package;\)V/s ? 0 : 1)' "$atlsm" || fail "ATLLoadedApp.getSystemApplication host-verified certificate insert failed (drift?)"
+
+amsm="$work/smali/android/content/res/AssetManager.smali"
+[ -f "$amsm" ] || fail "AssetManager.smali not found after baksmali"
+n="$(grep -cxF '.method private final native deleteTheme(J)V' "$amsm")" || true
+[ "$n" = "1" ] || fail "AssetManager.smali deleteTheme native declaration found $n times (expected 1) — installed AssetManager drifted; update patch-framework.sh"
+ANCHOR_RELEASE_THEME=$'.method final releaseTheme(J)V\n    .registers 4\n\n    monitor-enter p0\n\n    :try_start_1\n    new-instance v0, Ljava/lang/Long;\n'
+RELEASE_THEME=$'.method final releaseTheme(J)V\n    .registers 4\n\n    monitor-enter p0\n\n    :try_start_1\n    invoke-direct {p0, p1, p2}, Landroid/content/res/AssetManager;->deleteTheme(J)V\n\n    new-instance v0, Ljava/lang/Long;\n'
+n="$(ANCHOR="$ANCHOR_RELEASE_THEME" perl -0777 -ne 'print scalar(() = /\Q$ENV{ANCHOR}\E/g)' "$amsm")"
+[ "$n" = "1" ] || fail "AssetManager.releaseTheme is not the upstream body (found $n, expected 1) — installed AssetManager drifted; update patch-framework.sh"
+ANCHOR="$ANCHOR_RELEASE_THEME" PATCHED="$RELEASE_THEME" perl -0777 -pi -e 's{\Q$ENV{ANCHOR}\E}{$ENV{PATCHED}}' "$amsm"
+perl -0777 -ne 'exit(/\.method final releaseTheme\(J\)V(?:(?!\.end method).)*->deleteTheme\(J\)V(?:(?!\.end method).)*->decRefsLocked\(I\)V/s ? 0 : 1)' "$amsm" || fail "AssetManager.releaseTheme no longer frees the native theme before dropping its reference"
+mkdir -p "$work/smali-view/android/content/res"
+cp "$amsm" "$work/smali-view/android/content/res/AssetManager.smali"
 
 mkdir -p "$work/smali-view/android/atl" "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/content" "$work/smali-view/android/content/pm" "$work/smali-view/android/net" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics"
 cp "$crsm" "$work/smali-view/android/content/ContentResolver.smali"
