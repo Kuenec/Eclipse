@@ -32,12 +32,12 @@ jobs:
           sudo apt-get install --yes libasound2-dev libfontconfig1-dev libfreetype6-dev pkg-config shellcheck
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
         with:
           components: clippy, rustfmt
 
       - name: Restore Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: quality
 
@@ -72,10 +72,10 @@ jobs:
           sudo apt-get install --yes libasound2-dev libfontconfig1-dev libfreetype6-dev pkg-config
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
 
       - name: Restore Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: tests-stable
 
@@ -99,10 +99,10 @@ jobs:
           sudo apt-get install --yes libasound2-dev libfontconfig1-dev libfreetype6-dev pkg-config
 
       - name: Install minimum supported Rust
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a
 
       - name: Restore Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: msrv-1.95
 
@@ -126,12 +126,12 @@ jobs:
           sudo apt-get install --yes libasound2-dev libgbm1 libgtk-3-dev libnss3
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
         with:
           components: clippy
 
       - name: Restore Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: webview
           workspaces: crates/eclipse-webview -> target
@@ -206,10 +206,10 @@ jobs:
           sudo apt-get install --yes libasound2-dev libfontconfig1-dev libfreetype6-dev pkg-config
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
 
       - name: Restore Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: release
 
