@@ -16,7 +16,12 @@ use super::store::{
 use super::{ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, ROBLOX_PACKAGE, TARGET_ABI};
 use crate::status::StatusSink;
 
-const PAGE_URL: &str = "https://apkcombo.com/roblox/com.roblox.client/download/apk";
+const SITE: &str = "https://apkcombo.com";
+const NEWEST_PAGE_PATH: &str = "/roblox/com.roblox.client/download/apk";
+const RELEASE_PAGE_PREFIX: &str = "/roblox/com.roblox.client/download/phone-";
+const RELEASE_PAGE_SUFFIX: &str = "-apk";
+const RELEASE_LINK: &str = "class=\"ver-item\" href=\"";
+const MAX_OLDER_PAGES: usize = 3;
 const DOWNLOAD_HOSTS: &[Host] = &[Host::Exact(
     "apks.39b7cb94d40914bac590886981b0ed6e.r2.cloudflarestorage.com",
 )];
@@ -88,7 +93,35 @@ impl fmt::Display for AdvertisedSize {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Offer {
+pub enum Page {
+    Newest,
+    Release(String),
+}
+
+impl Page {
+    fn url(&self) -> String {
+        match self {
+            Self::Newest => format!("{SITE}{NEWEST_PAGE_PATH}"),
+            Self::Release(version_name) => {
+                format!("{SITE}{RELEASE_PAGE_PREFIX}{version_name}{RELEASE_PAGE_SUFFIX}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for Page {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Newest => f.write_str("APKCombo's Roblox download page"),
+            Self::Release(version_name) => {
+                write!(f, "APKCombo's download page for Roblox {version_name}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Offer {
     version_name: String,
     version_code: VersionCode,
     packaging: Packaging,
@@ -120,31 +153,192 @@ impl fmt::Display for Offer {
     }
 }
 
-pub fn newest_offer() -> Result<Offer, ApkComboError> {
-    let response = https::request_agent()
-        .run(page_request())
-        .map_err(ApkComboError::page)?;
-    parse_offer(&page_text(response)?)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingBuild {
+    version_name: String,
+    version_code: VersionCode,
+    offered: Vec<String>,
+}
+
+impl fmt::Display for MissingBuild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Roblox {} (versionCode {}, offered only for {})",
+            self.version_name,
+            self.version_code,
+            self.offered.join(" or ")
+        )
+    }
+}
+
+fn missing_text(releases: &[MissingBuild]) -> String {
+    releases
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Listing {
+    Offer(Offer),
+    Missing(MissingBuild),
+}
+
+impl Listing {
+    fn release(&self) -> (&str, VersionCode) {
+        match self {
+            Self::Offer(offer) => (&offer.version_name, offer.version_code),
+            Self::Missing(release) => (&release.version_name, release.version_code),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Choice {
+    Offered {
+        offer: Offer,
+        passed_over: Vec<MissingBuild>,
+    },
+    Kept {
+        installed: InstalledVersion,
+        passed_over: Vec<MissingBuild>,
+    },
+}
+
+impl fmt::Display for Choice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Offered { offer, passed_over } if passed_over.is_empty() => {
+                write!(f, "APKCombo offers {offer}")
+            }
+            Self::Offered { offer, passed_over } => write!(
+                f,
+                "APKCombo has no {TARGET_ABI} build of {} yet, so Eclipse chose {offer}, the \
+                 newest release that has one",
+                missing_text(passed_over)
+            ),
+            Self::Kept {
+                installed,
+                passed_over,
+            } if passed_over.is_empty() => write!(
+                f,
+                "APKCombo has no {TARGET_ABI} build newer than the installed Roblox {installed}"
+            ),
+            Self::Kept {
+                installed,
+                passed_over,
+            } => write!(
+                f,
+                "APKCombo has no {TARGET_ABI} build of {} yet, so Eclipse keeps the installed \
+                 Roblox {installed} for now",
+                missing_text(passed_over)
+            ),
+        }
+    }
 }
 
 pub fn update(
-    offer: &Offer,
     store: &Store,
     current: Option<&ApkSet>,
     rejected: Option<Release>,
     status: &StatusSink,
 ) -> Result<UpdateOutcome, ApkComboError> {
-    let agent = https::download_agent();
+    let pages = https::request_agent();
+    let downloads = https::download_agent();
+    update_from(
+        store,
+        current,
+        rejected,
+        status,
+        |page| fetch_page(&pages, page),
+        |url, resume| https::open_download(&downloads, &url.to_string(), DOWNLOAD_HOSTS, resume),
+    )
+}
+
+fn update_from<R: Read>(
+    store: &Store,
+    current: Option<&ApkSet>,
+    rejected: Option<Release>,
+    status: &StatusSink,
+    mut fetch: impl FnMut(&Page) -> Result<String, ApkComboError>,
+    mut open: impl FnMut(&Uri, Option<&Resume>) -> Result<Download<R>, DownloadError>,
+) -> Result<UpdateOutcome, ApkComboError> {
+    let installed = current.map(InstalledVersion::from);
+    let choice = choose(installed.as_ref(), &mut fetch)?;
+    status.step(choice.to_string());
+    let offer = match choice {
+        Choice::Offered { offer, .. } => offer,
+        Choice::Kept { installed, .. } => return Ok(UpdateOutcome::UpToDate { installed }),
+    };
+    let own_page = Page::Release(offer.version_name.clone());
     let mut link = offer.url.clone();
-    update_with(offer, store, current, rejected, status, |resume| {
-        open_renewing(
-            offer,
-            &mut link,
-            resume,
-            |url, resume| https::open_download(&agent, &url.to_string(), DOWNLOAD_HOSTS, resume),
-            newest_offer,
-        )
+    update_with(&offer, store, current, rejected, status, |resume| {
+        open_renewing(&offer, &mut link, resume, &mut open, || {
+            parse_listing(&fetch(&own_page)?, &own_page)
+        })
     })
+}
+
+fn choose(
+    installed: Option<&InstalledVersion>,
+    mut fetch: impl FnMut(&Page) -> Result<String, ApkComboError>,
+) -> Result<Choice, ApkComboError> {
+    let newest_html = fetch(&Page::Newest)?;
+    let newest = match parse_listing(&newest_html, &Page::Newest)? {
+        Listing::Offer(offer) => {
+            return Ok(Choice::Offered {
+                offer,
+                passed_over: Vec::new(),
+            })
+        }
+        Listing::Missing(release) => release,
+    };
+    let newer = |code: VersionCode| installed.is_none_or(|installed| code > installed.version_code);
+    let mut passed_over = Vec::new();
+    if newer(newest.version_code) {
+        let own_page = Page::Release(newest.version_name.clone());
+        let mut previous = newest.version_code;
+        passed_over.push(newest);
+        let older = release_pages(&newest_html)
+            .filter(|page| !matches!(page, Ok(page) if *page == own_page))
+            .take(MAX_OLDER_PAGES);
+        for page in older {
+            let page = page?;
+            let listing = parse_listing(&fetch(&page)?, &page)?;
+            let (version_name, version_code) = listing.release();
+            if !matches!(&page, Page::Release(listed) if listed == version_name) {
+                return Err(ApkComboError::layout(
+                    &page,
+                    "a release page lists another release",
+                ));
+            }
+            if version_code >= previous {
+                return Err(ApkComboError::layout(
+                    &page,
+                    "old versions are not listed newest first",
+                ));
+            }
+            previous = version_code;
+            match listing {
+                Listing::Offer(offer) if newer(version_code) => {
+                    return Ok(Choice::Offered { offer, passed_over })
+                }
+                Listing::Missing(release) if newer(version_code) => passed_over.push(release),
+                Listing::Offer(_) | Listing::Missing(_) => break,
+            }
+        }
+    }
+    match installed {
+        Some(installed) => Ok(Choice::Kept {
+            installed: installed.clone(),
+            passed_over,
+        }),
+        None => Err(ApkComboError::NoX86_64 {
+            missing: passed_over,
+        }),
+    }
 }
 
 fn open_renewing<R>(
@@ -152,18 +346,20 @@ fn open_renewing<R>(
     link: &mut Uri,
     resume: Option<&Resume>,
     mut open: impl FnMut(&Uri, Option<&Resume>) -> Result<Download<R>, DownloadError>,
-    renew: impl FnOnce() -> Result<Offer, ApkComboError>,
+    renew: impl FnOnce() -> Result<Listing, ApkComboError>,
 ) -> Result<Download<R>, ApkComboError> {
     match open(link, resume) {
         Err(DownloadError::Status(EXPIRED_LINK_STATUS)) if resume.is_some() => {}
         opened => return opened.map_err(ApkComboError::Download),
     }
-    let renewed = renew()?;
-    if renewed.url.path() != offer.url.path() {
-        return Err(ApkComboError::Superseded {
-            offered: offer.to_string(),
-        });
-    }
+    let renewed = match renew()? {
+        Listing::Offer(renewed) if renewed.url.path() == offer.url.path() => renewed,
+        Listing::Offer(_) | Listing::Missing(_) => {
+            return Err(ApkComboError::Superseded {
+                offered: offer.to_string(),
+            })
+        }
+    };
     *link = renewed.url;
     open(link, resume).map_err(ApkComboError::Download)
 }
@@ -319,30 +515,65 @@ fn store_failure(error: StoreError) -> ApkComboError {
     }
 }
 
-fn page_request() -> Request<()> {
-    Request::get(PAGE_URL)
-        .header(USER_AGENT, format!("Eclipse/{}", crate::VERSION))
-        .body(())
-        .expect("a GET of a static URL with an ASCII User-Agent is a valid request")
+fn fetch_page(agent: &ureq::Agent, page: &Page) -> Result<String, ApkComboError> {
+    let response = agent
+        .run(page_request(page))
+        .map_err(|error| ApkComboError::page(page, error))?;
+    page_text(page, response)
 }
 
-fn page_text(response: Response<ureq::Body>) -> Result<String, ApkComboError> {
+fn page_request(page: &Page) -> Request<()> {
+    Request::get(page.url())
+        .header(USER_AGENT, format!("Eclipse/{}", crate::VERSION))
+        .body(())
+        .expect("a GET of an APKCombo page with an ASCII User-Agent is a valid request")
+}
+
+fn page_text(page: &Page, response: Response<ureq::Body>) -> Result<String, ApkComboError> {
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
-        return Err(ApkComboError::PageStatus(status));
+        return Err(ApkComboError::PageStatus {
+            page: page.clone(),
+            status,
+        });
     }
     let body = response
         .into_body()
         .into_with_config()
         .limit(MAX_PAGE_BYTES)
         .read_to_vec()
-        .map_err(ApkComboError::page)?;
+        .map_err(|error| ApkComboError::page(page, error))?;
     Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+fn release_pages(html: &str) -> impl Iterator<Item = Result<Page, ApkComboError>> + '_ {
+    html.split(RELEASE_LINK).skip(1).map(|piece| {
+        piece
+            .split_once('"')
+            .and_then(|(href, _)| release_page(href))
+            .ok_or_else(|| {
+                ApkComboError::layout(
+                    &Page::Newest,
+                    "an old version link does not name a Roblox release page",
+                )
+            })
+    })
+}
+
+fn release_page(href: &str) -> Option<Page> {
+    let version_name = href
+        .strip_prefix(RELEASE_PAGE_PREFIX)?
+        .strip_suffix(RELEASE_PAGE_SUFFIX)?;
+    version_name
+        .split('.')
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| Page::Release(version_name.to_owned()))
 }
 
 struct VariantLink<'a> {
     abis: &'a str,
-    anchor: &'a str,
+    href: &'a str,
+    body: &'a str,
 }
 
 impl VariantLink<'_> {
@@ -351,37 +582,62 @@ impl VariantLink<'_> {
     }
 }
 
-fn parse_offer(page: &str) -> Result<Offer, ApkComboError> {
-    let links = variant_links(page)?;
-    if links.is_empty() {
-        return Err(ApkComboError::PageLayout("it has no download links"));
-    }
-    let mut offers = Vec::new();
-    let mut offered = Vec::new();
-    for link in links {
-        if link.has_target_abi() {
-            offers.push(parse_variant(link.anchor)?);
-        } else if !offered.iter().any(|abis| abis == link.abis.trim()) {
-            offered.push(link.abis.trim().to_owned());
-        }
-    }
-    offers
+fn parse_listing(html: &str, page: &Page) -> Result<Listing, ApkComboError> {
+    let (targeted, others): (Vec<_>, Vec<_>) = variant_links(html, page)?
+        .into_iter()
+        .partition(VariantLink::has_target_abi);
+    let offers = targeted
+        .iter()
+        .map(|link| parse_variant(link, page))
+        .collect::<Result<Vec<_>, _>>()?;
+    match offers
         .into_iter()
         .max_by_key(|offer| (offer.version_code, offer.packaging == Packaging::Xapk))
-        .ok_or(ApkComboError::NoX86_64 { offered })
+    {
+        Some(offer) => Ok(Listing::Offer(offer)),
+        None => missing_build(&others, page).map(Listing::Missing),
+    }
 }
 
-fn variant_links(page: &str) -> Result<Vec<VariantLink<'_>>, ApkComboError> {
-    let mut pieces = page.split(VARIANT_LINK);
+fn missing_build(links: &[VariantLink<'_>], page: &Page) -> Result<MissingBuild, ApkComboError> {
+    let releases = links
+        .iter()
+        .map(|link| listed_release(link.body, page))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (version_name, version_code) = releases
+        .into_iter()
+        .max_by_key(|&(_, version_code)| version_code)
+        .ok_or_else(|| ApkComboError::layout(page, "it has no download links"))?;
+    let mut offered: Vec<String> = Vec::new();
+    for link in links {
+        let abis = link.abis.trim();
+        if !offered.iter().any(|listed| listed == abis) {
+            offered.push(abis.to_owned());
+        }
+    }
+    Ok(MissingBuild {
+        version_name: version_name.to_owned(),
+        version_code,
+        offered,
+    })
+}
+
+fn variant_links<'a>(html: &'a str, page: &Page) -> Result<Vec<VariantLink<'a>>, ApkComboError> {
+    let mut pieces = html.split(VARIANT_LINK);
     let mut abis = pieces.next().and_then(last_abi_list);
     let mut links = Vec::new();
     for piece in pieces {
         let (anchor, rest) = piece
             .split_once("</a>")
-            .ok_or(ApkComboError::PageLayout("a download link is not closed"))?;
+            .ok_or_else(|| ApkComboError::layout(page, "a download link is not closed"))?;
+        let (href, body) = anchor
+            .split_once('"')
+            .ok_or_else(|| ApkComboError::layout(page, "a download link is not quoted"))?;
         links.push(VariantLink {
-            abis: abis.ok_or(ApkComboError::PageLayout("a download link has no ABI list"))?,
-            anchor,
+            abis: abis
+                .ok_or_else(|| ApkComboError::layout(page, "a download link has no ABI list"))?,
+            href,
+            body,
         });
         abis = last_abi_list(rest).or(abis);
     }
@@ -394,39 +650,41 @@ fn last_abi_list(html: &str) -> Option<&str> {
     Some(&html[start..start + length])
 }
 
-fn parse_variant(anchor: &str) -> Result<Offer, ApkComboError> {
-    let (href, body) = anchor
-        .split_once('"')
-        .ok_or(ApkComboError::PageLayout("a download link is not quoted"))?;
-    let href = href.replace("&amp;", "&");
-    let encoded = href
-        .split_once('&')
-        .map_or(href.as_str(), |(value, _)| value);
-    let url = percent_decode(encoded).ok_or(ApkComboError::PageLayout(
-        "a download link is not percent-encoded",
-    ))?;
-    let url = https::trusted_uri(&url, DOWNLOAD_HOSTS).map_err(ApkComboError::Download)?;
-    let key = ObjectKey::parse(url.path()).ok_or(ApkComboError::UnexpectedLink)?;
-
+fn listed_release<'a>(body: &'a str, page: &Page) -> Result<(&'a str, VersionCode), ApkComboError> {
     let version_name = element_text(body, "vername")
         .and_then(|text| text.split_whitespace().last())
-        .ok_or(ApkComboError::PageLayout("a download has no version name"))?;
+        .ok_or_else(|| ApkComboError::layout(page, "a download has no version name"))?;
     let version_code = element_text(body, "vercode")
         .and_then(|text| text.strip_prefix('(')?.strip_suffix(')')?.parse().ok())
         .map(VersionCode)
-        .ok_or(ApkComboError::PageLayout("a download has no versionCode"))?;
-    let packaging = if body.contains("class=\"type-xapk\"") {
+        .ok_or_else(|| ApkComboError::layout(page, "a download has no versionCode"))?;
+    Ok((version_name, version_code))
+}
+
+fn parse_variant(link: &VariantLink<'_>, page: &Page) -> Result<Offer, ApkComboError> {
+    let href = link.href.replace("&amp;", "&");
+    let encoded = href
+        .split_once('&')
+        .map_or(href.as_str(), |(value, _)| value);
+    let url = percent_decode(encoded)
+        .ok_or_else(|| ApkComboError::layout(page, "a download link is not percent-encoded"))?;
+    let url = https::trusted_uri(&url, DOWNLOAD_HOSTS).map_err(ApkComboError::Download)?;
+    let key = ObjectKey::parse(url.path()).ok_or(ApkComboError::UnexpectedLink)?;
+
+    let (version_name, version_code) = listed_release(link.body, page)?;
+    let packaging = if link.body.contains("class=\"type-xapk\"") {
         Packaging::Xapk
-    } else if body.contains("class=\"type-apk\"") {
+    } else if link.body.contains("class=\"type-apk\"") {
         Packaging::Apk
     } else {
-        return Err(ApkComboError::PageLayout(
+        return Err(ApkComboError::layout(
+            page,
             "a download is neither an APK nor an XAPK",
         ));
     };
-    let size = element_text(body, "spec ltr")
+    let size = element_text(link.body, "spec ltr")
         .and_then(AdvertisedSize::parse)
-        .ok_or(ApkComboError::PageLayout("a download has no size"))?;
+        .ok_or_else(|| ApkComboError::layout(page, "a download has no size"))?;
 
     if key.version_name != version_name || key.version_code != version_code {
         return Err(ApkComboError::Inconsistent {
@@ -568,15 +826,22 @@ fn file_sha1(path: &Path) -> Result<[u8; SHA1_OUTPUT_LEN], ApkComboError> {
 #[derive(Debug)]
 pub enum ApkComboError {
     Page {
+        page: Page,
         detail: String,
     },
 
-    PageStatus(u16),
+    PageStatus {
+        page: Page,
+        status: u16,
+    },
 
-    PageLayout(&'static str),
+    PageLayout {
+        page: Page,
+        problem: &'static str,
+    },
 
     NoX86_64 {
-        offered: Vec<String>,
+        missing: Vec<MissingBuild>,
     },
 
     Inconsistent {
@@ -624,9 +889,17 @@ pub enum ApkComboError {
 }
 
 impl ApkComboError {
-    fn page(error: ureq::Error) -> Self {
+    fn page(page: &Page, error: ureq::Error) -> Self {
         Self::Page {
+            page: page.clone(),
             detail: https::redacted(error),
+        }
+    }
+
+    fn layout(page: &Page, problem: &'static str) -> Self {
+        Self::PageLayout {
+            page: page.clone(),
+            problem,
         }
     }
 
@@ -644,28 +917,25 @@ impl ApkComboError {
 impl fmt::Display for ApkComboError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Page { detail } => {
-                write!(f, "cannot load APKCombo's Roblox download page: {detail}")
-            }
-            Self::PageStatus(status @ (403 | 429 | 503)) => write!(
+            Self::Page { page, detail } => write!(f, "cannot load {page}: {detail}"),
+            Self::PageStatus {
+                page,
+                status: status @ (403 | 429 | 503),
+            } => write!(
                 f,
-                "APKCombo's Roblox download page answered HTTP {status}; it may be refusing \
-                 automated requests right now, so try again later or install the APKs with \
-                 `eclipse install <PATH>`"
+                "{page} answered HTTP {status}; it may be refusing automated requests right now, \
+                 so try again later or install the APKs with `eclipse install <PATH>`"
             ),
-            Self::PageStatus(status) => {
-                write!(f, "APKCombo's Roblox download page answered HTTP {status}")
-            }
-            Self::PageLayout(problem) => write!(
+            Self::PageStatus { page, status } => write!(f, "{page} answered HTTP {status}"),
+            Self::PageLayout { page, problem } => write!(
                 f,
-                "APKCombo's Roblox download page has an unexpected layout ({problem}); install \
-                 the APKs with `eclipse install <PATH>` until Eclipse supports the new layout"
+                "{page} has an unexpected layout ({problem}); install the APKs with `eclipse \
+                 install <PATH>` until Eclipse supports the new layout"
             ),
-            Self::NoX86_64 { offered } => write!(
+            Self::NoX86_64 { missing } => write!(
                 f,
-                "APKCombo offers no {TARGET_ABI} build of the newest Roblox (it offers: {}); try \
-                 again later",
-                offered.join("; ")
+                "APKCombo has no {TARGET_ABI} build of {} yet; try again later",
+                missing_text(missing)
             ),
             Self::Inconsistent { listed, linked } => write!(
                 f,
@@ -681,7 +951,7 @@ impl fmt::Display for ApkComboError {
             Self::Superseded { offered } => write!(
                 f,
                 "APKCombo's download link for {offered} expired during the download and \
-                 APKCombo now offers a different file; the next update check downloads it"
+                 APKCombo no longer offers that file; the next update check starts over"
             ),
             Self::SizeMismatch { advertised, actual } => write!(
                 f,
@@ -729,8 +999,8 @@ impl std::error::Error for ApkComboError {
             | Self::Store(error)
             | Self::NotRemembered { source: error, .. } => Some(error),
             Self::Page { .. }
-            | Self::PageStatus(_)
-            | Self::PageLayout(_)
+            | Self::PageStatus { .. }
+            | Self::PageLayout { .. }
             | Self::NoX86_64 { .. }
             | Self::Inconsistent { .. }
             | Self::UnexpectedLink
@@ -763,7 +1033,9 @@ mod tests {
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
+    const ARM_ONLY_PAGE: &str = include_str!("../../tests/fixtures/apkcombo-2.741.1061.html");
     const LATEST_PAGE: &str = include_str!("../../tests/fixtures/apkcombo-2.740.931.html");
+    const OLDER_PAGE: &str = include_str!("../../tests/fixtures/apkcombo-2.739.691.html");
     const MIXED_PAGE: &str = include_str!("../../tests/fixtures/apkcombo-2.738.1397.html");
     const LATEST_BASE_SHA1: &str = "4000331cf5d800c02fc213cc6a51dc823df6ea7c";
     const UNIVERSAL_APK_SHA1: &str = "4ab4e3ce235bd53755d77f4c81939c6c3353f87f";
@@ -790,6 +1062,21 @@ mod tests {
         }
     }
 
+    fn newest_listing(html: &str) -> Result<Listing, ApkComboError> {
+        parse_listing(html, &Page::Newest)
+    }
+
+    fn offer_on(html: &str) -> Offer {
+        match newest_listing(html).unwrap() {
+            Listing::Offer(offer) => offer,
+            Listing::Missing(release) => panic!("the page has no {TARGET_ABI} build: {release}"),
+        }
+    }
+
+    fn release(name: &str) -> Page {
+        Page::Release(name.to_owned())
+    }
+
     fn page_response(status: u16, body: impl Into<Vec<u8>>) -> Response<ureq::Body> {
         Response::builder()
             .status(status)
@@ -798,54 +1085,78 @@ mod tests {
     }
 
     #[test]
-    fn page_request_is_an_anonymous_https_get_with_an_honest_user_agent() {
-        let request = page_request();
-        assert_eq!(request.method(), "GET");
-        assert_eq!(request.uri().to_string(), PAGE_URL);
-        assert_eq!(request.uri().scheme_str(), Some("https"));
-        assert_eq!(
-            request.headers()[USER_AGENT],
-            format!("Eclipse/{}", crate::VERSION)
-        );
-        assert_eq!(
-            request.headers().len(),
-            1,
-            "no cookies, credentials or other headers: {:?}",
-            request.headers()
-        );
+    fn page_requests_are_anonymous_https_gets_with_an_honest_user_agent() {
+        for (page, url) in [
+            (
+                Page::Newest,
+                "https://apkcombo.com/roblox/com.roblox.client/download/apk",
+            ),
+            (
+                release("2.740.931"),
+                "https://apkcombo.com/roblox/com.roblox.client/download/phone-2.740.931-apk",
+            ),
+        ] {
+            let request = page_request(&page);
+            assert_eq!(request.method(), "GET");
+            assert_eq!(request.uri().to_string(), url);
+            assert_eq!(request.uri().scheme_str(), Some("https"));
+            assert_eq!(
+                request.headers()[USER_AGENT],
+                format!("Eclipse/{}", crate::VERSION)
+            );
+            assert_eq!(
+                request.headers().len(),
+                1,
+                "no cookies, credentials or other headers: {:?}",
+                request.headers()
+            );
+        }
     }
 
     #[test]
     fn the_page_is_read_only_from_a_success_status_and_below_four_mebibytes() {
+        let newest = &Page::Newest;
         assert_eq!(
-            page_text(page_response(200, LATEST_PAGE)).unwrap(),
+            page_text(newest, page_response(200, LATEST_PAGE)).unwrap(),
             LATEST_PAGE
         );
         let largest = MAX_PAGE_BYTES as usize - 1;
         assert_eq!(
-            page_text(page_response(200, vec![b'a'; largest]))
+            page_text(newest, page_response(200, vec![b'a'; largest]))
                 .unwrap()
                 .len(),
             largest
         );
 
-        let err = page_text(page_response(200, vec![b'a'; largest + 1])).unwrap_err();
-        assert!(matches!(err, ApkComboError::Page { .. }), "{err:?}");
+        let older = &release("2.740.931");
+        let err = page_text(older, page_response(200, vec![b'a'; largest + 1])).unwrap_err();
+        assert!(
+            matches!(&err, ApkComboError::Page { page, .. } if page == older),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("cannot load APKCombo's download page for Roblox 2.740.931: "),
+            "{err}"
+        );
         for status in [403, 429, 503] {
-            let err = page_text(page_response(status, "Just a moment...")).unwrap_err();
+            let err = page_text(newest, page_response(status, "Just a moment...")).unwrap_err();
             assert!(
-                matches!(err, ApkComboError::PageStatus(code) if code == status),
+                matches!(err, ApkComboError::PageStatus { status: code, .. } if code == status),
                 "{err:?}"
             );
             assert!(err.to_string().contains("eclipse install"), "{err}");
         }
-        let err = page_text(page_response(404, "")).unwrap_err();
-        assert!(matches!(err, ApkComboError::PageStatus(404)), "{err:?}");
+        let err = page_text(older, page_response(404, "")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "APKCombo's download page for Roblox 2.740.931 answered HTTP 404"
+        );
     }
 
     #[test]
     fn the_newest_release_page_offers_the_x86_64_xapk() {
-        let offer = parse_offer(LATEST_PAGE).unwrap();
+        let offer = offer_on(LATEST_PAGE);
         assert_eq!(offer.version_name, "2.740.931");
         assert_eq!(offer.version_code, VersionCode(3170));
         assert_eq!(offer.packaging, Packaging::Xapk);
@@ -884,7 +1195,7 @@ mod tests {
 
     #[test]
     fn a_universal_apk_is_chosen_when_the_xapk_has_no_x86_64_split() {
-        let offer = parse_offer(MIXED_PAGE).unwrap();
+        let offer = offer_on(MIXED_PAGE);
         assert_eq!(offer.version_code, VersionCode(3092));
         assert_eq!(offer.version_name, "2.738.1397");
         assert_eq!(offer.packaging, Packaging::Apk);
@@ -898,26 +1209,330 @@ mod tests {
             "<code>arm64-v8a, armeabi-v7a</code>",
             "<code>arm64-v8a, armeabi-v7a, x86_64</code>",
         );
-        let offer = parse_offer(&page).unwrap();
+        let offer = offer_on(&page);
         assert_eq!(offer.packaging, Packaging::Xapk);
         assert_eq!(offer.version_code, VersionCode(3092));
     }
 
     #[test]
-    fn pages_without_an_x86_64_build_are_refused() {
-        let page = LATEST_PAGE.replace("armeabi-v7a, x86_64</code>", "armeabi-v7a</code>");
-        let err = parse_offer(&page).unwrap_err();
-        assert!(
-            matches!(&err, ApkComboError::NoX86_64 { offered } if offered == &["arm64-v8a, armeabi-v7a"]),
-            "{err:?}"
+    fn a_page_without_an_x86_64_build_names_its_release_and_abis() {
+        let newest = MissingBuild {
+            version_name: "2.741.1061".to_owned(),
+            version_code: VersionCode(3212),
+            offered: vec!["arm64-v8a, armeabi-v7a".to_owned()],
+        };
+        assert_eq!(
+            newest_listing(ARM_ONLY_PAGE).unwrap(),
+            Listing::Missing(newest.clone())
         );
-        assert!(err.to_string().contains("no x86_64 build"), "{err}");
+        assert_eq!(
+            newest.to_string(),
+            "Roblox 2.741.1061 (versionCode 3212, offered only for arm64-v8a, armeabi-v7a)"
+        );
 
         let page = MIXED_PAGE.replace(", x86_64</code>", "</code>");
-        let err = parse_offer(&page).unwrap_err();
+        let Listing::Missing(release) = newest_listing(&page).unwrap() else {
+            panic!("the page has no {TARGET_ABI} build");
+        };
+        assert_eq!(release.version_code, VersionCode(3092));
+        assert_eq!(
+            release.offered,
+            ["arm64-v8a, armeabi-v7a"],
+            "each offered ABI list is reported once"
+        );
+    }
+
+    fn gap_site() -> Vec<(Page, String)> {
+        vec![
+            (Page::Newest, ARM_ONLY_PAGE.to_owned()),
+            (release("2.741.1061"), ARM_ONLY_PAGE.to_owned()),
+            (release("2.740.931"), LATEST_PAGE.to_owned()),
+            (release("2.739.691"), OLDER_PAGE.to_owned()),
+        ]
+    }
+
+    fn served_pages<'a>(
+        site: &'a [(Page, String)],
+        fetched: &'a mut Vec<Page>,
+    ) -> impl FnMut(&Page) -> Result<String, ApkComboError> + 'a {
+        move |page| {
+            fetched.push(page.clone());
+            site.iter()
+                .find(|(listed, _)| listed == page)
+                .map(|(_, html)| html.clone())
+                .ok_or_else(|| ApkComboError::PageStatus {
+                    page: page.clone(),
+                    status: 404,
+                })
+        }
+    }
+
+    fn choose_on(
+        site: &[(Page, String)],
+        installed: Option<&InstalledVersion>,
+    ) -> (Result<Choice, ApkComboError>, Vec<Page>) {
+        let mut fetched = Vec::new();
+        let choice = choose(installed, served_pages(site, &mut fetched));
+        (choice, fetched)
+    }
+
+    fn arm_only(version_name: &str, code: u32) -> MissingBuild {
+        MissingBuild {
+            version_name: version_name.to_owned(),
+            version_code: VersionCode(code),
+            offered: vec!["arm64-v8a, armeabi-v7a".to_owned()],
+        }
+    }
+
+    #[test]
+    fn older_release_pages_are_read_from_the_old_versions_list() {
+        let pages = release_pages(ARM_ONLY_PAGE)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            pages,
+            [
+                release("2.741.1061"),
+                release("2.740.931"),
+                release("2.739.691")
+            ]
+        );
+        assert!(release_pages(LATEST_PAGE).next().is_none());
+        for href in [
+            "/roblox/com.roblox.client/download/phone-2.740.931/../x-apk",
+            "/roblox/com.evil.client/download/phone-2.740.931-apk",
+            "https://evil.example/roblox/com.roblox.client/download/phone-2.740.931-apk",
+            "/roblox/com.roblox.client/download/phone--apk",
+            "/roblox/com.roblox.client/download/phone-2..931-apk",
+            "/roblox/com.roblox.client/download/phone-2.740.931-apk?u=x",
+        ] {
+            let page = ARM_ONLY_PAGE.replace(
+                "/roblox/com.roblox.client/download/phone-2.740.931-apk",
+                href,
+            );
+            let err = release_pages(&page)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ApkComboError::PageLayout {
+                        page: Page::Newest,
+                        ..
+                    }
+                ),
+                "{href}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_newest_release_is_offered_directly_when_it_has_an_x86_64_build() {
+        let site = [(Page::Newest, LATEST_PAGE.to_owned())];
+        for installed_code in [None, Some(3120), Some(3170)] {
+            let (choice, fetched) = choose_on(&site, installed_code.map(installed).as_ref());
+            let choice = choice.unwrap();
+            assert_eq!(
+                choice,
+                Choice::Offered {
+                    offer: offer_on(LATEST_PAGE),
+                    passed_over: Vec::new()
+                }
+            );
+            assert_eq!(fetched, [Page::Newest]);
+            assert_eq!(
+                choice.to_string(),
+                "APKCombo offers Roblox 2.740.931 (versionCode 3170, XAPK, about 234 MiB)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_user_gets_the_newest_release_that_has_an_x86_64_build() {
+        let site = gap_site();
+        let (choice, fetched) = choose_on(&site, None);
+        let choice = choice.expect("an older release with an x86_64 build is offered");
+        assert_eq!(
+            choice,
+            Choice::Offered {
+                offer: offer_on(LATEST_PAGE),
+                passed_over: vec![arm_only("2.741.1061", 3212)]
+            }
+        );
+        assert_eq!(
+            fetched,
+            [Page::Newest, release("2.740.931")],
+            "older pages are read only until one has the build"
+        );
+        assert_eq!(
+            choice.to_string(),
+            "APKCombo has no x86_64 build of Roblox 2.741.1061 (versionCode 3212, offered only \
+             for arm64-v8a, armeabi-v7a) yet, so Eclipse chose Roblox 2.740.931 (versionCode \
+             3170, XAPK, about 234 MiB), the newest release that has one"
+        );
+
+        let (choice, _) = choose_on(&site, Some(&installed(3120)));
         assert!(
-            matches!(&err, ApkComboError::NoX86_64 { offered } if offered.len() == 1),
-            "each offered ABI list is reported once: {err:?}"
+            matches!(choice.unwrap(), Choice::Offered { offer, .. } if offer.version_code == VersionCode(3170)),
+            "an older install is updated to it"
+        );
+    }
+
+    #[test]
+    fn an_installed_release_is_kept_while_nothing_newer_has_an_x86_64_build() {
+        let site = gap_site();
+        let current = InstalledVersion {
+            version_code: VersionCode(3170),
+            version_name: Some("2.740.931".to_owned()),
+        };
+        let (choice, fetched) = choose_on(&site, Some(&current));
+        let choice = choice.expect("a missing build is no error for an installed release");
+        assert_eq!(
+            choice,
+            Choice::Kept {
+                installed: current,
+                passed_over: vec![arm_only("2.741.1061", 3212)]
+            }
+        );
+        assert_eq!(fetched, [Page::Newest, release("2.740.931")]);
+        assert_eq!(
+            choice.to_string(),
+            "APKCombo has no x86_64 build of Roblox 2.741.1061 (versionCode 3212, offered only \
+             for arm64-v8a, armeabi-v7a) yet, so Eclipse keeps the installed Roblox 2.740.931 \
+             (versionCode 3170) for now"
+        );
+
+        for code in [3212, 3300] {
+            let (choice, fetched) = choose_on(&site, Some(&installed(code)));
+            let choice = choice.unwrap();
+            assert_eq!(
+                choice,
+                Choice::Kept {
+                    installed: installed(code),
+                    passed_over: Vec::new()
+                }
+            );
+            assert_eq!(fetched, [Page::Newest], "no older page can be newer");
+            assert_eq!(
+                choice.to_string(),
+                format!(
+                    "APKCombo has no x86_64 build newer than the installed Roblox {}",
+                    installed(code)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn older_pages_are_read_newest_first_and_at_most_three() {
+        let mut site = gap_site();
+        site[2].1 = LATEST_PAGE.replace(", x86_64</code>", "</code>");
+        let (choice, fetched) = choose_on(&site, None);
+        let Choice::Offered { offer, passed_over } = choice.unwrap() else {
+            panic!("the third newest release has an x86_64 build");
+        };
+        assert_eq!(offer.version_code, VersionCode(3120));
+        assert_eq!(
+            passed_over,
+            [arm_only("2.741.1061", 3212), arm_only("2.740.931", 3170)]
+        );
+        assert_eq!(
+            fetched,
+            [Page::Newest, release("2.740.931"), release("2.739.691")]
+        );
+
+        site[3].1 = OLDER_PAGE.replace(", x86_64</code>", "</code>");
+        let (choice, _) = choose_on(&site, None);
+        let err = choice.unwrap_err();
+        assert!(
+            matches!(&err, ApkComboError::NoX86_64 { missing } if missing.len() == 3),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.starts_with(
+                "APKCombo has no x86_64 build of Roblox 2.741.1061 (versionCode 3212, offered \
+                 only for arm64-v8a, armeabi-v7a) or Roblox 2.740.931 (versionCode 3170"
+            ) && text.ends_with("yet; try again later"),
+            "{text}"
+        );
+        let (choice, _) = choose_on(&site, Some(&installed(3092)));
+        assert!(
+            matches!(choice.unwrap(), Choice::Kept { passed_over, .. } if passed_over.len() == 3)
+        );
+
+        let names = ["2.738.100", "2.737.100", "2.736.100"];
+        for (index, name) in (0u32..).zip(names) {
+            site[0].1.push_str(&format!(
+                "<a class=\"ver-item\" href=\"{RELEASE_PAGE_PREFIX}{name}{RELEASE_PAGE_SUFFIX}\">"
+            ));
+            site.push((
+                release(name),
+                ARM_ONLY_PAGE
+                    .replace("2.741.1061", name)
+                    .replace("(3212)", &format!("({})", 3100 - index)),
+            ));
+        }
+        let (choice, fetched) = choose_on(&site, None);
+        let err = choice.unwrap_err();
+        assert!(
+            matches!(&err, ApkComboError::NoX86_64 { missing } if missing.len() == 1 + MAX_OLDER_PAGES),
+            "{err:?}"
+        );
+        assert_eq!(
+            fetched,
+            [
+                Page::Newest,
+                release("2.740.931"),
+                release("2.739.691"),
+                release("2.738.100")
+            ]
+        );
+    }
+
+    #[test]
+    fn older_pages_must_list_their_own_older_release_from_the_pinned_bucket() {
+        let mut site = gap_site();
+        for (html, problem) in [
+            (
+                OLDER_PAGE.to_owned(),
+                "a release page lists another release",
+            ),
+            (
+                ARM_ONLY_PAGE.replace("2.741.1061", "2.740.931"),
+                "old versions are not listed newest first",
+            ),
+            (
+                LATEST_PAGE.replace("234 MB", "big"),
+                "a download has no size",
+            ),
+        ] {
+            site[2].1 = html;
+            let err = choose_on(&site, None).0.unwrap_err();
+            assert!(
+                err.to_string().starts_with(&format!(
+                    "APKCombo's download page for Roblox 2.740.931 has an unexpected layout \
+                     ({problem}); "
+                )),
+                "{err}"
+            );
+        }
+
+        site[2].1 = LATEST_PAGE.replace(".r2.cloudflarestorage.com", ".evil.example");
+        let err = choose_on(&site, None).0.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApkComboError::Download(DownloadError::Untrusted { .. })
+            ),
+            "{err:?}"
+        );
+
+        site.remove(2);
+        let err = choose_on(&site, Some(&installed(3120))).0.unwrap_err();
+        assert!(
+            matches!(&err, ApkComboError::PageStatus { page, status: 404 } if *page == release("2.740.931")),
+            "{err:?}"
         );
     }
 
@@ -935,8 +1550,12 @@ mod tests {
             LATEST_PAGE.replace("https%3A%2F", "https%zz%2F"),
         ];
         for page in pages {
-            let err = parse_offer(&page).unwrap_err();
-            assert!(matches!(err, ApkComboError::PageLayout(_)), "{err:?}");
+            let err = newest_listing(&page).unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("APKCombo's Roblox download page has an unexpected layout ("),
+                "{err}"
+            );
             assert!(err.to_string().contains("eclipse install"), "{err}");
         }
     }
@@ -947,7 +1566,7 @@ mod tests {
             LATEST_PAGE.replace("(3170)", "(3171)"),
             LATEST_PAGE.replace("Roblox 2.740.931<", "Roblox 2.740.932<"),
         ] {
-            let err = parse_offer(&page).unwrap_err();
+            let err = newest_listing(&page).unwrap_err();
             assert!(matches!(err, ApkComboError::Inconsistent { .. }), "{err:?}");
         }
     }
@@ -959,7 +1578,7 @@ mod tests {
             LATEST_PAGE.replace(".r2.cloudflarestorage.com", ".evil.example"),
             LATEST_PAGE.replace("%2F%2Fapks.39b7cb94", "%2F%2Fother.39b7cb94"),
         ] {
-            let err = parse_offer(&page).unwrap_err();
+            let err = newest_listing(&page).unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -977,7 +1596,7 @@ mod tests {
                 "3170.apks",
             ),
         ] {
-            let err = parse_offer(&page).unwrap_err();
+            let err = newest_listing(&page).unwrap_err();
             assert!(matches!(err, ApkComboError::UnexpectedLink), "{err:?}");
         }
     }
@@ -1224,10 +1843,10 @@ mod tests {
                 answer(url)
             },
             || {
-                Ok(Offer {
+                Ok(Listing::Offer(Offer {
                     url: renewed_url(offer.url.path()),
                     ..small_offer()
-                })
+                }))
             },
         )
         .expect("the download continues from the renewed link");
@@ -1241,23 +1860,27 @@ mod tests {
             ]
         );
 
+        let other_file = Listing::Offer(Offer {
+            url: renewed_url("/com.roblox.client/2.741.1/3171.aa.apks"),
+            ..small_offer()
+        });
+        let withdrawn = newest_listing(ARM_ONLY_PAGE).unwrap();
+        for renewed in [other_file, withdrawn] {
+            let mut link = offer.url.clone();
+            let err = open_renewing(
+                &offer,
+                &mut link,
+                Some(&resume),
+                |url, _| answer(url),
+                || Ok(renewed),
+            )
+            .err()
+            .expect("a different file is not appended");
+            assert!(matches!(err, ApkComboError::Superseded { .. }), "{err:?}");
+            assert_eq!(link, offer.url);
+        }
+
         let mut link = offer.url.clone();
-        let err = open_renewing(
-            &offer,
-            &mut link,
-            Some(&resume),
-            |url, _| answer(url),
-            || {
-                Ok(Offer {
-                    url: renewed_url("/com.roblox.client/2.741.1/3171.aa.apks"),
-                    ..small_offer()
-                })
-            },
-        )
-        .err()
-        .expect("a different file is not appended");
-        assert!(matches!(err, ApkComboError::Superseded { .. }), "{err:?}");
-        assert_eq!(link, offer.url);
 
         let err = open_renewing(
             &offer,
@@ -1275,6 +1898,65 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn an_expired_link_is_renewed_from_the_chosen_releases_own_page() {
+        let newest_offered = vec![
+            (Page::Newest, LATEST_PAGE.to_owned()),
+            (release("2.740.931"), LATEST_PAGE.to_owned()),
+        ];
+        let path =
+            "/com.roblox.client/2.740.931/3170.4000331cf5d800c02fc213cc6a51dc823df6ea7c.apks";
+        for (site, choice_pages) in [
+            (newest_offered, vec![Page::Newest]),
+            (gap_site(), vec![Page::Newest, release("2.740.931")]),
+        ] {
+            let dir = temp_dir("renew");
+            let store = Store::at(dir.join("store"));
+            let mut fetched = Vec::new();
+            let mut opened = Vec::new();
+            let err = update_from(
+                &store,
+                None,
+                None,
+                &StatusSink::terminal(),
+                served_pages(&site, &mut fetched),
+                |url: &Uri, resume: Option<&Resume>| {
+                    opened.push((url.path().to_owned(), resume.map(|resume| resume.offset)));
+                    match opened.len() {
+                        1 => Ok(whole(
+                            Box::new((&[0u8; 60][..]).chain(FailingBody)) as Box<dyn Read>,
+                            Some(234 * MEBIBYTE),
+                        )),
+                        2 => Err(DownloadError::Status(EXPIRED_LINK_STATUS)),
+                        _ => Err(DownloadError::Status(404)),
+                    }
+                },
+            )
+            .err()
+            .expect("the renewed link is refused");
+            assert!(
+                matches!(err, ApkComboError::Download(DownloadError::Status(404))),
+                "{err:?}"
+            );
+            assert_eq!(
+                fetched,
+                [choice_pages, vec![release("2.740.931")]].concat(),
+                "the expired link is renewed from the page of the release being downloaded, \
+                 which keeps listing its file after the main page moves on"
+            );
+            assert_eq!(
+                opened,
+                [
+                    (path.to_owned(), None),
+                    (path.to_owned(), Some(60)),
+                    (path.to_owned(), Some(60))
+                ]
+            );
+            assert_eq!(store.last_check().unwrap(), None);
+            fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]
@@ -1299,7 +1981,7 @@ mod tests {
 
     #[test]
     fn only_a_newer_release_is_downloaded_and_roblox_is_never_downgraded() {
-        let offer = parse_offer(LATEST_PAGE).unwrap();
+        let offer = offer_on(LATEST_PAGE);
         assert_eq!(plan(&offer, None, None, None).unwrap(), Plan::Download);
         assert_eq!(
             plan(&offer, Some(&installed(3056)), Some(&installed(3056)), None).unwrap(),
@@ -1323,7 +2005,7 @@ mod tests {
 
     #[test]
     fn a_rejected_release_is_skipped_but_an_installed_or_other_one_is_not() {
-        let offer = parse_offer(LATEST_PAGE).unwrap();
+        let offer = offer_on(LATEST_PAGE);
         let rejected = Some(offer.release());
         assert_eq!(
             plan(
@@ -1362,7 +2044,7 @@ mod tests {
     fn small_offer() -> Offer {
         Offer {
             size: SMALL,
-            ..parse_offer(LATEST_PAGE).unwrap()
+            ..offer_on(LATEST_PAGE)
         }
     }
 
@@ -1744,6 +2426,38 @@ mod tests {
         .expect("the installed release is up to date");
         assert!(
             matches!(&outcome, UpdateOutcome::UpToDate { installed } if installed.version_code == offer.version_code)
+        );
+
+        let installed = InstalledVersion::from(&set);
+        let newer_code = (installed.version_code.0 + 1).to_string();
+        let site = [
+            (Page::Newest, ARM_ONLY_PAGE.replace("3212", &newer_code)),
+            (
+                release("2.740.931"),
+                LATEST_PAGE.replace("3170", &installed.version_code.to_string()),
+            ),
+        ];
+        let mut fetched = Vec::new();
+        let outcome = update_from(
+            &store,
+            Some(&set),
+            None,
+            &StatusSink::terminal(),
+            served_pages(&site, &mut fetched),
+            |_: &Uri, _: Option<&Resume>| -> Result<Download<&[u8]>, DownloadError> {
+                panic!("the installed release is kept, not downloaded again")
+            },
+        )
+        .expect("a newer release without an x86_64 build is no error for an installed one");
+        assert!(
+            matches!(&outcome, UpdateOutcome::UpToDate { installed: kept } if *kept == installed),
+            "the installed release is kept"
+        );
+        assert_eq!(fetched, [Page::Newest, release("2.740.931")]);
+        assert_eq!(
+            store.last_check().unwrap(),
+            None,
+            "keeping the installed release records no check of its own"
         );
         drop(set);
 

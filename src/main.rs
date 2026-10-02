@@ -530,9 +530,7 @@ fn update_from_apkcombo(
     status: &StatusSink,
 ) -> Result<Option<ApkSet>, Box<dyn std::error::Error>> {
     status.step("Checking APKCombo for the newest Roblox client…");
-    let offer = eclipse::apk::apkcombo::newest_offer()?;
-    status.step(format!("APKCombo offers {offer}"));
-    let outcome = eclipse::apk::apkcombo::update(&offer, store, current, rejected, status)?;
+    let outcome = eclipse::apk::apkcombo::update(store, current, rejected, status)?;
     finish_update(store, outcome, status)
 }
 
