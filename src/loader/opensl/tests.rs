@@ -1,6 +1,7 @@
 use super::*;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -637,7 +638,7 @@ fn full_engine_path_builds_and_enqueues_with_zero_sl_errors_no_device() {
 fn create_audio_player_rejects_non_pcm_source() {
     let mut engine: *mut c_void = std::ptr::null_mut();
 
-    unsafe {
+    let r = unsafe {
         eclipse_sl_create_engine(
             std::ptr::addr_of_mut!(engine).cast(),
             0,
@@ -645,11 +646,11 @@ fn create_audio_player_rejects_non_pcm_source() {
             0,
             std::ptr::null(),
             std::ptr::null(),
-        );
-    }
-    obj_realize(engine, 0);
-    let mut eng_itf: *mut c_void = std::ptr::null_mut();
-    obj_get_interface(engine, iid_value(3), std::ptr::addr_of_mut!(eng_itf).cast());
+        )
+    };
+    assert_eq!(r, SL_RESULT_SUCCESS);
+    assert_eq!(obj_realize(engine, 0), SL_RESULT_SUCCESS);
+    let eng_itf = interface(engine, 3);
 
     let mut bad_loc: u32 = SL_DATALOCATOR_OUTPUTMIX;
     let mut pcm = SlDataFormatPcm {
@@ -799,12 +800,12 @@ impl TestPlayer {
 }
 
 fn interface(obj: SlObjectItf, index: usize) -> *mut c_void {
-    let mut itf: *mut c_void = std::ptr::null_mut();
+    let mut itf: Option<NonNull<c_void>> = None;
     assert_eq!(
         obj_get_interface(obj, iid_value(index), std::ptr::addr_of_mut!(itf).cast()),
         SL_RESULT_SUCCESS
     );
-    itf
+    itf.expect("GetInterface wrote the interface").as_ptr()
 }
 
 fn bq_enqueue_via_vtable(bq: *mut c_void, bytes: &[u8]) -> u32 {
