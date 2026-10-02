@@ -10,7 +10,6 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ring::rand::SecureRandom;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -303,10 +302,10 @@ impl<'a> Session<'a> {
 
     fn acquire(&self, version: VersionCode) -> Result<(), PlayError> {
         const STEP: &str = "the Roblox library request";
-        let mut nonce = [0u8; ACQUIRE_NONCE_BYTES];
-        ring::rand::SystemRandom::new()
-            .fill(&mut nonce)
-            .map_err(|_| PlayError::Random)?;
+        let nonce =
+            ring::rand::generate::<[u8; ACQUIRE_NONCE_BYTES]>(&ring::rand::SystemRandom::new())
+                .map_err(|_| PlayError::Random)?
+                .expose();
         let body = acquire_request(version, &nonce);
         let response = self
             .store_headers(self.agent.post(format!("{FDFE_URL}/acquire")))
