@@ -16,7 +16,7 @@
 
 </div>
 
-Eclipse runs Roblox's official Android x86-64 client natively on Linux, with a small Android compatibility layer instead of a full Android VM. It is experimental and not affiliated with Roblox Corporation.
+Eclipse runs Roblox's official Android x86-64 client natively on Linux, with a small Android compatibility layer instead of a full Android VM. It is a fully open-source alternative to [Sober](https://sober.vinegarhq.org), which is closed source, and it is verified to work in-game. Eclipse is not affiliated with Roblox Corporation.
 
 ## Install
 
