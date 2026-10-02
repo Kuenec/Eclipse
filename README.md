@@ -22,16 +22,16 @@ You need an x86-64 Linux desktop (Wayland or X11) and a Vulkan driver. Eclipse u
 
 ## Features
 
-- **No setup.** On first start Eclipse downloads Roblox, verifies it and launches it. It keeps Roblox updated by itself, with no account needed.
-- **Official and unmodified.** Every file must carry Roblox Corporation's signature (certificate SHA-256 `44932ea3…ba1477`), checked at install and at every launch. Eclipse never patches the game.
-- **Plays like the desktop client.** Mouse lock and right-click camera, a full keyboard in text boxes, clipboard, input methods, and F11 fullscreen.
-- **Your frame rate.** Roblox's own Maximum Frame Rate setting (up to 240 FPS) is the only limit, whatever your monitor's refresh rate.
+- **No setup.** Eclipse downloads and updates Roblox by itself, with no account needed.
+- **Official and unmodified.** Only files signed by Roblox run, and the game is never patched.
+- **Plays like the desktop client.** Mouse lock, clipboard, input methods and F11 fullscreen.
+- **Uncapped frame rate.** Roblox's own frame rate menu, up to 240 FPS on any monitor.
 - **Browser Play button.** `roblox://` and `roblox-player:` links open in Eclipse.
 - **Sandboxed** in Flatpak, with no telemetry.
 
 ## Usage
 
-Start **Eclipse** from your app menu. Its window shows downloads and errors until Roblox opens. Commands are run with `flatpak run io.github.kuenec.Eclipse <command>`:
+Start **Eclipse** from your app menu. From a terminal, use `flatpak run io.github.kuenec.Eclipse <command>`:
 
 | Command | What it does |
 |---|---|
@@ -42,19 +42,16 @@ Start **Eclipse** from your app menu. Its window shows downloads and errors unti
 
 ## Settings
 
-Settings live in `~/.var/app/io.github.kuenec.Eclipse/config/eclipse/config.json`. Every key is optional:
+Settings live in `~/.var/app/io.github.kuenec.Eclipse/config/eclipse/config.json`:
 
 ```json
 {
   "fflags": {},
-  "touch_mode": "off",
-  "graphics_optimization_mode": "balanced"
+  "touch_mode": "off"
 }
 ```
 
-- `fflags` adds Fast Flags for Roblox. Eclipse sets one by default, `FFlagGameBasicSettingsFramerateCap5`, which shows Roblox's frame rate menu. Set it to `"False"` to hide the menu.
-- `touch_mode` set to `"on"` sends clicks as touch input.
-- `graphics_optimization_mode` set to `"performance"` pins Eclipse to physical cores on large SMT CPUs.
+`fflags` passes Fast Flags to Roblox. `touch_mode: "on"` sends clicks as touch input. More options are in the [user guide](docs/guide.md#settings).
 
 ## How it works
 
@@ -76,8 +73,6 @@ flowchart LR
     WebView --> Linux
 ```
 
-Roblox's Java code runs in ART with a patched Android framework. Its native engine is loaded by Eclipse's own ELF loader, with Android's graphics, input and audio interfaces mapped onto the Linux desktop.
-
 ## Troubleshooting
 
 - **Something failed?** The log of the last launch is in `~/.var/app/io.github.kuenec.Eclipse/data/eclipse/app-data/logs/eclipse.log`.
@@ -89,7 +84,7 @@ When reporting a bug, include your distro, desktop, GPU and driver, and the log.
 
 ## More
 
-- [User guide](docs/guide.md): Google Play downloads, file locations, browser links, controls and frame-rate details.
+- [User guide](docs/guide.md): installing from your own files, Google Play, browser links and file locations.
 - [CONTRIBUTING.md](CONTRIBUTING.md): building from source, architecture, tests and releases.
 
 Thanks to [Yoshi-OOF](https://github.com/Yoshi-OOF) for framework, CI and browser launch work.
