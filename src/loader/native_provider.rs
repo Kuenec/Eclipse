@@ -3793,20 +3793,16 @@ mod tests {
 
         let rc = unsafe { eclipse_getaddrinfo(node.as_ptr(), std::ptr::null(), &hints, &mut res) };
         assert_eq!(rc, 0, "numeric-host lookup must succeed offline");
-        assert!(!res.is_null(), "success must produce a chain");
 
-        let first = unsafe { &*res };
+        let first = unsafe { res.as_ref() }.expect("success must produce a chain");
         assert_eq!(first.ai_family, libc::AF_INET);
-        assert!(
-            !first.ai_addr.is_null(),
-            "ai_addr (the BIONIC @32 slot) must be populated"
-        );
         assert_eq!(
             first.ai_addrlen as usize,
             std::mem::size_of::<libc::sockaddr_in>()
         );
 
-        let sin = unsafe { &*(first.ai_addr.cast::<libc::sockaddr_in>()) };
+        let sin = unsafe { first.ai_addr.cast::<libc::sockaddr_in>().as_ref() }
+            .expect("ai_addr (the BIONIC @32 slot) must be populated");
         assert_eq!(sin.sin_family, libc::AF_INET as libc::sa_family_t);
         assert_eq!(u32::from_be(sin.sin_addr.s_addr), 0x7f00_0001);
 
