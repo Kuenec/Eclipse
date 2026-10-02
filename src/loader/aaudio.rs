@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -362,6 +362,7 @@ struct StreamShared {
     state: AtomicStreamState,
     frames_per_burst: AtomicI32,
     xrun_count: AtomicI32,
+    host_callbacks: AtomicU64,
 }
 
 impl StreamShared {
@@ -370,6 +371,7 @@ impl StreamShared {
             state: AtomicStreamState::new(StreamState::Open),
             frames_per_burst: AtomicI32::new(frames_per_burst as i32),
             xrun_count: AtomicI32::new(0),
+            host_callbacks: AtomicU64::new(0),
         }
     }
 
@@ -486,6 +488,7 @@ impl<A: cpal::SizedSample> Renderer<A> {
     }
 
     fn note_burst(&self, samples: usize) {
+        self.shared.host_callbacks.fetch_add(1, Ordering::Relaxed);
         let frames = (samples / self.channels) as i32;
         if frames > 0 && self.shared.frames_per_burst.load(Ordering::Relaxed) != frames {
             self.shared
@@ -550,36 +553,69 @@ impl<A: cpal::SizedSample> Renderer<A> {
     }
 }
 
+pub(crate) const HOST_ERROR_STREAK_LIMIT: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy)]
+struct ErrorStreakStart {
+    at: Instant,
+    host_callbacks: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct HostErrorStreak(Option<ErrorStreakStart>);
+
+impl HostErrorStreak {
+    pub(crate) fn ends_stream(
+        &mut self,
+        kind: cpal::ErrorKind,
+        host_callbacks: u64,
+        at: Instant,
+    ) -> bool {
+        match kind {
+            cpal::ErrorKind::Xrun
+            | cpal::ErrorKind::DeviceChanged
+            | cpal::ErrorKind::RealtimeDenied => false,
+            cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated => true,
+            _ => match self.0 {
+                Some(start) if start.host_callbacks == host_callbacks => {
+                    at.saturating_duration_since(start.at) >= HOST_ERROR_STREAK_LIMIT
+                }
+                _ => {
+                    self.0 = Some(ErrorStreakStart { at, host_callbacks });
+                    false
+                }
+            },
+        }
+    }
+}
+
 struct ErrorReporter {
     shared: Arc<StreamShared>,
     callback: Option<ErrorCallbackTarget>,
     stream: usize,
+    streak: HostErrorStreak,
 }
 
 impl ErrorReporter {
-    fn report(&self, error: cpal::Error) {
-        match error.kind() {
-            cpal::ErrorKind::Xrun => {
-                self.shared.xrun_count.fetch_add(1, Ordering::Relaxed);
-            }
-            cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated => {
-                if self.shared.state.swap(StreamState::Disconnected) == StreamState::Disconnected {
-                    return;
-                }
-                tracing::warn!(target: "eclipse::audio", %error, "AAudio: stream disconnected");
-                if let Some(target) = self.callback {
-                    unsafe {
-                        (target.func)(
-                            self.stream as *mut c_void,
-                            target.user_data as *mut c_void,
-                            AAUDIO_ERROR_DISCONNECTED,
-                        )
-                    };
-                }
-            }
-            _ => {
-                tracing::warn!(target: "eclipse::audio", %error, "AAudio: host stream error");
-            }
+    fn report(&mut self, error: cpal::Error, at: Instant) {
+        if error.kind() == cpal::ErrorKind::Xrun {
+            self.shared.xrun_count.fetch_add(1, Ordering::Relaxed);
+        }
+        let host_callbacks = self.shared.host_callbacks.load(Ordering::Relaxed);
+        if !self.streak.ends_stream(error.kind(), host_callbacks, at)
+            || self.shared.state.swap(StreamState::Disconnected) == StreamState::Disconnected
+        {
+            return;
+        }
+        tracing::warn!(target: "eclipse::audio", %error, "AAudio: stream disconnected");
+        if let Some(target) = self.callback {
+            unsafe {
+                (target.func)(
+                    self.stream as *mut c_void,
+                    target.user_data as *mut c_void,
+                    AAUDIO_ERROR_DISCONNECTED,
+                )
+            };
         }
     }
 }
@@ -602,6 +638,7 @@ fn build_host_stream(
         shared: Arc::clone(shared),
         callback: params.error_callback,
         stream: stream as usize,
+        streak: HostErrorStreak::default(),
     };
     let shared = Arc::clone(shared);
     match plan.format.app {
@@ -672,7 +709,7 @@ fn build_output<T, A>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     mut renderer: Renderer<A>,
-    reporter: ErrorReporter,
+    mut reporter: ErrorReporter,
 ) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample + cpal::FromSample<A>,
@@ -681,7 +718,7 @@ where
     device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| renderer.render_output(data),
-        move |error| reporter.report(error),
+        move |error| reporter.report(error, Instant::now()),
         None,
     )
 }
@@ -690,7 +727,7 @@ fn build_input<T, A>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     mut renderer: Renderer<A>,
-    reporter: ErrorReporter,
+    mut reporter: ErrorReporter,
 ) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample,
@@ -699,7 +736,7 @@ where
     device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| renderer.capture_input(data),
-        move |error| reporter.report(error),
+        move |error| reporter.report(error, Instant::now()),
         None,
     )
 }
