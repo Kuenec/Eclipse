@@ -39,6 +39,8 @@ updates:
     groups:
       webview-dependencies:
         patterns: ["*"]
+    ignore:
+      - dependency-name: cef
 
   - package-ecosystem: github-actions
     directory: /
