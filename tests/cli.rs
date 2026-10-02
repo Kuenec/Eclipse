@@ -1,7 +1,13 @@
+#[path = "../src/bounded_child.rs"]
+mod bounded_child;
+
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
+
+const RUN_LIMIT: Duration = Duration::from_secs(60);
 
 fn sandbox(tag: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("eclipse-cli-{tag}"));
@@ -11,17 +17,18 @@ fn sandbox(tag: &str) -> PathBuf {
 }
 
 fn eclipse(root: &Path, app_data: &Path, args: &[&OsStr]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_eclipse"))
-        .args(args)
-        .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("XDG_CACHE_HOME", root.join("cache"))
-        .env("ECLIPSE_APP_DATA_DIR", app_data)
-        .env_remove("LD_PRELOAD")
-        .env_remove("ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE")
-        .env_remove("ECLIPSE_CLIENT_APP_SETTINGS_PATH")
-        .output()
-        .expect("spawn eclipse")
+    bounded_child::output(
+        Command::new(env!("CARGO_BIN_EXE_eclipse"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("ECLIPSE_APP_DATA_DIR", app_data)
+            .env_remove("LD_PRELOAD")
+            .env_remove("ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE")
+            .env_remove("ECLIPSE_CLIENT_APP_SETTINGS_PATH"),
+        RUN_LIMIT,
+    )
 }
 
 fn stderr(output: &Output) -> String {

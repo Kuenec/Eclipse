@@ -1687,33 +1687,40 @@ mod tests {
         );
     }
 
+    fn thread_cpu_time() -> std::time::Duration {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+        std::time::Duration::try_from(now).expect("the thread CPU clock is never negative")
+    }
+
     #[test]
     fn single_line_layout_time_grows_linearly_with_the_text() {
         let Some(chain) = host_chain() else {
             return;
         };
         let field = style(600, 40, LineMode::Single);
-        let fastest = |length: usize| {
-            let text: String = "lorem ipsum dolor sit amet "
+        let text = |length: usize| -> String {
+            "lorem ipsum dolor sit amet "
                 .chars()
                 .cycle()
                 .take(length)
-                .collect();
-            (0..5)
-                .map(|_| {
-                    let started = std::time::Instant::now();
-                    let layout = lay_out(&text, at_end(&text), &field, chain, Scroll::default());
-                    layout.hit_test(100.0, 10.0);
-                    started.elapsed()
-                })
-                .min()
-                .expect("timed layouts")
+                .collect()
         };
-        let short = fastest(1_000);
-        let long = fastest(8_000);
+        let (short, long) = (text(1_000), text(8_000));
+        let cpu_time = |text: &str| {
+            let started = thread_cpu_time();
+            let layout = lay_out(text, at_end(text), &field, chain, Scroll::default());
+            layout.hit_test(100.0, 10.0);
+            thread_cpu_time() - started
+        };
+        let mut ratios: Vec<f64> = (0..9)
+            .map(|_| cpu_time(&long).as_secs_f64() / cpu_time(&short).as_secs_f64())
+            .collect();
+        ratios.sort_by(f64::total_cmp);
+        let median = ratios[ratios.len() / 2];
         assert!(
-            long < short * 14,
-            "eight times the text took {long:?} against {short:?}"
+            median < 14.0,
+            "eight times the text took {median:.1} times the CPU time of the short text \
+             (ratios {ratios:.1?})"
         );
     }
 

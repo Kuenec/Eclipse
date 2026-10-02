@@ -800,6 +800,8 @@ mod tests {
 
     const X11_SURFACE_CHILD: &str = "ECLIPSE_TEST_X11_SURFACE_CHILD";
 
+    const X11_SURFACE_CHILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
     type XOpenDisplay = unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void;
     type XDefaultRootWindow = unsafe extern "C" fn(*mut std::ffi::c_void) -> std::ffi::c_ulong;
     type XCreateSimpleWindow = unsafe extern "C" fn(
@@ -992,20 +994,22 @@ mod tests {
                 eprintln!("SKIP: no X11 display (DISPLAY unset)");
                 return;
             }
-            let output = std::process::Command::new(
-                std::env::current_exe().expect("the test harness executable must have a path"),
-            )
-            .args([
-                "--exact",
-                "loader::vulkan_wsi::tests::x11_window_backs_the_engine_vulkan_and_egl_surfaces",
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .env(X11_SURFACE_CHILD, "1")
-            .env_remove("WAYLAND_DISPLAY")
-            .env_remove("WAYLAND_SOCKET")
-            .output()
-            .expect("the X11 surface child must start");
+            let output = crate::bounded_child::output(
+                std::process::Command::new(
+                    std::env::current_exe().expect("the test harness executable must have a path"),
+                )
+                .args([
+                    "--exact",
+                    "loader::vulkan_wsi::tests::\
+                     x11_window_backs_the_engine_vulkan_and_egl_surfaces",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(X11_SURFACE_CHILD, "1")
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("WAYLAND_SOCKET"),
+                X11_SURFACE_CHILD_LIMIT,
+            );
             let report = String::from_utf8_lossy(&output.stdout);
             assert!(
                 output.status.success() && report.contains("1 passed"),
