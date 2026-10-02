@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -41,7 +42,7 @@ COMMANDS:
                 play-login instead.
     play-login  Sign in to Google Play with your own Google account (once, for update --play).
     install-url-handler
-                Register Eclipse for browser Play clicks (they run the installed client).
+                Register Eclipse for browser Play clicks (they start Roblox as `run` does).
     config      Show effective configuration and its path
     help        Show this help
     --version   Show version
@@ -53,8 +54,7 @@ NOTE: Eclipse runs only the official, unmodified Roblox client signed by Roblox 
 ";
 
 fn main() -> ExitCode {
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    let args = match normalize_browser_launch(raw_args) {
+    let args = match normalize_browser_launch(std::env::args_os().skip(1).collect()) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("eclipse browser launch: {error}");
@@ -65,7 +65,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if is_android_run_command(args.first().map(String::as_str)) {
+    let command = args.first().map(|command| command.to_string_lossy());
+    let command = command.as_deref();
+    if is_android_run_command(command) {
         let settings = match std::env::var_os(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV) {
             None => install_client_settings_and_reexec(&args),
             Some(_) => verify_client_settings_redirect().map_err(Into::into),
@@ -75,9 +77,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    if is_android_run_command(args.first().map(String::as_str))
-        || matches!(args.first().map(String::as_str), Some("__webview-test"))
-    {
+    if is_android_run_command(command) || matches!(command, Some("__webview-test")) {
         if let Err(error) = eclipse::runtime::prepare_art_boot_environment() {
             report_setup_failure(&args, "eclipse ART startup", &error.to_string());
             return ExitCode::FAILURE;
@@ -86,12 +86,8 @@ fn main() -> ExitCode {
 
     eclipse::diagnostics::init();
 
-    tracing::debug!(
-        version = eclipse::VERSION,
-        command = args.first(),
-        "eclipse starting"
-    );
-    match args.first().map(String::as_str) {
+    tracing::debug!(version = eclipse::VERSION, command, "eclipse starting");
+    match command {
         Some("--version") | Some("-V") => {
             println!("eclipse {}", eclipse::VERSION);
             ExitCode::SUCCESS
@@ -238,7 +234,7 @@ fn is_android_run_command(command: Option<&str>) -> bool {
     matches!(command, Some("run") | Some("__run-browser-place"))
 }
 
-fn launches_in_window(args: &[String]) -> bool {
+fn launches_in_window(args: &[OsString]) -> bool {
     match args {
         [command] => command == "run",
         [command, _] => command == "__run-browser-place",
@@ -246,38 +242,42 @@ fn launches_in_window(args: &[String]) -> bool {
     }
 }
 
-fn report_setup_failure(args: &[String], context: &str, error: &str) {
+fn report_setup_failure(args: &[OsString], context: &str, error: &str) {
     eprintln!("{context}: {error}");
     if launches_in_window(args) {
         show_error_window(error, None);
     }
 }
 
-fn normalize_browser_launch(mut arguments: Vec<String>) -> Result<Vec<String>, String> {
-    if !matches!(
-        arguments.first().map(String::as_str),
-        Some(desktop_integration::BROWSER_HANDLER_COMMAND)
-    ) {
+fn normalize_browser_launch(mut arguments: Vec<OsString>) -> Result<Vec<OsString>, String> {
+    if !arguments
+        .first()
+        .is_some_and(|command| command == desktop_integration::BROWSER_HANDLER_COMMAND)
+    {
         return Ok(arguments);
     }
     if arguments.len() != 2 {
         return Err("the Roblox URL handler requires exactly one URL".to_string());
     }
 
-    let place_id = browser_launch::place_id(&arguments[1]).map_err(|error| error.to_string())?;
+    let url = arguments[1]
+        .to_str()
+        .ok_or("the Roblox URL is not valid UTF-8")?;
+    let place_id = browser_launch::place_id(url).map_err(|error| error.to_string())?;
     arguments.clear();
-    arguments.push("__run-browser-place".to_string());
-    arguments.push(place_id.to_string());
+    arguments.push("__run-browser-place".into());
+    arguments.push(place_id.to_string().into());
     Ok(arguments)
 }
 
-fn parse_internal_place_id(arguments: &[String]) -> Result<u64, String> {
+fn parse_internal_place_id(arguments: &[OsString]) -> Result<u64, String> {
     let [place_id] = arguments else {
         return Err("invalid internal browser launch request".to_string());
     };
     let place_id = place_id
-        .parse::<u64>()
-        .map_err(|_| "invalid internal browser launch request".to_string())?;
+        .to_str()
+        .and_then(|place_id| place_id.parse::<u64>().ok())
+        .ok_or_else(|| "invalid internal browser launch request".to_string())?;
     if place_id == 0 {
         return Err("invalid internal browser launch request".to_string());
     }
@@ -297,18 +297,21 @@ fn verify_client_settings_redirect() -> Result<(), String> {
         })
 }
 
-fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn install_client_settings_and_reexec(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::process::CommandExt as _;
 
     let json = eclipse::config::Config::load()?.client_app_settings_json()?;
-    let app_data_dir = eclipse::framework::app_data_dir().ok_or(
-        "cannot resolve Eclipse's app-data directory; set HOME, XDG_DATA_HOME, or ECLIPSE_APP_DATA_DIR",
-    )?;
+    let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
     let runtime_dir = app_data_dir.join(RUNTIME_DIR);
-    std::fs::create_dir_all(&runtime_dir)?;
-    let settings_path = stage_client_settings(&runtime_dir, &json)?.canonicalize()?;
-    let runtime_dir = runtime_dir.canonicalize()?;
+    std::fs::create_dir_all(&runtime_dir)
+        .map_err(|error| format!("cannot create {}: {error}", runtime_dir.display()))?;
+    let resolve = |path: &Path| {
+        path.canonicalize()
+            .map_err(|error| format!("cannot resolve {}: {error}", path.display()))
+    };
+    let settings_path = resolve(&stage_client_settings(&runtime_dir, &json)?)?;
+    let runtime_dir = resolve(&runtime_dir)?;
     if runtime_dir
         .as_os_str()
         .as_bytes()
@@ -332,7 +335,8 @@ fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
 
-    let current_exe = std::env::current_exe()?;
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("cannot locate the Eclipse executable to restart it: {error}"))?;
     let error = std::process::Command::new(current_exe)
         .args(args)
         .env(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV, "1")
@@ -410,6 +414,9 @@ fn show_config() -> Result<(), eclipse::config::ConfigError> {
 const NOT_INSTALLED: &str = "Roblox is not installed; run `eclipse update` to download it, or \
      install the APKs with `eclipse install <PATH>`";
 
+const NO_APP_DATA_DIR: &str = "cannot resolve Eclipse's app-data directory; set HOME, \
+     XDG_DATA_HOME, or ECLIPSE_APP_DATA_DIR";
+
 const VERIFYING_SIGNATURE: &str = "Verifying the Roblox client's signature…";
 
 const RUNTIME_DIR: &str = "runtime";
@@ -432,7 +439,7 @@ that uses one. Use a secondary Google account, not your main one.
    oauth2_4/ and works only once.
 ";
 
-fn parse_run_path(arguments: &[String]) -> Result<Option<&std::path::Path>, String> {
+fn parse_run_path(arguments: &[OsString]) -> Result<Option<&std::path::Path>, String> {
     match arguments {
         [] => Ok(None),
         [path] => Ok(Some(std::path::Path::new(path))),
@@ -440,11 +447,12 @@ fn parse_run_path(arguments: &[String]) -> Result<Option<&std::path::Path>, Stri
     }
 }
 
-fn install_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn install_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     if arguments.is_empty() {
         return Err("usage: eclipse install <APK | DIRECTORY | BUNDLE>...".into());
     }
     let sources: Vec<PathBuf> = arguments.iter().map(PathBuf::from).collect();
+    let _client = lock_out_clients()?;
     let status = StatusSink::terminal();
     status.step("Verifying and installing the Roblox client…");
     let committed = Store::open()?.install(&sources, &status)?;
@@ -458,7 +466,7 @@ fn install_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-fn play_login_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn play_login_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     if !arguments.is_empty() {
         return Err("usage: eclipse play-login".into());
     }
@@ -478,7 +486,7 @@ fn play_login_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-fn parse_libroblox_init_lib_dir(arguments: &[String]) -> Result<&std::path::Path, String> {
+fn parse_libroblox_init_lib_dir(arguments: &[OsString]) -> Result<&std::path::Path, String> {
     match arguments {
         [lib_dir] => Ok(std::path::Path::new(lib_dir)),
         _ => Err("usage: eclipse __run-libroblox-init <LIB_DIR>".to_string()),
@@ -503,7 +511,7 @@ enum UpdateSource {
     GooglePlay,
 }
 
-fn parse_update_source(arguments: &[String]) -> Result<UpdateSource, String> {
+fn parse_update_source(arguments: &[OsString]) -> Result<UpdateSource, String> {
     match arguments {
         [] => Ok(UpdateSource::ApkCombo),
         [flag] if flag == "--play" => Ok(UpdateSource::GooglePlay),
@@ -511,8 +519,9 @@ fn parse_update_source(arguments: &[String]) -> Result<UpdateSource, String> {
     }
 }
 
-fn update_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn update_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     let source = parse_update_source(arguments)?;
+    let _client = lock_out_clients()?;
     let store = Store::open()?;
     let current = store.usable_current()?;
     let status = StatusSink::terminal();
@@ -611,21 +620,14 @@ fn update_if_due(
     Err(error)
 }
 
-fn installed_apk_set(
-    check_for_update: bool,
-    status: &StatusSink,
-) -> Result<ApkSet, Box<dyn std::error::Error>> {
+fn installed_apk_set(status: &StatusSink) -> Result<ApkSet, Box<dyn std::error::Error>> {
     let store = Store::open()?;
     status.step(VERIFYING_SIGNATURE);
-    let set = if check_for_update {
-        installed_or_updated_set(&store, status, |current| {
-            update_if_due(&store, current.map(ApkSet::version_code), |rejected| {
-                update_from_apkcombo(&store, current, rejected, status)
-            })
-        })?
-    } else {
-        store.verified_current()?.ok_or(NOT_INSTALLED)?
-    };
+    let set = installed_or_updated_set(&store, status, |current| {
+        update_if_due(&store, current.map(ApkSet::version_code), |rejected| {
+            update_from_apkcombo(&store, current, rejected, status)
+        })
+    })?;
     if let Some(cache) = eclipse::runtime::dalvik_cache_dir() {
         remove_other_version_oats(&cache, store.root(), set.base_path(), set.version_code())?;
     }
@@ -733,7 +735,7 @@ fn installed_or_updated_set(
     }
 }
 
-fn install_url_handler_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn install_url_handler_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     if !arguments.is_empty() {
         return Err("usage: eclipse install-url-handler".into());
     }
@@ -842,15 +844,17 @@ impl Launch {
     fn already_running(self, lock: &Path) -> String {
         let advice = match self {
             Self::Installed | Self::File => {
-                "switch to its window, or close it before starting Roblox again"
+                "switch to its window, or close it or wait for the install to finish before \
+                 starting Roblox again"
             }
             Self::BrowserPlace(_) => {
-                "this browser Play click did not start a second copy; close Roblox in Eclipse, \
-                 then click Play again"
+                "this browser Play click did not start a second copy; close Roblox in Eclipse \
+                 or wait for the install to finish, then click Play again"
             }
         };
         format!(
-            "Roblox is already running in Eclipse; {advice} (another Eclipse holds {})",
+            "Roblox is already running in Eclipse, or Eclipse is installing it; {advice} \
+             (another Eclipse holds {})",
             lock.display()
         )
     }
@@ -886,15 +890,14 @@ struct ClientRun {
 
 impl ClientRun {
     fn start(launch: Launch) -> Result<Self, String> {
-        let app_data_dir = eclipse::framework::app_data_dir().ok_or(
-            "cannot resolve Eclipse's app-data directory; set HOME, XDG_DATA_HOME, or \
-             ECLIPSE_APP_DATA_DIR",
-        )?;
+        let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
         Self::start_in(&app_data_dir, launch)
     }
 
     fn start_in(app_data_dir: &Path, launch: Launch) -> Result<Self, String> {
-        let lock = lock_client_in(&app_data_dir.join(RUNTIME_DIR), launch)?;
+        let lock = lock_client_in(&app_data_dir.join(RUNTIME_DIR), |lock| {
+            launch.already_running(lock)
+        })?;
         let log = eclipse::diagnostics::start_run_log(app_data_dir).map_err(|error| {
             format!(
                 "cannot write Eclipse's log under {}: {error}",
@@ -905,7 +908,21 @@ impl ClientRun {
     }
 }
 
-fn lock_client_in(runtime_dir: &Path, launch: Launch) -> Result<std::fs::File, String> {
+fn lock_out_clients() -> Result<std::fs::File, String> {
+    let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
+    lock_client_in(&app_data_dir.join(RUNTIME_DIR), |lock| {
+        format!(
+            "Roblox is running in Eclipse, or another Eclipse is installing it; close Roblox or \
+             wait for that install to finish, then try again (another Eclipse holds {})",
+            lock.display()
+        )
+    })
+}
+
+fn lock_client_in(
+    runtime_dir: &Path,
+    held: impl FnOnce(&Path) -> String,
+) -> Result<std::fs::File, String> {
     std::fs::create_dir_all(runtime_dir)
         .map_err(|error| format!("cannot create {}: {error}", runtime_dir.display()))?;
     let path = runtime_dir.join(CLIENT_LOCK_FILE);
@@ -917,7 +934,7 @@ fn lock_client_in(runtime_dir: &Path, launch: Launch) -> Result<std::fs::File, S
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     match lock.try_lock() {
         Ok(()) => Ok(lock),
-        Err(std::fs::TryLockError::WouldBlock) => Err(launch.already_running(&path)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(held(&path)),
         Err(std::fs::TryLockError::Error(error)) => {
             Err(format!("cannot lock {}: {error}", path.display()))
         }
@@ -969,7 +986,7 @@ fn launch_in_window(launch: Launch) -> libc::c_int {
     };
     let (sender, updates) = std::sync::mpsc::channel();
     let status = StatusSink::with_window(sender.clone());
-    let preparation = prepare_in_background(launch, sender);
+    let preparation = prepare_in_background(sender);
     let mut window = match LaunchWindow::open(&window_title()) {
         Ok(window) => window,
         Err(error) => {
@@ -992,15 +1009,13 @@ fn launch_in_window(launch: Launch) -> libc::c_int {
 }
 
 fn prepare_in_background(
-    launch: Launch,
     updates: std::sync::mpsc::Sender<StatusUpdate>,
 ) -> std::io::Result<Preparation> {
-    let check_for_update = launch == Launch::Installed;
     std::thread::Builder::new()
         .name("eclipse-install".to_owned())
         .spawn(move || {
             let status = StatusSink::with_window(updates);
-            installed_apk_set(check_for_update, &status)
+            installed_apk_set(&status)
                 .and_then(|apks| prepare_client(apks, &status))
                 .map_err(|error| error.to_string())
         })
@@ -1627,6 +1642,7 @@ mod tests {
     use eclipse::apk::VersionCode;
     use eclipse::runtime::NativeLibRoot;
     use eclipse::status::StatusSink;
+    use std::ffi::OsString;
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1645,7 +1661,7 @@ mod tests {
 
     #[test]
     fn run_accepts_at_most_one_path_argument() {
-        let apk = "roblox.apk".to_string();
+        let apk = OsString::from("roblox.apk");
         assert_eq!(parse_run_path(&[]).unwrap(), None);
         assert_eq!(
             parse_run_path(std::slice::from_ref(&apk)).unwrap(),
@@ -1658,13 +1674,10 @@ mod tests {
     fn update_uses_apkcombo_unless_google_play_is_asked_for() {
         assert_eq!(parse_update_source(&[]).unwrap(), UpdateSource::ApkCombo);
         assert_eq!(
-            parse_update_source(&["--play".to_string()]).unwrap(),
+            parse_update_source(&["--play".into()]).unwrap(),
             UpdateSource::GooglePlay
         );
-        for arguments in [
-            vec!["play".to_string()],
-            vec!["--play".to_string(), "--play".to_string()],
-        ] {
+        for arguments in [vec!["play".into()], vec!["--play".into(), "--play".into()]] {
             assert_eq!(
                 parse_update_source(&arguments).unwrap_err(),
                 "usage: eclipse update [--play]"
@@ -1816,7 +1829,10 @@ mod tests {
         );
         drop(first);
         let concurrent_spawns_released_it = (0..100).find_map(|_| {
-            let lock = lock_client_in(&root.join(super::RUNTIME_DIR), Launch::File).ok();
+            let lock = lock_client_in(&root.join(super::RUNTIME_DIR), |lock| {
+                Launch::File.already_running(lock)
+            })
+            .ok();
             if lock.is_none() {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -1831,7 +1847,7 @@ mod tests {
 
     #[test]
     fn only_launches_with_a_launch_window_show_setup_failures_in_one() {
-        let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
         assert!(launches_in_window(&args(&["run"])));
         assert!(launches_in_window(&args(&["__run-browser-place", "1818"])));
         assert!(!launches_in_window(&args(&["run", "/home/u/roblox"])));
@@ -1928,7 +1944,7 @@ mod tests {
 
     #[test]
     fn libroblox_init_takes_exactly_one_explicit_lib_dir() {
-        let lib_dir = "harness-libs".to_string();
+        let lib_dir = OsString::from("harness-libs");
         assert!(parse_libroblox_init_lib_dir(&[]).is_err());
         assert_eq!(
             parse_libroblox_init_lib_dir(std::slice::from_ref(&lib_dir)).unwrap(),
@@ -2073,10 +2089,26 @@ mod tests {
             "roblox-player:1+launchmode:play+gameinfo:{secret}+placelauncherurl:https%3A%2F%2Fassetgame.roblox.com%2Fgame%2FPlaceLauncher.ashx%3Frequest%3DRequestGame%26placeId%3D90441122676618"
         );
         let normalized =
-            normalize_browser_launch(vec!["__handle-roblox-player-url".to_string(), protocol])
+            normalize_browser_launch(vec!["__handle-roblox-player-url".into(), protocol.into()])
                 .unwrap();
         assert_eq!(normalized, ["__run-browser-place", "90441122676618"]);
-        assert!(!normalized.iter().any(|argument| argument.contains(secret)));
+        assert!(!normalized
+            .iter()
+            .any(|argument| argument.to_string_lossy().contains(secret)));
+    }
+
+    #[test]
+    fn arguments_that_are_not_utf8_are_parsed_without_panicking() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let latin1 = OsString::from_vec(b"R\xf6blox.xapk".to_vec());
+        assert_eq!(
+            parse_run_path(std::slice::from_ref(&latin1)).unwrap(),
+            Some(std::path::Path::new(&latin1))
+        );
+        let error = normalize_browser_launch(vec!["__handle-roblox-player-url".into(), latin1])
+            .expect_err("a Roblox URL is text");
+        assert!(error.contains("UTF-8"), "{error}");
     }
 
     #[test]

@@ -778,10 +778,8 @@ impl std::error::Error for PruneError {
 
 impl StoreError {
     pub fn is_unusable_install(&self) -> bool {
-        matches!(
-            self,
-            Self::Corrupt { .. } | Self::MissingInstall { .. } | Self::Set(_)
-        )
+        matches!(self, Self::Corrupt { .. } | Self::MissingInstall { .. })
+            || matches!(self, Self::Set(error) if !matches!(error, ApkSetError::Locate { .. }))
     }
 }
 
@@ -1298,6 +1296,32 @@ mod tests {
     }
 
     #[test]
+    fn an_install_that_cannot_be_read_is_reported_instead_of_replaced() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_root("unreadable-install");
+        let store = Store::at(root.clone());
+        fs::write(
+            root.join(CURRENT_FILE),
+            serde_json::to_vec(&version(3056)).unwrap(),
+        )
+        .unwrap();
+        let base = root.join("3056").join(BASE_APK);
+        fs::create_dir_all(base.parent().unwrap()).unwrap();
+        fs::write(&base, synthetic_apk(None, true)).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let usable = usable_version(&store);
+        fs::remove_dir_all(&root).ok();
+        let err = usable.unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Set(ApkSetError::Locate { path, .. }) if *path == base),
+            "a read failure is an error, not a missing install: {err:?}"
+        );
+        assert!(!err.is_unusable_install());
+    }
+
+    #[test]
     fn loose_apks_are_staged_by_their_manifest_role() {
         let root = temp_root("classify");
         let sources = temp_root("classify-sources");
@@ -1594,19 +1618,37 @@ mod tests {
     fn an_old_install_that_cannot_be_removed_does_not_fail_the_new_install() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        struct Cleanup<'a> {
+            read_only: &'a Path,
+            roots: [&'a Path; 2],
+        }
+
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                fs::set_permissions(self.read_only, fs::Permissions::from_mode(0o755)).ok();
+                for root in self.roots {
+                    fs::remove_dir_all(root).ok();
+                }
+            }
+        }
+
         let Some(sources) = official_sources("prune-leftover-sources") else {
             return;
         };
         let root = temp_root("prune-leftover");
         let locked = root.join("123").join("locked");
+        let _cleanup = Cleanup {
+            read_only: &locked,
+            roots: [&root, &sources],
+        };
         fs::create_dir_all(&locked).unwrap();
         fs::write(locked.join("file"), b"old").unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
 
         let store = Store::at(root.clone());
-        let committed = store.install(std::slice::from_ref(&sources), &StatusSink::terminal());
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-        let committed = committed.expect("the new install succeeds");
+        let staging = store.begin(&StatusSink::terminal()).unwrap();
+        staging.add_source(&sources).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let committed = staging.commit(None).expect("the new install succeeds");
         let leftover = committed.leftover.expect("the old install is reported");
         assert_eq!(leftover.path, root.join("123"));
         assert_eq!(leftover.source.kind(), io::ErrorKind::PermissionDenied);
@@ -1614,9 +1656,6 @@ mod tests {
             store.current().unwrap(),
             Some(InstalledVersion::from(&committed.set))
         );
-        drop(committed.set);
-        fs::remove_dir_all(&root).ok();
-        fs::remove_dir_all(&sources).ok();
     }
 
     #[test]

@@ -13,7 +13,9 @@ use super::store::{
     CheckOutcome, Committed, InstalledVersion, Release, Staging, Store, StoreError, UpdateCheck,
     UpdateOutcome,
 };
-use super::{ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, ROBLOX_PACKAGE, TARGET_ABI};
+use super::{
+    ApkSet, ApkSetError, VersionCode, BASE_APK, MAX_APK_BYTES, ROBLOX_PACKAGE, TARGET_ABI,
+};
 use crate::status::StatusSink;
 
 const SITE: &str = "https://apkcombo.com";
@@ -500,7 +502,8 @@ fn store_failure(error: StoreError) -> ApkComboError {
         | StoreError::Io { .. }
         | StoreError::Replace { .. }
         | StoreError::Corrupt { .. }
-        | StoreError::MissingInstall { .. } => ApkComboError::Store(error),
+        | StoreError::MissingInstall { .. }
+        | StoreError::Set(ApkSetError::Locate { .. }) => ApkComboError::Store(error),
         StoreError::Set(_)
         | StoreError::Apk { .. }
         | StoreError::UnneededSplit { .. }
@@ -1028,7 +1031,7 @@ impl From<DownloadError> for ApkComboError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apk::{ApkSetError, ApkSetPaths, NATIVE_SPLIT_APK};
+    use crate::apk::{ApkSetPaths, NATIVE_SPLIT_APK};
     use std::io::Write;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
@@ -2227,6 +2230,20 @@ mod tests {
         assert!(matches!(replace, ApkComboError::Store(_)), "{replace:?}");
         assert!(!replace.to_string().contains("discarded"), "{replace}");
         assert!(!replace.rejects_offer());
+
+        let unreadable = store_failure(StoreError::Set(ApkSetError::Locate {
+            path: PathBuf::from("/store/3170.partial/base.apk"),
+            source: io::Error::other("read failed"),
+        }));
+        assert!(
+            matches!(unreadable, ApkComboError::Store(_)),
+            "{unreadable:?}"
+        );
+        assert!(
+            !unreadable.to_string().contains("discarded"),
+            "{unreadable}"
+        );
+        assert!(!unreadable.rejects_offer());
 
         let rejected = store_failure(StoreError::UnexpectedVersion {
             expected: VersionCode(3170),

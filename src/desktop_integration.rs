@@ -1,4 +1,5 @@
 use directories::BaseDirs;
+use eclipse::temp_file::TempFile;
 use std::ffi::OsStr;
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
@@ -136,7 +137,18 @@ pub(super) fn flatpak_handler_notice(app_id: &str, desktop_path: &Path) -> Strin
 }
 
 fn install_host_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let handler = std::env::current_exe()?.canonicalize()?;
+    let executable = std::env::current_exe().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot locate the Eclipse executable for the URL handler: {error}"),
+        )
+    })?;
+    let handler = executable.canonicalize().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot resolve {}: {error}", executable.display()),
+        )
+    })?;
     let base_dirs = BaseDirs::new().ok_or_else(|| {
         io::Error::new(
             ErrorKind::NotFound,
@@ -144,13 +156,7 @@ fn install_host_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
         )
     })?;
     let applications = base_dirs.data_dir().join("applications");
-    std::fs::create_dir_all(&applications)?;
-
-    let desktop_path = applications.join(DESKTOP_FILE_ID);
-    let temporary = applications.join(format!(".{DESKTOP_FILE_ID}.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, desktop_entry(&handler)?)?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644))?;
-    std::fs::rename(&temporary, &desktop_path)?;
+    let desktop_path = write_desktop_file(&applications, &handler)?;
 
     if let Some(validator) = find_on_path("desktop-file-validate") {
         run_checked(
@@ -206,7 +212,16 @@ fn install_host_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
             .arg("query")
             .arg("default")
             .arg(mime)
-            .output()?;
+            .output()
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot run {} to query the {mime} handler: {error}",
+                        xdg_mime.display()
+                    ),
+                )
+            })?;
         if !query.status.success()
             || String::from_utf8_lossy(&query.stdout).trim() != DESKTOP_FILE_ID
         {
@@ -217,6 +232,33 @@ fn install_host_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(desktop_path)
+}
+
+fn write_desktop_file(
+    applications: &Path,
+    handler: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(applications).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot create {}: {error}", applications.display()),
+        )
+    })?;
+    let desktop_path = applications.join(DESKTOP_FILE_ID);
+    let write_error = |error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot write {}: {error}", desktop_path.display()),
+        )
+    };
+    let mut temporary = TempFile::create(applications, DESKTOP_FILE_ID).map_err(write_error)?;
+    temporary
+        .write_all(desktop_entry(handler)?.as_bytes())
+        .map_err(write_error)?;
+    std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o644))
+        .map_err(write_error)?;
+    temporary.persist(&desktop_path).map_err(write_error)?;
     Ok(desktop_path)
 }
 
@@ -304,7 +346,15 @@ fn run_checked(
     command: &mut Command,
     action: &'static str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let status = command.status()?;
+    let status = command.status().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot run {} to {action}: {error}",
+                Path::new(command.get_program()).display()
+            ),
+        )
+    })?;
     if status.success() {
         Ok(())
     } else {
@@ -315,6 +365,76 @@ fn run_checked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_desktop_file_that_cannot_be_written_leaves_no_temporary() {
+        let applications = std::env::temp_dir().join(format!(
+            "eclipse-desktop-file-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&applications).ok();
+        std::fs::create_dir_all(applications.join(DESKTOP_FILE_ID)).unwrap();
+
+        let result = write_desktop_file(&applications, Path::new("/usr/bin/eclipse"));
+        let left: Vec<_> = std::fs::read_dir(&applications)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        std::fs::remove_dir_all(&applications).ok();
+        assert!(result.is_err(), "the desktop file path is a directory");
+        assert_eq!(left, [DESKTOP_FILE_ID]);
+    }
+
+    #[test]
+    fn desktop_file_errors_name_the_step_and_path_that_failed() {
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-desktop-file-errors-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let uncreatable = root.join("file").join("applications");
+        std::fs::write(root.join("file"), b"").unwrap();
+        let applications = root.join("applications");
+        std::fs::create_dir_all(applications.join(DESKTOP_FILE_ID)).unwrap();
+        let handler = Path::new("/usr/bin/eclipse");
+
+        let create = write_desktop_file(&uncreatable, handler);
+        let persist = write_desktop_file(&applications, handler);
+        std::fs::remove_dir_all(&root).ok();
+        let create = create.unwrap_err().to_string();
+        assert!(
+            create.starts_with(&format!("cannot create {}: ", uncreatable.display())),
+            "{create}"
+        );
+        let persist = persist.unwrap_err().to_string();
+        let desktop_path = applications.join(DESKTOP_FILE_ID);
+        assert!(
+            persist.starts_with(&format!("cannot write {}: ", desktop_path.display())),
+            "{persist}"
+        );
+    }
+
+    #[test]
+    fn commands_that_cannot_start_name_the_program_and_step() {
+        let program = std::env::temp_dir()
+            .join(format!(
+                "eclipse-desktop-missing-program-{:?}",
+                std::thread::current().id()
+            ))
+            .join("xdg-mime");
+
+        let error = run_checked(&mut Command::new(&program), "set the Roblox URL handlers")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(&format!(
+                "cannot run {} to set the Roblox URL handlers: ",
+                program.display()
+            )),
+            "{error}"
+        );
+    }
 
     #[test]
     fn desktop_entry_passes_one_unquoted_url_field() {

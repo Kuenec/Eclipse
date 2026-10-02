@@ -98,19 +98,24 @@ impl Config {
 
     pub fn load() -> Result<Self, ConfigError> {
         let path = Self::config_path()?;
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(serde_json::from_str(&text)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(ConfigError::Io(e)),
-        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(source) => return Err(ConfigError::Read { path, source }),
+        };
+        serde_json::from_str(&text).map_err(|source| ConfigError::Parse { path, source })
     }
 
     pub fn save(&self) -> Result<(), ConfigError> {
         let path = Self::config_path()?;
+        let write_error = |source| ConfigError::Write {
+            path: path.clone(),
+            source,
+        };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(write_error)?;
         }
-        std::fs::write(&path, self.to_json_pretty()?)?;
+        std::fs::write(&path, self.to_json_pretty()?).map_err(write_error)?;
         Ok(())
     }
 
@@ -138,7 +143,20 @@ const MAXIMUM_FRAME_RATE_ROW_FLAG: &str = "FFlagGameBasicSettingsFramerateCap5";
 pub enum ConfigError {
     NoConfigDir,
 
-    Io(std::io::Error),
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     Json(serde_json::Error),
 }
@@ -149,7 +167,15 @@ impl fmt::Display for ConfigError {
             Self::NoConfigDir => {
                 f.write_str("could not determine a config directory (is $HOME set?)")
             }
-            Self::Io(e) => write!(f, "config file I/O error: {e}"),
+            Self::Read { path, source } => write!(f, "cannot read {}: {source}", path.display()),
+            Self::Parse { path, source } => write!(
+                f,
+                "{} is not valid Eclipse settings JSON: {source}",
+                path.display()
+            ),
+            Self::Write { path, source } => {
+                write!(f, "cannot write {}: {source}", path.display())
+            }
             Self::Json(e) => write!(f, "config JSON error: {e}"),
         }
     }
@@ -159,15 +185,10 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NoConfigDir => None,
-            Self::Io(e) => Some(e),
+            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
+            Self::Parse { source, .. } => Some(source),
             Self::Json(e) => Some(e),
         }
-    }
-}
-
-impl From<std::io::Error> for ConfigError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
     }
 }
 
