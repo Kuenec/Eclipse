@@ -48,6 +48,8 @@ struct GameWindow<'vm> {
 
     create_error: Option<OsError>,
 
+    handoff_error: Option<GraphicsError>,
+
     vm: Option<&'vm crate::runtime::Vm>,
 
     touch_mode: crate::config::TouchMode,
@@ -171,6 +173,33 @@ fn next_wake(deadlines: impl IntoIterator<Item = Option<std::time::Instant>>) ->
         .flatten()
         .min()
         .map_or(ControlFlow::Wait, ControlFlow::WaitUntil)
+}
+
+fn surface_handoff(
+    dispatched: Result<bool, crate::framework::FrameworkError>,
+    width: i32,
+    height: i32,
+) -> Result<(), GraphicsError> {
+    match dispatched {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(GraphicsError::EngineSurfaceUnavailable { width, height }),
+        Err(e) => Err(GraphicsError::EngineSurfaceHandoff(e)),
+    }
+}
+
+fn loop_wake(
+    main_looper: crate::framework::MainLooperDue,
+    now: std::time::Instant,
+    display_refresh_poll: std::time::Instant,
+    main_thread_retry: Option<std::time::Instant>,
+    pointer_lock: PointerLock,
+) -> ControlFlow {
+    next_wake([
+        main_looper.deadline(now),
+        Some(display_refresh_poll),
+        main_thread_retry,
+        pointer_lock_recheck(pointer_lock),
+    ])
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -370,11 +399,16 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
                 if let (Some(window), Some(renderer)) =
                     (self.window.as_ref(), self.renderer.as_mut())
                 {
-                    if let Err(e) = renderer.draw_frame(window) {
-                        tracing::error!(error = %e, "Vulkan frame draw failed");
+                    match renderer.draw_frame(window) {
+                        Ok(()) => window.request_redraw(),
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "Vulkan frame draw failed; window stays open without GPU presentation"
+                            );
+                            self.renderer = None;
+                        }
                     }
-
-                    window.request_redraw();
                 }
 
                 self.maybe_synthetic_tap();
@@ -559,6 +593,7 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
             }
         };
 
+        let mut surface_probe_failed = false;
         if !self.handed_off && self.engine_window.is_some() {
             match crate::framework::engine_surface_callback_ready(vm) {
                 Ok(true) => {
@@ -567,8 +602,16 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
 
                     self.renderer = None;
 
-                    if let Err(e) = crate::framework::dispatch_surface_lifecycle(vm, w, h) {
-                        tracing::warn!(error = %e, "engine SurfaceView lifecycle dispatch failed after renderer release");
+                    if let Err(e) = surface_handoff(
+                        crate::framework::dispatch_surface_lifecycle(vm, w, h),
+                        w,
+                        h,
+                    ) {
+                        tracing::error!(error = %e, "engine SurfaceView handoff failed; stopping");
+                        self.handoff_error = Some(e);
+                        self.shutdown_runtime();
+                        event_loop.exit();
+                        return;
                     }
                     self.handed_off = true;
                     self.handoff_at = Some(std::time::Instant::now());
@@ -582,6 +625,7 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
                 Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(error = %e, "engine surface-callback readiness probe failed (retry)");
+                    surface_probe_failed = true;
                 }
             }
         } else if self.handed_off && crate::loader::ndk_registry::engine_claimed_surface() {
@@ -621,17 +665,17 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
             self.publish_engine_display_refresh_rates();
             self.next_display_refresh_poll = now + DISPLAY_REFRESH_POLL_INTERVAL;
         }
-        if self.handed_off {
-            let main_thread_retry = (crate::framework::textbox_geometry_pending()
-                || crate::framework::global_layout_pending())
-            .then(|| now + MAIN_THREAD_RETRY_DELAY);
-            event_loop.set_control_flow(next_wake([
-                main_looper.deadline(now),
-                Some(self.next_display_refresh_poll),
-                main_thread_retry,
-                pointer_lock_recheck(self.pointer_lock),
-            ]));
-        }
+        let main_thread_retry = (surface_probe_failed
+            || crate::framework::textbox_geometry_pending()
+            || crate::framework::global_layout_pending())
+        .then(|| now + MAIN_THREAD_RETRY_DELAY);
+        event_loop.set_control_flow(loop_wake(
+            main_looper,
+            now,
+            self.next_display_refresh_poll,
+            main_thread_retry,
+            self.pointer_lock,
+        ));
     }
 
     fn device_event(
@@ -901,6 +945,30 @@ impl PointerLockReasons {
             _ => self.right_drag,
         };
         Self { right_drag, ..self }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimaryRelease {
+    Nothing,
+    MouseButton,
+    TouchUp { down_time: i64 },
+}
+
+fn primary_release(
+    touch_mode: crate::config::TouchMode,
+    held: &mut EngineHeldInput,
+    touch_down_time: Option<i64>,
+) -> PrimaryRelease {
+    use crate::config::TouchMode;
+
+    match touch_mode {
+        TouchMode::Off if held.release_button(0) => PrimaryRelease::MouseButton,
+        TouchMode::Off => PrimaryRelease::Nothing,
+        TouchMode::On | TouchMode::FakeOff => touch_down_time
+            .map_or(PrimaryRelease::Nothing, |down_time| {
+                PrimaryRelease::TouchUp { down_time }
+            }),
     }
 }
 
@@ -1276,7 +1344,7 @@ impl GameWindow<'_> {
             py,
             None,
         ) {
-            Ok(outcome) => {
+            Ok(Some(outcome)) => {
                 self.engine_tap_downtime = Some(outcome.down_time_ms);
                 tracing::info!(
                     x = px,
@@ -1285,6 +1353,7 @@ impl GameWindow<'_> {
                     "engine pointer ACTION_DOWN → RBXSurfaceView.onTouchEventInternal"
                 );
             }
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!(error = %e, "engine pointer ACTION_DOWN dispatch failed (ignored)");
             }
@@ -1295,23 +1364,24 @@ impl GameWindow<'_> {
         let down_time = self.engine_tap_downtime.take();
         let Some(vm) = self.vm else { return };
         let Some((px, py)) = self.cursor else { return };
-        if self.touch_mode == crate::config::TouchMode::Off {
-            if !self.engine_held.release_button(0) {
+        let down_time = match primary_release(self.touch_mode, &mut self.engine_held, down_time) {
+            PrimaryRelease::Nothing => return,
+            PrimaryRelease::MouseButton => {
+                if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, false, 0) {
+                    tracing::warn!(error = %e, "engine desktop mouse-button up dispatch failed (ignored)");
+                }
                 return;
             }
-            if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, false, 0) {
-                tracing::warn!(error = %e, "engine desktop mouse-button up dispatch failed (ignored)");
-            }
-            return;
-        }
+            PrimaryRelease::TouchUp { down_time } => down_time,
+        };
         match crate::framework::dispatch_touch_to_engine_surface(
             vm,
             crate::framework::MotionAction::Up,
             px,
             py,
-            down_time,
+            Some(down_time),
         ) {
-            Ok(outcome) => {
+            Ok(Some(outcome)) => {
                 tracing::info!(
                     x = px,
                     y = py,
@@ -1319,6 +1389,7 @@ impl GameWindow<'_> {
                     "engine pointer ACTION_UP → RBXSurfaceView.onTouchEventInternal"
                 );
             }
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!(error = %e, "engine pointer ACTION_UP dispatch failed (ignored)");
             }
@@ -1948,9 +2019,10 @@ impl GameWindow<'_> {
 
 pub type HostEventLoop = EventLoop<crate::framework::MainLooperWake>;
 
-pub fn host_event_loop() -> Result<HostEventLoop, GraphicsError> {
+pub fn host_event_loop() -> Result<&'static mut HostEventLoop, GraphicsError> {
     HostEventLoop::with_user_event()
         .build()
+        .map(|event_loop| Box::leak(Box::new(event_loop)))
         .map_err(GraphicsError::EventLoop)
 }
 
@@ -1967,6 +2039,7 @@ pub fn run_windowed(
         window: None,
         renderer: None,
         create_error: None,
+        handoff_error: None,
         vm,
         touch_mode,
         cursor: None,
@@ -2018,6 +2091,9 @@ pub fn run_windowed(
 
     if let Some(e) = app.create_error {
         return Err(GraphicsError::CreateWindow(e));
+    }
+    if let Some(e) = app.handoff_error {
+        return Err(e);
     }
     Ok(())
 }
@@ -2214,8 +2290,10 @@ fn is_vertical_linear(class_name: &str) -> bool {
     class_name.ends_with("LinearLayout")
 }
 
+const HORIZONTAL_GRAVITY_MASK: i32 = 0x07;
 const GRAVITY_CENTER_HORIZONTAL: i32 = 0x01;
 const GRAVITY_RIGHT: i32 = 0x05;
+const VERTICAL_GRAVITY_MASK: i32 = 0x70;
 const GRAVITY_CENTER_VERTICAL: i32 = 0x10;
 const GRAVITY_BOTTOM: i32 = 0x50;
 
@@ -2228,12 +2306,10 @@ fn gravity_dx(gravity: i32, slot_w: f32, cw: f32) -> f32 {
         return 0.0;
     }
     let slack = (slot_w - cw).max(0.0);
-    if gravity & GRAVITY_RIGHT == GRAVITY_RIGHT {
-        slack
-    } else if gravity & GRAVITY_CENTER_HORIZONTAL != 0 {
-        slack * 0.5
-    } else {
-        0.0
+    match gravity & HORIZONTAL_GRAVITY_MASK {
+        GRAVITY_RIGHT => slack,
+        GRAVITY_CENTER_HORIZONTAL => slack * 0.5,
+        _ => 0.0,
     }
 }
 
@@ -2242,12 +2318,10 @@ fn gravity_dy(gravity: i32, slot_h: f32, ch: f32) -> f32 {
         return 0.0;
     }
     let slack = (slot_h - ch).max(0.0);
-    if gravity & GRAVITY_BOTTOM == GRAVITY_BOTTOM {
-        slack
-    } else if gravity & GRAVITY_CENTER_VERTICAL != 0 {
-        slack * 0.5
-    } else {
-        0.0
+    match gravity & VERTICAL_GRAVITY_MASK {
+        GRAVITY_BOTTOM => slack,
+        GRAVITY_CENTER_VERTICAL => slack * 0.5,
+        _ => 0.0,
     }
 }
 
@@ -4216,12 +4290,21 @@ impl VulkanRenderer {
             surface_format,
             render_pass: self.render_pass,
         };
-        let new_swapchain = target.create_swapchain(size, self.swapchain.swapchain)?;
-
-        unsafe {
-            let old = std::mem::replace(&mut self.swapchain, new_swapchain);
-            old.destroy(&self.device, &self.swapchain_loader);
-        }
+        let (next, created) = match target.create_swapchain(size, self.swapchain.swapchain) {
+            Ok(swapchain) => (swapchain, Ok(())),
+            Err(e) => (
+                Swapchain {
+                    swapchain: vk::SwapchainKHR::null(),
+                    image_views: Vec::new(),
+                    framebuffers: Vec::new(),
+                    extent: self.swapchain.extent,
+                },
+                Err(e),
+            ),
+        };
+        let old = std::mem::replace(&mut self.swapchain, next);
+        unsafe { old.destroy(&self.device, &self.swapchain_loader) };
+        created?;
         self.swapchain_extent = self.swapchain.extent;
         self.needs_recreate = false;
         Ok(())
@@ -4249,19 +4332,24 @@ impl VulkanRenderer {
         self.draw_nodes(window, &crate::framework::view_registry::snapshot_tree())
     }
 
-    fn draw_nodes(&mut self, window: &Window, nodes: &[RenderNode]) -> Result<(), GraphicsError> {
+    fn current_extent(&mut self, window: &Window) -> Result<Option<vk::Extent2D>, GraphicsError> {
         if self.needs_recreate {
             self.recreate_swapchain(window)?;
             if self.swapchain.framebuffers.is_empty() {
-                return Ok(());
+                return Ok(None);
             }
         }
+        Ok(Some(self.swapchain.extent))
+    }
+
+    fn draw_nodes(&mut self, window: &Window, nodes: &[RenderNode]) -> Result<(), GraphicsError> {
+        let Some(extent) = self.current_extent(window)? else {
+            return Ok(());
+        };
 
         self.in_flight
             .retire(&self.device)
             .map_err(|e| GraphicsError::Vulkan(format!("wait for the previous frame: {e}")))?;
-
-        let extent = self.swapchain.extent;
 
         let measure = self.text.as_ref().map(|t| TextMeasure { atlas: &t.atlas });
         let views = layout_views(nodes, extent, measure);
@@ -5744,6 +5832,10 @@ pub enum GraphicsError {
     CreateWindow(OsError),
 
     Vulkan(String),
+
+    EngineSurfaceUnavailable { width: i32, height: i32 },
+
+    EngineSurfaceHandoff(crate::framework::FrameworkError),
 }
 
 impl fmt::Display for GraphicsError {
@@ -5752,6 +5844,16 @@ impl fmt::Display for GraphicsError {
             Self::EventLoop(e) => write!(f, "winit event loop error: {e}"),
             Self::CreateWindow(e) => write!(f, "failed to create host window: {e}"),
             Self::Vulkan(msg) => write!(f, "Vulkan error: {msg}"),
+            Self::EngineSurfaceUnavailable { width, height } => write!(
+                f,
+                "Roblox's SurfaceView stopped accepting the {width}x{height} window right after \
+                 it registered its surface callback"
+            ),
+            Self::EngineSurfaceHandoff(e) => write!(
+                f,
+                "handing the window to Roblox's SurfaceView (surfaceCreated, then surfaceChanged) \
+                 failed: {e}"
+            ),
         }
     }
 }
@@ -5761,7 +5863,8 @@ impl std::error::Error for GraphicsError {
         match self {
             Self::EventLoop(e) => Some(e),
             Self::CreateWindow(e) => Some(e),
-            Self::Vulkan(_) => None,
+            Self::EngineSurfaceHandoff(e) => Some(e),
+            Self::Vulkan(_) | Self::EngineSurfaceUnavailable { .. } => None,
         }
     }
 }
@@ -6567,6 +6670,38 @@ mod tests {
     }
 
     #[test]
+    fn a_primary_release_reaches_the_engine_only_after_its_press_did() {
+        use crate::config::TouchMode;
+
+        let mut held = EngineHeldInput::default();
+        for mode in [TouchMode::On, TouchMode::FakeOff] {
+            assert_eq!(
+                primary_release(mode, &mut held, Some(40)),
+                PrimaryRelease::TouchUp { down_time: 40 }
+            );
+            assert_eq!(
+                primary_release(mode, &mut held, None),
+                PrimaryRelease::Nothing,
+                "a touch whose ACTION_DOWN never reached the engine, or whose ACTION_UP \
+                 was already sent on focus loss, sends no second ACTION_UP"
+            );
+        }
+        assert_eq!(
+            primary_release(TouchMode::Off, &mut held, None),
+            PrimaryRelease::Nothing
+        );
+        held.press_button(0);
+        assert_eq!(
+            primary_release(TouchMode::Off, &mut held, None),
+            PrimaryRelease::MouseButton
+        );
+        assert_eq!(
+            primary_release(TouchMode::Off, &mut held, None),
+            PrimaryRelease::Nothing
+        );
+    }
+
+    #[test]
     fn a_key_release_reuses_the_key_code_sent_with_its_press() {
         let slash = EngineKey {
             scan_code: 53,
@@ -6659,6 +6794,69 @@ mod tests {
             ControlFlow::WaitUntil(soon)
         );
         assert_eq!(next_wake([None, None]), ControlFlow::Wait);
+    }
+
+    #[test]
+    fn the_handoff_fails_unless_the_surface_view_took_the_window() {
+        use crate::framework::FrameworkError;
+
+        assert!(surface_handoff(Ok(true), 1280, 720).is_ok());
+        assert!(matches!(
+            surface_handoff(Ok(false), 1280, 720),
+            Err(GraphicsError::EngineSurfaceUnavailable {
+                width: 1280,
+                height: 720
+            })
+        ));
+        assert!(matches!(
+            surface_handoff(Err(FrameworkError::Panicked), 1280, 720),
+            Err(GraphicsError::EngineSurfaceHandoff(
+                FrameworkError::Panicked
+            ))
+        ));
+    }
+
+    #[test]
+    fn the_loop_wakes_for_main_looper_messages_before_the_handoff() {
+        use crate::framework::MainLooperDue;
+
+        let now = std::time::Instant::now();
+        let delayed = now + std::time::Duration::from_millis(30);
+        let retry = now + MAIN_THREAD_RETRY_DELAY;
+        let refresh_poll = now + DISPLAY_REFRESH_POLL_INTERVAL;
+
+        assert_eq!(
+            loop_wake(
+                MainLooperDue::At(delayed),
+                now,
+                refresh_poll,
+                None,
+                PointerLock::Free
+            ),
+            ControlFlow::WaitUntil(delayed),
+            "a postDelayed message runs on time while the splash is hidden"
+        );
+        assert_eq!(
+            loop_wake(
+                MainLooperDue::WhenWoken,
+                now,
+                refresh_poll,
+                Some(retry),
+                PointerLock::Free
+            ),
+            ControlFlow::WaitUntil(retry),
+            "a failed surface-callback probe is retried without a redraw"
+        );
+        assert_eq!(
+            loop_wake(
+                MainLooperDue::WhenWoken,
+                now,
+                refresh_poll,
+                None,
+                PointerLock::Free
+            ),
+            ControlFlow::WaitUntil(refresh_poll)
+        );
     }
 
     #[test]
@@ -7188,6 +7386,53 @@ mod tests {
             (views[1].x, views[1].y),
             (0.0, 0.0),
             "unspecified gravity → origin"
+        );
+    }
+
+    #[test]
+    fn gravity_decodes_each_axis_from_its_own_field() {
+        const GRAVITY_LEFT: i32 = 0x03;
+        const GRAVITY_START: i32 = 0x0080_0003;
+        const GRAVITY_TOP: i32 = 0x30;
+        const GRAVITY_FILL: i32 = 0x77;
+
+        let extent = vk::Extent2D {
+            width: 200,
+            height: 200,
+        };
+        let root_lp = LayoutParams {
+            width: MATCH_PARENT,
+            height: MATCH_PARENT,
+            ..Default::default()
+        };
+        let child_at = |class: &str, gravity: i32| {
+            let child_lp = LayoutParams {
+                width: 50,
+                height: 50,
+                gravity,
+                ..Default::default()
+            };
+            let nodes = [
+                node_lp(class, None, 0, root_lp, &[1]),
+                node_lp("android.view.View", None, 1, child_lp, &[]),
+            ];
+            let views = layout_views(&nodes, extent, None);
+            (views[1].x, views[1].y)
+        };
+        let frame = "android.widget.FrameLayout";
+
+        assert_eq!(child_at(frame, GRAVITY_LEFT | GRAVITY_TOP), (0.0, 0.0));
+        assert_eq!(child_at(frame, GRAVITY_START | GRAVITY_TOP), (0.0, 0.0));
+        assert_eq!(child_at(frame, GRAVITY_RIGHT | GRAVITY_TOP), (150.0, 0.0));
+        assert_eq!(child_at(frame, GRAVITY_LEFT | GRAVITY_BOTTOM), (0.0, 150.0));
+        assert_eq!(
+            child_at(frame, GRAVITY_LEFT | GRAVITY_CENTER_VERTICAL),
+            (0.0, 75.0)
+        );
+        assert_eq!(child_at(frame, GRAVITY_FILL), (0.0, 0.0));
+        assert_eq!(
+            child_at("android.widget.LinearLayout", GRAVITY_LEFT),
+            (0.0, 0.0)
         );
     }
 

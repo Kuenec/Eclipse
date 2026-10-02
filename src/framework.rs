@@ -12975,7 +12975,7 @@ pub fn dispatch_touch_to_engine_surface(
     x: f32,
     y: f32,
     down_time_ms: Option<i64>,
-) -> Result<EngineTouchOutcome, FrameworkError> {
+) -> Result<Option<EngineTouchOutcome>, FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
@@ -12998,25 +12998,21 @@ fn touch_engine_surface(
     x: f32,
     y: f32,
     down_time_ms: Option<i64>,
-) -> Result<EngineTouchOutcome, FrameworkError> {
-    let not_dispatched = EngineTouchOutcome {
-        consumed: false,
-        down_time_ms: down_time_ms.unwrap_or(0),
-    };
+) -> Result<Option<EngineTouchOutcome>, FrameworkError> {
     let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
         tracing::debug!(
             ?action,
             "engine touch: RBXSurfaceView not registered yet (no-op)"
         );
-        return Ok(not_dispatched);
+        return Ok(None);
     };
     let surface = match view_registry::local_jobject(env, handle) {
         Ok(Ok(Some(surface))) => surface,
-        Ok(Ok(None)) => return Ok(not_dispatched),
+        Ok(Ok(None)) => return Ok(None),
         Ok(Err(e)) => return Err(FrameworkError::Jni(e)),
         Err(e) => {
             tracing::debug!(error = %e, "engine touch: surface not dispatchable (ignored)");
-            return Ok(not_dispatched);
+            return Ok(None);
         }
     };
     let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
@@ -13086,10 +13082,10 @@ fn touch_engine_surface(
     }) {
         tracing::debug!(error = %e, "MotionEvent.recycle failed (ignored)");
     }
-    Ok(EngineTouchOutcome {
+    Ok(Some(EngineTouchOutcome {
         consumed: consumed?,
         down_time_ms: down_time,
-    })
+    }))
 }
 
 pub fn pass_hardware_key_to_engine(

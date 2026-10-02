@@ -188,6 +188,9 @@ impl WaylandClipboard {
     }
 
     fn store(&self, text: String) -> Result<(), ClipboardError> {
+        if self.earlier_load_unanswered() {
+            return Err(ClipboardError::WaylandOwnerUnresponsive);
+        }
         self.send(WaylandCommand::Store(text))
     }
 }
@@ -196,10 +199,12 @@ impl Drop for WaylandClipboard {
     fn drop(&mut self) {
         if self.earlier_load_unanswered() {
             tracing::warn!(
-                "waiting for the application holding the Wayland clipboard to answer an earlier paste"
+                "leaving the Wayland clipboard worker behind: the application holding the \
+                 clipboard never answered an earlier paste"
             );
+            return;
         }
-        if self.commands.send(WaylandCommand::Stop).is_err() {
+        if self.commands.try_send(WaylandCommand::Stop).is_err() {
             return;
         }
         if let Some(worker) = self.worker.take() {
@@ -254,12 +259,43 @@ mod tests {
             clipboard.load(),
             Err(ClipboardError::WaylandOwnerUnresponsive)
         ));
-        clipboard.store("copied".to_owned()).unwrap();
+        assert!(
+            matches!(
+                clipboard.store("copied".to_owned()),
+                Err(ClipboardError::WaylandOwnerUnresponsive)
+            ),
+            "a cut keeps its text while the worker still waits on the earlier paste"
+        );
         drop(clipboard);
 
-        assert_eq!(
-            requests.try_iter().collect::<Vec<_>>(),
-            ["load", "store copied"]
+        assert_eq!(requests.iter().collect::<Vec<_>>(), ["load"]);
+    }
+
+    #[test]
+    fn closing_does_not_wait_for_a_paste_the_clipboard_owner_never_answers() {
+        let (release, released) = mpsc::channel::<()>();
+        let released = std::sync::Mutex::new(released);
+        let (mut clipboard, requests) = clipboard_owner(move |_| {
+            released.lock().unwrap().recv().unwrap();
+            None
+        });
+        assert!(matches!(
+            clipboard.load(),
+            Err(ClipboardError::WaylandOwnerUnresponsive)
+        ));
+
+        let (closed, close_finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(clipboard);
+            closed.send(()).unwrap();
+        });
+        let closed_promptly = close_finished.recv_timeout(Duration::from_secs(2)).is_ok();
+        release.send(()).unwrap();
+        assert_eq!(requests.recv().unwrap(), "load");
+
+        assert!(
+            closed_promptly,
+            "closing waited for the clipboard owner to answer"
         );
     }
 
