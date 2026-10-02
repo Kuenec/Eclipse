@@ -720,32 +720,132 @@ fn input_capture_converts_device_samples_for_the_app() {
     assert_eq!(*probe.received.lock().unwrap(), expected);
 }
 
-#[test]
-fn host_errors_count_xruns_and_disconnect_once() {
-    let shared = Arc::new(StreamShared::new(4));
-    shared.state.swap(StreamState::Started);
-    let probe = CallbackProbe::default();
-    let reporter = ErrorReporter {
-        shared: Arc::clone(&shared),
+fn error_reporter(shared: &Arc<StreamShared>, probe: &CallbackProbe) -> ErrorReporter {
+    ErrorReporter {
+        shared: Arc::clone(shared),
         callback: Some(ErrorCallbackTarget {
             func: record_error,
             user_data: probe.user_data(),
         }),
         stream: 0x10,
-    };
+        streak: HostErrorStreak::default(),
+    }
+}
 
-    reporter.report(cpal::ErrorKind::Xrun.into());
-    reporter.report(cpal::ErrorKind::Xrun.into());
-    reporter.report(cpal::Error::with_message(
+fn server_lost() -> cpal::Error {
+    cpal::Error::with_message(
         cpal::ErrorKind::BackendError,
-        "snd_pcm_recover failed",
-    ));
+        "ALSA function 'snd_pcm_avail_delay' failed with error 'I/O error (5)'",
+    )
+}
+
+#[test]
+fn host_errors_count_xruns_and_disconnect_once() {
+    let shared = Arc::new(StreamShared::new(4));
+    shared.state.swap(StreamState::Started);
+    let probe = CallbackProbe::default();
+    let mut reporter = error_reporter(&shared, &probe);
+    let start = Instant::now();
+
+    reporter.report(cpal::ErrorKind::Xrun.into(), start);
+    reporter.report(cpal::ErrorKind::Xrun.into(), start);
+    reporter.report(cpal::ErrorKind::DeviceChanged.into(), start);
+    reporter.report(cpal::ErrorKind::RealtimeDenied.into(), start);
     assert_eq!(shared.xrun_count.load(Ordering::Relaxed), 2);
     assert_eq!(shared.state.load(), StreamState::Started);
+    assert!(probe.errors.lock().unwrap().is_empty());
 
-    reporter.report(cpal::ErrorKind::DeviceNotAvailable.into());
-    reporter.report(cpal::ErrorKind::StreamInvalidated.into());
+    reporter.report(cpal::ErrorKind::DeviceNotAvailable.into(), start);
     assert_eq!(shared.state.load(), StreamState::Disconnected);
+    assert_eq!(*probe.errors.lock().unwrap(), [AAUDIO_ERROR_DISCONNECTED]);
+
+    reporter.report(cpal::ErrorKind::StreamInvalidated.into(), start);
+    reporter.report(server_lost(), start);
+    reporter.report(server_lost(), start + HOST_ERROR_STREAK_LIMIT);
+    assert_eq!(shared.state.load(), StreamState::Disconnected);
+    assert_eq!(*probe.errors.lock().unwrap(), [AAUDIO_ERROR_DISCONNECTED]);
+}
+
+#[test]
+fn a_lost_device_disconnects_the_stream_at_once() {
+    for kind in [
+        cpal::ErrorKind::DeviceNotAvailable,
+        cpal::ErrorKind::StreamInvalidated,
+    ] {
+        let shared = Arc::new(StreamShared::new(4));
+        shared.state.swap(StreamState::Started);
+        let probe = CallbackProbe::default();
+        let mut reporter = error_reporter(&shared, &probe);
+        reporter.report(kind.into(), Instant::now());
+        assert_eq!(shared.state.load(), StreamState::Disconnected, "{kind:?}");
+        assert_eq!(
+            *probe.errors.lock().unwrap(),
+            [AAUDIO_ERROR_DISCONNECTED],
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn host_errors_without_host_callbacks_disconnect_once_after_the_streak_limit() {
+    for kind in [
+        cpal::ErrorKind::BackendError,
+        cpal::ErrorKind::DeviceBusy,
+        cpal::ErrorKind::HostUnavailable,
+        cpal::ErrorKind::InvalidInput,
+        cpal::ErrorKind::PermissionDenied,
+        cpal::ErrorKind::ResourceExhausted,
+        cpal::ErrorKind::UnsupportedConfig,
+        cpal::ErrorKind::UnsupportedOperation,
+        cpal::ErrorKind::Other,
+    ] {
+        let shared = Arc::new(StreamShared::new(4));
+        shared.state.swap(StreamState::Started);
+        let probe = CallbackProbe::default();
+        let mut reporter = error_reporter(&shared, &probe);
+        let start = Instant::now();
+
+        reporter.report(kind.into(), start);
+        reporter.report(
+            kind.into(),
+            start + HOST_ERROR_STREAK_LIMIT - Duration::from_millis(1),
+        );
+        assert_eq!(shared.state.load(), StreamState::Started, "{kind:?}");
+        assert!(probe.errors.lock().unwrap().is_empty(), "{kind:?}");
+
+        reporter.report(kind.into(), start + HOST_ERROR_STREAK_LIMIT);
+        reporter.report(kind.into(), start + 2 * HOST_ERROR_STREAK_LIMIT);
+        assert_eq!(shared.state.load(), StreamState::Disconnected, "{kind:?}");
+        assert_eq!(
+            *probe.errors.lock().unwrap(),
+            [AAUDIO_ERROR_DISCONNECTED],
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn a_host_error_followed_by_a_host_callback_keeps_the_stream_started() {
+    let shared = Arc::new(StreamShared::new(4));
+    shared.state.swap(StreamState::Started);
+    let probe = CallbackProbe::default();
+    let mut renderer = renderer::<i16>(&shared, write_i16_ramp, &probe);
+    let mut reporter = error_reporter(&shared, &probe);
+    let start = Instant::now();
+
+    reporter.report(server_lost(), start);
+    renderer.render_output(&mut [0.0f32; 16]);
+    reporter.report(server_lost(), start + HOST_ERROR_STREAK_LIMIT);
+    assert_eq!(shared.state.load(), StreamState::Started);
+    assert!(probe.errors.lock().unwrap().is_empty());
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+
+    reporter.report(server_lost(), start + 2 * HOST_ERROR_STREAK_LIMIT);
+    assert_eq!(
+        shared.state.load(),
+        StreamState::Disconnected,
+        "the error after the callback starts a new streak"
+    );
     assert_eq!(*probe.errors.lock().unwrap(), [AAUDIO_ERROR_DISCONNECTED]);
 }
 

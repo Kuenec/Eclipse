@@ -2,15 +2,21 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::{c_void, CStr};
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+use super::aaudio::HostErrorStreak;
 
 pub const SL_RESULT_SUCCESS: u32 = 0x0000_0000;
 
 pub const SL_RESULT_PARAMETER_INVALID: u32 = 0x0000_0002;
 
 pub const SL_RESULT_MEMORY_FAILURE: u32 = 0x0000_0003;
+
+pub const SL_RESULT_RESOURCE_ERROR: u32 = 0x0000_0004;
 
 pub const SL_RESULT_BUFFER_INSUFFICIENT: u32 = 0x0000_0007;
 
@@ -193,11 +199,6 @@ impl PcmRing {
         }
     }
 
-    fn queued_samples(&self) -> usize {
-        let total: usize = self.queue.iter().map(Vec::len).sum();
-        total - self.front_pos
-    }
-
     fn enqueue(&mut self, bytes: &[u8]) -> u32 {
         if self.queue.len() >= self.max_buffers {
             return SL_RESULT_BUFFER_INSUFFICIENT;
@@ -271,10 +272,16 @@ enum ObjectKind {
 struct PlayerState {
     ring: Arc<Mutex<PcmRing>>,
 
-    stream: Option<cpal::Stream>,
+    host_stream: Arc<HostStream>,
 
     stream_type: i32,
     performance_mode: u32,
+}
+
+impl Drop for PlayerState {
+    fn drop(&mut self) {
+        stop_host_stream(&self.host_stream);
+    }
 }
 
 #[repr(C)]
@@ -868,25 +875,21 @@ extern "C" fn eng_create_audio_player(
 
     let ring = Arc::new(Mutex::new(PcmRing::new(format, max_buffers)));
 
-    let stream = match start_host_stream(&ring, format) {
-        Ok(stream) => Some(stream),
-        Err(AudioHostError::UnsupportedFormat) => {
+    let host_stream = match start_host_stream(&ring, format) {
+        Ok(host_stream) => host_stream,
+        Err(error) => {
             tracing::warn!(
+                ?error,
                 channels = format.channels,
                 sample_rate = format.sample_rate,
-                "OpenSL: host output device cannot play the source format"
+                "OpenSL: host output stream unavailable"
             );
-            return SL_RESULT_FEATURE_UNSUPPORTED;
-        }
-        Err(error) => {
-            tracing::warn!(?error, "OpenSL: host output stream unavailable");
-            None
+            return error.sl_result();
         }
     };
-    let host_stream_live = stream.is_some();
     let player = Box::new(PlayerState {
         ring,
-        stream,
+        host_stream,
         stream_type: SL_ANDROID_STREAM_MEDIA,
         performance_mode: SL_ANDROID_PERFORMANCE_LATENCY,
     });
@@ -900,7 +903,6 @@ extern "C" fn eng_create_audio_player(
         channels = format.channels,
         sample_rate = format.sample_rate,
         bits_per_sample = format.bits_per_sample,
-        host_stream_live,
         "OpenSL: audio player created"
     );
     SL_RESULT_SUCCESS
@@ -1477,10 +1479,62 @@ fn mint_object(kind: ObjectKind) -> Result<*mut c_void, ObjectError> {
     Ok(reg.insert(state))
 }
 
+type HostStream = Mutex<Option<cpal::Stream>>;
+
+fn stop_host_stream(host_stream: &HostStream) {
+    let mut stream = host_stream.lock().unwrap_or_else(PoisonError::into_inner);
+    drop(stream.take());
+}
+
+struct HostErrorReporter {
+    host_stream: Weak<HostStream>,
+    host_callbacks: Arc<AtomicU64>,
+    streak: HostErrorStreak,
+    failed: bool,
+}
+
+impl HostErrorReporter {
+    fn new(host_stream: Weak<HostStream>, host_callbacks: Arc<AtomicU64>) -> Self {
+        Self {
+            host_stream,
+            host_callbacks,
+            streak: HostErrorStreak::default(),
+            failed: false,
+        }
+    }
+
+    fn report(&mut self, error: cpal::Error, at: Instant) {
+        let host_callbacks = self.host_callbacks.load(Ordering::Relaxed);
+        if !self.streak.ends_stream(error.kind(), host_callbacks, at)
+            || std::mem::replace(&mut self.failed, true)
+        {
+            return;
+        }
+        tracing::warn!(
+            target: "eclipse::audio",
+            %error,
+            "OpenSL: host output stream failed; the player stays silent"
+        );
+        let Some(host_stream) = self.host_stream.upgrade() else {
+            return;
+        };
+        let stopper = std::thread::Builder::new()
+            .name("eclipse-sl-stop".to_owned())
+            .spawn(move || stop_host_stream(&host_stream));
+        if let Err(error) = stopper {
+            tracing::warn!(
+                target: "eclipse::audio",
+                %error,
+                "OpenSL: the failed host output stream keeps polling until the player is destroyed"
+            );
+        }
+    }
+}
+
 fn start_host_stream(
     ring: &Arc<Mutex<PcmRing>>,
     format: PcmFormat,
-) -> Result<cpal::Stream, AudioHostError> {
+) -> Result<Arc<HostStream>, AudioHostError> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -1489,25 +1543,31 @@ fn start_host_stream(
         format,
         device
             .supported_output_configs()
-            .map_err(|_| AudioHostError::NoConfig)?,
+            .map_err(AudioHostError::NoConfig)?,
     )?;
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
-    let ring = Arc::clone(ring);
-
-    let err_fn = |e| tracing::warn!(target: "eclipse::audio", "cpal output stream error: {e}");
+    let host_stream = Arc::new(HostStream::default());
+    let host_callbacks = Arc::new(AtomicU64::new(0));
+    let renderer = RingRenderer::new(Arc::clone(ring), Arc::clone(&host_callbacks));
+    let mut reporter = HostErrorReporter::new(Arc::downgrade(&host_stream), host_callbacks);
+    let err_fn = move |error| reporter.report(error, Instant::now());
 
     let stream = match sample_format {
-        cpal::SampleFormat::F32 => build_stream::<f32>(&device, config, ring, err_fn),
-        cpal::SampleFormat::I32 => build_stream::<i32>(&device, config, ring, err_fn),
-        cpal::SampleFormat::I24 => build_stream::<cpal::I24>(&device, config, ring, err_fn),
-        cpal::SampleFormat::I16 => build_stream::<i16>(&device, config, ring, err_fn),
-        cpal::SampleFormat::U16 => build_stream::<u16>(&device, config, ring, err_fn),
+        cpal::SampleFormat::F32 => build_stream::<f32>(&device, config, renderer, err_fn),
+        cpal::SampleFormat::I32 => build_stream::<i32>(&device, config, renderer, err_fn),
+        cpal::SampleFormat::I24 => build_stream::<cpal::I24>(&device, config, renderer, err_fn),
+        cpal::SampleFormat::I16 => build_stream::<i16>(&device, config, renderer, err_fn),
+        cpal::SampleFormat::U16 => build_stream::<u16>(&device, config, renderer, err_fn),
         _ => return Err(AudioHostError::UnsupportedSampleFormat),
     }
-    .map_err(|_| AudioHostError::BuildFailed)?;
-    stream.play().map_err(|_| AudioHostError::PlayFailed)?;
-    Ok(stream)
+    .map_err(AudioHostError::BuildFailed)?;
+    let mut slot = host_stream.lock().unwrap_or_else(PoisonError::into_inner);
+    slot.insert(stream)
+        .play()
+        .map_err(AudioHostError::PlayFailed)?;
+    drop(slot);
+    Ok(host_stream)
 }
 
 fn host_stream_config(
@@ -1538,13 +1598,15 @@ const RENDER_CHUNK_SAMPLES: usize = 4096;
 
 struct RingRenderer {
     ring: Arc<Mutex<PcmRing>>,
+    host_callbacks: Arc<AtomicU64>,
     scratch: Box<[f32]>,
 }
 
 impl RingRenderer {
-    fn new(ring: Arc<Mutex<PcmRing>>) -> Self {
+    fn new(ring: Arc<Mutex<PcmRing>>, host_callbacks: Arc<AtomicU64>) -> Self {
         Self {
             ring,
+            host_callbacks,
             scratch: vec![0.0; RENDER_CHUNK_SAMPLES].into_boxed_slice(),
         }
     }
@@ -1553,6 +1615,7 @@ impl RingRenderer {
     where
         T: cpal::SizedSample + cpal::FromSample<f32>,
     {
+        self.host_callbacks.fetch_add(1, Ordering::Relaxed);
         let (fires, callback) = match self.ring.lock() {
             Ok(mut guard) => {
                 let mut fires = 0;
@@ -1580,13 +1643,12 @@ impl RingRenderer {
 fn build_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
-    ring: Arc<Mutex<PcmRing>>,
+    mut renderer: RingRenderer,
     err_fn: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
-    let mut renderer = RingRenderer::new(ring);
     device.build_output_stream(
         config,
         move |data: &mut [T], _info: &cpal::OutputCallbackInfo| renderer.render(data),
@@ -1595,19 +1657,32 @@ where
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioHostError {
     NoDevice,
 
-    NoConfig,
+    NoConfig(cpal::Error),
 
     UnsupportedSampleFormat,
 
     UnsupportedFormat,
 
-    BuildFailed,
+    BuildFailed(cpal::Error),
 
-    PlayFailed,
+    PlayFailed(cpal::Error),
+}
+
+impl AudioHostError {
+    fn sl_result(&self) -> u32 {
+        match self {
+            Self::UnsupportedSampleFormat | Self::UnsupportedFormat => {
+                SL_RESULT_FEATURE_UNSUPPORTED
+            }
+            Self::NoDevice | Self::NoConfig(_) | Self::BuildFailed(_) | Self::PlayFailed(_) => {
+                SL_RESULT_RESOURCE_ERROR
+            }
+        }
+    }
 }
 
 pub(crate) unsafe extern "C" fn eclipse_sl_create_engine(
@@ -1632,15 +1707,13 @@ pub(crate) unsafe extern "C" fn eclipse_sl_create_engine(
 }
 
 pub fn run_audio_test() -> Result<String, String> {
-    use std::time::{Duration, Instant};
-
     static CB_FIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     CB_FIRES.store(0, std::sync::atomic::Ordering::SeqCst);
     extern "C" fn on_buffer_done(_caller: *mut c_void, _ctx: *mut c_void) {
         CB_FIRES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    let engine = TestObject::create("slCreateEngine", |out| unsafe {
+    let engine = TestObject::create(|out| unsafe {
         eclipse_sl_create_engine(
             out,
             0,
@@ -1649,14 +1722,16 @@ pub fn run_audio_test() -> Result<String, String> {
             std::ptr::null(),
             std::ptr::null(),
         )
-    })?;
+    })
+    .map_err(|r| format!("slCreateEngine failed: SLresult={r:#x}"))?;
     engine.realize()?;
     let eng_itf = engine.interface(3)?;
 
-    let mix = TestObject::create("CreateOutputMix", |out| unsafe {
+    let mix = TestObject::create(|out| unsafe {
         let vt = *(eng_itf.as_ptr() as *const *const EngineItfVtable);
         ((*vt).create_output_mix)(eng_itf.as_ptr(), out, 0, std::ptr::null(), std::ptr::null())
-    })?;
+    })
+    .map_err(|r| format!("CreateOutputMix failed: SLresult={r:#x}"))?;
     mix.realize()?;
 
     let mut bq_loc = SlDataLocatorBufferQueue {
@@ -1685,7 +1760,7 @@ pub fn run_audio_test() -> Result<String, String> {
         p_format: std::ptr::null(),
     };
 
-    let player = TestObject::create("CreateAudioPlayer", |out| unsafe {
+    let created = TestObject::create(|out| unsafe {
         let vt = *(eng_itf.as_ptr() as *const *const EngineItfVtable);
         ((*vt).create_audio_player)(
             eng_itf.as_ptr(),
@@ -1696,10 +1771,17 @@ pub fn run_audio_test() -> Result<String, String> {
             std::ptr::null(),
             std::ptr::null(),
         )
-    })?;
+    });
+    let player = match created {
+        Ok(player) => player,
+        Err(SL_RESULT_RESOURCE_ERROR) => {
+            return Ok("SKIP (no host audio device): engine and output mix built; \
+                       CreateAudioPlayer reported SL_RESULT_RESOURCE_ERROR"
+                .to_owned());
+        }
+        Err(r) => return Err(format!("CreateAudioPlayer failed: SLresult={r:#x}")),
+    };
     player.realize()?;
-
-    let has_device = player_has_host_stream(player.0.as_ptr()).unwrap_or(false);
 
     let play_itf = player.interface(4)?;
     let bq_itf = player.interface(1)?;
@@ -1738,15 +1820,6 @@ pub fn run_audio_test() -> Result<String, String> {
         return Err(format!("Enqueue failed: SLresult={r:#x}"));
     }
 
-    if !has_device {
-        let queued = player_queued_samples(player.0.as_ptr()).unwrap_or(0);
-        return Ok(format!(
-            "SKIP (no host audio device): full OpenSL path built (engine→mix→player), \
-             {} PCM samples enqueued with 0 SL errors; no device to play them",
-            queued
-        ));
-    }
-
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut fires = 0u64;
     while Instant::now() < deadline {
@@ -1774,12 +1847,12 @@ pub fn run_audio_test() -> Result<String, String> {
 struct TestObject(NonNull<c_void>);
 
 impl TestObject {
-    fn create(name: &str, call: impl FnOnce(*mut c_void) -> u32) -> Result<Self, String> {
+    fn create(call: impl FnOnce(*mut c_void) -> u32) -> Result<Self, u32> {
         let mut out: Option<NonNull<c_void>> = None;
         let r = call(std::ptr::addr_of_mut!(out).cast());
         match out {
             Some(handle) if r == SL_RESULT_SUCCESS => Ok(Self(handle)),
-            _ => Err(format!("{name} failed: SLresult={r:#x}")),
+            _ => Err(r),
         }
     }
 
@@ -1833,16 +1906,6 @@ fn generate_sine_pcm16(freq: f32, rate: u32, frames: usize) -> Vec<u8> {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out
-}
-
-fn player_has_host_stream(player: *mut c_void) -> Option<bool> {
-    with_player_state(player, |p| p.stream.is_some())
-}
-
-fn player_queued_samples(player: *mut c_void) -> Option<usize> {
-    with_player_state(player, |p| {
-        p.ring.lock().map(|r| r.queued_samples()).unwrap_or(0)
-    })
 }
 
 fn player_drained_buffers(player: *mut c_void) -> Option<u64> {
