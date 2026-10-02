@@ -2,372 +2,98 @@
 
 # 🌘 Eclipse
 
-### Run the official Android Roblox client on Linux
-
-Eclipse is a native Rust runtime for the Android x86-64 Roblox client. It runs the client on your Linux desktop through a focused Android compatibility layer instead of a full Android VM.
+**Play the official Roblox client on Linux.**
 
 [![Release](https://img.shields.io/github/v/release/Kuenec/Eclipse?color=7c3aed)](https://github.com/Kuenec/Eclipse/releases/latest)
-[![Flatpak](https://github.com/Kuenec/Eclipse/actions/workflows/flatpak.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/flatpak.yml)
 [![CI](https://github.com/Kuenec/Eclipse/actions/workflows/ci.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/ci.yml)
-[![E2E](https://github.com/Kuenec/Eclipse/actions/workflows/e2e.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/e2e.yml)
-[![Security](https://github.com/Kuenec/Eclipse/actions/workflows/security.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/security.yml)
-[![Rust 1.95+](https://img.shields.io/badge/Rust-1.95%2B-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Linux x86-64](https://img.shields.io/badge/Linux-x86--64-FCC624?logo=linux&logoColor=black)](https://kernel.org/)
 [![License MIT](https://img.shields.io/github/license/Kuenec/Eclipse?color=7c3aed)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/Kuenec/Eclipse?style=flat&color=f59e0b)](https://github.com/Kuenec/Eclipse/stargazers)
-
-[Install](#install) · [Get Roblox](#get-roblox) · [Play](#play) · [Settings](#settings) · [For developers](#for-developers)
 
 </div>
 
-> [!IMPORTANT]
-> Eclipse is experimental and under active development. Compatibility changes quickly, and it is not yet a drop-in replacement for a mature Android environment.
+Eclipse runs Roblox's official Android x86-64 client natively on Linux, with a small Android compatibility layer instead of a full Android VM. It is experimental and not affiliated with Roblox Corporation.
 
 ## Install
-
-Eclipse is distributed as a prebuilt Flatpak. You do not need Rust or any build tools to use it.
-
-You need:
-
-- Linux on x86-64 with a Wayland or X11 desktop session
-- A graphics driver with Vulkan support
-- [Flatpak](https://flatpak.org/setup/)
-
-Install Eclipse together with its update source:
 
 ```bash
 flatpak install --user https://kuenec.github.io/Eclipse/io.github.kuenec.Eclipse.flatpakref
 ```
 
-This installs the app from Eclipse's GPG-signed Flatpak repository and offers to keep that repository as a remote named `eclipse`. The GNOME 51 runtime that Eclipse uses comes from Flathub; if Flathub is not set up yet, Flatpak offers to add it. Software centers with Flatpak support, such as GNOME Software and KDE Discover, can also open the `.flatpakref` file.
+You need an x86-64 Linux desktop (Wayland or X11) and a Vulkan driver. Eclipse updates with `flatpak update`. A [standalone bundle](https://github.com/Kuenec/Eclipse/releases/latest) is also available.
 
-New Eclipse versions arrive with your other Flatpak updates:
+## Features
 
-```bash
-flatpak update
-```
+- **No setup.** On first start Eclipse downloads Roblox, verifies it and launches it. It keeps Roblox updated by itself, with no account needed.
+- **Official and unmodified.** Every file must carry Roblox Corporation's signature (certificate SHA-256 `44932ea3…ba1477`), checked at install and at every launch. Eclipse never patches the game.
+- **Plays like the desktop client.** Mouse lock and right-click camera, a full keyboard in text boxes, clipboard, input methods, and F11 fullscreen.
+- **Your frame rate.** Roblox's own Maximum Frame Rate setting (up to 240 FPS) is the only limit, whatever your monitor's refresh rate.
+- **Browser Play button.** `roblox://` and `roblox-player:` links open in Eclipse.
+- **Sandboxed** in Flatpak, with no telemetry.
 
-Two other ways to install:
+## Usage
 
-- Add only the repository and install from it. Flathub must already be configured for your user, because the runtime comes from there; the first command below does that if needed.
+Start **Eclipse** from your app menu. Its window shows downloads and errors until Roblox opens. Commands are run with `flatpak run io.github.kuenec.Eclipse <command>`:
 
-  ```bash
-  flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-  flatpak remote-add --user --if-not-exists eclipse https://kuenec.github.io/Eclipse/io.github.kuenec.Eclipse.flatpakrepo
-  flatpak install --user eclipse io.github.kuenec.Eclipse
-  ```
-
-- Download `eclipse-x86_64.flatpak` from the [latest release](https://github.com/Kuenec/Eclipse/releases/latest) and run `flatpak install --user eclipse-x86_64.flatpak`. The bundle points at the same repository, so `flatpak update` keeps Eclipse current afterwards.
-
-The rest of this README writes commands as `eclipse <command>`. With the Flatpak, type `flatpak run io.github.kuenec.Eclipse <command>` instead, or define an alias in your shell:
-
-```bash
-alias eclipse='flatpak run io.github.kuenec.Eclipse'
-```
-
-## Get Roblox
-
-Eclipse does not include Roblox. It installs the official Android client into its own data directory and runs only files signed by Roblox Corporation, as described in [What Eclipse checks and what it never does](#what-eclipse-checks-and-what-it-never-does).
-
-### Automatic download
-
-You do not need to do anything: the first time you start Eclipse, it downloads the newest Roblox client that has an x86-64 build, which APKCombo often adds some time after a new release, verifies Roblox's signature and installs it, then launches it. No Google or other account is needed. Eclipse gets the client from [APKCombo](https://apkcombo.com/roblox/com.roblox.client/), which mirrors Roblox's own Google Play release files; Eclipse keeps only `base.apk` and `split_config.x86_64.apk` from the download and discards everything if Roblox's signature does not verify.
-
-After that, starting Eclipse checks for a newer Roblox version at most every six hours and installs it before launching. If the check fails, Eclipse starts the version you already have, shows a warning, and checks again 30 minutes later at the earliest. A download that stalls or drops continues where it stopped. To check right away:
-
-```bash
-eclipse update
-```
-
-Eclipse never replaces the installed client with an older version, and it keeps the previous version until the new one is installed.
-
-### Install the client from APK files
-
-You can also install the official files yourself, for example ones you downloaded elsewhere.
-
-Eclipse needs two files from Roblox's official Android release: `base.apk` and `split_config.x86_64.apk`, which holds the x86-64 engine. `eclipse install` accepts any of these:
-
-- the two APK files, under any file names
-- a directory that holds them as `base.apk` and `split_config.x86_64.apk`
-- an `.apks`, `.xapk` or `.apkm` bundle that contains them (encrypted bundles, such as newer `.apkm` files, are not supported)
-- a single APK that already contains the x86-64 engine
-
-```bash
-eclipse install ~/Downloads/base.apk ~/Downloads/split_config.x86_64.apk
-eclipse install ~/Downloads/roblox.apks
-```
-
-The Flatpak can read your Downloads folder, so keep the files there. To let it read another folder, grant access once, for example with `flatpak override --user --filesystem=~/Games/roblox:ro io.github.kuenec.Eclipse`.
-
-Eclipse verifies the signature of every file before it installs anything. If a file is not Roblox's official, unmodified release, the install stops and the client you already have stays in place.
-
-### Download from Google Play instead
-
-`eclipse update --play` downloads the client from Google Play with your own Google account instead of APKCombo. It needs a one-time `eclipse play-login`, which explains each step. Automatic updates always use APKCombo.
-
-> [!WARNING]
-> Google's terms do not allow unofficial Play clients, and Google may restrict an account that uses one. Use a secondary Google account, not your main one.
-
-## Play
-
-Start **Eclipse** from your application menu. Its window shows the update check, the download and any error until Roblox opens, and an error names Eclipse's log of that launch (see [Where Eclipse keeps its files](#where-eclipse-keeps-its-files)). Only one Roblox client runs at a time: starting Eclipse again, or clicking Play in a browser while Roblox is open, shows a message instead of a second copy. To see all of Eclipse's messages, start it from a terminal instead:
-
-```bash
-flatpak run io.github.kuenec.Eclipse run
-```
-
-`flatpak run io.github.kuenec.Eclipse` without a command prints the help. `eclipse run <PATH>` runs an APK file, or a directory that holds the split set, without installing it; the same signature check applies.
-
-### Browser Play button
-
-The Flatpak registers Eclipse for `roblox-player:` and `roblox://` links, so the Play button on the Roblox website opens the experience in Eclipse. If another app already handles these links, make Eclipse the default by running this outside the sandbox:
-
-```bash
-xdg-mime default io.github.kuenec.Eclipse.UrlHandler.desktop x-scheme-handler/roblox-player x-scheme-handler/roblox
-```
-
-Outside the Flatpak, run `eclipse install-url-handler` once to register the binary you are running.
-
-Eclipse reads only the place ID from the link. It discards the launch ticket that `roblox-player:` links carry, and the client opens the place with the account signed in inside it. Browser launches start the installed client without checking for a Roblox update first.
-
-### Mouse and keyboard
-
-- Over the game, Eclipse hides the desktop cursor, because Roblox draws its own cursor as it does on Android. The desktop cursor comes back over web pages the client opens, such as sign-in pages.
-- Hold the right mouse button to turn the camera. The cursor stays where it is while you drag and is at the same spot when you release the button.
-- When the game locks the mouse, as in shift lock and first person, Eclipse locks the pointer too.
-- On Wayland, Eclipse uses the compositor's pointer lock. On X11, which has no pointer lock, it confines the cursor to the window and moves it back to where the lock began.
-- Switching to another window releases the lock and every key and mouse button the game still holds.
-- F11 toggles fullscreen.
-
-This applies with the default `touch_mode` of `"off"`.
-
-In a Roblox text box, Enter submits a single-line box and starts a new line in a multi-line box, and Escape leaves the box, as on Android. The arrow keys, Home, End, Delete and Ctrl+Backspace edit as usual, and Ctrl+A, Ctrl+C, Ctrl+X and Ctrl+V use the desktop clipboard on Wayland and X11. Input methods such as fcitx5 and IBus work while a text box has focus. Password boxes take keys directly, without the input method, so it cannot show or learn what you type.
+| Command | What it does |
+|---|---|
+| `run` | Start Roblox (the default from the app menu) |
+| `update` | Check for a newer Roblox now |
+| `install <files>` | Install Roblox from your own `base.apk` + `split_config.x86_64.apk`, or an `.apks`/`.xapk` bundle |
+| `config` | Show the settings file path and the values in effect |
 
 ## Settings
 
-`eclipse config` prints the path of the configuration file and the values in effect. The file is optional plain JSON, and keys you leave out keep their defaults. With the Flatpak it is `~/.var/app/io.github.kuenec.Eclipse/config/eclipse/config.json`; otherwise it is `~/.config/eclipse/config.json`. Changes take effect the next time you start Eclipse.
+Settings live in `~/.var/app/io.github.kuenec.Eclipse/config/eclipse/config.json`. Every key is optional:
 
 ```json
 {
-  "graphics_optimization_mode": "performance",
+  "fflags": {},
   "touch_mode": "off",
-  "fflags": {}
+  "graphics_optimization_mode": "balanced"
 }
 ```
 
-| Key | Default | Effect |
-|---|---|---|
-| `fflags` | `{}` | Fast Flags for the client. Eclipse writes these to the client's `ClientAppSettings.json` together with one default of its own, `"FFlagGameBasicSettingsFramerateCap5": "True"`, which shows the client's Maximum Frame Rate setting. A value you give that flag replaces the default, so `{"FFlagGameBasicSettingsFramerateCap5": "False"}` turns it off. |
-| `graphics_optimization_mode` | `"balanced"` | `"performance"` pins Eclipse to one logical CPU per physical core on CPUs with SMT and at least eight physical cores. `"quality"` and `"balanced"` currently behave the same. |
-| `touch_mode` | `"off"` | `"off"` delivers the mouse to the game as a desktop mouse. `"on"` and `"fake-off"` deliver clicks as touch input and keep the desktop cursor visible. `"on"` also tells the client that the device has a touchscreen and is not a PC; `"off"` and `"fake-off"` report a PC without a touchscreen. |
-| `webview_allow_unsandboxed` | `false` | Outside the Flatpak only: lets the WebView helper run without Chromium's sandbox when the host cannot provide one. The Flatpak always sandboxes it. |
-| `webview_helper_path` | `null` | Overrides the path of the `eclipse-webview` helper. It is only needed for source builds where the helper is neither next to the `eclipse` binary nor in `crates/eclipse-webview/target/`. Leave it unset in the Flatpak. |
+- `fflags` adds Fast Flags for Roblox. Eclipse sets one by default, `FFlagGameBasicSettingsFramerateCap5`, which shows Roblox's frame rate menu. Set it to `"False"` to hide the menu.
+- `touch_mode` set to `"on"` sends clicks as touch input.
+- `graphics_optimization_mode` set to `"performance"` pins Eclipse to physical cores on large SMT CPUs.
 
-`eclipse config` also lists keys such as `use_opengl`, `enable_gamemode` and `discord_rpc_enabled`. Eclipse accepts them but does not act on them yet.
-
-### Frame rate
-
-The client's own Maximum Frame Rate setting, under Settings in the in-game menu, is the only frame-rate limit Eclipse leaves in place. It offers 60, 120, 144, 160, 165, 180, 200 and 240 FPS, and Default, which is 60 FPS in the Android client. Without Eclipse's default flag the row is hidden and the client always runs at Default. Eclipse does not pace the client's frames.
-
-The client asks the graphics driver for immediate presentation, which does not wait for the monitor's refresh. Where the driver offers it, Eclipse passes that request through unchanged. Some drivers offer immediate presentation only when the compositor supports tearing control, and otherwise offer only FIFO, which waits for every refresh and would hold the game to the monitor's refresh rate, and mailbox, which does not wait. On those systems Eclipse still offers the client immediate presentation and carries it out with mailbox: the game renders up to its limit, and at each refresh the compositor shows the newest finished frame, without tearing. A frame that a newer one replaces before the next refresh is never shown.
-
-Eclipse tells the client the refresh rate of the monitor the window is on and any other refresh rates the display server lists for that monitor at the same resolution, and updates them when the window moves to another monitor or the mode changes. Some Wayland compositors, Hyprland among them, announce only the current mode, so the client sees the current refresh rate and any other rate that monitor has switched to since Eclipse started, not every rate the monitor supports. When the host reports no refresh rate, the client keeps Android's default of 60 Hz, or the last rate Eclipse reported. The client uses these rates for its own performance tuning but does not limit the frame rate to them, so a limit above the monitor's refresh rate still applies. On a variable refresh rate monitor, the rate reported is the top of its range, the refresh rate of its current mode.
-
-## Where Eclipse keeps its files
-
-These paths assume the default XDG base directories.
-
-| What | Flatpak, under `~/.var/app/io.github.kuenec.Eclipse/` | Outside the Flatpak |
-|---|---|---|
-| Settings | `config/eclipse/config.json` | `~/.config/eclipse/config.json` |
-| Installed Roblox client (current and previous version) | `data/eclipse/roblox/<versionCode>/` | `~/.local/share/eclipse/roblox/<versionCode>/` |
-| Game data, WebView profile and staged Fast Flags | `data/eclipse/app-data/` | `~/.local/share/eclipse/app-data/` |
-| Log of the last launch: `eclipse.log`, and in long sessions `eclipse.log.1` with the 8 MiB before it | `data/eclipse/app-data/logs/` | `~/.local/share/eclipse/app-data/logs/` |
-| Last update check | `data/eclipse/roblox/last-update-check.json` | `~/.local/share/eclipse/roblox/last-update-check.json` |
-| Google Play sign-in (only with `play-login`), readable only by you | `data/eclipse/google-play.json` | `~/.local/share/eclipse/google-play.json` |
-| Extracted native libraries | `cache/eclipse/native-libs/` | `~/.cache/eclipse/native-libs/` |
-
-To remove Eclipse, the installed Roblox client and all of this data:
-
-```bash
-flatpak uninstall --user --delete-data io.github.kuenec.Eclipse
-flatpak remote-delete --user eclipse
-```
-
-Run the second command only if you added the `eclipse` remote, either by keeping it when you installed from the `.flatpakref` or with `flatpak remote-add`.
-
-## What Eclipse checks and what it never does
-
-- Every APK that Eclipse installs or runs must carry a valid APK Signature Scheme v2 signature from Roblox Corporation's certificate, whose SHA-256 digest is `44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477`. If the base APK also has a v3 or v3.1 signature, its key-rotation proof must start at that certificate. A file changed after signing fails the check. Eclipse checks at install time and again at every launch.
-- Eclipse does not modify or patch the client, and it does not host, mirror or redistribute it. Downloads come from APKCombo's copy of Roblox's Google Play release (or Google Play itself with `--play`) over HTTPS from an allowlisted host, and must match the size and hash that the source declares before the signature check runs.
-- Eclipse never installs an older Roblox version than the one you have.
-- Eclipse sets exactly one Fast Flag of its own, `FFlagGameBasicSettingsFramerateCap5` set to `True`, which makes the client show its Maximum Frame Rate setting as Roblox already does for its Windows and Mac clients. It goes through the client's own `ClientAppSettings.json` override file, and everything else in that file comes from the `fflags` in your settings; `{"FFlagGameBasicSettingsFramerateCap5": "False"}` there replaces the default and turns the setting off.
-- When the client asks the Android package manager for its signing certificates, Eclipse reports the real certificates from the verified APK.
-- Browser launches hand only the place ID to the client.
-
-## Troubleshooting
-
-- If Roblox closes or fails to start, read `logs/eclipse.log` in Eclipse's app-data directory (see [Where Eclipse keeps its files](#where-eclipse-keeps-its-files)). Starting Roblox again replaces it, so copy it first.
-- Start Eclipse from a terminal to see what it is doing. For more detail, run `flatpak run --env=RUST_LOG=debug io.github.kuenec.Eclipse run`.
-- If the first download fails, Eclipse prints why. Run `eclipse update` to try again, or install the files yourself with `eclipse install`.
-- A signature error means the files are not Roblox's official, unmodified release. Get a clean copy of the files and install again.
-- Eclipse hands the client its `ClientAppSettings.json` through a small library that it keeps in the app-data directory and loads into itself at every start, so that directory must allow executable files and its path must not contain a colon or semicolon. If Eclipse stops with an error about this, set `ECLIPSE_APP_DATA_DIR` to a directory that meets both.
-- To report a problem, see [Contributing](#contributing) for what to include.
-
-## For developers
-
-### How it works
-
-Instead of booting a full Android system, Eclipse loads the Android x86-64 client into a native Linux process and implements or bridges only the platform surfaces the client uses.
-
-| Part | How Eclipse provides it |
-|---|---|
-| Java side | The art_standalone ART VM with the Android Translation Layer framework and Eclipse's framework overlay |
-| Native engine | Eclipse's own ELF loader with Bionic, JNI and NDK compatibility |
-| Graphics | Vulkan WSI and EGL/GLES bridged to `ANativeWindow`, presented in a winit window through Vulkan |
-| Input | Keyboard and mouse events from winit, delivered as Android input |
-| Audio | AAudio and OpenSL ES bridged to cpal |
-| Web content | An out-of-process, sandboxed CEF helper over shared memory and a Unix socket |
-| Client files | The verified official APKs, never bundled or redistributed |
+## How it works
 
 ```mermaid
 flowchart LR
-    APKs["Official Roblox split set<br/>base.apk + split_config.x86_64.apk"] --> Verify["Signature verification<br/>pinned Roblox certificate"]
+    APKs["Official Roblox APKs"] --> Verify["Signature check<br/>pinned Roblox certificate"]
     Verify --> Store["Versioned install store"]
-    Store --> Parser["APK manifest + resource parser"]
-    Parser --> ART["ART VM + framework overlay"]
-    Parser --> Loader["ELF / Bionic loader<br/>libroblox.so"]
+    Store --> ART["ART VM + Android framework"]
+    Store --> Loader["ELF / Bionic loader<br/>libroblox.so"]
     ART --> Runtime["Eclipse runtime"]
     Loader --> Runtime
-    Runtime --> Graphics["Vulkan / EGL / GLES"]
-    Runtime --> Input["winit input"]
-    Runtime --> Audio["AAudio / OpenSL ES → cpal"]
-    Runtime --> WebView["IPC → CEF helper"]
-    Graphics --> Linux["Linux host"]
+    Runtime --> Graphics["Vulkan / EGL"]
+    Runtime --> Input["Keyboard, mouse, IME"]
+    Runtime --> Audio["AAudio / OpenSL ES"]
+    Runtime --> WebView["Sandboxed WebView helper"]
+    Graphics --> Linux["Your Linux desktop"]
     Input --> Linux
     Audio --> Linux
     WebView --> Linux
 ```
 
-### Repository layout
+Roblox's Java code runs in ART with a patched Android framework. Its native engine is loaded by Eclipse's own ELF loader, with Android's graphics, input and audio interfaces mapped onto the Linux desktop.
 
-```text
-src/                             Core runtime, CLI and host bridges
-src/apk/                         Binary manifest, resource-table and native-library handling
-src/apk/signature.rs             Roblox APK signature verification (v2, v3 and v3.1 rotation)
-src/apk/store.rs                 Versioned install store behind eclipse install and update
-src/apk/apkcombo.rs              Account-free download of Roblox's release files behind eclipse update
-src/apk/https.rs                 Shared HTTPS download rules: host allowlists, redirects, size limits
-src/apk/play/                    Google Play client behind eclipse play-login and update --play
-src/framework.rs, src/framework/ Android framework natives, registries and lifecycle
-src/loader/                      ELF, Bionic, JNI, NDK, audio and graphics loading
-src/webview/                     WebView IPC, shared memory and lifecycle
-src/browser_launch.rs            roblox-player: and roblox:// link parsing
-src/desktop_integration.rs       Browser Play handler registration
-src/graphics.rs                  Host window, Vulkan presentation and input
-crates/libm-shim/                apkenv-compatible no-std libm shim
-crates/eclipse-webview/          Detached CEF WebView process
-packaging/flatpak/               Flatpak manifest, desktop entries, AppStream metadata, icon, and the offline Cargo source list with its update and check scripts
-shaders/                         Host compositor shaders and their SPIR-V builds
-tools/framework-overlay/         Android framework patch sources and probes
-tools/webview-dist/              Verified CEF payload packager
-tests/                           Cross-component engine milestones
-```
+## Troubleshooting
 
-### Build from source
+- **Something failed?** The log of the last launch is in `~/.var/app/io.github.kuenec.Eclipse/data/eclipse/app-data/logs/eclipse.log`.
+- **More detail:** `flatpak run --env=RUST_LOG=debug io.github.kuenec.Eclipse run`
+- **Signature error:** the files are not Roblox's official release. Install a clean copy.
+- **Uninstall everything:** `flatpak uninstall --user --delete-data io.github.kuenec.Eclipse`
 
-Building needs Rust 1.95 or newer, a C/C++ toolchain, `pkg-config`, and the ALSA, Fontconfig and FreeType development headers. On Debian or Ubuntu:
+When reporting a bug, include your distro, desktop, GPU and driver, and the log. Never attach APKs, cookies or account data.
 
-```bash
-sudo apt install build-essential pkg-config libasound2-dev libfontconfig1-dev libfreetype6-dev
-git clone https://github.com/Kuenec/Eclipse.git
-cd Eclipse
-cargo build --release --locked
-```
+## More
 
-Running a source build needs the Android runtime that the Flatpak bundles: art_standalone, bionic_translation, Android Translation Layer and libopensles-standalone installed on the host (the Flatpak manifest pins the commits), plus Eclipse's patched framework, which `tools/framework-overlay/patch-framework.sh` writes to `~/.cache/eclipse/framework-patched` by default. Eclipse looks for `libart.so` at `/usr/lib/art/libart.so`. These environment variables override the defaults:
+- [User guide](docs/guide.md): Google Play downloads, file locations, browser links, controls and frame-rate details.
+- [CONTRIBUTING.md](CONTRIBUTING.md): building from source, architecture, tests and releases.
 
-| Variable | Purpose |
-|---|---|
-| `ECLIPSE_LIBART` | The `libart.so` to load |
-| `ECLIPSE_ANDROID_FRAMEWORK_DIR` | The patched framework directory |
-| `ECLIPSE_ART_BOOT_IMAGE` | The ART boot image |
-| `ECLIPSE_APP_DATA_DIR` | The app data root, instead of `~/.local/share/eclipse/app-data` |
-| `ECLIPSE_NATIVE_LIB_DIR` | Where native libraries are extracted, into `<dir>/<versionCode>`; Eclipse never removes anything there |
-| `ECLIPSE_WEBVIEW_HELPER` | The `eclipse-webview` helper binary |
-| `ECLIPSE_ROBLOX_APK` | An official APK or split-set directory for the tests that need the real client; they skip without it |
-
-The WebView helper and its pinned CEF runtime stay out of the root Cargo graph. To assemble the complete payload in `dist/eclipse-linux-x86_64`:
-
-```bash
-cargo install export-cef-dir --version 152.2.0 --locked
-./tools/webview-dist/package-webview.sh
-```
-
-The script verifies both the SHA-1 and SHA-256 digests of the pinned CEF archive, builds both binaries, checks the helper's `$ORIGIN` runtime path and smoke-tests the packaged helper. Tagged releases attach this payload as `eclipse-<tag>-linux-x86_64.tar.zst` with `SHA256SUMS`; it does not contain the Android runtime.
-
-### Build the Flatpak locally
-
-```bash
-flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak-builder --user --install-deps-from=flathub --install --force-clean \
-  --state-dir=build/flatpak-builder build/flatpak-app packaging/flatpak/io.github.kuenec.Eclipse.yml
-```
-
-The manifest builds against the GNOME 51 SDK with the openjdk17 and rust-stable SDK extensions, which `--install-deps-from=flathub` installs from the Flathub remote of your user installation; the first command adds that remote if it is missing. Both working directories sit under `build/`, which the manifest leaves out of its source copy. The build is offline, so after changing any `Cargo.lock`, regenerate the vendored crate list with `packaging/flatpak/update-cargo-sources.sh` (it needs curl, sha256sum, uv and python3); the Flatpak workflow fails when the list is out of date.
-
-### Testing and CI
-
-The checks that GitHub Actions runs for the main crate can be run locally:
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all-targets --locked
-cargo build --release --locked
-```
-
-| Workflow | Runs on | Coverage |
-|---|---|---|
-| [CI](.github/workflows/ci.yml) | Pushes to main, pull requests | Formatting, Clippy for Eclipse and the libm shim, ShellCheck, actionlint, all targets and tests, the Rust 1.95 MSRV, the WebView helper's build, Clippy and tests against the pinned CEF archive, and an optimized release build with a CLI smoke test |
-| [E2E](.github/workflows/e2e.yml) | Pushes to main, pull requests, weekly | Engine milestone tests, headless EGL/GLES rendering, real WSI binding, and the input and audio pipelines |
-| [Security](.github/workflows/security.yml) | Pushes to main, pull requests, weekly | RustSec audits of Eclipse and the WebView helper, dependency review on pull requests, and CodeQL for Rust and Actions |
-| [Release](.github/workflows/release.yml) | `v*.*.*` tags | Verified CEF payload, compressed Linux archive, checksums and the GitHub Release |
-| [Flatpak](.github/workflows/flatpak.yml) | Changes to a `Cargo.lock`, `cargo-sources.json` or its check script, `v*.*.*` tags | Checks that `cargo-sources.json` vendors every locked crate; on tags, builds the Flatpak, publishes the signed repository to GitHub Pages and attaches `eclipse-x86_64.flatpak` to the release |
-
-The public E2E job uses Mesa software rendering under Xvfb and does not require proprietary files. The full APK, ART and WebView milestone suite runs on a self-hosted runner labelled `eclipse-e2e` when the repository variable `ECLIPSE_FULL_E2E_ENABLED` is `true` and `ECLIPSE_E2E_APK_PATH` names an official APK or split-set directory on that runner. It does not run for pull requests.
-
-### Releasing
-
-Pushing a `vX.Y.Z` tag runs the Release and Flatpak workflows. The Flatpak workflow needs the repository secret `FLATPAK_GPG_PRIVATE_KEY` holding an ASCII-armored GPG private key without a passphrase, GitHub Pages set to deploy from GitHub Actions, and the `github-pages` environment (Settings, Environments) allowed to deploy from tags matching `v*.*.*`. It signs the build into the OSTree repository at `https://kuenec.github.io/Eclipse/repo/` and publishes the `.flatpakref` and `.flatpakrepo` files at the site root.
-
-## Contributing
-
-Focused bug reports and pull requests are welcome. Before opening a PR:
-
-1. Keep changes scoped and explain the Android or client contract they preserve.
-2. Add a regression test for loader, framework or runtime behavior where practical.
-3. Run the formatting, Clippy and test commands from [Testing and CI](#testing-and-ci).
-4. In compatibility reports, include your distribution, display server, GPU and driver, whether you use the Flatpak or a source build, the Roblox version that `eclipse run` prints, and relevant redacted logs.
-
-Please do not attach APKs, client assets, account data, cookies, `google-play.json` or other authentication material to issues.
-
-## Contributors
-
-- [Yoshi-OOF](https://github.com/Yoshi-OOF) — framework, CI, and browser launch improvements
-
-## Project scope and disclaimer
-
-Eclipse is an independent, unofficial compatibility project. It is **not affiliated with, authorized by or endorsed by Roblox Corporation**. Roblox is a trademark of Roblox Corporation.
-
-You are responsible for obtaining and using client files in accordance with the terms and laws that apply to you. Eclipse does not redistribute Roblox binaries or bypass account authentication.
+Thanks to [Yoshi-OOF](https://github.com/Yoshi-OOF) for framework, CI and browser launch work.
 
 ## License
 
-Eclipse is released under the [MIT License](LICENSE).
-
-<div align="center">
-
-Built with Rust, stubbornness and a healthy respect for ABI boundaries.
-
-</div>
+[MIT](LICENSE). Roblox is a trademark of Roblox Corporation. Eclipse is an independent project and does not redistribute Roblox.
