@@ -322,6 +322,10 @@ struct OverlayState {
 
     swapchain: u64,
 
+    surface: u64,
+
+    out_of_date: bool,
+
     format: i32,
 
     width: u32,
@@ -333,6 +337,8 @@ struct OverlayState {
 static STATE: Mutex<OverlayState> = Mutex::new(OverlayState {
     device: 0,
     swapchain: 0,
+    surface: 0,
+    out_of_date: false,
     format: 0,
     width: 0,
     height: 0,
@@ -480,7 +486,59 @@ unsafe extern "system" fn eclipse_vk_acquire_next_image_khr(
     let host: vk::PFN_vkAcquireNextImageKHR =
         unsafe { std::mem::transmute::<usize, vk::PFN_vkAcquireNextImageKHR>(addr) };
     let _swapchain = swapchain_lock();
-    unsafe { host(device, swapchain, timeout, semaphore, fence, p_image_index) }
+    unsafe {
+        acquire_like_android(swapchain, p_image_index, || {
+            host(device, swapchain, timeout, semaphore, fence, p_image_index)
+        })
+    }
+}
+
+unsafe fn acquire_like_android(
+    swapchain: vk::SwapchainKHR,
+    p_image_index: *mut u32,
+    host_acquire: impl FnOnce() -> vk::Result,
+) -> vk::Result {
+    let engine_index = unsafe { p_image_index.as_ref() }.copied();
+    let result = host_acquire();
+    match result {
+        vk::Result::SUCCESS => result,
+        vk::Result::SUBOPTIMAL_KHR => vk::Result::SUCCESS,
+        failed => {
+            if let (Some(index), Some(slot)) = (engine_index, unsafe { p_image_index.as_mut() }) {
+                *slot = index;
+            }
+            if failed == vk::Result::ERROR_OUT_OF_DATE_KHR {
+                note_out_of_date(swapchain);
+            }
+            failed
+        }
+    }
+}
+
+fn note_out_of_date(swapchain: vk::SwapchainKHR) {
+    let mut st = STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if st.swapchain == 0 || st.swapchain != swapchain.as_raw() || st.out_of_date {
+        return;
+    }
+    st.out_of_date = true;
+    tracing::info!(
+        swapchain = format_args!("{:#x}", st.swapchain),
+        "vk-overlay: the host reports the engine swapchain out of date; its next surface \
+         capability query reports the surface lost so the engine rebuilds the swapchain"
+    );
+}
+
+pub(crate) fn take_out_of_date_surface(surface: vk::SurfaceKHR) -> bool {
+    let mut st = STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lost = st.swapchain != 0 && st.out_of_date && st.surface == surface.as_raw();
+    if lost {
+        st.out_of_date = false;
+    }
+    lost
 }
 
 unsafe extern "system" fn eclipse_vk_acquire_next_image2_khr(
@@ -493,8 +551,14 @@ unsafe extern "system" fn eclipse_vk_acquire_next_image2_khr(
     };
     let host: vk::PFN_vkAcquireNextImage2KHR =
         unsafe { std::mem::transmute::<usize, vk::PFN_vkAcquireNextImage2KHR>(addr) };
+    let swapchain =
+        unsafe { p_acquire_info.as_ref() }.map_or(vk::SwapchainKHR::null(), |i| i.swapchain);
     let _swapchain = swapchain_lock();
-    unsafe { host(device, p_acquire_info, p_image_index) }
+    unsafe {
+        acquire_like_android(swapchain, p_image_index, || {
+            host(device, p_acquire_info, p_image_index)
+        })
+    }
 }
 
 unsafe extern "system" fn eclipse_vk_destroy_device(
@@ -602,6 +666,8 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
         let swapchain = unsafe { *p_swapchain };
         if let Ok(mut st) = STATE.lock() {
             st.swapchain = swapchain.as_raw();
+            st.surface = info.surface.as_raw();
+            st.out_of_date = false;
             st.format = info.image_format.as_raw();
             st.width = info.image_extent.width;
             st.height = info.image_extent.height;
@@ -3559,13 +3625,30 @@ unsafe extern "system" fn eclipse_vk_queue_present_khr(
     note_engine_present();
     crate::framework::engine_presented();
     let _swapchain = swapchain_lock();
-    unsafe {
+    let result = unsafe {
         present_with_overlay(
             host,
             queue,
             p_present_info,
             crate::webview::client::active_view(),
         )
+    };
+    if result == vk::Result::ERROR_OUT_OF_DATE_KHR {
+        for &swapchain in unsafe { presented_swapchains(p_present_info) } {
+            note_out_of_date(swapchain);
+        }
+    }
+    result
+}
+
+unsafe fn presented_swapchains<'a>(
+    p_present_info: *const vk::PresentInfoKHR<'a>,
+) -> &'a [vk::SwapchainKHR] {
+    match unsafe { p_present_info.as_ref() } {
+        Some(pi) if pi.swapchain_count > 0 && !pi.p_swapchains.is_null() => unsafe {
+            std::slice::from_raw_parts(pi.p_swapchains, pi.swapchain_count as usize)
+        },
+        _ => &[],
     }
 }
 
@@ -4298,7 +4381,7 @@ mod tests {
         let info = unsafe { &*info };
         STUB_CREATED_PRESENT_MODE.store(info.present_mode.as_raw() as u32, Ordering::SeqCst);
         STUB_CREATED_WIDTH.store(info.image_extent.width, Ordering::SeqCst);
-        unsafe { *swapchain = vk::SwapchainKHR::from_raw(0xB) };
+        unsafe { *swapchain = vk::SwapchainKHR::from_raw(CREATED_SWAPCHAIN) };
         vk::Result::SUCCESS
     }
 
@@ -4425,6 +4508,294 @@ mod tests {
         assert!(
             locked,
             "retiring oldSwapchain is serialized with the WebView presenter"
+        );
+    }
+
+    const SUBOPTIMAL_SWAPCHAIN: u64 = 0x50;
+    const OUT_OF_DATE_SWAPCHAIN: u64 = 0x51;
+    const RETIRED_SWAPCHAIN: u64 = 0x52;
+    const CREATED_SWAPCHAIN: u64 = 0xB;
+    const OUT_OF_DATE_AFTER_PULL_SWAPCHAIN: u64 = 0x53;
+    const SUBOPTIMAL_IMAGE: u32 = 2;
+
+    fn stub_host_acquire(swapchain: vk::SwapchainKHR, image_index: *mut u32) -> vk::Result {
+        match swapchain.as_raw() {
+            SUBOPTIMAL_SWAPCHAIN => {
+                unsafe { *image_index = SUBOPTIMAL_IMAGE };
+                vk::Result::SUBOPTIMAL_KHR
+            }
+            OUT_OF_DATE_SWAPCHAIN | RETIRED_SWAPCHAIN | CREATED_SWAPCHAIN => {
+                vk::Result::ERROR_OUT_OF_DATE_KHR
+            }
+            OUT_OF_DATE_AFTER_PULL_SWAPCHAIN => {
+                unsafe { *image_index = SUBOPTIMAL_IMAGE };
+                vk::Result::ERROR_OUT_OF_DATE_KHR
+            }
+            _ => vk::Result::ERROR_SURFACE_LOST_KHR,
+        }
+    }
+
+    unsafe extern "system" fn stub_acquire_image(
+        _device: vk::Device,
+        swapchain: vk::SwapchainKHR,
+        _timeout: u64,
+        _semaphore: vk::Semaphore,
+        _fence: vk::Fence,
+        image_index: *mut u32,
+    ) -> vk::Result {
+        stub_host_acquire(swapchain, image_index)
+    }
+
+    unsafe extern "system" fn stub_acquire_image2(
+        _device: vk::Device,
+        info: *const vk::AcquireNextImageInfoKHR<'_>,
+        image_index: *mut u32,
+    ) -> vk::Result {
+        stub_host_acquire(unsafe { (*info).swapchain }, image_index)
+    }
+
+    fn engine_acquires(swapchain: u64) -> [(vk::Result, u32); 2] {
+        let swapchain = vk::SwapchainKHR::from_raw(swapchain);
+        let mut first = u32::MAX;
+        let acquired = unsafe {
+            eclipse_vk_acquire_next_image_khr(
+                vk::Device::null(),
+                swapchain,
+                u64::MAX,
+                vk::Semaphore::null(),
+                vk::Fence::null(),
+                &mut first,
+            )
+        };
+        let mut second = u32::MAX;
+        let info = vk::AcquireNextImageInfoKHR::default()
+            .swapchain(swapchain)
+            .timeout(u64::MAX)
+            .device_mask(1);
+        let acquired2 =
+            unsafe { eclipse_vk_acquire_next_image2_khr(vk::Device::null(), &info, &mut second) };
+        [(acquired, first), (acquired2, second)]
+    }
+
+    #[test]
+    fn a_suboptimal_host_swapchain_hands_the_engine_its_image_like_android() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved =
+            HOST_ACQUIRE_NEXT_IMAGE.swap(stub_acquire_image as *const () as u64, Ordering::SeqCst);
+        let saved2 = HOST_ACQUIRE_NEXT_IMAGE2
+            .swap(stub_acquire_image2 as *const () as u64, Ordering::SeqCst);
+
+        let suboptimal = engine_acquires(SUBOPTIMAL_SWAPCHAIN);
+        let out_of_date = engine_acquires(OUT_OF_DATE_SWAPCHAIN);
+
+        HOST_ACQUIRE_NEXT_IMAGE.store(saved, Ordering::SeqCst);
+        HOST_ACQUIRE_NEXT_IMAGE2.store(saved2, Ordering::SeqCst);
+
+        assert_eq!(
+            suboptimal,
+            [(vk::Result::SUCCESS, SUBOPTIMAL_IMAGE); 2],
+            "an image acquired from a suboptimal swapchain reaches the engine as a plain success"
+        );
+        assert_eq!(
+            out_of_date,
+            [(vk::Result::ERROR_OUT_OF_DATE_KHR, u32::MAX); 2],
+            "an out-of-date swapchain still reports the error and acquires no image"
+        );
+    }
+
+    #[test]
+    fn a_failed_host_acquire_leaves_the_engine_image_index_alone_like_android() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved =
+            HOST_ACQUIRE_NEXT_IMAGE.swap(stub_acquire_image as *const () as u64, Ordering::SeqCst);
+        let saved2 = HOST_ACQUIRE_NEXT_IMAGE2
+            .swap(stub_acquire_image2 as *const () as u64, Ordering::SeqCst);
+
+        let failed = engine_acquires(OUT_OF_DATE_AFTER_PULL_SWAPCHAIN);
+
+        HOST_ACQUIRE_NEXT_IMAGE.store(saved, Ordering::SeqCst);
+        HOST_ACQUIRE_NEXT_IMAGE2.store(saved2, Ordering::SeqCst);
+
+        assert_eq!(
+            failed,
+            [(vk::Result::ERROR_OUT_OF_DATE_KHR, u32::MAX); 2],
+            "an acquire that fails after the host wrote an index keeps the engine's own index, \
+             so the engine never presents an image it did not acquire"
+        );
+    }
+
+    const ENGINE_SURFACE: u64 = 0x5F;
+    const OTHER_SURFACE: u64 = 0x60;
+    const HOST_MIN_IMAGE_COUNT: u32 = 3;
+    const HOST_EXTENT: vk::Extent2D = vk::Extent2D {
+        width: 1280,
+        height: 720,
+    };
+
+    unsafe extern "system" fn stub_surface_capabilities(
+        _physical_device: vk::PhysicalDevice,
+        _surface: vk::SurfaceKHR,
+        caps: *mut vk::SurfaceCapabilitiesKHR,
+    ) -> vk::Result {
+        unsafe {
+            *caps = vk::SurfaceCapabilitiesKHR::default()
+                .min_image_count(HOST_MIN_IMAGE_COUNT)
+                .current_extent(HOST_EXTENT)
+        };
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn stub_out_of_date_present(
+        _queue: vk::Queue,
+        _info: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        vk::Result::ERROR_OUT_OF_DATE_KHR
+    }
+
+    fn engine_swapchain_on(surface: u64) -> vk::SwapchainKHR {
+        let info = vk::SwapchainCreateInfoKHR::default().surface(vk::SurfaceKHR::from_raw(surface));
+        let mut swapchain = vk::SwapchainKHR::null();
+        let created = unsafe {
+            eclipse_vk_create_swapchain_khr(
+                vk::Device::null(),
+                &info,
+                std::ptr::null(),
+                &mut swapchain,
+            )
+        };
+        assert_eq!(created, vk::Result::SUCCESS);
+        swapchain
+    }
+
+    fn engine_presents(swapchain: vk::SwapchainKHR) -> vk::Result {
+        let swapchains = [swapchain];
+        let image_indices = [0];
+        let info = vk::PresentInfoKHR::default()
+            .swapchains(&swapchains)
+            .image_indices(&image_indices);
+        unsafe { eclipse_vk_queue_present_khr(vk::Queue::null(), &info) }
+    }
+
+    fn engine_queries_surface(surface: u64) -> (vk::Result, vk::SurfaceCapabilitiesKHR) {
+        let mut caps = vk::SurfaceCapabilitiesKHR::default();
+        let queried = unsafe {
+            super::super::vulkan_wsi::eclipse_vk_get_physical_device_surface_capabilities_khr(
+                vk::PhysicalDevice::null(),
+                vk::SurfaceKHR::from_raw(surface),
+                &mut caps,
+            )
+        };
+        (queried, caps)
+    }
+
+    struct OutOfDateHost {
+        saved: [(&'static AtomicU64, u64); 5],
+    }
+
+    impl OutOfDateHost {
+        fn install() -> Self {
+            let stub = |slot: &'static AtomicU64, f: *const ()| {
+                (slot, slot.swap(f as u64, Ordering::SeqCst))
+            };
+            super::super::vulkan_wsi::use_host_surface_capabilities_for_test(Some(
+                stub_surface_capabilities,
+            ));
+            Self {
+                saved: [
+                    stub(&HOST_ACQUIRE_NEXT_IMAGE, stub_acquire_image as *const ()),
+                    stub(&HOST_ACQUIRE_NEXT_IMAGE2, stub_acquire_image2 as *const ()),
+                    stub(&HOST_CREATE_SWAPCHAIN, stub_create_swapchain as *const ()),
+                    stub(&HOST_DESTROY_SWAPCHAIN, stub_destroy_swapchain as *const ()),
+                    stub(&HOST_QUEUE_PRESENT, stub_out_of_date_present as *const ()),
+                ],
+            }
+        }
+    }
+
+    impl Drop for OutOfDateHost {
+        fn drop(&mut self) {
+            for (slot, saved) in self.saved {
+                slot.store(saved, Ordering::SeqCst);
+            }
+            super::super::vulkan_wsi::use_host_surface_capabilities_for_test(None);
+            set_state(0, Vec::new());
+        }
+    }
+
+    #[test]
+    fn an_out_of_date_engine_swapchain_reports_its_surface_lost_to_the_next_query() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _host = OutOfDateHost::install();
+        let swapchain = engine_swapchain_on(ENGINE_SURFACE);
+
+        let retired = engine_acquires(RETIRED_SWAPCHAIN);
+        let (after_retired, _) = engine_queries_surface(ENGINE_SURFACE);
+        let current = engine_acquires(swapchain.as_raw());
+        let (other_surface, _) = engine_queries_surface(OTHER_SURFACE);
+        let (first, lost_caps) = engine_queries_surface(ENGINE_SURFACE);
+        let (second, _) = engine_queries_surface(ENGINE_SURFACE);
+        let flagged = engine_acquires(swapchain.as_raw());
+        let _replacement = engine_swapchain_on(ENGINE_SURFACE);
+        let (after_replacement, _) = engine_queries_surface(ENGINE_SURFACE);
+
+        assert_eq!(
+            [retired, current],
+            [[(vk::Result::ERROR_OUT_OF_DATE_KHR, u32::MAX); 2]; 2],
+            "the engine still sees the out-of-date result of its acquire"
+        );
+        assert_eq!(
+            after_retired,
+            vk::Result::SUCCESS,
+            "a swapchain the engine already replaced leaves its surface alone"
+        );
+        assert_eq!(other_surface, vk::Result::SUCCESS);
+        assert_eq!(
+            [first, second],
+            [vk::Result::ERROR_SURFACE_LOST_KHR, vk::Result::SUCCESS],
+            "the engine's next query of the surface reports it lost once, so the engine drops \
+             the swapchain and builds a new one"
+        );
+        assert_eq!(
+            (lost_caps.min_image_count, lost_caps.current_extent),
+            (HOST_MIN_IMAGE_COUNT, HOST_EXTENT),
+            "the surface-lost answer still carries the host's capabilities, because one of the \
+             engine's queries builds a swapchain from them without checking the result"
+        );
+        assert_eq!(flagged, [(vk::Result::ERROR_OUT_OF_DATE_KHR, u32::MAX); 2]);
+        assert_eq!(
+            after_replacement,
+            vk::Result::SUCCESS,
+            "a swapchain the engine builds before its next query clears the pending answer"
+        );
+    }
+
+    #[test]
+    fn an_out_of_date_present_reports_the_surface_lost_unless_the_engine_dropped_the_swapchain() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _host = OutOfDateHost::install();
+
+        let dropped = engine_swapchain_on(ENGINE_SURFACE);
+        let dropped_present = engine_presents(dropped);
+        unsafe { eclipse_vk_destroy_swapchain_khr(vk::Device::null(), dropped, std::ptr::null()) };
+        let (after_drop, _) = engine_queries_surface(ENGINE_SURFACE);
+
+        let current = engine_swapchain_on(ENGINE_SURFACE);
+        let current_present = engine_presents(current);
+        let (after_present, _) = engine_queries_surface(ENGINE_SURFACE);
+
+        assert_eq!(
+            [dropped_present, current_present],
+            [vk::Result::ERROR_OUT_OF_DATE_KHR; 2]
+        );
+        assert_eq!(
+            after_drop,
+            vk::Result::SUCCESS,
+            "a swapchain the engine destroyed itself needs no rebuild"
+        );
+        assert_eq!(
+            after_present,
+            vk::Result::ERROR_SURFACE_LOST_KHR,
+            "an out-of-date present makes the engine rebuild its swapchain"
         );
     }
 
@@ -4904,6 +5275,7 @@ mod tests {
             width: extent.width,
             height: extent.height,
             images: vec![image.as_raw()],
+            ..OverlayState::default()
         };
         let rect = vk::Rect2D {
             offset: vk::Offset2D { x: 4, y: 2 },
