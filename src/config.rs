@@ -64,8 +64,6 @@ pub struct Config {
     pub fflags: BTreeMap<String, serde_json::Value>,
 
     pub webview_helper_path: Option<String>,
-
-    pub webview_allow_unsandboxed: bool,
 }
 
 impl Default for Config {
@@ -85,7 +83,6 @@ impl Default for Config {
             use_libsecret: false,
             fflags: BTreeMap::new(),
             webview_helper_path: None,
-            webview_allow_unsandboxed: false,
         }
     }
 }
@@ -221,8 +218,6 @@ mod tests {
             GraphicsOptimizationMode::Balanced
         );
         assert_eq!(cfg.touch_mode, TouchMode::Off);
-
-        assert!(!cfg.webview_allow_unsandboxed);
     }
 
     #[test]

@@ -2,9 +2,13 @@
 
 use std::io::Read;
 
+pub const PROTO_VERSION: u16 = 6;
+
 pub const MAGIC: [u8; 4] = *b"ECWV";
 
 pub const GLOBAL_FRAME_CAP: u32 = 8 * 1024 * 1024;
+
+pub const PERSISTENT_COOKIE_FILE: &str = "cookies.sqlite";
 
 const DEFAULT_CAP: u32 = 64 * 1024;
 
@@ -16,47 +20,46 @@ mod ct {
     pub(super) const HELLO: u8 = 0x01;
     pub(super) const CREATE_VIEW: u8 = 0x02;
     pub(super) const CLOSE_VIEW: u8 = 0x03;
-    pub(super) const RESIZE_VIEW: u8 = 0x04;
-    pub(super) const LOAD_URL: u8 = 0x05;
-    pub(super) const LOAD_DATA_WITH_BASE_URL: u8 = 0x06;
-    pub(super) const MOUSE_MOVE: u8 = 0x07;
-    pub(super) const MOUSE_CLICK: u8 = 0x08;
-    pub(super) const MOUSE_WHEEL: u8 = 0x09;
-    pub(super) const KEY: u8 = 0x0A;
-    pub(super) const EVALUATE_JS: u8 = 0x0B;
-    pub(super) const COOKIE_SET: u8 = 0x0C;
-    pub(super) const COOKIE_GET: u8 = 0x0D;
-    pub(super) const COOKIES_CLEAR: u8 = 0x0E;
-    pub(super) const FRAME_ACK: u8 = 0x0F;
-    pub(super) const SHUTDOWN: u8 = 0x10;
-
-    pub(super) const BRIDGE_REGISTER: u8 = 0x11;
-    pub(super) const BRIDGE_RESULT: u8 = 0x12;
-    pub(super) const EVALUATE_JS_FOR_RESULT: u8 = 0x13;
-    pub(super) const COOKIE_SET_FOR_RESULT: u8 = 0x14;
-
+    pub(super) const SET_VISIBLE: u8 = 0x04;
+    pub(super) const ACTIVATE: u8 = 0x05;
+    pub(super) const SET_USER_AGENT: u8 = 0x06;
+    pub(super) const LOAD_URL: u8 = 0x07;
+    pub(super) const LOAD_DATA: u8 = 0x08;
+    pub(super) const RELOAD: u8 = 0x09;
+    pub(super) const STOP_LOADING: u8 = 0x0A;
+    pub(super) const GO_BACK: u8 = 0x0B;
+    pub(super) const EVALUATE_JS: u8 = 0x0C;
+    pub(super) const BRIDGE_REGISTER: u8 = 0x0D;
+    pub(super) const BRIDGE_UNREGISTER: u8 = 0x0E;
+    pub(super) const BRIDGE_RESULT: u8 = 0x0F;
+    pub(super) const POLICY_REPLY: u8 = 0x10;
+    pub(super) const COOKIE_SET: u8 = 0x11;
+    pub(super) const COOKIE_IMPORT: u8 = 0x12;
+    pub(super) const COOKIE_GET: u8 = 0x13;
+    pub(super) const COOKIES_CLEAR: u8 = 0x14;
     pub(super) const COOKIE_FLUSH: u8 = 0x15;
-    pub(super) const COOKIES_CLEAR_SESSION: u8 = 0x16;
-    pub(super) const GO_BACK: u8 = 0x17;
+    pub(super) const SHUTDOWN: u8 = 0x16;
 }
 
 mod ht {
     pub(super) const HELLO_ACK: u8 = 0x81;
-    pub(super) const LOAD_STATE: u8 = 0x82;
-    pub(super) const FRAME_BUFFER_NEW: u8 = 0x83;
-    pub(super) const FRAME_READY: u8 = 0x84;
-    pub(super) const CONSOLE: u8 = 0x85;
-    pub(super) const CRASH: u8 = 0x86;
-    pub(super) const COOKIE_LIST: u8 = 0x87;
-    pub(super) const VIEW_CLOSED: u8 = 0x88;
-
-    pub(super) const BRIDGE_CALL: u8 = 0x89;
-    pub(super) const EVALUATE_JS_RESULT: u8 = 0x8A;
-    pub(super) const COOKIE_SET_RESULT: u8 = 0x8B;
-
-    pub(super) const COOKIE_FLUSH_DONE: u8 = 0x8C;
-    pub(super) const COOKIES_CLEAR_DONE: u8 = 0x8D;
-    pub(super) const NAVIGATION_STATE: u8 = 0x8E;
+    pub(super) const FATAL: u8 = 0x82;
+    pub(super) const LOAD_CHANGED: u8 = 0x83;
+    pub(super) const NAVIGATION_STATE: u8 = 0x84;
+    pub(super) const PROGRESS: u8 = 0x85;
+    pub(super) const LOAD_FAILED: u8 = 0x86;
+    pub(super) const RESOURCE_LOAD: u8 = 0x87;
+    pub(super) const POLICY_REQUEST: u8 = 0x88;
+    pub(super) const CLOSE_REQUESTED: u8 = 0x89;
+    pub(super) const VIEW_CLOSED: u8 = 0x8A;
+    pub(super) const WEB_PROCESS_GONE: u8 = 0x8B;
+    pub(super) const BRIDGE_CALL: u8 = 0x8C;
+    pub(super) const EVALUATE_JS_RESULT: u8 = 0x8D;
+    pub(super) const COOKIE_SET_RESULT: u8 = 0x8E;
+    pub(super) const COOKIE_IMPORT_RESULT: u8 = 0x8F;
+    pub(super) const COOKIE_LIST: u8 = 0x90;
+    pub(super) const COOKIES_CLEARED: u8 = 0x91;
+    pub(super) const COOKIE_FLUSHED: u8 = 0x92;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,56 +157,173 @@ impl std::fmt::Display for ProtoError {
 
 impl std::error::Error for ProtoError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadEvent {
+    Started,
+    Redirected,
+    Committed,
+    Finished,
+}
+
+impl LoadEvent {
+    pub fn android_state(self) -> i32 {
+        match self {
+            Self::Started => 0,
+            Self::Redirected => 1,
+            Self::Committed => 2,
+            Self::Finished => 3,
+        }
+    }
+
+    fn byte(self) -> u8 {
+        match self {
+            Self::Started => 0,
+            Self::Redirected => 1,
+            Self::Committed => 2,
+            Self::Finished => 3,
+        }
+    }
+
+    fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Started),
+            1 => Some(Self::Redirected),
+            2 => Some(Self::Committed),
+            3 => Some(Self::Finished),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadError {
+    Unknown,
+    HostLookup,
+    Connect,
+    Io,
+    Timeout,
+    UnsupportedScheme,
+    FailedSslHandshake,
+    BadUrl,
+    FileNotFound,
+}
+
+impl LoadError {
+    pub fn android_code(self) -> i32 {
+        match self {
+            Self::Unknown => -1,
+            Self::HostLookup => -2,
+            Self::Connect => -6,
+            Self::Io => -7,
+            Self::Timeout => -8,
+            Self::UnsupportedScheme => -10,
+            Self::FailedSslHandshake => -11,
+            Self::BadUrl => -12,
+            Self::FileNotFound => -14,
+        }
+    }
+
+    fn byte(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::HostLookup => 1,
+            Self::Connect => 2,
+            Self::Io => 3,
+            Self::Timeout => 4,
+            Self::UnsupportedScheme => 5,
+            Self::FailedSslHandshake => 6,
+            Self::BadUrl => 7,
+            Self::FileNotFound => 8,
+        }
+    }
+
+    fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::HostLookup),
+            2 => Some(Self::Connect),
+            3 => Some(Self::Io),
+            4 => Some(Self::Timeout),
+            5 => Some(Self::UnsupportedScheme),
+            6 => Some(Self::FailedSslHandshake),
+            7 => Some(Self::BadUrl),
+            8 => Some(Self::FileNotFound),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearScope {
+    All,
+    Session,
+}
+
+impl ClearScope {
+    fn byte(self) -> u8 {
+        match self {
+            Self::All => 0,
+            Self::Session => 1,
+        }
+    }
+
+    fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::All),
+            1 => Some(Self::Session),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameSite {
+    None,
+    Lax,
+    Strict,
+}
+
+impl SameSite {
+    fn byte(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Lax => 1,
+            Self::Strict => 2,
+        }
+    }
+
+    fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::None),
+            1 => Some(Self::Lax),
+            2 => Some(Self::Strict),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookieExpiry {
+    Session,
+    At { epoch_s: i64 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CookieEntry {
+pub struct StoredCookie {
     pub name: String,
     pub value: String,
     pub domain: String,
     pub path: String,
     pub secure: bool,
     pub http_only: bool,
+    pub same_site: SameSite,
+    pub expiry: CookieExpiry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BridgeMethod {
+pub struct CookiePair {
     pub name: String,
-    pub returns_value: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Console {
-    severity: u8,
-
-    source: String,
-    line: u32,
-    message_len: u32,
-}
-
-impl Console {
-    pub fn from_raw(severity: u8, raw_source_url: &str, line: u32, message_text: &str) -> Self {
-        Self {
-            severity,
-            source: super::redact::url_scheme_and_host_for_log(raw_source_url),
-            line,
-            message_len: u32::try_from(message_text.len()).unwrap_or(u32::MAX),
-        }
-    }
-
-    pub fn severity(&self) -> u8 {
-        self.severity
-    }
-
-    pub fn source(&self) -> &str {
-        &self.source
-    }
-
-    pub fn line(&self) -> u32 {
-        self.line
-    }
-
-    pub fn message_len(&self) -> u32 {
-        self.message_len
-    }
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,18 +334,25 @@ pub enum ConsumerMsg {
 
     CreateView {
         view: i64,
-        width: u16,
-        height: u16,
     },
 
     CloseView {
         view: i64,
     },
 
-    ResizeView {
+    SetVisible {
         view: i64,
-        width: u16,
-        height: u16,
+        visible: bool,
+    },
+
+    Activate {
+        view: i64,
+        token: String,
+    },
+
+    SetUserAgent {
+        view: i64,
+        user_agent: String,
     },
 
     LoadUrl {
@@ -233,65 +360,63 @@ pub enum ConsumerMsg {
         url: String,
     },
 
-    LoadDataWithBaseUrl {
+    LoadData {
         view: i64,
         base_url: String,
         data: String,
         mime: String,
         encoding: String,
-        history_url: String,
     },
 
-    MouseMove {
+    Reload {
         view: i64,
-        x: i32,
-        y: i32,
-        modifiers: u32,
-        leave: bool,
     },
 
-    MouseClick {
+    StopLoading {
         view: i64,
-        x: i32,
-        y: i32,
-        button: u8,
-        down: bool,
-        click_count: u8,
-        modifiers: u32,
     },
 
-    MouseWheel {
+    GoBack {
         view: i64,
-        x: i32,
-        y: i32,
-        delta_x: i32,
-        delta_y: i32,
-        modifiers: u32,
-    },
-
-    Key {
-        view: i64,
-        kind: u8,
-        windows_key_code: i32,
-        native_key_code: i32,
-        character: u16,
-        modifiers: u32,
     },
 
     EvaluateJs {
         view: i64,
+        request_id: u32,
         script: String,
     },
 
-    CookieSet {
-        url: String,
+    BridgeRegister {
+        view: i64,
         name: String,
-        value: String,
-        domain: String,
-        path: String,
-        secure: bool,
-        http_only: bool,
-        expires_epoch_s: i64,
+        methods: Vec<String>,
+    },
+
+    BridgeUnregister {
+        view: i64,
+        name: String,
+    },
+
+    BridgeResult {
+        call_id: u32,
+        ok: bool,
+        result_json: String,
+    },
+
+    PolicyReply {
+        policy_id: u32,
+        override_load: bool,
+    },
+
+    CookieSet {
+        request_id: u32,
+        url: String,
+        header: String,
+    },
+
+    CookieImport {
+        request_id: u32,
+        cookies: Vec<StoredCookie>,
     },
 
     CookieGet {
@@ -301,57 +426,14 @@ pub enum ConsumerMsg {
 
     CookiesClear {
         request_id: u32,
-    },
-
-    FrameAck {
-        view: i64,
-        generation: u32,
-        seq: u32,
-    },
-
-    Shutdown,
-
-    BridgeRegister {
-        view: i64,
-        name: String,
-        methods: Vec<BridgeMethod>,
-    },
-
-    BridgeResult {
-        call_id: u32,
-        ok: bool,
-        result_json: String,
-    },
-
-    EvaluateJsForResult {
-        view: i64,
-        request_id: u32,
-        script: String,
-    },
-
-    CookieSetForResult {
-        request_id: u32,
-        url: String,
-        name: String,
-        value: String,
-        domain: String,
-        path: String,
-        secure: bool,
-        http_only: bool,
-        expires_epoch_s: i64,
+        scope: ClearScope,
     },
 
     CookieFlush {
         request_id: u32,
     },
 
-    CookiesClearSession {
-        request_id: u32,
-    },
-
-    GoBack {
-        view: i64,
-    },
+    Shutdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,46 +443,58 @@ pub enum HelperMsg {
         engine: String,
     },
 
-    LoadState {
-        view: i64,
-        state: u8,
-        http_status: i32,
+    Fatal {
+        reason: String,
     },
 
-    FrameBufferNew {
+    LoadChanged {
         view: i64,
-        generation: u32,
-        width: u16,
-        height: u16,
-        stride: u32,
-        slot_bytes: u32,
-        slot_count: u8,
+        event: LoadEvent,
+        url: String,
     },
 
-    FrameReady {
+    NavigationState {
         view: i64,
-        generation: u32,
-        slot: u8,
-        seq: u32,
+        url: String,
+        title: String,
+        can_go_back: bool,
     },
 
-    Console {
+    Progress {
         view: i64,
-        console: Console,
+        percent: u8,
     },
 
-    Crash {
+    LoadFailed {
         view: i64,
-        kind: u8,
-        code: i32,
+        url: String,
+        error: LoadError,
+        description: String,
     },
 
-    CookieList {
-        request_id: u32,
-        cookies: Vec<CookieEntry>,
+    ResourceLoad {
+        view: i64,
+        url: String,
+    },
+
+    PolicyRequest {
+        view: i64,
+        policy_id: u32,
+        url: String,
+        redirect: bool,
+        user_gesture: bool,
+        method: String,
+    },
+
+    CloseRequested {
+        view: i64,
     },
 
     ViewClosed {
+        view: i64,
+    },
+
+    WebProcessGone {
         view: i64,
     },
 
@@ -421,19 +515,25 @@ pub enum HelperMsg {
         ok: bool,
     },
 
-    CookieFlushDone {
+    CookieImportResult {
         request_id: u32,
-        ok: bool,
+        imported: u32,
+        failed: u32,
     },
 
-    CookiesClearDone {
+    CookieList {
+        request_id: u32,
+        cookies: Vec<CookiePair>,
+    },
+
+    CookiesCleared {
         request_id: u32,
         removed: bool,
     },
 
-    NavigationState {
-        view: i64,
-        can_go_back: bool,
+    CookieFlushed {
+        request_id: u32,
+        ok: bool,
     },
 }
 
@@ -447,44 +547,48 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
     match dir {
         Dir::FromConsumer => match type_byte {
             ct::LOAD_URL => Some(LOAD_URL_CAP),
-
-            ct::LOAD_DATA_WITH_BASE_URL
+            ct::LOAD_DATA
             | ct::EVALUATE_JS
             | ct::BRIDGE_RESULT
-            | ct::EVALUATE_JS_FOR_RESULT => Some(PAYLOAD_CAP),
+            | ct::COOKIE_IMPORT
+            | ct::COOKIE_SET
+            | ct::COOKIE_GET => Some(PAYLOAD_CAP),
             ct::HELLO
             | ct::CREATE_VIEW
             | ct::CLOSE_VIEW
-            | ct::RESIZE_VIEW
-            | ct::MOUSE_MOVE
-            | ct::MOUSE_CLICK
-            | ct::MOUSE_WHEEL
-            | ct::KEY
-            | ct::COOKIE_SET
-            | ct::COOKIE_GET
-            | ct::COOKIES_CLEAR
-            | ct::FRAME_ACK
-            | ct::SHUTDOWN
+            | ct::SET_VISIBLE
+            | ct::ACTIVATE
+            | ct::SET_USER_AGENT
+            | ct::RELOAD
+            | ct::STOP_LOADING
+            | ct::GO_BACK
             | ct::BRIDGE_REGISTER
-            | ct::COOKIE_SET_FOR_RESULT
+            | ct::BRIDGE_UNREGISTER
+            | ct::POLICY_REPLY
+            | ct::COOKIES_CLEAR
             | ct::COOKIE_FLUSH
-            | ct::COOKIES_CLEAR_SESSION
-            | ct::GO_BACK => Some(DEFAULT_CAP),
+            | ct::SHUTDOWN => Some(DEFAULT_CAP),
             _ => None,
         },
         Dir::FromHelper => match type_byte {
-            ht::BRIDGE_CALL | ht::EVALUATE_JS_RESULT | ht::COOKIE_LIST => Some(PAYLOAD_CAP),
+            ht::LOAD_CHANGED
+            | ht::NAVIGATION_STATE
+            | ht::LOAD_FAILED
+            | ht::RESOURCE_LOAD
+            | ht::POLICY_REQUEST
+            | ht::BRIDGE_CALL
+            | ht::EVALUATE_JS_RESULT
+            | ht::COOKIE_LIST => Some(PAYLOAD_CAP),
             ht::HELLO_ACK
-            | ht::LOAD_STATE
-            | ht::FRAME_BUFFER_NEW
-            | ht::FRAME_READY
-            | ht::CONSOLE
-            | ht::CRASH
+            | ht::FATAL
+            | ht::PROGRESS
+            | ht::CLOSE_REQUESTED
             | ht::VIEW_CLOSED
+            | ht::WEB_PROCESS_GONE
             | ht::COOKIE_SET_RESULT
-            | ht::COOKIE_FLUSH_DONE
-            | ht::COOKIES_CLEAR_DONE
-            | ht::NAVIGATION_STATE => Some(DEFAULT_CAP),
+            | ht::COOKIE_IMPORT_RESULT
+            | ht::COOKIES_CLEARED
+            | ht::COOKIE_FLUSHED => Some(DEFAULT_CAP),
             _ => None,
         },
     }
@@ -495,10 +599,6 @@ fn put_u16(buf: &mut Vec<u8>, v: u16) {
 }
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
-    buf.extend_from_slice(&v.to_le_bytes());
-}
-
-fn put_i32(buf: &mut Vec<u8>, v: i32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
@@ -513,6 +613,44 @@ fn put_bool(buf: &mut Vec<u8>, v: bool) {
 fn put_str(buf: &mut Vec<u8>, s: &str) {
     put_u32(buf, u32::try_from(s.len()).unwrap_or(u32::MAX));
     buf.extend_from_slice(s.as_bytes());
+}
+
+fn put_count(buf: &mut Vec<u8>, type_byte: u8, len: usize) -> Result<(), ProtoError> {
+    let count = u16::try_from(len).map_err(|_| ProtoError::BadValue {
+        type_byte,
+        what: "item count (at most 65535)",
+    })?;
+    put_u16(buf, count);
+    Ok(())
+}
+
+fn put_cookies(
+    buf: &mut Vec<u8>,
+    type_byte: u8,
+    cookies: &[StoredCookie],
+) -> Result<(), ProtoError> {
+    put_count(buf, type_byte, cookies.len())?;
+    for cookie in cookies {
+        put_stored_cookie(buf, cookie);
+    }
+    Ok(())
+}
+
+fn put_stored_cookie(buf: &mut Vec<u8>, cookie: &StoredCookie) {
+    put_str(buf, &cookie.name);
+    put_str(buf, &cookie.value);
+    put_str(buf, &cookie.domain);
+    put_str(buf, &cookie.path);
+    put_bool(buf, cookie.secure);
+    put_bool(buf, cookie.http_only);
+    buf.push(cookie.same_site.byte());
+    match cookie.expiry {
+        CookieExpiry::Session => put_bool(buf, false),
+        CookieExpiry::At { epoch_s } => {
+            put_bool(buf, true);
+            put_i64(buf, epoch_s);
+        }
+    }
 }
 
 fn compose_frame(dir: Dir, type_byte: u8, body: Vec<u8>) -> Result<Vec<u8>, ProtoError> {
@@ -542,160 +680,70 @@ impl ConsumerMsg {
                 put_u16(&mut b, *version);
                 ct::HELLO
             }
-            Self::CreateView {
-                view,
-                width,
-                height,
-            } => {
+            Self::CreateView { view } => {
                 put_i64(&mut b, *view);
-                put_u16(&mut b, *width);
-                put_u16(&mut b, *height);
                 ct::CREATE_VIEW
             }
             Self::CloseView { view } => {
                 put_i64(&mut b, *view);
                 ct::CLOSE_VIEW
             }
-            Self::ResizeView {
-                view,
-                width,
-                height,
-            } => {
+            Self::SetVisible { view, visible } => {
                 put_i64(&mut b, *view);
-                put_u16(&mut b, *width);
-                put_u16(&mut b, *height);
-                ct::RESIZE_VIEW
+                put_bool(&mut b, *visible);
+                ct::SET_VISIBLE
+            }
+            Self::Activate { view, token } => {
+                put_i64(&mut b, *view);
+                put_str(&mut b, token);
+                ct::ACTIVATE
+            }
+            Self::SetUserAgent { view, user_agent } => {
+                put_i64(&mut b, *view);
+                put_str(&mut b, user_agent);
+                ct::SET_USER_AGENT
             }
             Self::LoadUrl { view, url } => {
                 put_i64(&mut b, *view);
                 put_str(&mut b, url);
                 ct::LOAD_URL
             }
-            Self::LoadDataWithBaseUrl {
+            Self::LoadData {
                 view,
                 base_url,
                 data,
                 mime,
                 encoding,
-                history_url,
             } => {
                 put_i64(&mut b, *view);
                 put_str(&mut b, base_url);
                 put_str(&mut b, data);
                 put_str(&mut b, mime);
                 put_str(&mut b, encoding);
-                put_str(&mut b, history_url);
-                ct::LOAD_DATA_WITH_BASE_URL
+                ct::LOAD_DATA
             }
-            Self::MouseMove {
+            Self::Reload { view } => {
+                put_i64(&mut b, *view);
+                ct::RELOAD
+            }
+            Self::StopLoading { view } => {
+                put_i64(&mut b, *view);
+                ct::STOP_LOADING
+            }
+            Self::GoBack { view } => {
+                put_i64(&mut b, *view);
+                ct::GO_BACK
+            }
+            Self::EvaluateJs {
                 view,
-                x,
-                y,
-                modifiers,
-                leave,
+                request_id,
+                script,
             } => {
                 put_i64(&mut b, *view);
-                put_i32(&mut b, *x);
-                put_i32(&mut b, *y);
-                put_u32(&mut b, *modifiers);
-                put_bool(&mut b, *leave);
-                ct::MOUSE_MOVE
-            }
-            Self::MouseClick {
-                view,
-                x,
-                y,
-                button,
-                down,
-                click_count,
-                modifiers,
-            } => {
-                put_i64(&mut b, *view);
-                put_i32(&mut b, *x);
-                put_i32(&mut b, *y);
-                b.push(*button);
-                put_bool(&mut b, *down);
-                b.push(*click_count);
-                put_u32(&mut b, *modifiers);
-                ct::MOUSE_CLICK
-            }
-            Self::MouseWheel {
-                view,
-                x,
-                y,
-                delta_x,
-                delta_y,
-                modifiers,
-            } => {
-                put_i64(&mut b, *view);
-                put_i32(&mut b, *x);
-                put_i32(&mut b, *y);
-                put_i32(&mut b, *delta_x);
-                put_i32(&mut b, *delta_y);
-                put_u32(&mut b, *modifiers);
-                ct::MOUSE_WHEEL
-            }
-            Self::Key {
-                view,
-                kind,
-                windows_key_code,
-                native_key_code,
-                character,
-                modifiers,
-            } => {
-                put_i64(&mut b, *view);
-                b.push(*kind);
-                put_i32(&mut b, *windows_key_code);
-                put_i32(&mut b, *native_key_code);
-                put_u16(&mut b, *character);
-                put_u32(&mut b, *modifiers);
-                ct::KEY
-            }
-            Self::EvaluateJs { view, script } => {
-                put_i64(&mut b, *view);
+                put_u32(&mut b, *request_id);
                 put_str(&mut b, script);
                 ct::EVALUATE_JS
             }
-            Self::CookieSet {
-                url,
-                name,
-                value,
-                domain,
-                path,
-                secure,
-                http_only,
-                expires_epoch_s,
-            } => {
-                put_str(&mut b, url);
-                put_str(&mut b, name);
-                put_str(&mut b, value);
-                put_str(&mut b, domain);
-                put_str(&mut b, path);
-                put_bool(&mut b, *secure);
-                put_bool(&mut b, *http_only);
-                put_i64(&mut b, *expires_epoch_s);
-                ct::COOKIE_SET
-            }
-            Self::CookieGet { request_id, url } => {
-                put_u32(&mut b, *request_id);
-                put_str(&mut b, url);
-                ct::COOKIE_GET
-            }
-            Self::CookiesClear { request_id } => {
-                put_u32(&mut b, *request_id);
-                ct::COOKIES_CLEAR
-            }
-            Self::FrameAck {
-                view,
-                generation,
-                seq,
-            } => {
-                put_i64(&mut b, *view);
-                put_u32(&mut b, *generation);
-                put_u32(&mut b, *seq);
-                ct::FRAME_ACK
-            }
-            Self::Shutdown => ct::SHUTDOWN,
             Self::BridgeRegister {
                 view,
                 name,
@@ -703,12 +751,16 @@ impl ConsumerMsg {
             } => {
                 put_i64(&mut b, *view);
                 put_str(&mut b, name);
-                put_u16(&mut b, u16::try_from(methods.len()).unwrap_or(u16::MAX));
-                for m in methods.iter().take(usize::from(u16::MAX)) {
-                    put_str(&mut b, &m.name);
-                    put_bool(&mut b, m.returns_value);
+                put_count(&mut b, ct::BRIDGE_REGISTER, methods.len())?;
+                for method in methods {
+                    put_str(&mut b, method);
                 }
                 ct::BRIDGE_REGISTER
+            }
+            Self::BridgeUnregister { view, name } => {
+                put_i64(&mut b, *view);
+                put_str(&mut b, name);
+                ct::BRIDGE_UNREGISTER
             }
             Self::BridgeResult {
                 call_id,
@@ -720,50 +772,47 @@ impl ConsumerMsg {
                 put_str(&mut b, result_json);
                 ct::BRIDGE_RESULT
             }
-            Self::EvaluateJsForResult {
-                view,
-                request_id,
-                script,
+            Self::PolicyReply {
+                policy_id,
+                override_load,
             } => {
-                put_i64(&mut b, *view);
-                put_u32(&mut b, *request_id);
-                put_str(&mut b, script);
-                ct::EVALUATE_JS_FOR_RESULT
+                put_u32(&mut b, *policy_id);
+                put_bool(&mut b, *override_load);
+                ct::POLICY_REPLY
             }
-            Self::CookieSetForResult {
+            Self::CookieSet {
                 request_id,
                 url,
-                name,
-                value,
-                domain,
-                path,
-                secure,
-                http_only,
-                expires_epoch_s,
+                header,
             } => {
                 put_u32(&mut b, *request_id);
                 put_str(&mut b, url);
-                put_str(&mut b, name);
-                put_str(&mut b, value);
-                put_str(&mut b, domain);
-                put_str(&mut b, path);
-                put_bool(&mut b, *secure);
-                put_bool(&mut b, *http_only);
-                put_i64(&mut b, *expires_epoch_s);
-                ct::COOKIE_SET_FOR_RESULT
+                put_str(&mut b, header);
+                ct::COOKIE_SET
+            }
+            Self::CookieImport {
+                request_id,
+                cookies,
+            } => {
+                put_u32(&mut b, *request_id);
+                put_cookies(&mut b, ct::COOKIE_IMPORT, cookies)?;
+                ct::COOKIE_IMPORT
+            }
+            Self::CookieGet { request_id, url } => {
+                put_u32(&mut b, *request_id);
+                put_str(&mut b, url);
+                ct::COOKIE_GET
+            }
+            Self::CookiesClear { request_id, scope } => {
+                put_u32(&mut b, *request_id);
+                b.push(scope.byte());
+                ct::COOKIES_CLEAR
             }
             Self::CookieFlush { request_id } => {
                 put_u32(&mut b, *request_id);
                 ct::COOKIE_FLUSH
             }
-            Self::CookiesClearSession { request_id } => {
-                put_u32(&mut b, *request_id);
-                ct::COOKIES_CLEAR_SESSION
-            }
-            Self::GoBack { view } => {
-                put_i64(&mut b, *view);
-                ct::GO_BACK
-            }
+            Self::Shutdown => ct::SHUTDOWN,
         };
         compose_frame(Dir::FromConsumer, t, b)
     }
@@ -773,19 +822,23 @@ impl HelperMsg {
     pub fn name(&self) -> &'static str {
         match self {
             Self::HelloAck { .. } => "HelloAck",
-            Self::LoadState { .. } => "LoadState",
-            Self::FrameBufferNew { .. } => "FrameBufferNew",
-            Self::FrameReady { .. } => "FrameReady",
-            Self::Console { .. } => "Console",
-            Self::Crash { .. } => "Crash",
-            Self::CookieList { .. } => "CookieList",
+            Self::Fatal { .. } => "Fatal",
+            Self::LoadChanged { .. } => "LoadChanged",
+            Self::NavigationState { .. } => "NavigationState",
+            Self::Progress { .. } => "Progress",
+            Self::LoadFailed { .. } => "LoadFailed",
+            Self::ResourceLoad { .. } => "ResourceLoad",
+            Self::PolicyRequest { .. } => "PolicyRequest",
+            Self::CloseRequested { .. } => "CloseRequested",
             Self::ViewClosed { .. } => "ViewClosed",
+            Self::WebProcessGone { .. } => "WebProcessGone",
             Self::BridgeCall { .. } => "BridgeCall",
             Self::EvaluateJsResult { .. } => "EvaluateJsResult",
             Self::CookieSetResult { .. } => "CookieSetResult",
-            Self::CookieFlushDone { .. } => "CookieFlushDone",
-            Self::CookiesClearDone { .. } => "CookiesClearDone",
-            Self::NavigationState { .. } => "NavigationState",
+            Self::CookieImportResult { .. } => "CookieImportResult",
+            Self::CookieList { .. } => "CookieList",
+            Self::CookiesCleared { .. } => "CookiesCleared",
+            Self::CookieFlushed { .. } => "CookieFlushed",
         }
     }
 
@@ -797,79 +850,77 @@ impl HelperMsg {
                 put_str(&mut b, engine);
                 ht::HELLO_ACK
             }
-            Self::LoadState {
+            Self::Fatal { reason } => {
+                put_str(&mut b, reason);
+                ht::FATAL
+            }
+            Self::LoadChanged { view, event, url } => {
+                put_i64(&mut b, *view);
+                b.push(event.byte());
+                put_str(&mut b, url);
+                ht::LOAD_CHANGED
+            }
+            Self::NavigationState {
                 view,
-                state,
-                http_status,
+                url,
+                title,
+                can_go_back,
             } => {
                 put_i64(&mut b, *view);
-                b.push(*state);
-                put_i32(&mut b, *http_status);
-                ht::LOAD_STATE
+                put_str(&mut b, url);
+                put_str(&mut b, title);
+                put_bool(&mut b, *can_go_back);
+                ht::NAVIGATION_STATE
             }
-            Self::FrameBufferNew {
+            Self::Progress { view, percent } => {
+                put_i64(&mut b, *view);
+                b.push(*percent);
+                ht::PROGRESS
+            }
+            Self::LoadFailed {
                 view,
-                generation,
-                width,
-                height,
-                stride,
-                slot_bytes,
-                slot_count,
+                url,
+                error,
+                description,
             } => {
                 put_i64(&mut b, *view);
-                put_u32(&mut b, *generation);
-                put_u16(&mut b, *width);
-                put_u16(&mut b, *height);
-                put_u32(&mut b, *stride);
-                put_u32(&mut b, *slot_bytes);
-                b.push(*slot_count);
-                ht::FRAME_BUFFER_NEW
+                put_str(&mut b, url);
+                b.push(error.byte());
+                put_str(&mut b, description);
+                ht::LOAD_FAILED
             }
-            Self::FrameReady {
+            Self::ResourceLoad { view, url } => {
+                put_i64(&mut b, *view);
+                put_str(&mut b, url);
+                ht::RESOURCE_LOAD
+            }
+            Self::PolicyRequest {
                 view,
-                generation,
-                slot,
-                seq,
+                policy_id,
+                url,
+                redirect,
+                user_gesture,
+                method,
             } => {
                 put_i64(&mut b, *view);
-                put_u32(&mut b, *generation);
-                b.push(*slot);
-                put_u32(&mut b, *seq);
-                ht::FRAME_READY
+                put_u32(&mut b, *policy_id);
+                put_str(&mut b, url);
+                put_bool(&mut b, *redirect);
+                put_bool(&mut b, *user_gesture);
+                put_str(&mut b, method);
+                ht::POLICY_REQUEST
             }
-            Self::Console { view, console } => {
+            Self::CloseRequested { view } => {
                 put_i64(&mut b, *view);
-                b.push(console.severity);
-                put_str(&mut b, &console.source);
-                put_u32(&mut b, console.line);
-                put_u32(&mut b, console.message_len);
-                ht::CONSOLE
-            }
-            Self::Crash { view, kind, code } => {
-                put_i64(&mut b, *view);
-                b.push(*kind);
-                put_i32(&mut b, *code);
-                ht::CRASH
-            }
-            Self::CookieList {
-                request_id,
-                cookies,
-            } => {
-                put_u32(&mut b, *request_id);
-                put_u16(&mut b, u16::try_from(cookies.len()).unwrap_or(u16::MAX));
-                for c in cookies.iter().take(usize::from(u16::MAX)) {
-                    put_str(&mut b, &c.name);
-                    put_str(&mut b, &c.value);
-                    put_str(&mut b, &c.domain);
-                    put_str(&mut b, &c.path);
-                    put_bool(&mut b, c.secure);
-                    put_bool(&mut b, c.http_only);
-                }
-                ht::COOKIE_LIST
+                ht::CLOSE_REQUESTED
             }
             Self::ViewClosed { view } => {
                 put_i64(&mut b, *view);
                 ht::VIEW_CLOSED
+            }
+            Self::WebProcessGone { view } => {
+                put_i64(&mut b, *view);
+                ht::WEB_PROCESS_GONE
             }
             Self::BridgeCall {
                 view,
@@ -896,23 +947,40 @@ impl HelperMsg {
                 put_bool(&mut b, *ok);
                 ht::COOKIE_SET_RESULT
             }
-            Self::CookieFlushDone { request_id, ok } => {
+            Self::CookieImportResult {
+                request_id,
+                imported,
+                failed,
+            } => {
                 put_u32(&mut b, *request_id);
-                put_bool(&mut b, *ok);
-                ht::COOKIE_FLUSH_DONE
+                put_u32(&mut b, *imported);
+                put_u32(&mut b, *failed);
+                ht::COOKIE_IMPORT_RESULT
             }
-            Self::CookiesClearDone {
+            Self::CookieList {
+                request_id,
+                cookies,
+            } => {
+                put_u32(&mut b, *request_id);
+                put_count(&mut b, ht::COOKIE_LIST, cookies.len())?;
+                for cookie in cookies {
+                    put_str(&mut b, &cookie.name);
+                    put_str(&mut b, &cookie.value);
+                }
+                ht::COOKIE_LIST
+            }
+            Self::CookiesCleared {
                 request_id,
                 removed,
             } => {
                 put_u32(&mut b, *request_id);
                 put_bool(&mut b, *removed);
-                ht::COOKIES_CLEAR_DONE
+                ht::COOKIES_CLEARED
             }
-            Self::NavigationState { view, can_go_back } => {
-                put_i64(&mut b, *view);
-                put_bool(&mut b, *can_go_back);
-                ht::NAVIGATION_STATE
+            Self::CookieFlushed { request_id, ok } => {
+                put_u32(&mut b, *request_id);
+                put_bool(&mut b, *ok);
+                ht::COOKIE_FLUSHED
             }
         };
         compose_frame(Dir::FromHelper, t, b)
@@ -962,16 +1030,19 @@ impl<'a> Body<'a> {
         Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
 
-    fn i32(&mut self) -> Result<i32, ProtoError> {
-        let s = self.take(4)?;
-        Ok(i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
     fn i64(&mut self) -> Result<i64, ProtoError> {
         let s = self.take(8)?;
         Ok(i64::from_le_bytes([
             s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
         ]))
+    }
+
+    fn view(&mut self) -> Result<i64, ProtoError> {
+        let view = self.i64()?;
+        if view < 1 {
+            return Err(self.bad("view handle (must be >= 1)"));
+        }
+        Ok(view)
     }
 
     fn bool(&mut self) -> Result<bool, ProtoError> {
@@ -995,6 +1066,58 @@ impl<'a> Body<'a> {
             })
     }
 
+    fn enumerated<T>(
+        &mut self,
+        parse: fn(u8) -> Option<T>,
+        what: &'static str,
+    ) -> Result<T, ProtoError> {
+        let value = self.u8()?;
+        parse(value).ok_or_else(|| self.bad(what))
+    }
+
+    fn stored_cookie(&mut self) -> Result<StoredCookie, ProtoError> {
+        let name = self.string()?;
+        let value = self.string()?;
+        let domain = self.string()?;
+        let path = self.string()?;
+        let secure = self.bool()?;
+        let http_only = self.bool()?;
+        let same_site = self.enumerated(SameSite::from_byte, "cookie SameSite policy")?;
+        let expiry = if self.bool()? {
+            CookieExpiry::At {
+                epoch_s: self.i64()?,
+            }
+        } else {
+            CookieExpiry::Session
+        };
+        Ok(StoredCookie {
+            name,
+            value,
+            domain,
+            path,
+            secure,
+            http_only,
+            same_site,
+            expiry,
+        })
+    }
+
+    fn cookies(&mut self) -> Result<Vec<StoredCookie>, ProtoError> {
+        let count = self.u16()?;
+        let mut cookies = Vec::with_capacity(usize::from(count).min(256));
+        for _ in 0..count {
+            cookies.push(self.stored_cookie()?);
+        }
+        Ok(cookies)
+    }
+
+    fn bad(&self, what: &'static str) -> ProtoError {
+        ProtoError::BadValue {
+            type_byte: self.type_byte,
+            what,
+        }
+    }
+
     fn finish(self) -> Result<(), ProtoError> {
         if self.pos == self.buf.len() {
             Ok(())
@@ -1005,6 +1128,41 @@ impl<'a> Body<'a> {
             })
         }
     }
+}
+
+fn checked_len(dir: Dir, declared_len: u32, type_byte: Option<u8>) -> Result<(), ProtoError> {
+    if declared_len == 0 {
+        return Err(ProtoError::EmptyFrame);
+    }
+    if declared_len > GLOBAL_FRAME_CAP {
+        return Err(ProtoError::Oversized {
+            type_byte: None,
+            declared_len,
+            cap: GLOBAL_FRAME_CAP,
+        });
+    }
+    let Some(type_byte) = type_byte else {
+        return Ok(());
+    };
+    let cap = type_cap(dir, type_byte).ok_or(ProtoError::UnknownType { type_byte })?;
+    if declared_len > cap {
+        return Err(ProtoError::Oversized {
+            type_byte: Some(type_byte),
+            declared_len,
+            cap,
+        });
+    }
+    Ok(())
+}
+
+pub fn consumer_frame_len(buf: &[u8]) -> Result<Option<usize>, ProtoError> {
+    let Some(len_bytes) = buf.get(..4) else {
+        return Ok(None);
+    };
+    let declared_len = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]);
+    checked_len(Dir::FromConsumer, declared_len, buf.get(4).copied())?;
+    let total = 4 + declared_len as usize;
+    Ok((buf.len() >= total).then_some(total))
 }
 
 fn read_frame<R: Read>(r: &mut R, dir: Dir) -> Result<(u8, Vec<u8>), ProtoError> {
@@ -1025,27 +1183,11 @@ fn read_frame<R: Read>(r: &mut R, dir: Dir) -> Result<(u8, Vec<u8>), ProtoError>
         }
     }
     let declared_len = u32::from_le_bytes(len_buf);
-    if declared_len == 0 {
-        return Err(ProtoError::EmptyFrame);
-    }
-    if declared_len > GLOBAL_FRAME_CAP {
-        return Err(ProtoError::Oversized {
-            type_byte: None,
-            declared_len,
-            cap: GLOBAL_FRAME_CAP,
-        });
-    }
+    checked_len(dir, declared_len, None)?;
     let mut type_buf = [0u8; 1];
     read_exact_frame(r, &mut type_buf)?;
     let type_byte = type_buf[0];
-    let cap = type_cap(dir, type_byte).ok_or(ProtoError::UnknownType { type_byte })?;
-    if declared_len > cap {
-        return Err(ProtoError::Oversized {
-            type_byte: Some(type_byte),
-            declared_len,
-            cap,
-        });
-    }
+    checked_len(dir, declared_len, Some(type_byte))?;
 
     let mut body = vec![0u8; (declared_len - 1) as usize];
     read_exact_frame(r, &mut body)?;
@@ -1070,155 +1212,46 @@ pub fn read_consumer_msg<R: Read>(r: &mut R) -> Result<ConsumerMsg, ProtoError> 
             }
             ConsumerMsg::Hello { version: b.u16()? }
         }
-        ct::CREATE_VIEW => {
-            let view = b.i64()?;
-            let width = b.u16()?;
-            let height = b.u16()?;
-            if view < 1 {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "view handle (must be >= 1)",
-                });
-            }
-            if width == 0 || height == 0 {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "view dimensions (must be nonzero)",
-                });
-            }
-            ConsumerMsg::CreateView {
-                view,
-                width,
-                height,
-            }
-        }
-        ct::CLOSE_VIEW => ConsumerMsg::CloseView { view: b.i64()? },
-        ct::RESIZE_VIEW => {
-            let view = b.i64()?;
-            let width = b.u16()?;
-            let height = b.u16()?;
-            if width == 0 || height == 0 {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "view dimensions (must be nonzero)",
-                });
-            }
-            ConsumerMsg::ResizeView {
-                view,
-                width,
-                height,
-            }
-        }
+        ct::CREATE_VIEW => ConsumerMsg::CreateView { view: b.view()? },
+        ct::CLOSE_VIEW => ConsumerMsg::CloseView { view: b.view()? },
+        ct::SET_VISIBLE => ConsumerMsg::SetVisible {
+            view: b.view()?,
+            visible: b.bool()?,
+        },
+        ct::ACTIVATE => ConsumerMsg::Activate {
+            view: b.view()?,
+            token: b.string()?,
+        },
+        ct::SET_USER_AGENT => ConsumerMsg::SetUserAgent {
+            view: b.view()?,
+            user_agent: b.string()?,
+        },
         ct::LOAD_URL => ConsumerMsg::LoadUrl {
-            view: b.i64()?,
+            view: b.view()?,
             url: b.string()?,
         },
-        ct::LOAD_DATA_WITH_BASE_URL => ConsumerMsg::LoadDataWithBaseUrl {
-            view: b.i64()?,
+        ct::LOAD_DATA => ConsumerMsg::LoadData {
+            view: b.view()?,
             base_url: b.string()?,
             data: b.string()?,
             mime: b.string()?,
             encoding: b.string()?,
-            history_url: b.string()?,
         },
-        ct::MOUSE_MOVE => ConsumerMsg::MouseMove {
-            view: b.i64()?,
-            x: b.i32()?,
-            y: b.i32()?,
-            modifiers: b.u32()?,
-            leave: b.bool()?,
-        },
-        ct::MOUSE_CLICK => {
-            let view = b.i64()?;
-            let x = b.i32()?;
-            let y = b.i32()?;
-            let button = b.u8()?;
-            let down = b.bool()?;
-            let click_count = b.u8()?;
-            let modifiers = b.u32()?;
-            if button > 2 {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "mouse button (0=L/1=M/2=R)",
-                });
-            }
-            ConsumerMsg::MouseClick {
-                view,
-                x,
-                y,
-                button,
-                down,
-                click_count,
-                modifiers,
-            }
-        }
-        ct::MOUSE_WHEEL => ConsumerMsg::MouseWheel {
-            view: b.i64()?,
-            x: b.i32()?,
-            y: b.i32()?,
-            delta_x: b.i32()?,
-            delta_y: b.i32()?,
-            modifiers: b.u32()?,
-        },
-        ct::KEY => {
-            let view = b.i64()?;
-            let kind = b.u8()?;
-            let windows_key_code = b.i32()?;
-            let native_key_code = b.i32()?;
-            let character = b.u16()?;
-            let modifiers = b.u32()?;
-            if kind > 2 {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "key kind (0=down/1=up/2=char)",
-                });
-            }
-            ConsumerMsg::Key {
-                view,
-                kind,
-                windows_key_code,
-                native_key_code,
-                character,
-                modifiers,
-            }
-        }
+        ct::RELOAD => ConsumerMsg::Reload { view: b.view()? },
+        ct::STOP_LOADING => ConsumerMsg::StopLoading { view: b.view()? },
+        ct::GO_BACK => ConsumerMsg::GoBack { view: b.view()? },
         ct::EVALUATE_JS => ConsumerMsg::EvaluateJs {
-            view: b.i64()?,
+            view: b.view()?,
+            request_id: b.u32()?,
             script: b.string()?,
         },
-        ct::COOKIE_SET => ConsumerMsg::CookieSet {
-            url: b.string()?,
-            name: b.string()?,
-            value: b.string()?,
-            domain: b.string()?,
-            path: b.string()?,
-            secure: b.bool()?,
-            http_only: b.bool()?,
-            expires_epoch_s: b.i64()?,
-        },
-        ct::COOKIE_GET => ConsumerMsg::CookieGet {
-            request_id: b.u32()?,
-            url: b.string()?,
-        },
-        ct::COOKIES_CLEAR => ConsumerMsg::CookiesClear {
-            request_id: b.u32()?,
-        },
-        ct::FRAME_ACK => ConsumerMsg::FrameAck {
-            view: b.i64()?,
-            generation: b.u32()?,
-            seq: b.u32()?,
-        },
-        ct::SHUTDOWN => ConsumerMsg::Shutdown,
         ct::BRIDGE_REGISTER => {
-            let view = b.i64()?;
+            let view = b.view()?;
             let name = b.string()?;
             let count = b.u16()?;
             let mut methods = Vec::with_capacity(usize::from(count).min(256));
             for _ in 0..count {
-                methods.push(BridgeMethod {
-                    name: b.string()?,
-                    returns_value: b.bool()?,
-                });
+                methods.push(b.string()?);
             }
             ConsumerMsg::BridgeRegister {
                 view,
@@ -1226,35 +1259,40 @@ pub fn read_consumer_msg<R: Read>(r: &mut R) -> Result<ConsumerMsg, ProtoError> 
                 methods,
             }
         }
+        ct::BRIDGE_UNREGISTER => ConsumerMsg::BridgeUnregister {
+            view: b.view()?,
+            name: b.string()?,
+        },
         ct::BRIDGE_RESULT => ConsumerMsg::BridgeResult {
             call_id: b.u32()?,
             ok: b.bool()?,
             result_json: b.string()?,
         },
-        ct::EVALUATE_JS_FOR_RESULT => ConsumerMsg::EvaluateJsForResult {
-            view: b.i64()?,
-            request_id: b.u32()?,
-            script: b.string()?,
+        ct::POLICY_REPLY => ConsumerMsg::PolicyReply {
+            policy_id: b.u32()?,
+            override_load: b.bool()?,
         },
-        ct::COOKIE_SET_FOR_RESULT => ConsumerMsg::CookieSetForResult {
+        ct::COOKIE_SET => ConsumerMsg::CookieSet {
             request_id: b.u32()?,
             url: b.string()?,
-            name: b.string()?,
-            value: b.string()?,
-            domain: b.string()?,
-            path: b.string()?,
-            secure: b.bool()?,
-            http_only: b.bool()?,
-            expires_epoch_s: b.i64()?,
+            header: b.string()?,
+        },
+        ct::COOKIE_IMPORT => ConsumerMsg::CookieImport {
+            request_id: b.u32()?,
+            cookies: b.cookies()?,
+        },
+        ct::COOKIE_GET => ConsumerMsg::CookieGet {
+            request_id: b.u32()?,
+            url: b.string()?,
+        },
+        ct::COOKIES_CLEAR => ConsumerMsg::CookiesClear {
+            request_id: b.u32()?,
+            scope: b.enumerated(ClearScope::from_byte, "cookie clear scope")?,
         },
         ct::COOKIE_FLUSH => ConsumerMsg::CookieFlush {
             request_id: b.u32()?,
         },
-        ct::COOKIES_CLEAR_SESSION => ConsumerMsg::CookiesClearSession {
-            request_id: b.u32()?,
-        },
-        ct::GO_BACK => ConsumerMsg::GoBack { view: b.i64()? },
-
+        ct::SHUTDOWN => ConsumerMsg::Shutdown,
         _ => return Err(ProtoError::UnknownType { type_byte: t }),
     };
     b.finish()?;
@@ -1269,133 +1307,51 @@ pub fn read_helper_msg<R: Read>(r: &mut R) -> Result<HelperMsg, ProtoError> {
             version: b.u16()?,
             engine: b.string()?,
         },
-        ht::LOAD_STATE => {
-            let view = b.i64()?;
-            let state = b.u8()?;
-            let http_status = b.i32()?;
-            if state != 0 && state != 3 {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "load state (0=started/3=finished)",
-                });
+        ht::FATAL => HelperMsg::Fatal {
+            reason: b.string()?,
+        },
+        ht::LOAD_CHANGED => HelperMsg::LoadChanged {
+            view: b.view()?,
+            event: b.enumerated(LoadEvent::from_byte, "load event")?,
+            url: b.string()?,
+        },
+        ht::NAVIGATION_STATE => HelperMsg::NavigationState {
+            view: b.view()?,
+            url: b.string()?,
+            title: b.string()?,
+            can_go_back: b.bool()?,
+        },
+        ht::PROGRESS => {
+            let view = b.view()?;
+            let percent = b.u8()?;
+            if percent > 100 {
+                return Err(b.bad("load progress (must be 0..=100)"));
             }
-            HelperMsg::LoadState {
-                view,
-                state,
-                http_status,
-            }
+            HelperMsg::Progress { view, percent }
         }
-        ht::FRAME_BUFFER_NEW => {
-            let view = b.i64()?;
-            let generation = b.u32()?;
-            let width = b.u16()?;
-            let height = b.u16()?;
-            let stride = b.u32()?;
-            let slot_bytes = b.u32()?;
-            let slot_count = b.u8()?;
-            if width == 0 || height == 0 {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "frame dimensions (must be nonzero)",
-                });
-            }
-            if stride != 4 * u32::from(width) {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "stride (must be 4*width in v1)",
-                });
-            }
-            if slot_bytes != stride.saturating_mul(u32::from(height)) {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "slot_bytes (must be stride*height)",
-                });
-            }
-            if slot_count != super::slots::SLOT_COUNT {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "slot_count (must equal the tracker's SLOT_COUNT)",
-                });
-            }
-            HelperMsg::FrameBufferNew {
-                view,
-                generation,
-                width,
-                height,
-                stride,
-                slot_bytes,
-                slot_count,
-            }
-        }
-        ht::FRAME_READY => {
-            let view = b.i64()?;
-            let generation = b.u32()?;
-            let slot = b.u8()?;
-            let seq = b.u32()?;
-            if slot >= super::slots::SLOT_COUNT {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "slot index (must be below the tracker's SLOT_COUNT)",
-                });
-            }
-            HelperMsg::FrameReady {
-                view,
-                generation,
-                slot,
-                seq,
-            }
-        }
-        ht::CONSOLE => {
-            let view = b.i64()?;
-            let severity = b.u8()?;
-            let source = b.string()?;
-            let line = b.u32()?;
-            let message_len = b.u32()?;
-            HelperMsg::Console {
-                view,
-
-                console: Console {
-                    severity,
-                    source: super::redact::url_scheme_and_host_for_log(&source),
-                    line,
-                    message_len,
-                },
-            }
-        }
-        ht::CRASH => {
-            let view = b.i64()?;
-            let kind = b.u8()?;
-            let code = b.i32()?;
-            if kind > 2 {
-                return Err(ProtoError::BadValue {
-                    type_byte: t,
-                    what: "crash kind (0=renderer/1=init/2=internal)",
-                });
-            }
-            HelperMsg::Crash { view, kind, code }
-        }
-        ht::COOKIE_LIST => {
-            let request_id = b.u32()?;
-            let count = b.u16()?;
-            let mut cookies = Vec::with_capacity(usize::from(count).min(256));
-            for _ in 0..count {
-                cookies.push(CookieEntry {
-                    name: b.string()?,
-                    value: b.string()?,
-                    domain: b.string()?,
-                    path: b.string()?,
-                    secure: b.bool()?,
-                    http_only: b.bool()?,
-                });
-            }
-            HelperMsg::CookieList {
-                request_id,
-                cookies,
-            }
-        }
-        ht::VIEW_CLOSED => HelperMsg::ViewClosed { view: b.i64()? },
+        ht::LOAD_FAILED => HelperMsg::LoadFailed {
+            view: b.view()?,
+            url: b.string()?,
+            error: b.enumerated(LoadError::from_byte, "load error")?,
+            description: b.string()?,
+        },
+        ht::RESOURCE_LOAD => HelperMsg::ResourceLoad {
+            view: b.view()?,
+            url: b.string()?,
+        },
+        ht::POLICY_REQUEST => HelperMsg::PolicyRequest {
+            view: b.view()?,
+            policy_id: b.u32()?,
+            url: b.string()?,
+            redirect: b.bool()?,
+            user_gesture: b.bool()?,
+            method: b.string()?,
+        },
+        ht::CLOSE_REQUESTED => HelperMsg::CloseRequested { view: b.view()? },
+        ht::VIEW_CLOSED => HelperMsg::ViewClosed { view: b.view()? },
+        ht::WEB_PROCESS_GONE => HelperMsg::WebProcessGone { view: b.view()? },
         ht::BRIDGE_CALL => HelperMsg::BridgeCall {
-            view: b.i64()?,
+            view: b.view()?,
             call_id: b.u32()?,
             payload_json: b.string()?,
         },
@@ -1408,17 +1364,33 @@ pub fn read_helper_msg<R: Read>(r: &mut R) -> Result<HelperMsg, ProtoError> {
             request_id: b.u32()?,
             ok: b.bool()?,
         },
-        ht::COOKIE_FLUSH_DONE => HelperMsg::CookieFlushDone {
+        ht::COOKIE_IMPORT_RESULT => HelperMsg::CookieImportResult {
             request_id: b.u32()?,
-            ok: b.bool()?,
+            imported: b.u32()?,
+            failed: b.u32()?,
         },
-        ht::COOKIES_CLEAR_DONE => HelperMsg::CookiesClearDone {
+        ht::COOKIE_LIST => {
+            let request_id = b.u32()?;
+            let count = b.u16()?;
+            let mut cookies = Vec::with_capacity(usize::from(count).min(256));
+            for _ in 0..count {
+                cookies.push(CookiePair {
+                    name: b.string()?,
+                    value: b.string()?,
+                });
+            }
+            HelperMsg::CookieList {
+                request_id,
+                cookies,
+            }
+        }
+        ht::COOKIES_CLEARED => HelperMsg::CookiesCleared {
             request_id: b.u32()?,
             removed: b.bool()?,
         },
-        ht::NAVIGATION_STATE => HelperMsg::NavigationState {
-            view: b.i64()?,
-            can_go_back: b.bool()?,
+        ht::COOKIE_FLUSHED => HelperMsg::CookieFlushed {
+            request_id: b.u32()?,
+            ok: b.bool()?,
         },
         _ => return Err(ProtoError::UnknownType { type_byte: t }),
     };
@@ -1426,98 +1398,125 @@ pub fn read_helper_msg<R: Read>(r: &mut R) -> Result<HelperMsg, ProtoError> {
     Ok(msg)
 }
 
+pub fn encode_cookies(cookies: &[StoredCookie]) -> Result<Vec<u8>, ProtoError> {
+    let mut buf = Vec::new();
+    put_cookies(&mut buf, ct::COOKIE_IMPORT, cookies)?;
+    Ok(buf)
+}
+
+pub fn decode_cookies(bytes: &[u8]) -> Result<Vec<StoredCookie>, ProtoError> {
+    let mut body = Body::new(bytes, ct::COOKIE_IMPORT);
+    let cookies = body.cookies()?;
+    body.finish()?;
+    Ok(cookies)
+}
+
 pub fn hello_ack_version_supported(version: u16) -> bool {
-    version == super::PROTO_VERSION
+    version == PROTO_VERSION
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn a_cookie(name: &str, expiry: CookieExpiry) -> StoredCookie {
+        StoredCookie {
+            name: name.to_string(),
+            value: "v".to_string(),
+            domain: ".roblox.com".to_string(),
+            path: "/".to_string(),
+            secure: true,
+            http_only: true,
+            same_site: SameSite::Lax,
+            expiry,
+        }
+    }
+
     fn all_consumer_msgs() -> Vec<ConsumerMsg> {
         vec![
             ConsumerMsg::Hello {
-                version: super::super::PROTO_VERSION,
+                version: PROTO_VERSION,
             },
             ConsumerMsg::CreateView {
                 view: 0x0000_0002_0000_0001,
-                width: 1024,
-                height: 768,
             },
             ConsumerMsg::CloseView { view: 42 },
-            ConsumerMsg::ResizeView {
+            ConsumerMsg::SetVisible {
                 view: 42,
-                width: 800,
-                height: 600,
+                visible: true,
+            },
+            ConsumerMsg::Activate {
+                view: 42,
+                token: "activation-token".to_string(),
+            },
+            ConsumerMsg::SetUserAgent {
+                view: 42,
+                user_agent: "Mozilla/5.0 ROBLOX Android App Hybrid()".to_string(),
             },
             ConsumerMsg::LoadUrl {
                 view: 42,
                 url: "https://apps.roblox.com/challenge?t=x".to_string(),
             },
-            ConsumerMsg::LoadDataWithBaseUrl {
+            ConsumerMsg::LoadData {
                 view: 42,
                 base_url: "https://host".to_string(),
                 data: "<html>päge</html>".to_string(),
                 mime: "text/html".to_string(),
                 encoding: "utf-8".to_string(),
-                history_url: String::new(),
             },
-            ConsumerMsg::MouseMove {
-                view: 42,
-                x: -1,
-                y: 7,
-                modifiers: u32::MAX,
-                leave: true,
-            },
-            ConsumerMsg::MouseClick {
-                view: 42,
-                x: 10,
-                y: 20,
-                button: 2,
-                down: false,
-                click_count: 1,
-                modifiers: 0,
-            },
-            ConsumerMsg::MouseWheel {
-                view: 42,
-                x: 0,
-                y: 0,
-                delta_x: -120,
-                delta_y: 120,
-                modifiers: 0,
-            },
-            ConsumerMsg::Key {
-                view: 42,
-                kind: 2,
-                windows_key_code: 0x41,
-                native_key_code: 30,
-                character: 0x2764,
-                modifiers: 4,
-            },
+            ConsumerMsg::Reload { view: 42 },
+            ConsumerMsg::StopLoading { view: 42 },
+            ConsumerMsg::GoBack { view: 42 },
             ConsumerMsg::EvaluateJs {
                 view: 42,
-                script: "console.log(1)".to_string(),
+                request_id: 7,
+                script: "navigator.userAgent".to_string(),
+            },
+            ConsumerMsg::BridgeRegister {
+                view: 42,
+                name: "EclipseTest".to_string(),
+                methods: vec!["echo".to_string(), "pöst".to_string()],
+            },
+            ConsumerMsg::BridgeUnregister {
+                view: 42,
+                name: "EclipseTest".to_string(),
+            },
+            ConsumerMsg::BridgeResult {
+                call_id: u32::MAX,
+                ok: false,
+                result_json: String::new(),
+            },
+            ConsumerMsg::PolicyReply {
+                policy_id: 3,
+                override_load: true,
             },
             ConsumerMsg::CookieSet {
+                request_id: 9,
                 url: "https://www.roblox.com/".to_string(),
-                name: ".ROBLOSECURITY".to_string(),
-                value: "v".to_string(),
-                domain: ".roblox.com".to_string(),
-                path: "/".to_string(),
-                secure: true,
-                http_only: true,
-                expires_epoch_s: 0,
+                header: ".ROBLOSECURITY=v; Domain=.roblox.com; Path=/; Secure; HttpOnly"
+                    .to_string(),
+            },
+            ConsumerMsg::CookieImport {
+                request_id: 10,
+                cookies: vec![
+                    a_cookie("session", CookieExpiry::Session),
+                    a_cookie(
+                        "persistent",
+                        CookieExpiry::At {
+                            epoch_s: 1_900_000_000,
+                        },
+                    ),
+                ],
             },
             ConsumerMsg::CookieGet {
-                request_id: 7,
+                request_id: 11,
                 url: "https://www.roblox.com/".to_string(),
             },
-            ConsumerMsg::CookiesClear { request_id: 8 },
-            ConsumerMsg::FrameAck {
-                view: 42,
-                generation: 3,
-                seq: 99,
+            ConsumerMsg::CookiesClear {
+                request_id: 12,
+                scope: ClearScope::Session,
             },
+            ConsumerMsg::CookieFlush { request_id: 13 },
             ConsumerMsg::Shutdown,
         ]
     }
@@ -1525,59 +1524,89 @@ mod tests {
     fn all_helper_msgs() -> Vec<HelperMsg> {
         vec![
             HelperMsg::HelloAck {
-                version: super::super::PROTO_VERSION,
-                engine: "cef/152.0.6+g708dc14+chromium-152.0.7977.83".to_string(),
+                version: PROTO_VERSION,
+                engine: "webkitgtk/2.54.0".to_string(),
             },
-            HelperMsg::LoadState {
+            HelperMsg::Fatal {
+                reason: "no display".to_string(),
+            },
+            HelperMsg::LoadChanged {
                 view: 42,
-                state: 3,
-                http_status: 200,
+                event: LoadEvent::Committed,
+                url: "https://www.roblox.com/login".to_string(),
             },
-            HelperMsg::FrameBufferNew {
+            HelperMsg::NavigationState {
                 view: 42,
-                generation: 3,
-                width: 1024,
-                height: 768,
-                stride: 4096,
-                slot_bytes: 4096 * 768,
-                slot_count: super::super::slots::SLOT_COUNT,
+                url: "https://www.roblox.com/login".to_string(),
+                title: "Roblox".to_string(),
+                can_go_back: true,
             },
-            HelperMsg::FrameReady {
+            HelperMsg::Progress {
                 view: 42,
-                generation: 3,
-                slot: super::super::slots::SLOT_COUNT - 1,
-                seq: 99,
+                percent: 100,
             },
-            HelperMsg::Console {
+            HelperMsg::LoadFailed {
                 view: 42,
-                console: Console::from_raw(2, "https://host/x?y", 12, "text"),
+                url: "https://nx.invalid/".to_string(),
+                error: LoadError::HostLookup,
+                description: "Error resolving".to_string(),
             },
-            HelperMsg::Crash {
-                view: 0,
-                kind: 1,
-                code: -7,
+            HelperMsg::ResourceLoad {
+                view: 42,
+                url: "https://css.rbxcdn.com/a.css".to_string(),
+            },
+            HelperMsg::PolicyRequest {
+                view: 42,
+                policy_id: 3,
+                url: "roblox://placeId=1".to_string(),
+                redirect: false,
+                user_gesture: true,
+                method: "GET".to_string(),
+            },
+            HelperMsg::CloseRequested { view: 42 },
+            HelperMsg::ViewClosed { view: 42 },
+            HelperMsg::WebProcessGone { view: 42 },
+            HelperMsg::BridgeCall {
+                view: 42,
+                call_id: 1,
+                payload_json: "{\"iface\":\"EclipseTest\",\"method\":\"echo\",\"args\":[\"ping\"]}"
+                    .to_string(),
+            },
+            HelperMsg::EvaluateJsResult {
+                request_id: u32::MAX,
+                ok: true,
+                value_json: "\"echo:ping\"".to_string(),
+            },
+            HelperMsg::CookieSetResult {
+                request_id: 9,
+                ok: true,
+            },
+            HelperMsg::CookieImportResult {
+                request_id: 10,
+                imported: 2,
+                failed: 0,
             },
             HelperMsg::CookieList {
-                request_id: 7,
-                cookies: vec![CookieEntry {
+                request_id: 11,
+                cookies: vec![CookiePair {
                     name: "a".to_string(),
                     value: "b".to_string(),
-                    domain: ".roblox.com".to_string(),
-                    path: "/".to_string(),
-                    secure: true,
-                    http_only: false,
                 }],
             },
-            HelperMsg::ViewClosed { view: 42 },
+            HelperMsg::CookiesCleared {
+                request_id: 12,
+                removed: false,
+            },
+            HelperMsg::CookieFlushed {
+                request_id: 13,
+                ok: true,
+            },
         ]
     }
 
     #[test]
-    fn proto_roundtrip_encodes_and_decodes_every_v1_message() {
+    fn every_message_round_trips_through_its_encoding() {
         let consumer = all_consumer_msgs();
-        let helper = all_helper_msgs();
-        assert_eq!(consumer.len() + helper.len(), 24, "v1 has exactly 24 types");
-
         let mut stream = Vec::new();
         for m in &consumer {
             stream.extend_from_slice(&m.encode().expect("encode"));
@@ -1590,6 +1619,7 @@ mod tests {
         }
         assert_eq!(read_consumer_msg(&mut r), Err(ProtoError::Eof));
 
+        let helper = all_helper_msgs();
         let mut stream = Vec::new();
         for m in &helper {
             stream.extend_from_slice(&m.encode().expect("encode"));
@@ -1604,7 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn proto_decoder_is_total_on_truncated_frames() {
+    fn decoders_are_total_on_every_truncated_prefix() {
         let mut stream = Vec::new();
         for m in all_consumer_msgs() {
             stream.extend_from_slice(&m.encode().expect("encode"));
@@ -1637,12 +1667,11 @@ mod tests {
     }
 
     #[test]
-    fn proto_rejects_oversized_declared_length_before_allocating() {
+    fn oversized_declared_lengths_are_rejected_before_allocating() {
         let mut hostile = Vec::new();
         hostile.extend_from_slice(&u32::MAX.to_le_bytes());
-        let mut r = hostile.as_slice();
         assert_eq!(
-            read_consumer_msg(&mut r),
+            read_consumer_msg(&mut hostile.as_slice()),
             Err(ProtoError::Oversized {
                 type_byte: None,
                 declared_len: u32::MAX,
@@ -1654,34 +1683,44 @@ mod tests {
         let mut hostile = Vec::new();
         hostile.extend_from_slice(&(declared as u32).to_le_bytes());
         hostile.push(ct::LOAD_URL);
-        let mut r = hostile.as_slice();
         assert_eq!(
-            read_consumer_msg(&mut r),
+            read_consumer_msg(&mut hostile.as_slice()),
             Err(ProtoError::Oversized {
                 type_byte: Some(ct::LOAD_URL),
                 declared_len: declared as u32,
                 cap: LOAD_URL_CAP,
             })
         );
+
+        let declared = 65 * 1024;
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&(declared as u32).to_le_bytes());
+        hostile.push(ht::PROGRESS);
+        assert_eq!(
+            read_helper_msg(&mut hostile.as_slice()),
+            Err(ProtoError::Oversized {
+                type_byte: Some(ht::PROGRESS),
+                declared_len: declared as u32,
+                cap: DEFAULT_CAP,
+            })
+        );
     }
 
     #[test]
-    fn proto_rejects_unknown_type_trailing_bytes_and_bad_bools() {
+    fn unknown_types_trailing_bytes_bad_bools_and_bad_enums_are_rejected() {
         let mut frame = Vec::new();
         frame.extend_from_slice(&1u32.to_le_bytes());
         frame.push(0x7F);
-        let mut r = frame.as_slice();
         assert_eq!(
-            read_consumer_msg(&mut r),
+            read_consumer_msg(&mut frame.as_slice()),
             Err(ProtoError::UnknownType { type_byte: 0x7F })
         );
 
         let mut frame = Vec::new();
         frame.extend_from_slice(&1u32.to_le_bytes());
         frame.push(ht::HELLO_ACK);
-        let mut r = frame.as_slice();
         assert_eq!(
-            read_consumer_msg(&mut r),
+            read_consumer_msg(&mut frame.as_slice()),
             Err(ProtoError::UnknownType {
                 type_byte: ht::HELLO_ACK
             })
@@ -1691,64 +1730,85 @@ mod tests {
         frame.extend_from_slice(&2u32.to_le_bytes());
         frame.push(ct::SHUTDOWN);
         frame.push(0xAA);
-        let mut r = frame.as_slice();
         assert_eq!(
-            read_consumer_msg(&mut r),
+            read_consumer_msg(&mut frame.as_slice()),
             Err(ProtoError::TrailingBytes {
                 type_byte: ct::SHUTDOWN,
                 extra: 1
             })
         );
 
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&5u32.to_le_bytes());
-        frame.push(ct::CLOSE_VIEW);
-        frame.extend_from_slice(&[0, 0, 0, 0]);
-        let mut r = frame.as_slice();
-        assert_eq!(
-            read_consumer_msg(&mut r),
-            Err(ProtoError::TruncatedBody {
-                type_byte: ct::CLOSE_VIEW
-            })
-        );
-
-        let good = ConsumerMsg::MouseMove {
+        let mut bad = ConsumerMsg::SetVisible {
             view: 1,
-            x: 0,
-            y: 0,
-            modifiers: 0,
-            leave: false,
+            visible: true,
         }
         .encode()
         .expect("encode");
-        let mut bad = good.clone();
         let last = bad.len() - 1;
         bad[last] = 2;
-        let mut r = bad.as_slice();
         assert_eq!(
-            read_consumer_msg(&mut r),
+            read_consumer_msg(&mut bad.as_slice()),
             Err(ProtoError::BadBool {
-                type_byte: ct::MOUSE_MOVE,
+                type_byte: ct::SET_VISIBLE,
                 value: 2
             })
         );
+
+        let mut bad = ConsumerMsg::CookiesClear {
+            request_id: 1,
+            scope: ClearScope::All,
+        }
+        .encode()
+        .expect("encode");
+        let last = bad.len() - 1;
+        bad[last] = 9;
+        assert!(matches!(
+            read_consumer_msg(&mut bad.as_slice()),
+            Err(ProtoError::BadValue {
+                type_byte: ct::COOKIES_CLEAR,
+                ..
+            })
+        ));
+
+        let mut bad = HelperMsg::Progress {
+            view: 1,
+            percent: 100,
+        }
+        .encode()
+        .expect("encode");
+        let last = bad.len() - 1;
+        bad[last] = 101;
+        assert!(matches!(
+            read_helper_msg(&mut bad.as_slice()),
+            Err(ProtoError::BadValue {
+                type_byte: ht::PROGRESS,
+                ..
+            })
+        ));
+
+        let bad = ConsumerMsg::CloseView { view: 0 }.encode().expect("encode");
+        assert!(matches!(
+            read_consumer_msg(&mut bad.as_slice()),
+            Err(ProtoError::BadValue {
+                type_byte: ct::CLOSE_VIEW,
+                ..
+            })
+        ));
     }
 
     #[test]
-    fn proto_rejects_invalid_utf8_in_string_fields() {
-        let good = ConsumerMsg::LoadUrl {
+    fn invalid_utf8_in_a_string_field_is_rejected() {
+        let mut bad = ConsumerMsg::LoadUrl {
             view: 1,
             url: "https://host/ab".to_string(),
         }
         .encode()
         .expect("encode");
-        let mut bad = good.clone();
         let last = bad.len() - 1;
         bad[last] = 0xFF;
         bad[last - 1] = 0xFE;
-        let mut r = bad.as_slice();
         assert_eq!(
-            read_consumer_msg(&mut r),
+            read_consumer_msg(&mut bad.as_slice()),
             Err(ProtoError::BadUtf8 {
                 type_byte: ct::LOAD_URL
             })
@@ -1757,287 +1817,71 @@ mod tests {
 
     #[test]
     fn hello_handshake_requires_exact_magic_and_version() {
-        let good = ConsumerMsg::Hello {
-            version: super::super::PROTO_VERSION,
+        let mut bad = ConsumerMsg::Hello {
+            version: PROTO_VERSION,
         }
         .encode()
         .expect("encode");
-        let mut bad = good.clone();
         bad[5] = b'X';
-        let mut r = bad.as_slice();
-        assert_eq!(read_consumer_msg(&mut r), Err(ProtoError::BadMagic));
-
-        let ack = HelperMsg::HelloAck {
-            version: super::super::PROTO_VERSION + 1,
-            engine: "cef/test".to_string(),
-        };
-        let bytes = ack.encode().expect("encode");
-        let mut r = bytes.as_slice();
-        match read_helper_msg(&mut r).expect("decode") {
-            HelperMsg::HelloAck { version, .. } => {
-                assert!(!hello_ack_version_supported(version));
-                assert!(hello_ack_version_supported(super::super::PROTO_VERSION));
-            }
-            other => panic!("expected HelloAck, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn console_event_never_carries_message_text_or_raw_url() {
-        let secret_text = "SECRET-CONSOLE-TEXT-DO-NOT-SHIP";
-        let console = Console::from_raw(
-            2,
-            "https://apps.roblox.com/challenge/verify?token=TOKENSECRET",
-            7,
-            secret_text,
-        );
-        assert_eq!(console.source(), "https://apps.roblox.com");
-        assert_eq!(console.message_len(), secret_text.len() as u32);
-
-        let msg = HelperMsg::Console { view: 42, console };
-        let bytes = msg.encode().expect("encode");
-        let hay = bytes.as_slice();
-        for needle in [
-            secret_text.as_bytes(),
-            b"TOKENSECRET".as_slice(),
-            b"/challenge".as_slice(),
-            b"?token".as_slice(),
-        ] {
-            assert!(
-                !hay.windows(needle.len()).any(|w| w == needle),
-                "encoded console frame leaked {:?}",
-                String::from_utf8_lossy(needle)
-            );
-        }
-
-        let mut r = bytes.as_slice();
-        match read_helper_msg(&mut r).expect("decode") {
-            HelperMsg::Console { view, console } => {
-                assert_eq!(view, 42);
-                assert_eq!(console.severity(), 2);
-                assert_eq!(console.source(), "https://apps.roblox.com");
-                assert_eq!(console.line(), 7);
-                assert_eq!(console.message_len(), secret_text.len() as u32);
-            }
-            other => panic!("expected Console, got {other:?}"),
-        }
-    }
-
-    fn all_consumer_msgs_v2() -> Vec<ConsumerMsg> {
-        vec![
-            ConsumerMsg::BridgeRegister {
-                view: 0x0000_0002_0000_0001,
-                name: "EclipseTest".to_string(),
-                methods: vec![
-                    BridgeMethod {
-                        name: "echo".to_string(),
-                        returns_value: true,
-                    },
-                    BridgeMethod {
-                        name: "pöst".to_string(),
-                        returns_value: false,
-                    },
-                ],
-            },
-            ConsumerMsg::BridgeResult {
-                call_id: u32::MAX,
-                ok: false,
-                result_json: String::new(),
-            },
-            ConsumerMsg::EvaluateJsForResult {
-                view: -1,
-                request_id: 7,
-                script: "navigator.userAgent".to_string(),
-            },
-            ConsumerMsg::CookieSetForResult {
-                request_id: 0,
-                url: "https://www.roblox.com/".to_string(),
-                name: ".ROBLOSECURITY".to_string(),
-                value: "v".to_string(),
-                domain: ".roblox.com".to_string(),
-                path: "/".to_string(),
-                secure: true,
-                http_only: true,
-                expires_epoch_s: -5,
-            },
-        ]
-    }
-
-    fn all_helper_msgs_v2() -> Vec<HelperMsg> {
-        vec![
-            HelperMsg::BridgeCall {
-                view: 42,
-                call_id: 1,
-                payload_json: "{\"iface\":\"EclipseTest\",\"method\":\"echo\",\"args\":[\"ping\"]}"
-                    .to_string(),
-            },
-            HelperMsg::EvaluateJsResult {
-                request_id: u32::MAX,
-                ok: true,
-                value_json: "\"echo:ping\"".to_string(),
-            },
-            HelperMsg::CookieSetResult {
-                request_id: 9,
-                ok: true,
-            },
-        ]
-    }
-
-    #[test]
-    fn proto_roundtrip_encodes_and_decodes_every_v2_message() {
-        let consumer = all_consumer_msgs_v2();
-        let helper = all_helper_msgs_v2();
-        assert_eq!(consumer.len() + helper.len(), 7, "v2 adds exactly 7 types");
-
-        let mut stream = Vec::new();
-        for m in &consumer {
-            stream.extend_from_slice(&m.encode().expect("encode"));
-        }
-        let mut r = stream.as_slice();
-        for m in &consumer {
-            let decoded = read_consumer_msg(&mut r).expect("decode");
-            assert_eq!(&decoded, m);
-            assert_eq!(decoded.encode().expect("re-encode"), m.encode().unwrap());
-        }
-        assert_eq!(read_consumer_msg(&mut r), Err(ProtoError::Eof));
-
-        let mut stream = Vec::new();
-        for m in &helper {
-            stream.extend_from_slice(&m.encode().expect("encode"));
-        }
-        let mut r = stream.as_slice();
-        for m in &helper {
-            let decoded = read_helper_msg(&mut r).expect("decode");
-            assert_eq!(&decoded, m);
-            assert_eq!(decoded.encode().expect("re-encode"), m.encode().unwrap());
-        }
-        assert_eq!(read_helper_msg(&mut r), Err(ProtoError::Eof));
-    }
-
-    #[test]
-    fn proto_roundtrip_encodes_and_decodes_every_v3_message() {
-        let consumer = [
-            ConsumerMsg::CookieFlush {
-                request_id: u32::MAX,
-            },
-            ConsumerMsg::CookiesClearSession { request_id: 7 },
-        ];
-        let helper = [
-            HelperMsg::CookieFlushDone {
-                request_id: u32::MAX,
-                ok: true,
-            },
-            HelperMsg::CookiesClearDone {
-                request_id: 7,
-                removed: false,
-            },
-        ];
-        assert_eq!(consumer.len() + helper.len(), 4, "v3 adds exactly 4 types");
-
-        let mut stream = Vec::new();
-        for msg in &consumer {
-            stream.extend_from_slice(&msg.encode().expect("encode consumer v3"));
-        }
-        assert_eq!(stream[4], ct::COOKIE_FLUSH);
-        assert_eq!(stream[13], ct::COOKIES_CLEAR_SESSION);
-        let mut r = stream.as_slice();
-        for msg in &consumer {
-            assert_eq!(read_consumer_msg(&mut r).expect("decode consumer v3"), *msg);
-        }
-        assert_eq!(read_consumer_msg(&mut r), Err(ProtoError::Eof));
-
-        let mut stream = Vec::new();
-        for msg in &helper {
-            stream.extend_from_slice(&msg.encode().expect("encode helper v3"));
-        }
-        assert_eq!(stream[4], ht::COOKIE_FLUSH_DONE);
-        assert_eq!(stream[14], ht::COOKIES_CLEAR_DONE);
-        let mut r = stream.as_slice();
-        for msg in &helper {
-            assert_eq!(read_helper_msg(&mut r).expect("decode helper v3"), *msg);
-        }
-        assert_eq!(read_helper_msg(&mut r), Err(ProtoError::Eof));
-    }
-
-    #[test]
-    fn proto_roundtrip_encodes_and_decodes_every_v4_message() {
-        let consumer = ConsumerMsg::GoBack { view: 42 };
-        let helper = HelperMsg::NavigationState {
-            view: 42,
-            can_go_back: true,
-        };
-
-        let bytes = consumer.encode().expect("encode consumer v4");
-        assert_eq!(bytes[4], ct::GO_BACK);
         assert_eq!(
-            read_consumer_msg(&mut bytes.as_slice()).expect("decode consumer v4"),
-            consumer
+            read_consumer_msg(&mut bad.as_slice()),
+            Err(ProtoError::BadMagic)
         );
-
-        let bytes = helper.encode().expect("encode helper v4");
-        assert_eq!(bytes[4], ht::NAVIGATION_STATE);
-        assert_eq!(
-            read_helper_msg(&mut bytes.as_slice()).expect("decode helper v4"),
-            helper
-        );
+        assert!(hello_ack_version_supported(PROTO_VERSION));
+        assert!(!hello_ack_version_supported(PROTO_VERSION - 1));
+        assert!(!hello_ack_version_supported(PROTO_VERSION + 1));
     }
 
     #[test]
-    fn frame_messages_reject_slot_counts_and_indices_outside_the_tracker() {
-        let slots = super::super::slots::SLOT_COUNT;
-        let announce = |slot_count| {
-            HelperMsg::FrameBufferNew {
-                view: 1,
-                generation: 1,
-                width: 4,
-                height: 2,
-                stride: 16,
-                slot_bytes: 32,
-                slot_count,
-            }
-            .encode()
-            .expect("encode")
-        };
-        assert!(read_helper_msg(&mut announce(slots).as_slice()).is_ok());
-        for bad in [slots - 1, slots + 1] {
-            assert!(matches!(
-                read_helper_msg(&mut announce(bad).as_slice()),
-                Err(ProtoError::BadValue { .. })
-            ));
+    fn consumer_frame_len_waits_for_a_whole_frame_and_rejects_hostile_lengths() {
+        let frame = ConsumerMsg::GoBack { view: 3 }.encode().expect("encode");
+        for cut in 0..frame.len() {
+            assert_eq!(consumer_frame_len(&frame[..cut]), Ok(None), "cut {cut}");
         }
-        let ready = |slot| {
-            HelperMsg::FrameReady {
-                view: 1,
-                generation: 1,
-                slot,
-                seq: 1,
-            }
-            .encode()
-            .expect("encode")
-        };
-        assert!(read_helper_msg(&mut ready(slots - 1).as_slice()).is_ok());
+        let mut two = frame.clone();
+        two.extend_from_slice(&frame);
+        assert_eq!(consumer_frame_len(&two), Ok(Some(frame.len())));
+
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&(GLOBAL_FRAME_CAP + 1).to_le_bytes());
         assert!(matches!(
-            read_helper_msg(&mut ready(slots).as_slice()),
-            Err(ProtoError::BadValue { .. })
+            consumer_frame_len(&hostile),
+            Err(ProtoError::Oversized {
+                type_byte: None,
+                ..
+            })
         ));
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&(DEFAULT_CAP + 1).to_le_bytes());
+        hostile.push(ct::GO_BACK);
+        assert!(matches!(
+            consumer_frame_len(&hostile),
+            Err(ProtoError::Oversized {
+                type_byte: Some(ct::GO_BACK),
+                ..
+            })
+        ));
+        let mut unknown = Vec::new();
+        unknown.extend_from_slice(&1u32.to_le_bytes());
+        unknown.push(0x7F);
+        assert_eq!(
+            consumer_frame_len(&unknown),
+            Err(ProtoError::UnknownType { type_byte: 0x7F })
+        );
     }
 
     #[test]
-    fn cookie_list_carries_a_full_chromium_cookie_jar_for_one_url() {
-        let cookie = |i: usize| CookieEntry {
-            name: format!("n{i:03}"),
-            value: "v".repeat(4096 - 4),
-            domain: "d".repeat(1024),
-            path: "p".repeat(1024),
-            secure: i.is_multiple_of(2),
-            http_only: i.is_multiple_of(3),
-        };
+    fn a_full_cookie_jar_for_one_url_fits_a_single_frame() {
         let msg = HelperMsg::CookieList {
             request_id: 9,
-            cookies: (0..180).map(cookie).collect(),
+            cookies: (0..180)
+                .map(|i| CookiePair {
+                    name: format!("n{i:03}"),
+                    value: "v".repeat(4096 - 4),
+                })
+                .collect(),
         };
         let bytes = msg.encode().expect("a 180-cookie jar fits the frame cap");
-        assert_eq!(bytes[4], ht::COOKIE_LIST);
         assert_eq!(
             read_helper_msg(&mut bytes.as_slice()).expect("decode the full jar"),
             msg
@@ -2045,113 +1889,86 @@ mod tests {
     }
 
     #[test]
-    fn proto_v2_caps_reject_oversized_before_allocating() {
-        let declared = 65 * 1024;
-        let mut hostile = Vec::new();
-        hostile.extend_from_slice(&(declared as u32).to_le_bytes());
-        hostile.push(ct::BRIDGE_REGISTER);
-        let mut r = hostile.as_slice();
+    fn a_cookie_jar_round_trips_and_rejects_truncation_and_trailing_bytes() {
+        let jar = vec![
+            a_cookie("session", CookieExpiry::Session),
+            a_cookie(
+                "persistent",
+                CookieExpiry::At {
+                    epoch_s: 1_900_000_000,
+                },
+            ),
+        ];
+        let bytes = encode_cookies(&jar).expect("encode");
+        assert_eq!(decode_cookies(&bytes), Ok(jar));
         assert_eq!(
-            read_consumer_msg(&mut r),
-            Err(ProtoError::Oversized {
-                type_byte: Some(ct::BRIDGE_REGISTER),
-                declared_len: declared as u32,
-                cap: DEFAULT_CAP,
-            })
+            decode_cookies(&encode_cookies(&[]).expect("encode")),
+            Ok(Vec::new())
         );
-
-        let declared = 9 * 1024 * 1024;
-        let mut hostile = Vec::new();
-        hostile.extend_from_slice(&(declared as u32).to_le_bytes());
-        let mut r = hostile.as_slice();
-        assert_eq!(
-            read_consumer_msg(&mut r),
-            Err(ProtoError::Oversized {
-                type_byte: None,
-                declared_len: declared as u32,
-                cap: GLOBAL_FRAME_CAP,
-            })
-        );
+        assert!(matches!(
+            decode_cookies(&bytes[..bytes.len() - 1]),
+            Err(ProtoError::TruncatedBody { .. })
+        ));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            decode_cookies(&trailing),
+            Err(ProtoError::TrailingBytes { extra: 1, .. })
+        ));
     }
 
     #[test]
-    fn proto_v2_decoder_is_total_on_truncated_v2_frames() {
-        let mut stream = Vec::new();
-        for m in all_consumer_msgs_v2() {
-            stream.extend_from_slice(&m.encode().expect("encode"));
-        }
-        for cut in 0..stream.len() {
-            let mut r = &stream[..cut];
-            loop {
-                match read_consumer_msg(&mut r) {
-                    Ok(_) => continue,
-                    Err(ProtoError::Eof) | Err(ProtoError::Truncated) => break,
-                    Err(other) => panic!("consumer prefix len {cut}: unexpected error {other:?}"),
-                }
+    fn lists_longer_than_the_count_field_fail_to_encode_instead_of_truncating() {
+        let methods = vec![String::new(); usize::from(u16::MAX) + 1];
+        assert_eq!(
+            ConsumerMsg::BridgeRegister {
+                view: 1,
+                name: "EclipseTest".to_string(),
+                methods,
             }
-        }
-        let mut stream = Vec::new();
-        for m in all_helper_msgs_v2() {
-            stream.extend_from_slice(&m.encode().expect("encode"));
-        }
-        for cut in 0..stream.len() {
-            let mut r = &stream[..cut];
-            loop {
-                match read_helper_msg(&mut r) {
-                    Ok(_) => continue,
-                    Err(ProtoError::Eof) | Err(ProtoError::Truncated) => break,
-                    Err(other) => panic!("helper prefix len {cut}: unexpected error {other:?}"),
-                }
+            .encode(),
+            Err(ProtoError::BadValue {
+                type_byte: ct::BRIDGE_REGISTER,
+                what: "item count (at most 65535)",
+            })
+        );
+        let cookies = vec![
+            CookiePair {
+                name: String::new(),
+                value: String::new(),
+            };
+            usize::from(u16::MAX) + 1
+        ];
+        assert!(matches!(
+            HelperMsg::CookieList {
+                request_id: 1,
+                cookies,
             }
-        }
+            .encode(),
+            Err(ProtoError::BadValue {
+                type_byte: ht::COOKIE_LIST,
+                ..
+            })
+        ));
+        let jar = vec![a_cookie("n", CookieExpiry::Session); usize::from(u16::MAX) + 1];
+        assert!(matches!(
+            encode_cookies(&jar),
+            Err(ProtoError::BadValue { .. })
+        ));
     }
 
     #[test]
-    fn bridge_call_frame_never_leaks_payload_bytes() {
-        let payload = "opaque-test-value";
-        let call = HelperMsg::BridgeCall {
-            view: 7,
-            call_id: 3,
-            payload_json: format!("{{\"args\":[\"{payload}\"]}}"),
-        };
-        let bytes = call.encode().expect("encode");
-        assert!(
-            bytes
-                .windows(payload.len())
-                .any(|w| w == payload.as_bytes()),
-            "the page-controlled bridge payload must cross the wire"
-        );
-        let mut r = bytes.as_slice();
-        assert_eq!(read_helper_msg(&mut r).expect("decode"), call);
-
-        let set = ConsumerMsg::CookieSetForResult {
-            request_id: 1,
-            url: "https://www.roblox.com/".to_string(),
-            name: ".ROBLOSECURITY".to_string(),
-            value: payload.to_string(),
-            domain: ".roblox.com".to_string(),
-            path: "/".to_string(),
-            secure: true,
-            http_only: true,
-            expires_epoch_s: 0,
-        };
-        let bytes = set.encode().expect("encode");
-        assert!(bytes
-            .windows(payload.len())
-            .any(|w| w == payload.as_bytes()));
-        let mut r = bytes.as_slice();
-        assert_eq!(read_consumer_msg(&mut r).expect("decode"), set);
-
-        let eval = ConsumerMsg::EvaluateJsForResult {
-            view: 7,
-            request_id: 2,
-            script: format!("document.cookie=\"{payload}\""),
-        };
-        let bytes = eval.encode().expect("encode");
-        assert!(bytes
-            .windows(payload.len())
-            .any(|w| w == payload.as_bytes()));
-        let mut r = bytes.as_slice();
-        assert_eq!(read_consumer_msg(&mut r).expect("decode"), eval);
+    fn load_events_and_errors_map_to_the_android_constants() {
+        assert_eq!(LoadEvent::Started.android_state(), 0);
+        assert_eq!(LoadEvent::Committed.android_state(), 2);
+        assert_eq!(LoadEvent::Finished.android_state(), 3);
+        assert_eq!(LoadError::Unknown.android_code(), -1);
+        assert_eq!(LoadError::HostLookup.android_code(), -2);
+        assert_eq!(LoadError::Connect.android_code(), -6);
+        assert_eq!(LoadError::Timeout.android_code(), -8);
+        assert_eq!(LoadError::UnsupportedScheme.android_code(), -10);
+        assert_eq!(LoadError::FailedSslHandshake.android_code(), -11);
+        assert_eq!(LoadError::BadUrl.android_code(), -12);
+        assert_eq!(LoadError::FileNotFound.android_code(), -14);
     }
 }

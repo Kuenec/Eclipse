@@ -264,11 +264,11 @@ pub fn active_window() -> WindowHandle {
 }
 
 #[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn pack_unpack_round_trips() {

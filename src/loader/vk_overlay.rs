@@ -86,10 +86,10 @@ enum ByteOrder {
 
 impl ByteOrder {
     fn of_swapchain(format_raw: i32) -> Option<Self> {
-        match classify_swapchain_format(format_raw) {
-            CompositeFormat::Bgra => Some(Self::Bgra),
-            CompositeFormat::RgbaSwizzle => Some(Self::Rgba),
-            CompositeFormat::Unsupported => None,
+        match vk::Format::from_raw(format_raw) {
+            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => Some(Self::Bgra),
+            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => Some(Self::Rgba),
+            _ => None,
         }
     }
 
@@ -542,7 +542,6 @@ unsafe extern "system" fn eclipse_vk_acquire_next_image_khr(
     };
     let host: vk::PFN_vkAcquireNextImageKHR =
         unsafe { std::mem::transmute::<usize, vk::PFN_vkAcquireNextImageKHR>(addr) };
-    let _swapchain = swapchain_lock();
     unsafe {
         acquire_like_android(swapchain, p_image_index, || {
             host(device, swapchain, timeout, semaphore, fence, p_image_index)
@@ -619,7 +618,6 @@ unsafe extern "system" fn eclipse_vk_acquire_next_image2_khr(
         unsafe { std::mem::transmute::<usize, vk::PFN_vkAcquireNextImage2KHR>(addr) };
     let swapchain =
         unsafe { p_acquire_info.as_ref() }.map_or(vk::SwapchainKHR::null(), |i| i.swapchain);
-    let _swapchain = swapchain_lock();
     unsafe {
         acquire_like_android(swapchain, p_image_index, || {
             host(device, p_acquire_info, p_image_index)
@@ -655,37 +653,11 @@ unsafe extern "system" fn eclipse_vk_create_device(
     let host: vk::PFN_vkCreateDevice =
         unsafe { std::mem::transmute::<usize, vk::PFN_vkCreateDevice>(addr) };
 
-    let create_info = unsafe { p_create_info.as_ref() };
-    let engine_queues = create_info
-        .filter(|ci| ci.queue_create_info_count > 0 && !ci.p_queue_create_infos.is_null())
-        .map(|ci| unsafe {
-            std::slice::from_raw_parts(ci.p_queue_create_infos, ci.queue_create_info_count as usize)
-        });
-    let reservation = engine_queues.and_then(|infos| {
-        let available = queue_family_queue_count(physical_device, infos[0].queue_family_index)?;
-        reserve_web_present_queue(available, infos[0].queue_count).map(|index| (index, infos))
-    });
-    let (r, reserved_index) = match (reservation, create_info) {
-        (Some((index, infos)), Some(ci)) => {
-            let priorities = vec![1.0f32; index as usize + 1];
-            let mut queue_infos = infos.to_vec();
-            queue_infos[0] = queue_infos[0].queue_priorities(&priorities);
-            let widened = ci.queue_create_infos(&queue_infos);
-            (
-                unsafe { host(physical_device, &widened, p_allocator, p_device) },
-                index,
-            )
-        }
-        _ => (
-            unsafe { host(physical_device, p_create_info, p_allocator, p_device) },
-            u32::MAX,
-        ),
-    };
+    let r = unsafe { host(physical_device, p_create_info, p_allocator, p_device) };
     if r == vk::Result::SUCCESS && !p_device.is_null() {
         let device = unsafe { *p_device };
 
         PHYSICAL_DEVICE.store(physical_device.as_raw(), Ordering::Relaxed);
-        WEB_PRESENT_QUEUE_INDEX.store(reserved_index, Ordering::Relaxed);
         if !p_create_info.is_null() {
             let ci = unsafe { &*p_create_info };
             if ci.queue_create_info_count > 0 && !ci.p_queue_create_infos.is_null() {
@@ -715,7 +687,6 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
         unsafe { std::mem::transmute::<usize, vk::PFN_vkCreateSwapchainKHR>(addr) };
 
     let Some(requested) = (unsafe { p_create_info.as_ref() }) else {
-        let _swapchain = swapchain_lock();
         return unsafe { host(device, p_create_info, p_allocator, p_swapchain) };
     };
     let present_mode = match unsafe {
@@ -739,7 +710,6 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
         .present_mode(present_mode)
         .image_usage(image_usage);
 
-    let _swapchain = swapchain_lock();
     let r = unsafe { host(device, &info, p_allocator, p_swapchain) };
     if r == vk::Result::SUCCESS && !p_swapchain.is_null() {
         let swapchain = unsafe { *p_swapchain };
@@ -778,7 +748,6 @@ unsafe extern "system" fn eclipse_vk_destroy_swapchain_khr(
     let host: vk::PFN_vkDestroySwapchainKHR =
         unsafe { std::mem::transmute::<usize, vk::PFN_vkDestroySwapchainKHR>(addr) };
 
-    let _swapchain = swapchain_lock();
     retire_swapchain(swapchain.as_raw());
     unsafe { host(device, swapchain, p_allocator) };
     if let Ok(mut sets) = PRESENT_SEMAPHORES.lock() {
@@ -787,14 +756,6 @@ unsafe extern "system" fn eclipse_vk_destroy_swapchain_khr(
 }
 
 fn retire_swapchain(swapchain: u64) {
-    {
-        let mut slot = WEB_PRESENTER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.as_ref().is_some_and(|p| p.swapchain == swapchain) {
-            *slot = None;
-        }
-    }
     let mut st = STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -970,60 +931,7 @@ fn find_host_visible_mem_type(
 
 static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
 
-static WEB_COMPOSITE: Mutex<Option<Probe>> = Mutex::new(None);
-
-static WEB_COMPOSITE_LAST: AtomicU64 = AtomicU64::new(0);
-
-static SWAPCHAIN_LOCK: Mutex<()> = Mutex::new(());
-
 static PRESENT_SEMAPHORES: Mutex<Vec<PresentSemaphores>> = Mutex::new(Vec::new());
-
-static WEB_PRESENT_QUEUE_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
-
-static LAST_ENGINE_PRESENT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-
-static WEB_PRESENTER: Mutex<Option<WebPresenter>> = Mutex::new(None);
-
-static WEB_GPU_HELD: AtomicBool = AtomicBool::new(false);
-
-const WEB_PRESENT_ENGINE_GAP: std::time::Duration = std::time::Duration::from_millis(12);
-
-fn swapchain_lock() -> std::sync::MutexGuard<'static, ()> {
-    SWAPCHAIN_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn note_engine_present() {
-    if let Ok(mut last) = LAST_ENGINE_PRESENT.lock() {
-        *last = Some(std::time::Instant::now());
-    }
-}
-
-fn engine_presented_within(gap: std::time::Duration) -> bool {
-    LAST_ENGINE_PRESENT
-        .lock()
-        .ok()
-        .and_then(|last| *last)
-        .is_some_and(|at| at.elapsed() < gap)
-}
-
-fn reserve_web_present_queue(family_queue_count: u32, engine_queue_count: u32) -> Option<u32> {
-    (engine_queue_count > 0 && family_queue_count > engine_queue_count)
-        .then_some(engine_queue_count)
-}
-
-fn queue_family_queue_count(physical_device: vk::PhysicalDevice, family: u32) -> Option<u32> {
-    let entry = super::vulkan_wsi::host_entry()?;
-    let instance_raw = INSTANCE.load(Ordering::Relaxed);
-    if instance_raw == 0 {
-        return None;
-    }
-    let instance =
-        unsafe { ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(instance_raw)) };
-    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-    families.get(family as usize).map(|f| f.queue_count)
-}
 
 fn find_device_local_mem_type(
     props: &vk::PhysicalDeviceMemoryProperties,
@@ -1038,43 +946,6 @@ fn find_device_local_mem_type(
                     .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
         })
         .or_else(|| (0..props.memory_type_count).find(|&i| usable(i)))
-}
-
-struct WebPresenter {
-    device: ash::Device,
-    device_raw: u64,
-    queue: vk::Queue,
-    acquire_next_image: vk::PFN_vkAcquireNextImageKHR,
-    queue_present: vk::PFN_vkQueuePresentKHR,
-    swapchain: u64,
-    extent: vk::Extent2D,
-    images: Vec<u64>,
-    command_pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-    blank_frames: Vec<vk::CommandBuffer>,
-    fence: FrameFence,
-    acquire: vk::Semaphore,
-    done: Vec<vk::Semaphore>,
-    saved: vk::Image,
-    saved_memory: vk::DeviceMemory,
-    saved_valid: bool,
-    saved_ready: vk::Semaphore,
-    saved_signal_pending: bool,
-    frame: vk::Buffer,
-    frame_memory: vk::DeviceMemory,
-    frame_mapped: *mut u8,
-    frame_rect: vk::Rect2D,
-    frame_key: u64,
-}
-
-unsafe impl Send for WebPresenter {}
-
-#[derive(Debug, Clone, Copy)]
-struct SavedFrameTarget {
-    image: vk::Image,
-    extent: vk::Extent2D,
-    ready: vk::Semaphore,
-    wait_ready: bool,
 }
 
 fn rect_copy(rect: vk::Rect2D) -> vk::BufferImageCopy {
@@ -1147,115 +1018,6 @@ fn color_layers() -> vk::ImageSubresourceLayers {
         .layer_count(1)
 }
 
-unsafe fn record_blank_frame(
-    device: &ash::Device,
-    cmd: vk::CommandBuffer,
-    image: vk::Image,
-) -> ash::prelude::VkResult<()> {
-    let to_dst = vk::ImageMemoryBarrier::default()
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(color_range());
-    let to_present = vk::ImageMemoryBarrier::default()
-        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .dst_access_mask(vk::AccessFlags::MEMORY_READ)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(color_range());
-    unsafe {
-        device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[to_dst],
-        );
-        device.cmd_clear_color_image(
-            cmd,
-            image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.0, 1.0],
-            },
-            &[color_range()],
-        );
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[to_present],
-        );
-        device.end_command_buffer(cmd)
-    }
-}
-
-unsafe fn record_save_engine_frame(
-    device: &ash::Device,
-    cmd: vk::CommandBuffer,
-    image: vk::Image,
-    saved: vk::Image,
-    extent: vk::Extent2D,
-) {
-    let to_src = vk::ImageMemoryBarrier::default()
-        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(color_range());
-    let saved_writable = vk::ImageMemoryBarrier::default()
-        .old_layout(vk::ImageLayout::GENERAL)
-        .new_layout(vk::ImageLayout::GENERAL)
-        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(saved)
-        .subresource_range(color_range());
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[to_src, saved_writable],
-        );
-        let copy = vk::ImageCopy::default()
-            .src_subresource(color_layers())
-            .dst_subresource(color_layers())
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            });
-        device.cmd_copy_image(
-            cmd,
-            image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            saved,
-            vk::ImageLayout::GENERAL,
-            &[copy],
-        );
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct EngineHandles {
     instance: u64,
@@ -1282,696 +1044,8 @@ impl EngineHandles {
     }
 }
 
-impl WebPresenter {
-    fn build(
-        entry: &ash::Entry,
-        engine: EngineHandles,
-        queue_index: u32,
-        swapchain: u64,
-        extent: vk::Extent2D,
-        format: vk::Format,
-        images: Vec<u64>,
-    ) -> Option<WebPresenter> {
-        if !engine.complete()
-            || swapchain == 0
-            || extent.width == 0
-            || extent.height == 0
-            || images.is_empty()
-        {
-            return None;
-        }
-        let host_gdpa_addr = cached(&HOST_GDPA)?;
-        let host_gdpa: vk::PFN_vkGetDeviceProcAddr =
-            unsafe { std::mem::transmute::<usize, vk::PFN_vkGetDeviceProcAddr>(host_gdpa_addr) };
-        let device_handle = vk::Device::from_raw(engine.device);
-        let acquire_next_image: vk::PFN_vkAcquireNextImageKHR = unsafe {
-            std::mem::transmute::<vk::PFN_vkVoidFunction, Option<vk::PFN_vkAcquireNextImageKHR>>(
-                host_gdpa(device_handle, c"vkAcquireNextImageKHR".as_ptr()),
-            )
-        }?;
-        let queue_present: vk::PFN_vkQueuePresentKHR = unsafe {
-            std::mem::transmute::<vk::PFN_vkVoidFunction, Option<vk::PFN_vkQueuePresentKHR>>(
-                host_gdpa(device_handle, c"vkQueuePresentKHR".as_ptr()),
-            )
-        }?;
-
-        let instance = unsafe {
-            ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(engine.instance))
-        };
-        let device = unsafe { ash::Device::load(instance.fp_v1_0(), device_handle) };
-        let mem_props = unsafe {
-            instance.get_physical_device_memory_properties(vk::PhysicalDevice::from_raw(
-                engine.physical_device,
-            ))
-        };
-        let queue = unsafe { device.get_device_queue(engine.queue_family, queue_index) };
-
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-            .queue_family_index(engine.queue_family);
-        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }.ok()?;
-        let fence = match FrameFence::new(&device) {
-            Ok(fence) => fence,
-            Err(_) => {
-                unsafe { device.destroy_command_pool(command_pool, None) };
-                return None;
-            }
-        };
-        let mut presenter = WebPresenter {
-            device: device.clone(),
-            device_raw: engine.device,
-            queue,
-            acquire_next_image,
-            queue_present,
-            swapchain,
-            extent,
-            images,
-            command_pool,
-            cmd: vk::CommandBuffer::null(),
-            blank_frames: Vec::new(),
-            fence,
-            acquire: vk::Semaphore::null(),
-            done: Vec::new(),
-            saved: vk::Image::null(),
-            saved_memory: vk::DeviceMemory::null(),
-            saved_valid: false,
-            saved_ready: vk::Semaphore::null(),
-            saved_signal_pending: false,
-            frame: vk::Buffer::null(),
-            frame_memory: vk::DeviceMemory::null(),
-            frame_mapped: std::ptr::null_mut(),
-            frame_rect: vk::Rect2D::default(),
-            frame_key: 0,
-        };
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        presenter.cmd = unsafe { device.allocate_command_buffers(&alloc) }
-            .ok()?
-            .into_iter()
-            .next()?;
-        let blank_alloc = alloc.command_buffer_count(u32::try_from(presenter.images.len()).ok()?);
-        presenter.blank_frames = unsafe { device.allocate_command_buffers(&blank_alloc) }.ok()?;
-        for (&cmd, &image) in presenter.blank_frames.iter().zip(&presenter.images) {
-            unsafe { record_blank_frame(&device, cmd, vk::Image::from_raw(image)) }.ok()?;
-        }
-        presenter.acquire =
-            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.ok()?;
-        presenter.saved_ready =
-            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.ok()?;
-        for _ in 0..presenter.images.len() {
-            let done =
-                unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-                    .ok()?;
-            presenter.done.push(done);
-        }
-
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-        presenter.saved = unsafe { device.create_image(&image_info, None) }.ok()?;
-        let image_req = unsafe { device.get_image_memory_requirements(presenter.saved) };
-        let image_mt = find_device_local_mem_type(&mem_props, image_req.memory_type_bits)?;
-        presenter.saved_memory = unsafe {
-            device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(image_req.size)
-                    .memory_type_index(image_mt),
-                None,
-            )
-        }
-        .ok()?;
-        unsafe { device.bind_image_memory(presenter.saved, presenter.saved_memory, 0) }.ok()?;
-
-        let frame_bytes = u64::from(extent.width) * u64::from(extent.height) * 4;
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(frame_bytes)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        presenter.frame = unsafe { device.create_buffer(&buffer_info, None) }.ok()?;
-        let buffer_req = unsafe { device.get_buffer_memory_requirements(presenter.frame) };
-        let buffer_mt =
-            find_host_visible_mem_type(&mem_props, buffer_req.memory_type_bits, HostAccess::Write)?;
-        presenter.frame_memory = unsafe {
-            device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(buffer_req.size)
-                    .memory_type_index(buffer_mt),
-                None,
-            )
-        }
-        .ok()?;
-        unsafe { device.bind_buffer_memory(presenter.frame, presenter.frame_memory, 0) }.ok()?;
-        presenter.frame_mapped = unsafe {
-            device.map_memory(
-                presenter.frame_memory,
-                0,
-                frame_bytes,
-                vk::MemoryMapFlags::empty(),
-            )
-        }
-        .ok()?
-        .cast::<u8>();
-
-        unsafe { presenter.initialize_saved_layout() }.then_some(presenter)
-    }
-
-    unsafe fn initialize_saved_layout(&mut self) -> bool {
-        unsafe {
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            if self.device.begin_command_buffer(self.cmd, &begin).is_err() {
-                return false;
-            }
-            let to_general = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.saved)
-                .subresource_range(color_range());
-            self.device.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_general],
-            );
-            if self.device.end_command_buffer(self.cmd).is_err() {
-                return false;
-            }
-        }
-        let cmds = [self.cmd];
-        let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        self.fence
-            .submit(&self.device, self.queue, &[submit])
-            .is_ok()
-            && self.fence.retire(&self.device).is_ok()
-    }
-
-    fn saved_target(&self, extent: vk::Extent2D) -> Option<SavedFrameTarget> {
-        (self.extent == extent).then_some(SavedFrameTarget {
-            image: self.saved,
-            extent,
-            ready: self.saved_ready,
-            wait_ready: self.saved_signal_pending,
-        })
-    }
-
-    fn matches(&self, swapchain: u64, extent: vk::Extent2D, images: &[u64]) -> bool {
-        self.swapchain == swapchain && self.extent == extent && self.images == images
-    }
-
-    unsafe fn fill(
-        &mut self,
-        key: u64,
-        rect: vk::Rect2D,
-        src: &[u8],
-        src_stride: usize,
-        swizzle: bool,
-    ) -> bool {
-        if rect.extent.width == 0
-            || rect.extent.height == 0
-            || rect.extent.width > self.extent.width
-            || rect.extent.height > self.extent.height
-        {
-            return false;
-        }
-        if self.frame_key == key && self.frame_rect == rect {
-            return true;
-        }
-        if self.fence.retire(&self.device).is_err() {
-            return false;
-        }
-        let row_bytes = rect.extent.width as usize * 4;
-        let rows = rect.extent.height as usize;
-        let dst = unsafe { std::slice::from_raw_parts_mut(self.frame_mapped, row_bytes * rows) };
-        if !bgra_rows_into(dst, row_bytes, src, src_stride, rows, row_bytes, swizzle) {
-            return false;
-        }
-        self.frame_key = key;
-        self.frame_rect = rect;
-        true
-    }
-
-    unsafe fn present(&mut self) -> bool {
-        if self.fence.retire(&self.device).is_err() {
-            return false;
-        }
-        let mut image_index = 0u32;
-        let acquired = unsafe {
-            (self.acquire_next_image)(
-                vk::Device::from_raw(self.device_raw),
-                vk::SwapchainKHR::from_raw(self.swapchain),
-                0,
-                self.acquire,
-                vk::Fence::null(),
-                &mut image_index,
-            )
-        };
-        if acquired != vk::Result::SUCCESS && acquired != vk::Result::SUBOPTIMAL_KHR {
-            return false;
-        }
-        let slot = image_index as usize;
-        let (Some(&image_raw), Some(&done), Some(&blank)) = (
-            self.images.get(slot),
-            self.done.get(slot),
-            self.blank_frames.get(slot),
-        ) else {
-            return false;
-        };
-        if !unsafe { self.record_present_copy(vk::Image::from_raw(image_raw)) } {
-            unsafe { self.release_acquired(image_index, done, blank) };
-            return false;
-        }
-        let waits = [self.acquire, self.saved_ready];
-        let wait_count = if self.saved_signal_pending { 2 } else { 1 };
-        let wait_stages = [vk::PipelineStageFlags::TRANSFER; 2];
-        let cmds = [self.cmd];
-        let signals = [done];
-        let submit = vk::SubmitInfo::default()
-            .wait_semaphores(&waits[..wait_count])
-            .wait_dst_stage_mask(&wait_stages[..wait_count])
-            .command_buffers(&cmds)
-            .signal_semaphores(&signals);
-        if self
-            .fence
-            .submit(&self.device, self.queue, &[submit])
-            .is_err()
-        {
-            unsafe { self.release_acquired(image_index, done, blank) };
-            return false;
-        }
-        self.saved_signal_pending = false;
-        let presented = unsafe { self.present_image(image_index, done) };
-        self.fence.retire(&self.device).is_ok()
-            && (presented == vk::Result::SUCCESS || presented == vk::Result::SUBOPTIMAL_KHR)
-    }
-
-    unsafe fn present_image(&self, image_index: u32, done: vk::Semaphore) -> vk::Result {
-        let waits = [done];
-        let swapchains = [vk::SwapchainKHR::from_raw(self.swapchain)];
-        let indices = [image_index];
-        let present = vk::PresentInfoKHR::default()
-            .wait_semaphores(&waits)
-            .swapchains(&swapchains)
-            .image_indices(&indices);
-        unsafe { (self.queue_present)(self.queue, &present) }
-    }
-
-    unsafe fn release_acquired(
-        &mut self,
-        image_index: u32,
-        done: vk::Semaphore,
-        blank: vk::CommandBuffer,
-    ) {
-        let waits = [self.acquire];
-        let wait_stages = [vk::PipelineStageFlags::TRANSFER];
-        let cmds = [blank];
-        let signals = [done];
-        let release = vk::SubmitInfo::default()
-            .wait_semaphores(&waits)
-            .wait_dst_stage_mask(&wait_stages)
-            .command_buffers(&cmds)
-            .signal_semaphores(&signals);
-        if let Err(e) = self.fence.submit(&self.device, self.queue, &[release]) {
-            tracing::error!(
-                error = %e,
-                "vk-overlay: WebView presenter could not release an acquired swapchain image"
-            );
-            return;
-        }
-        let presented = unsafe { self.present_image(image_index, done) };
-        if presented != vk::Result::SUCCESS && presented != vk::Result::SUBOPTIMAL_KHR {
-            tracing::warn!(
-                result = ?presented,
-                "vk-overlay: presenting a released swapchain image failed"
-            );
-        }
-        if let Err(e) = self.fence.retire(&self.device) {
-            tracing::error!(error = %e, "vk-overlay: releasing a swapchain image did not finish");
-        }
-    }
-
-    unsafe fn record_present_copy(&self, image: vk::Image) -> bool {
-        let full = vk::Extent3D {
-            width: self.extent.width,
-            height: self.extent.height,
-            depth: 1,
-        };
-        unsafe {
-            if self
-                .device
-                .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
-                .is_err()
-            {
-                return false;
-            }
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            if self.device.begin_command_buffer(self.cmd, &begin).is_err() {
-                return false;
-            }
-            let to_dst = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(color_range());
-            let saved_readable = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.saved)
-                .subresource_range(color_range());
-            self.device.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE | vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_dst, saved_readable],
-            );
-            if self.saved_valid {
-                let copy = vk::ImageCopy::default()
-                    .src_subresource(color_layers())
-                    .dst_subresource(color_layers())
-                    .extent(full);
-                self.device.cmd_copy_image(
-                    self.cmd,
-                    self.saved,
-                    vk::ImageLayout::GENERAL,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[copy],
-                );
-                let ordered = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(image)
-                    .subresource_range(color_range());
-                self.device.cmd_pipeline_barrier(
-                    self.cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[ordered],
-                );
-            } else {
-                self.device.cmd_clear_color_image(
-                    self.cmd,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 1.0],
-                    },
-                    &[color_range()],
-                );
-            }
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(color_layers())
-                .image_offset(vk::Offset3D {
-                    x: self.frame_rect.offset.x,
-                    y: self.frame_rect.offset.y,
-                    z: 0,
-                })
-                .image_extent(vk::Extent3D {
-                    width: self.frame_rect.extent.width,
-                    height: self.frame_rect.extent.height,
-                    depth: 1,
-                });
-            self.device.cmd_copy_buffer_to_image(
-                self.cmd,
-                self.frame,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
-            let to_present = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(color_range());
-            self.device.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_present],
-            );
-            self.device.end_command_buffer(self.cmd).is_ok()
-        }
-    }
-
-    fn consume_saved_signal(&mut self) -> bool {
-        let waits = [self.saved_ready];
-        let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
-        let consume = vk::SubmitInfo::default()
-            .wait_semaphores(&waits)
-            .wait_dst_stage_mask(&wait_stages);
-        match unsafe {
-            self.device
-                .queue_submit(self.queue, &[consume], vk::Fence::null())
-        } {
-            Ok(()) => {
-                self.saved_signal_pending = false;
-                true
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "vk-overlay: could not consume the saved-frame semaphore; leaking it"
-                );
-                false
-            }
-        }
-    }
-}
-
-impl Drop for WebPresenter {
-    fn drop(&mut self) {
-        let saved_ready_idle = !self.saved_signal_pending || self.consume_saved_signal();
-        unsafe {
-            if let Err(e) = self.device.queue_wait_idle(self.queue) {
-                tracing::warn!(error = %e, "vk-overlay: WebView presenter queue did not drain");
-            }
-            for done in self.done.drain(..) {
-                self.device.destroy_semaphore(done, None);
-            }
-            self.device.destroy_semaphore(self.acquire, None);
-            if saved_ready_idle {
-                self.device.destroy_semaphore(self.saved_ready, None);
-            }
-            self.device.destroy_buffer(self.frame, None);
-            self.device.free_memory(self.frame_memory, None);
-            self.device.destroy_image(self.saved, None);
-            self.device.free_memory(self.saved_memory, None);
-            self.fence.destroy(&self.device);
-            self.device.destroy_command_pool(self.command_pool, None);
-        }
-    }
-}
-
-fn ensure_web_presenter() -> bool {
-    let queue_index = WEB_PRESENT_QUEUE_INDEX.load(Ordering::Relaxed);
-    if queue_index == u32::MAX {
-        return false;
-    }
-    let Ok(mut slot) = WEB_PRESENTER.lock() else {
-        return false;
-    };
-    let (device, swapchain, extent, format, images) = {
-        let Ok(st) = STATE.lock() else {
-            return false;
-        };
-        if st.device == 0 || st.swapchain == 0 || st.images.is_empty() {
-            return false;
-        }
-        let extent = vk::Extent2D {
-            width: st.width,
-            height: st.height,
-        };
-        if slot
-            .as_ref()
-            .is_some_and(|p| p.matches(st.swapchain, extent, &st.images))
-        {
-            return true;
-        }
-        (
-            st.device,
-            st.swapchain,
-            extent,
-            vk::Format::from_raw(st.format),
-            st.images.clone(),
-        )
-    };
-    *slot = None;
-    let Some(entry) = super::vulkan_wsi::host_entry() else {
-        return false;
-    };
-    match WebPresenter::build(
-        entry,
-        EngineHandles::current(device),
-        queue_index,
-        swapchain,
-        extent,
-        format,
-        images,
-    ) {
-        Some(presenter) => {
-            tracing::info!(
-                queue_index,
-                width = extent.width,
-                height = extent.height,
-                "vk-overlay: independent WebView presenter armed on Eclipse's reserved queue"
-            );
-            *slot = Some(presenter);
-            WEB_GPU_HELD.store(true, Ordering::Release);
-            true
-        }
-        None => {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    "vk-overlay: independent WebView presenter unavailable; WebView frames \
-                     will only reach the screen when the engine presents"
-                );
-            }
-            false
-        }
-    }
-}
-
-fn engine_frame_save_target(extent: vk::Extent2D) -> Option<SavedFrameTarget> {
-    if !ensure_web_presenter() {
-        return None;
-    }
-    WEB_PRESENTER
-        .lock()
-        .ok()?
-        .as_ref()
-        .and_then(|p| p.saved_target(extent))
-}
-
-fn mark_engine_frame_saved() {
-    if let Ok(mut slot) = WEB_PRESENTER.lock() {
-        if let Some(p) = slot.as_mut() {
-            p.saved_valid = true;
-            p.saved_signal_pending = true;
-        }
-    }
-}
-
-pub(crate) fn present_staged_webview_frame(view: i64) {
-    if crate::webview::client::active_view() != view
-        || engine_presented_within(WEB_PRESENT_ENGINE_GAP)
-    {
-        return;
-    }
-    let _swapchain = swapchain_lock();
-    if engine_presented_within(WEB_PRESENT_ENGINE_GAP) || !ensure_web_presenter() {
-        return;
-    }
-    let (extent, format_raw) = match STATE.lock() {
-        Ok(st) => (
-            vk::Extent2D {
-                width: st.width,
-                height: st.height,
-            },
-            st.format,
-        ),
-        Err(_) => return,
-    };
-    let swizzle = match classify_swapchain_format(format_raw) {
-        CompositeFormat::Bgra => false,
-        CompositeFormat::RgbaSwizzle => true,
-        CompositeFormat::Unsupported => return,
-    };
-    crate::webview::client::with_latest_frame(view, |stage| {
-        if stage.bytes.is_empty() {
-            return;
-        }
-        let Some((x, y, w, h)) = resolve_webview_rect(
-            crate::webview::client::composited_rect(),
-            extent.width,
-            extent.height,
-            stage.width,
-            stage.height,
-        ) else {
-            return;
-        };
-        let rect = vk::Rect2D {
-            offset: vk::Offset2D {
-                x: x as i32,
-                y: y as i32,
-            },
-            extent: vk::Extent2D {
-                width: w,
-                height: h,
-            },
-        };
-        let Ok(mut slot) = WEB_PRESENTER.lock() else {
-            return;
-        };
-        let Some(presenter) = slot.as_mut() else {
-            return;
-        };
-        let key = (u64::from(stage.generation) << 32) | u64::from(stage.seq);
-        if unsafe { presenter.fill(key, rect, stage.bytes, stage.stride as usize, swizzle) } {
-            unsafe { presenter.present() };
-        }
-    });
-}
-
-fn release_idle_web_gpu(active_view: i64) {
-    if active_view != 0 || !WEB_GPU_HELD.swap(false, Ordering::AcqRel) {
-        return;
-    }
-    *WEB_COMPOSITE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    *WEB_PRESENTER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-}
-
-fn release_probe_for_device(slot: &'static Mutex<Option<Probe>>, device: vk::Device) {
-    let mut probe = match slot.lock() {
+fn release_probe_for_device(device: vk::Device) {
+    let mut probe = match PROBE.lock() {
         Ok(probe) => probe,
         Err(poisoned) => {
             tracing::warn!("vk-overlay: recovering poisoned probe lock during device teardown");
@@ -1987,8 +1061,7 @@ fn release_probe_for_device(slot: &'static Mutex<Option<Probe>>, device: vk::Dev
 }
 
 fn release_overlay_device_resources(device: vk::Device) {
-    release_probe_for_device(&PROBE, device);
-    release_probe_for_device(&WEB_COMPOSITE, device);
+    release_probe_for_device(device);
     {
         let mut compositor = TEXT_COMPOSITOR
             .lock()
@@ -2000,14 +1073,6 @@ fn release_overlay_device_resources(device: vk::Device) {
         };
         if owned {
             *compositor = TextCompositorSlot::Empty;
-        }
-    }
-    if let Ok(mut slot) = WEB_PRESENTER.lock() {
-        if slot
-            .as_ref()
-            .is_some_and(|p| p.device_raw == device.as_raw())
-        {
-            *slot = None;
         }
     }
     if let Ok(mut sets) = PRESENT_SEMAPHORES.lock() {
@@ -2033,8 +1098,6 @@ fn release_overlay_device_resources(device: vk::Device) {
     HOST_GET_SWAPCHAIN_IMAGES.store(0, Ordering::Relaxed);
     HOST_ACQUIRE_NEXT_IMAGE.store(0, Ordering::Relaxed);
     HOST_ACQUIRE_NEXT_IMAGE2.store(0, Ordering::Relaxed);
-    WEB_PRESENT_QUEUE_INDEX.store(u32::MAX, Ordering::Relaxed);
-    WEB_COMPOSITE_LAST.store(0, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2196,13 +1259,6 @@ unsafe fn present_through_gate(
     unsafe { host(queue, &info) }
 }
 
-struct WebFrameSource<'a> {
-    bytes: &'a [u8],
-    stride: usize,
-    swizzle: bool,
-    refresh: bool,
-}
-
 struct Probe {
     device: ash::Device,
     command_pool: vk::CommandPool,
@@ -2219,12 +1275,7 @@ struct Probe {
 unsafe impl Send for Probe {}
 
 impl Probe {
-    fn build(
-        entry: &ash::Entry,
-        engine: EngineHandles,
-        rect: vk::Rect2D,
-        access: HostAccess,
-    ) -> Option<Probe> {
+    fn build(entry: &ash::Entry, engine: EngineHandles, rect: vk::Rect2D) -> Option<Probe> {
         if !engine.complete() || rect.extent.width == 0 || rect.extent.height == 0 {
             return None;
         }
@@ -2294,7 +1345,9 @@ impl Probe {
             }
             cleanup_pool(device);
         };
-        let Some(mt) = find_host_visible_mem_type(&mem_props, req.memory_type_bits, access) else {
+        let Some(mt) =
+            find_host_visible_mem_type(&mem_props, req.memory_type_bits, HostAccess::ReadWrite)
+        else {
             cleanup_buf(&device);
             return None;
         };
@@ -2444,140 +1497,6 @@ impl Probe {
             OverlayBatch::Completed
         }
     }
-
-    unsafe fn upload_bgra(
-        &mut self,
-        queue: vk::Queue,
-        image_raw: u64,
-        engine_waits: &[vk::Semaphore],
-        source: &WebFrameSource<'_>,
-        save_into: Option<SavedFrameTarget>,
-    ) -> OverlayBatch {
-        let image = vk::Image::from_raw(image_raw);
-        let range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
-
-        unsafe {
-            if self.fence.retire(&self.device).is_err()
-                || self
-                    .device
-                    .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
-                    .is_err()
-            {
-                return OverlayBatch::NotSubmitted;
-            }
-            if source.refresh {
-                let w = self.rect.extent.width as usize;
-                let h = self.rect.extent.height as usize;
-                let dst = std::slice::from_raw_parts_mut(self.mapped, w * h * 4);
-                if !bgra_rows_into(
-                    dst,
-                    w * 4,
-                    source.bytes,
-                    source.stride,
-                    h,
-                    w * 4,
-                    source.swizzle,
-                ) {
-                    return OverlayBatch::NotSubmitted;
-                }
-            }
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            if self.device.begin_command_buffer(self.cmd, &begin).is_err() {
-                return OverlayBatch::NotSubmitted;
-            }
-            let to_dst = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_access_mask(vk::AccessFlags::MEMORY_READ)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(range);
-            self.device.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_dst],
-            );
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .layer_count(1),
-                )
-                .image_offset(vk::Offset3D {
-                    x: self.rect.offset.x,
-                    y: self.rect.offset.y,
-                    z: 0,
-                })
-                .image_extent(vk::Extent3D {
-                    width: self.rect.extent.width,
-                    height: self.rect.extent.height,
-                    depth: 1,
-                });
-            self.device.cmd_copy_buffer_to_image(
-                self.cmd,
-                self.buffer,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
-            let mut presented_from = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
-            if let Some(save) = save_into {
-                record_save_engine_frame(&self.device, self.cmd, image, save.image, save.extent);
-                presented_from = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
-            }
-            let back = vk::ImageMemoryBarrier::default()
-                .old_layout(presented_from)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(range);
-            self.device.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[back],
-            );
-            if self.device.end_command_buffer(self.cmd).is_err() {
-                return OverlayBatch::NotSubmitted;
-            }
-            self.gather_waits(
-                engine_waits,
-                save_into
-                    .filter(|save| save.wait_ready)
-                    .map(|save| save.ready),
-            );
-            let cmds = [self.cmd];
-            let signals: &[vk::Semaphore] = match &save_into {
-                Some(save) => std::slice::from_ref(&save.ready),
-                None => &[],
-            };
-            let submit = vk::SubmitInfo::default()
-                .wait_semaphores(&self.waits)
-                .wait_dst_stage_mask(&self.wait_stages)
-                .command_buffers(&cmds)
-                .signal_semaphores(signals);
-            match self.fence.submit(&self.device, queue, &[submit]) {
-                Ok(()) => OverlayBatch::Queued,
-                Err(_) => OverlayBatch::NotSubmitted,
-            }
-        }
-    }
 }
 
 impl Drop for Probe {
@@ -2594,13 +1513,9 @@ impl Drop for Probe {
     }
 }
 
-fn ensure_probe_in(
-    slot: &'static Mutex<Option<Probe>>,
-    rect: vk::Rect2D,
-    access: HostAccess,
-) -> bool {
-    let Ok(mut guard) = slot.lock() else {
-        return false;
+fn ensure_probe(rect: vk::Rect2D) {
+    let Ok(mut guard) = PROBE.lock() else {
+        return;
     };
     if guard.as_ref().is_some_and(|p| {
         p.rect.offset.x == rect.offset.x
@@ -2608,227 +1523,27 @@ fn ensure_probe_in(
             && p.rect.extent.width == rect.extent.width
             && p.rect.extent.height == rect.extent.height
     }) {
-        return false;
+        return;
     }
     let device = STATE.lock().map(|s| s.device).unwrap_or(0);
     if device == 0 {
-        return false;
+        return;
     }
     let Some(entry) = super::vulkan_wsi::host_entry() else {
-        return false;
+        return;
     };
 
     *guard = None;
-    if let Some(p) = Probe::build(entry, EngineHandles::current(device), rect, access) {
+    if let Some(p) = Probe::build(entry, EngineHandles::current(device), rect) {
         tracing::info!(
             x = rect.offset.x,
             y = rect.offset.y,
             w = rect.extent.width,
             h = rect.extent.height,
-            "vk-overlay: overlay/composite objects built for rect"
+            "vk-overlay: text probe objects built for rect"
         );
         *guard = Some(p);
-        return true;
     }
-    false
-}
-
-fn ensure_probe(rect: vk::Rect2D) {
-    let _ = ensure_probe_in(&PROBE, rect, HostAccess::ReadWrite);
-}
-
-fn ensure_web_composite(rect: vk::Rect2D) -> bool {
-    let rebuilt = ensure_probe_in(&WEB_COMPOSITE, rect, HostAccess::Write);
-    if rebuilt {
-        WEB_GPU_HELD.store(true, Ordering::Release);
-    }
-    rebuilt
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompositeFormat {
-    Bgra,
-
-    RgbaSwizzle,
-
-    Unsupported,
-}
-
-fn classify_swapchain_format(raw: i32) -> CompositeFormat {
-    let f = vk::Format::from_raw(raw);
-    if f == vk::Format::B8G8R8A8_UNORM || f == vk::Format::B8G8R8A8_SRGB {
-        CompositeFormat::Bgra
-    } else if f == vk::Format::R8G8B8A8_UNORM || f == vk::Format::R8G8B8A8_SRGB {
-        CompositeFormat::RgbaSwizzle
-    } else {
-        CompositeFormat::Unsupported
-    }
-}
-
-fn bgra_rows_into(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    rows: usize,
-    row_bytes: usize,
-    swizzle: bool,
-) -> bool {
-    for r in 0..rows {
-        let Some(src_start) = r.checked_mul(src_stride) else {
-            return false;
-        };
-        let Some(dst_start) = r.checked_mul(dst_stride) else {
-            return false;
-        };
-        let Some(srow) = src.get(src_start..src_start + row_bytes) else {
-            return false;
-        };
-        let Some(drow) = dst.get_mut(dst_start..dst_start + row_bytes) else {
-            return false;
-        };
-        if swizzle {
-            let (destination_pixels, _) = drow.as_chunks_mut::<4>();
-            let (source_pixels, _) = srow.as_chunks::<4>();
-            for (d, s) in destination_pixels.iter_mut().zip(source_pixels) {
-                d[0] = s[2];
-                d[1] = s[1];
-                d[2] = s[0];
-                d[3] = s[3];
-            }
-        } else {
-            drow.copy_from_slice(srow);
-        }
-    }
-    true
-}
-
-fn clamp_webview_rect(
-    (x, y, w, h): (i32, i32, u32, u32),
-    (extent_w, extent_h): (u32, u32),
-    (stage_w, stage_h): (u32, u32),
-) -> Option<(u32, u32, u32, u32)> {
-    if extent_w == 0 || extent_h == 0 || stage_w == 0 || stage_h == 0 || w == 0 || h == 0 {
-        return None;
-    }
-    let cx = u32::try_from(x.max(0)).ok()?;
-    let cy = u32::try_from(y.max(0)).ok()?;
-    if cx >= extent_w || cy >= extent_h {
-        return None;
-    }
-    let cw = w.min(stage_w).min(extent_w - cx);
-    let ch = h.min(stage_h).min(extent_h - cy);
-    if cw == 0 || ch == 0 {
-        return None;
-    }
-    Some((cx, cy, cw, ch))
-}
-
-pub(crate) fn resolve_webview_rect(
-    cached: Option<(i32, i32, u32, u32)>,
-    extent_w: u32,
-    extent_h: u32,
-    stage_w: u32,
-    stage_h: u32,
-) -> Option<(u32, u32, u32, u32)> {
-    let (x, y, w, h) = match cached {
-        Some(r) => r,
-        None => {
-            let w = stage_w.min(extent_w);
-            let h = stage_h.min(extent_h);
-            (
-                ((extent_w - w) / 2) as i32,
-                ((extent_h - h) / 2) as i32,
-                w,
-                h,
-            )
-        }
-    };
-    clamp_webview_rect((x, y, w, h), (extent_w, extent_h), (stage_w, stage_h))
-}
-
-fn composite_webview_frame(
-    queue: vk::Queue,
-    view: i64,
-    image_raw: u64,
-    extent: vk::Extent2D,
-    format_raw: i32,
-    engine_waits: &[vk::Semaphore],
-) -> OverlayBatch {
-    let swizzle = match classify_swapchain_format(format_raw) {
-        CompositeFormat::Bgra => false,
-        CompositeFormat::RgbaSwizzle => true,
-        CompositeFormat::Unsupported => {
-            static FORMAT_WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !FORMAT_WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    format = format_raw,
-                    "vk-overlay: webview composite skipped — unsupported swapchain format \
-                     (expected B8G8R8A8/R8G8B8A8 UNORM/SRGB)"
-                );
-            }
-            return OverlayBatch::NotSubmitted;
-        }
-    };
-
-    let (batch, drawn) = crate::webview::client::with_latest_frame(view, |stage| {
-        if stage.bytes.is_empty() {
-            return (OverlayBatch::NotSubmitted, None);
-        }
-        let Some((cx, cy, cw, ch)) = resolve_webview_rect(
-            crate::webview::client::composited_rect(),
-            extent.width,
-            extent.height,
-            stage.width,
-            stage.height,
-        ) else {
-            return (OverlayBatch::NotSubmitted, None);
-        };
-        let rect = vk::Rect2D {
-            offset: vk::Offset2D {
-                x: cx as i32,
-                y: cy as i32,
-            },
-            extent: vk::Extent2D {
-                width: cw,
-                height: ch,
-            },
-        };
-        let rebuilt = ensure_web_composite(rect);
-        let key = (u64::from(stage.generation) << 32) | u64::from(stage.seq);
-        let source = WebFrameSource {
-            bytes: stage.bytes,
-            stride: stage.stride as usize,
-            swizzle,
-            refresh: rebuilt || WEB_COMPOSITE_LAST.load(Ordering::Relaxed) != key,
-        };
-        let save_into = engine_frame_save_target(extent);
-        let batch = match WEB_COMPOSITE.lock() {
-            Ok(mut guard) => match guard.as_mut() {
-                Some(p) => unsafe {
-                    p.upload_bgra(queue, image_raw, engine_waits, &source, save_into)
-                },
-                None => OverlayBatch::NotSubmitted,
-            },
-            Err(_) => OverlayBatch::NotSubmitted,
-        };
-        let consumed = batch != OverlayBatch::NotSubmitted;
-        if consumed && save_into.is_some() {
-            mark_engine_frame_saved();
-        }
-        if consumed && source.refresh {
-            WEB_COMPOSITE_LAST.store(key, Ordering::Relaxed);
-        }
-
-        (batch, consumed.then_some((cx as i32, cy as i32, cw, ch)))
-    })
-    .unwrap_or((OverlayBatch::NotSubmitted, None));
-
-    if let Some(rect) = drawn {
-        crate::webview::client::publish_composited_screen_rect(view, rect);
-    }
-    batch
 }
 
 const TEXT_BLEND_SPV: &[u8] = include_bytes!("../../shaders/text_blend.comp.spv");
@@ -3567,19 +2282,16 @@ unsafe fn present_with_overlay(
     host: vk::PFN_vkQueuePresentKHR,
     queue: vk::Queue,
     p_present_info: *const vk::PresentInfoKHR<'_>,
-    active_view: i64,
 ) -> vk::Result {
-    release_idle_web_gpu(active_view);
-    let webview_live = active_view != 0;
     if p_present_info.is_null() {
         return unsafe { host(queue, p_present_info) };
     }
 
-    if !overlay_enabled() && !probe_enabled() && !webview_live {
+    if !overlay_enabled() && !probe_enabled() {
         return unsafe { host(queue, p_present_info) };
     }
 
-    if !probe_enabled() && crate::framework::active_text_field() == 0 && !webview_live {
+    if !probe_enabled() && crate::framework::active_text_field() == 0 {
         return unsafe { host(queue, p_present_info) };
     }
 
@@ -3597,7 +2309,7 @@ unsafe fn present_with_overlay(
         if !COPIES_WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 "vk-overlay: the host surface does not allow copies into the engine swapchain, \
-                 so focused text and WebViews are not drawn over it"
+                 so focused text is not drawn over it"
             );
         }
         return unsafe { host(queue, p_present_info) };
@@ -3626,20 +2338,6 @@ unsafe fn present_with_overlay(
         };
 
     let mut gate = PresentGate::Engine;
-
-    if webview_live && image_raw != 0 {
-        let view = crate::webview::client::active_view();
-        if view != 0 {
-            gate = gate.after(composite_webview_frame(
-                queue,
-                view,
-                image_raw,
-                extent,
-                format_raw,
-                gate.waits(engine_waits),
-            ));
-        }
-    }
 
     if let Some(plan) = text_plan(extent, image_raw, format_raw) {
         if let Some(overlay) = &plan.overlay {
@@ -3713,17 +2411,8 @@ unsafe extern "system" fn eclipse_vk_queue_present_khr(
     let host: vk::PFN_vkQueuePresentKHR =
         unsafe { std::mem::transmute::<usize, vk::PFN_vkQueuePresentKHR>(addr) };
 
-    note_engine_present();
     crate::framework::engine_presented();
-    let _swapchain = swapchain_lock();
-    let result = unsafe {
-        present_with_overlay(
-            host,
-            queue,
-            p_present_info,
-            crate::webview::client::active_view(),
-        )
-    };
+    let result = unsafe { present_with_overlay(host, queue, p_present_info) };
     let report = match result {
         vk::Result::SUCCESS => Some(HostReport::FramePresented),
         vk::Result::SUBOPTIMAL_KHR => Some(HostReport::Suboptimal),
@@ -3753,148 +2442,6 @@ unsafe fn presented_swapchains<'a>(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicI32;
-
-    #[test]
-    fn web_present_queue_is_reserved_only_when_the_family_has_a_spare_queue() {
-        assert_eq!(reserve_web_present_queue(16, 1), Some(1));
-        assert_eq!(reserve_web_present_queue(2, 1), Some(1));
-        assert_eq!(reserve_web_present_queue(3, 2), Some(2));
-        assert_eq!(reserve_web_present_queue(1, 1), None);
-        assert_eq!(reserve_web_present_queue(4, 0), None);
-    }
-
-    #[test]
-    fn bgra_rows_into_copies_and_swizzles_rows() {
-        let src: Vec<u8> = [
-            [1, 2, 3, 4, 5, 6, 7, 8].as_slice(),
-            &[0xAA; 8],
-            &[9, 10, 11, 12, 13, 14, 15, 16],
-            &[0xBB; 8],
-        ]
-        .concat();
-
-        let mut dst = vec![0u8; 16];
-        assert!(bgra_rows_into(&mut dst, 8, &src, 16, 2, 8, false));
-        assert_eq!(
-            dst,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-        );
-
-        let mut dst = vec![0u8; 16];
-        assert!(bgra_rows_into(&mut dst, 8, &src, 16, 2, 8, true));
-        assert_eq!(
-            dst,
-            vec![3, 2, 1, 4, 7, 6, 5, 8, 11, 10, 9, 12, 15, 14, 13, 16]
-        );
-
-        let mut dst = vec![0u8; 16];
-        assert!(!bgra_rows_into(&mut dst, 8, &src[..8], 16, 2, 8, false));
-        let mut dst = vec![0u8; 8];
-        assert!(!bgra_rows_into(&mut dst, 8, &src, 16, 2, 8, false));
-    }
-
-    #[test]
-    fn classify_swapchain_format_detects_bgra_rgba_and_rejects_the_rest() {
-        assert_eq!(
-            classify_swapchain_format(vk::Format::B8G8R8A8_UNORM.as_raw()),
-            CompositeFormat::Bgra
-        );
-        assert_eq!(
-            classify_swapchain_format(vk::Format::B8G8R8A8_SRGB.as_raw()),
-            CompositeFormat::Bgra
-        );
-        assert_eq!(
-            classify_swapchain_format(vk::Format::R8G8B8A8_UNORM.as_raw()),
-            CompositeFormat::RgbaSwizzle
-        );
-        assert_eq!(
-            classify_swapchain_format(vk::Format::R8G8B8A8_SRGB.as_raw()),
-            CompositeFormat::RgbaSwizzle
-        );
-
-        assert_eq!(
-            classify_swapchain_format(vk::Format::R5G6B5_UNORM_PACK16.as_raw()),
-            CompositeFormat::Unsupported
-        );
-        assert_eq!(classify_swapchain_format(0), CompositeFormat::Unsupported);
-    }
-
-    #[test]
-    fn clamp_webview_rect_crops_top_left_to_surface_and_stage() {
-        assert_eq!(
-            clamp_webview_rect((10, 20, 300, 200), (800, 600), (1024, 768)),
-            Some((10, 20, 300, 200))
-        );
-
-        assert_eq!(
-            clamp_webview_rect((10, 20, 300, 200), (800, 600), (128, 64)),
-            Some((10, 20, 128, 64))
-        );
-
-        assert_eq!(
-            clamp_webview_rect((700, 500, 300, 200), (800, 600), (1024, 768)),
-            Some((700, 500, 100, 100))
-        );
-
-        assert_eq!(
-            clamp_webview_rect((-5, -7, 300, 200), (800, 600), (1024, 768)),
-            Some((0, 0, 300, 200))
-        );
-
-        assert_eq!(
-            clamp_webview_rect((900, 0, 10, 10), (800, 600), (64, 64)),
-            None
-        );
-        assert_eq!(
-            clamp_webview_rect((0, 0, 0, 10), (800, 600), (64, 64)),
-            None
-        );
-        assert_eq!(
-            clamp_webview_rect((0, 0, 10, 10), (800, 600), (0, 64)),
-            None
-        );
-        assert_eq!(clamp_webview_rect((0, 0, 10, 10), (0, 0), (64, 64)), None);
-    }
-
-    #[test]
-    fn resolve_webview_rect_falls_back_to_the_centered_stage_rect_and_always_clamps() {
-        assert_eq!(
-            resolve_webview_rect(None, 800, 600, 800, 600),
-            Some((0, 0, 800, 600))
-        );
-
-        assert_eq!(
-            resolve_webview_rect(None, 800, 600, 400, 300),
-            Some((200, 150, 400, 300))
-        );
-
-        assert_eq!(
-            resolve_webview_rect(None, 800, 600, 1024, 768),
-            Some((0, 0, 800, 600))
-        );
-
-        assert_eq!(
-            resolve_webview_rect(Some((10, 20, 300, 200)), 800, 600, 1024, 768),
-            Some((10, 20, 300, 200))
-        );
-
-        assert_eq!(
-            resolve_webview_rect(Some((700, 500, 300, 200)), 800, 600, 1024, 768),
-            Some((700, 500, 100, 100))
-        );
-
-        assert_eq!(
-            resolve_webview_rect(Some((-5, -7, 300, 200)), 800, 600, 1024, 768),
-            Some((0, 0, 300, 200))
-        );
-
-        assert_eq!(resolve_webview_rect(None, 0, 0, 800, 600), None);
-        assert_eq!(resolve_webview_rect(None, 800, 600, 0, 0), None);
-        assert_eq!(
-            resolve_webview_rect(Some((900, 0, 10, 10)), 800, 600, 64, 64),
-            None
-        );
-    }
 
     #[test]
     fn resolve_field_rect_draws_nothing_without_a_live_textbox_session() {
@@ -4446,8 +2993,6 @@ mod tests {
 
     static HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
     static STUB_DESTROYED: AtomicU64 = AtomicU64::new(0);
-    static STUB_SAW_SWAPCHAIN_LOCK: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
     static STUB_CREATED_PRESENT_MODE: AtomicU32 = AtomicU32::new(u32::MAX);
     static STUB_CREATED_WIDTH: AtomicU32 = AtomicU32::new(0);
     static STUB_CREATED_USAGE: AtomicU32 = AtomicU32::new(0);
@@ -4467,7 +3012,6 @@ mod tests {
         _allocator: *const vk::AllocationCallbacks<'_>,
     ) {
         STUB_DESTROYED.store(swapchain.as_raw(), Ordering::SeqCst);
-        STUB_SAW_SWAPCHAIN_LOCK.store(SWAPCHAIN_LOCK.try_lock().is_err(), Ordering::SeqCst);
     }
 
     unsafe extern "system" fn stub_create_swapchain(
@@ -4476,7 +3020,6 @@ mod tests {
         _allocator: *const vk::AllocationCallbacks<'_>,
         swapchain: *mut vk::SwapchainKHR,
     ) -> vk::Result {
-        STUB_SAW_SWAPCHAIN_LOCK.store(SWAPCHAIN_LOCK.try_lock().is_err(), Ordering::SeqCst);
         let info = unsafe { &*info };
         STUB_CREATED_PRESENT_MODE.store(info.present_mode.as_raw() as u32, Ordering::SeqCst);
         STUB_CREATED_WIDTH.store(info.image_extent.width, Ordering::SeqCst);
@@ -4498,6 +3041,108 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (st.swapchain, st.images.len())
+    }
+
+    static STUB_DEVICE_REQUEST: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "system" fn stub_create_device(
+        _physical_device: vk::PhysicalDevice,
+        info: *const vk::DeviceCreateInfo<'_>,
+        _allocator: *const vk::AllocationCallbacks<'_>,
+        device: *mut vk::Device,
+    ) -> vk::Result {
+        STUB_DEVICE_REQUEST.store(info as u64, Ordering::SeqCst);
+        unsafe { *device = vk::Device::from_raw(0xD) };
+        vk::Result::SUCCESS
+    }
+
+    #[test]
+    fn the_engine_device_is_created_exactly_as_the_engine_asks() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved =
+            HOST_CREATE_DEVICE.swap(stub_create_device as *const () as u64, Ordering::SeqCst);
+        let saved_device = STATE.lock().map(|state| state.device).unwrap_or(0);
+        let saved_physical = PHYSICAL_DEVICE.load(Ordering::SeqCst);
+        let saved_family = QUEUE_FAMILY.load(Ordering::SeqCst);
+        let priorities = [1.0f32];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(2)
+            .queue_priorities(&priorities)];
+        let request = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+        let mut device = vk::Device::null();
+
+        let created = unsafe {
+            eclipse_vk_create_device(
+                vk::PhysicalDevice::from_raw(0x7),
+                &request,
+                std::ptr::null(),
+                &mut device,
+            )
+        };
+        let forwarded = STUB_DEVICE_REQUEST.load(Ordering::SeqCst);
+        let captured = (
+            STATE.lock().map(|state| state.device).unwrap_or(0),
+            PHYSICAL_DEVICE.load(Ordering::SeqCst),
+            QUEUE_FAMILY.load(Ordering::SeqCst),
+        );
+
+        if let Ok(mut state) = STATE.lock() {
+            state.device = saved_device;
+        }
+        PHYSICAL_DEVICE.store(saved_physical, Ordering::SeqCst);
+        QUEUE_FAMILY.store(saved_family, Ordering::SeqCst);
+        HOST_CREATE_DEVICE.store(saved, Ordering::SeqCst);
+
+        assert_eq!(created, vk::Result::SUCCESS);
+        assert_eq!(device.as_raw(), 0xD);
+        assert_eq!(
+            forwarded, &raw const request as u64,
+            "the host receives the engine's own device request, with no queue added"
+        );
+        assert_eq!(captured, (0xD, 0x7, 2));
+    }
+
+    static STUB_PRESENTED_FRAME: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "system" fn stub_present_frame(
+        _queue: vk::Queue,
+        info: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        STUB_PRESENTED_FRAME.store(info as u64, Ordering::SeqCst);
+        vk::Result::SUBOPTIMAL_KHR
+    }
+
+    #[test]
+    fn an_engine_frame_with_nothing_to_draw_reaches_the_host_untouched() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved =
+            HOST_QUEUE_PRESENT.swap(stub_present_frame as *const () as u64, Ordering::SeqCst);
+        set_state(0xA, vec![0x1, 0x2]);
+        if let Ok(mut state) = STATE.lock() {
+            state.format = vk::Format::B8G8R8A8_UNORM.as_raw();
+        }
+        let waits = [vk::Semaphore::from_raw(0x5)];
+        let swapchains = [vk::SwapchainKHR::from_raw(0xA)];
+        let indices = [1];
+        let frame = vk::PresentInfoKHR::default()
+            .wait_semaphores(&waits)
+            .swapchains(&swapchains)
+            .image_indices(&indices);
+
+        let presented = unsafe { eclipse_vk_queue_present_khr(vk::Queue::from_raw(0x9), &frame) };
+        let forwarded = STUB_PRESENTED_FRAME.load(Ordering::SeqCst);
+
+        if let Ok(mut state) = STATE.lock() {
+            state.format = 0;
+        }
+        set_state(0, Vec::new());
+        HOST_QUEUE_PRESENT.store(saved, Ordering::SeqCst);
+
+        assert_eq!(presented, vk::Result::SUBOPTIMAL_KHR);
+        assert_eq!(
+            forwarded, &raw const frame as u64,
+            "the host presents the engine's own frame, waiting on the engine's semaphores only"
+        );
     }
 
     #[test]
@@ -4522,12 +3167,11 @@ mod tests {
     }
 
     #[test]
-    fn destroying_the_tracked_swapchain_forgets_it_under_the_swapchain_lock() {
+    fn destroying_the_tracked_swapchain_forgets_it() {
         let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = HOST_DESTROY_SWAPCHAIN
             .swap(stub_destroy_swapchain as *const () as u64, Ordering::SeqCst);
         set_state(0xA, vec![1, 2, 3]);
-        STUB_SAW_SWAPCHAIN_LOCK.store(false, Ordering::SeqCst);
 
         unsafe {
             eclipse_vk_destroy_swapchain_khr(
@@ -4538,7 +3182,6 @@ mod tests {
         };
         let retired = state_swapchain();
         let destroyed = STUB_DESTROYED.load(Ordering::SeqCst);
-        let locked = STUB_SAW_SWAPCHAIN_LOCK.load(Ordering::SeqCst);
 
         set_state(0xB, vec![4, 5]);
         unsafe {
@@ -4559,7 +3202,6 @@ mod tests {
             "a destroyed swapchain is no longer a present target"
         );
         assert_eq!(destroyed, 0xA);
-        assert!(locked, "the host destroy runs under the swapchain lock");
         assert_eq!(
             replaced,
             (0xB, 2),
@@ -4568,11 +3210,10 @@ mod tests {
     }
 
     #[test]
-    fn swapchain_creation_holds_the_swapchain_lock() {
+    fn swapchain_creation_forwards_the_engine_request_and_tracks_the_swapchain() {
         let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved =
             HOST_CREATE_SWAPCHAIN.swap(stub_create_swapchain as *const () as u64, Ordering::SeqCst);
-        STUB_SAW_SWAPCHAIN_LOCK.store(false, Ordering::SeqCst);
         let info = vk::SwapchainCreateInfoKHR::default()
             .image_extent(vk::Extent2D {
                 width: 640,
@@ -4589,7 +3230,6 @@ mod tests {
             )
         };
         let tracked = state_swapchain();
-        let locked = STUB_SAW_SWAPCHAIN_LOCK.load(Ordering::SeqCst);
         let forwarded = (
             STUB_CREATED_PRESENT_MODE.load(Ordering::SeqCst),
             STUB_CREATED_WIDTH.load(Ordering::SeqCst),
@@ -4604,10 +3244,6 @@ mod tests {
             forwarded,
             (vk::PresentModeKHR::FIFO_RELAXED.as_raw() as u32, 640),
             "the host receives the engine's swapchain request"
-        );
-        assert!(
-            locked,
-            "retiring oldSwapchain is serialized with the WebView presenter"
         );
     }
 
@@ -5333,15 +3969,11 @@ mod tests {
                 .0
                 .to_owned()
         };
-        let presenter = body("impl Drop for WebPresenter {");
         let probe = body("impl Drop for Probe {");
-        for (name, drop_body) in [("WebPresenter", &presenter), ("Probe", &probe)] {
-            assert!(
-                !drop_body.contains(concat!("device_wait", "_idle")),
-                "{name} teardown must not synchronize every queue of the engine's device"
-            );
-        }
-        assert!(presenter.contains("queue_wait_idle(self.queue)"));
+        assert!(
+            !probe.contains(concat!("device_wait", "_idle")),
+            "Probe teardown must not synchronize every queue of the engine's device"
+        );
         assert!(probe.contains("self.fence.retire(&self.device)"));
     }
 
@@ -5460,21 +4092,6 @@ mod tests {
         gpu.read(memory, len)
     }
 
-    fn build_probe(gpu: &crate::graphics::headless_vulkan::HeadlessGpu, rect: vk::Rect2D) -> Probe {
-        Probe::build(
-            &gpu.entry,
-            EngineHandles {
-                instance: gpu.instance.handle().as_raw(),
-                device: gpu.device.handle().as_raw(),
-                physical_device: gpu.physical_device.as_raw(),
-                queue_family: gpu.queue_family,
-            },
-            rect,
-            HostAccess::Write,
-        )
-        .expect("overlay probe")
-    }
-
     fn rect_rows(pixels: &[u8], extent: vk::Extent2D, rect: vk::Rect2D) -> Vec<u8> {
         let mut out = Vec::new();
         for y in 0..rect.extent.height {
@@ -5501,327 +4118,6 @@ mod tests {
                 inside || pixels[i..i + 4] == *background
             })
         })
-    }
-
-    static STUB_PRESENTED: AtomicU64 = AtomicU64::new(u64::MAX);
-
-    unsafe extern "system" fn stub_acquire_next_image(
-        _device: vk::Device,
-        _swapchain: vk::SwapchainKHR,
-        _timeout: u64,
-        _semaphore: vk::Semaphore,
-        _fence: vk::Fence,
-        _image_index: *mut u32,
-    ) -> vk::Result {
-        vk::Result::NOT_READY
-    }
-
-    unsafe extern "system" fn stub_queue_present(
-        _queue: vk::Queue,
-        info: *const vk::PresentInfoKHR<'_>,
-    ) -> vk::Result {
-        let index = unsafe { *(*info).p_image_indices };
-        STUB_PRESENTED.store(u64::from(index), Ordering::SeqCst);
-        vk::Result::SUCCESS
-    }
-
-    unsafe extern "system" fn stub_present_without_info(
-        _queue: vk::Queue,
-        _info: *const vk::PresentInfoKHR<'_>,
-    ) -> vk::Result {
-        vk::Result::SUCCESS
-    }
-
-    unsafe extern "system" fn stub_presenter_proc_addr(
-        _device: vk::Device,
-        name: *const c_char,
-    ) -> vk::PFN_vkVoidFunction {
-        let name = unsafe { CStr::from_ptr(name) };
-        if name == c"vkAcquireNextImageKHR" {
-            return Some(unsafe {
-                std::mem::transmute::<vk::PFN_vkAcquireNextImageKHR, unsafe extern "system" fn()>(
-                    stub_acquire_next_image,
-                )
-            });
-        }
-        if name == c"vkQueuePresentKHR" {
-            return Some(unsafe {
-                std::mem::transmute::<vk::PFN_vkQueuePresentKHR, unsafe extern "system" fn()>(
-                    stub_queue_present,
-                )
-            });
-        }
-        None
-    }
-
-    #[test]
-    fn releasing_an_acquired_image_presents_a_defined_blank_frame() {
-        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(gpu) = headless_gpu() else {
-            return;
-        };
-        let format = vk::Format::B8G8R8A8_UNORM;
-        let extent = vk::Extent2D {
-            width: 32,
-            height: 16,
-        };
-        let image = gpu.image(
-            format,
-            extent.width,
-            extent.height,
-            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
-        );
-        let rendered = engine_frame(&gpu, image, vk::ImageLayout::UNDEFINED);
-        gpu.run(&[rendered], &[], |_, _| {});
-        let saved = HOST_GDPA.swap(
-            stub_presenter_proc_addr as *const () as u64,
-            Ordering::SeqCst,
-        );
-        let presenter = WebPresenter::build(
-            &gpu.entry,
-            EngineHandles {
-                instance: gpu.instance.handle().as_raw(),
-                device: gpu.device.handle().as_raw(),
-                physical_device: gpu.physical_device.as_raw(),
-                queue_family: gpu.queue_family,
-            },
-            0,
-            0x5C,
-            extent,
-            format,
-            vec![image.as_raw()],
-        );
-        HOST_GDPA.store(saved, Ordering::SeqCst);
-        let mut presenter = presenter.expect("WebView presenter");
-        STUB_PRESENTED.store(u64::MAX, Ordering::SeqCst);
-        gpu.run(&[], &[presenter.acquire], |_, _| {});
-
-        let done = presenter.done[0];
-        let blank = presenter.blank_frames[0];
-        unsafe { presenter.release_acquired(0, done, blank) };
-
-        assert_eq!(STUB_PRESENTED.load(Ordering::SeqCst), 0);
-        let pixels = read_image(
-            &gpu,
-            image,
-            vk::ImageLayout::PRESENT_SRC_KHR,
-            extent,
-            &[done],
-        );
-        drop(presenter);
-        assert!(
-            pixels.chunks(4).all(|p| p == [0, 0, 0, 255]),
-            "a released image is presented as a defined black frame, not stale engine pixels"
-        );
-    }
-
-    fn web_gpu_held() -> (bool, bool, bool) {
-        let composite = WEB_COMPOSITE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
-        let presenter = WEB_PRESENTER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
-        (composite, presenter, WEB_GPU_HELD.load(Ordering::SeqCst))
-    }
-
-    #[test]
-    fn webview_gpu_resources_live_only_while_a_webview_is_shown() {
-        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(gpu) = headless_gpu() else {
-            return;
-        };
-        let format = vk::Format::B8G8R8A8_UNORM;
-        let extent = vk::Extent2D {
-            width: 32,
-            height: 16,
-        };
-        let image = gpu.image(
-            format,
-            extent.width,
-            extent.height,
-            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
-        );
-        let saved_gdpa = HOST_GDPA.swap(
-            stub_presenter_proc_addr as *const () as u64,
-            Ordering::SeqCst,
-        );
-        let saved_instance = INSTANCE.swap(gpu.instance.handle().as_raw(), Ordering::SeqCst);
-        let saved_physical = PHYSICAL_DEVICE.swap(gpu.physical_device.as_raw(), Ordering::SeqCst);
-        let saved_family = QUEUE_FAMILY.swap(gpu.queue_family, Ordering::SeqCst);
-        let saved_queue = WEB_PRESENT_QUEUE_INDEX.swap(0, Ordering::SeqCst);
-        *STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = OverlayState {
-            device: gpu.device.handle().as_raw(),
-            swapchain: 0x5D,
-            format: format.as_raw(),
-            width: extent.width,
-            height: extent.height,
-            images: vec![image.as_raw()],
-            ..OverlayState::default()
-        };
-        let rect = vk::Rect2D {
-            offset: vk::Offset2D { x: 4, y: 2 },
-            extent: vk::Extent2D {
-                width: 8,
-                height: 4,
-            },
-        };
-
-        let present = |active_view| unsafe {
-            present_with_overlay(
-                stub_present_without_info,
-                vk::Queue::null(),
-                std::ptr::null(),
-                active_view,
-            )
-        };
-
-        let composite_built = ensure_web_composite(rect);
-        let composite_only = web_gpu_held();
-        let first_close = present(0);
-        let composite_freed = web_gpu_held();
-        let presenter_built = ensure_web_presenter();
-        let presenter_only = web_gpu_held();
-        let composite_rebuilt = ensure_web_composite(rect);
-        let shown = present(0x5D);
-        let while_shown = web_gpu_held();
-        let second_close = present(0);
-        let after_close = web_gpu_held();
-
-        *WEB_COMPOSITE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *WEB_PRESENTER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        WEB_GPU_HELD.store(false, Ordering::SeqCst);
-        *STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = OverlayState::default();
-        WEB_PRESENT_QUEUE_INDEX.store(saved_queue, Ordering::SeqCst);
-        QUEUE_FAMILY.store(saved_family, Ordering::SeqCst);
-        PHYSICAL_DEVICE.store(saved_physical, Ordering::SeqCst);
-        INSTANCE.store(saved_instance, Ordering::SeqCst);
-        HOST_GDPA.store(saved_gdpa, Ordering::SeqCst);
-
-        assert_eq!(
-            composite_only,
-            (true, false, true),
-            "building the composite buffer marks WebView GPU memory as held"
-        );
-        assert_eq!(
-            composite_freed,
-            (false, false, false),
-            "a present without a WebView frees the composite buffer"
-        );
-        assert_eq!(
-            presenter_only,
-            (false, true, true),
-            "building the presenter marks WebView GPU memory as held"
-        );
-        assert_eq!(
-            while_shown,
-            (true, true, true),
-            "presenting with a WebView shown keeps its GPU resources"
-        );
-        assert_eq!(
-            after_close,
-            (false, false, false),
-            "the first present without a WebView frees its GPU resources"
-        );
-        assert!(composite_built && composite_rebuilt && presenter_built);
-        assert_eq!([first_close, shown, second_close], [vk::Result::SUCCESS; 3]);
-    }
-
-    #[test]
-    fn webview_upload_publishes_the_saved_frame_behind_its_semaphore() {
-        let Some(gpu) = headless_gpu() else {
-            return;
-        };
-        let extent = vk::Extent2D {
-            width: 64,
-            height: 32,
-        };
-        let format = vk::Format::B8G8R8A8_UNORM;
-        let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        let image = gpu.image(format, extent.width, extent.height, usage);
-        let saved = gpu.image(format, extent.width, extent.height, usage);
-        gpu.run(&[], &[], |device, cmd| {
-            image_barrier(
-                device,
-                cmd,
-                saved,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::GENERAL,
-            )
-        });
-        let saved_ready = gpu.semaphore();
-        let rect = vk::Rect2D {
-            offset: vk::Offset2D { x: 8, y: 4 },
-            extent: vk::Extent2D {
-                width: 16,
-                height: 8,
-            },
-        };
-        let mut probe = build_probe(&gpu, rect);
-        let stride = 20 * 4;
-        let frames: Vec<Vec<u8>> = (0..2u8)
-            .map(|k| {
-                (0..stride * 8)
-                    .map(|i| (i as u8).wrapping_mul(7) ^ k)
-                    .collect()
-            })
-            .collect();
-
-        let mut layout = vk::ImageLayout::UNDEFINED;
-        for (k, frame) in frames.iter().enumerate() {
-            let rendered = engine_frame(&gpu, image, layout);
-            layout = vk::ImageLayout::PRESENT_SRC_KHR;
-            let source = WebFrameSource {
-                bytes: frame,
-                stride,
-                swizzle: false,
-                refresh: true,
-            };
-            let target = SavedFrameTarget {
-                image: saved,
-                extent,
-                ready: saved_ready,
-                wait_ready: k > 0,
-            };
-            let batch = unsafe {
-                probe.upload_bgra(
-                    gpu.queue,
-                    image.as_raw(),
-                    &[rendered],
-                    &source,
-                    Some(target),
-                )
-            };
-            assert_eq!(batch, OverlayBatch::Queued);
-        }
-
-        let pixels = read_image(
-            &gpu,
-            saved,
-            vk::ImageLayout::GENERAL,
-            extent,
-            &[saved_ready],
-        );
-        let background = pixels[..4].to_vec();
-        let mut expected = Vec::new();
-        for row in 0..8 {
-            expected.extend_from_slice(&frames[1][row * stride..row * stride + 16 * 4]);
-        }
-        assert!(
-            rect_rows(&pixels, extent, rect) == expected,
-            "the saved frame holds the latest composited WebView frame"
-        );
-        assert!(outside_rect_is(&pixels, extent, rect, &background));
     }
 
     #[test]
