@@ -1878,9 +1878,7 @@ unsafe extern "C" fn eclipse_getaddrinfo(
     let mut tail: *mut BionicAddrinfo = std::ptr::null_mut();
     let mut count = 0u32;
     let mut cursor = g_res;
-    while !cursor.is_null() {
-        let g = unsafe { &*cursor };
-
+    while let Some(g) = unsafe { cursor.as_ref() } {
         let bionic_node = unsafe { bionic_node_from_glibc(g, bionic_flags) };
         if bionic_node.is_null() {
             unsafe { eclipse_freeaddrinfo(head) };
@@ -1888,10 +1886,9 @@ unsafe extern "C" fn eclipse_getaddrinfo(
             unsafe { libc::freeaddrinfo(g_res) };
             return BIONIC_EAI_MEMORY;
         }
-        if head.is_null() {
-            head = bionic_node;
-        } else {
-            unsafe { (*tail).ai_next = bionic_node };
+        match unsafe { tail.as_mut() } {
+            Some(last) => last.ai_next = bionic_node,
+            None => head = bionic_node,
         }
         tail = bionic_node;
         count += 1;
@@ -1914,8 +1911,8 @@ unsafe extern "C" fn eclipse_getaddrinfo(
 
 unsafe extern "C" fn eclipse_freeaddrinfo(head: *mut BionicAddrinfo) {
     let mut cursor = head;
-    while !cursor.is_null() {
-        let next = unsafe { (*cursor).ai_next };
+    while let Some(node) = unsafe { cursor.as_ref() } {
+        let next = node.ai_next;
 
         unsafe { libc::free(cursor.cast()) };
         cursor = next;
@@ -3835,6 +3832,49 @@ mod tests {
             .to_str()
             .expect("ascii");
         assert!(s.contains("not known"), "the NONAME message, got: {s}");
+    }
+
+    #[test]
+    fn bionic_getaddrinfo_links_every_glibc_node_in_order() {
+        let node = std::ffi::CString::new("127.0.0.1").expect("cstring");
+
+        let mut hints: BionicAddrinfo = unsafe { std::mem::zeroed() };
+        hints.ai_family = libc::AF_INET;
+        let mut res: *mut BionicAddrinfo = std::ptr::null_mut();
+        let rc = unsafe { eclipse_getaddrinfo(node.as_ptr(), std::ptr::null(), &hints, &mut res) };
+        assert_eq!(rc, 0, "numeric-host lookup must succeed offline");
+
+        let mut g_hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+        g_hints.ai_family = libc::AF_INET;
+        let mut g_res: *mut libc::addrinfo = std::ptr::null_mut();
+        let rc =
+            unsafe { libc::getaddrinfo(node.as_ptr(), std::ptr::null(), &g_hints, &mut g_res) };
+        assert_eq!(rc, 0, "numeric-host lookup must succeed offline");
+
+        let mut glibc_socktypes = Vec::new();
+        let mut cursor = g_res;
+        while let Some(g) = unsafe { cursor.as_ref() } {
+            glibc_socktypes.push(g.ai_socktype);
+            cursor = g.ai_next;
+        }
+        unsafe { libc::freeaddrinfo(g_res) };
+
+        let mut bionic_socktypes = Vec::new();
+        let mut cursor = res;
+        while let Some(b) = unsafe { cursor.as_ref() } {
+            assert_eq!(b.ai_family, libc::AF_INET);
+            let sin = unsafe { b.ai_addr.cast::<libc::sockaddr_in>().as_ref() }.expect("ai_addr");
+            assert_eq!(u32::from_be(sin.sin_addr.s_addr), 0x7f00_0001);
+            bionic_socktypes.push(b.ai_socktype);
+            cursor = b.ai_next;
+        }
+        unsafe { eclipse_freeaddrinfo(res) };
+
+        assert!(
+            glibc_socktypes.len() > 1,
+            "glibc returns one node per socket type"
+        );
+        assert_eq!(bionic_socktypes, glibc_socktypes);
     }
 
     #[test]
