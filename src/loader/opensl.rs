@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::{c_void, CStr};
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -1639,62 +1640,24 @@ pub fn run_audio_test() -> Result<String, String> {
         CB_FIRES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    let mut engine: *mut c_void = std::ptr::null_mut();
-
-    let r = unsafe {
+    let engine = TestObject::create("slCreateEngine", |out| unsafe {
         eclipse_sl_create_engine(
-            std::ptr::addr_of_mut!(engine).cast(),
+            out,
             0,
             std::ptr::null(),
             0,
             std::ptr::null(),
             std::ptr::null(),
         )
-    };
-    if r != SL_RESULT_SUCCESS || engine.is_null() {
-        return Err(format!("slCreateEngine failed: SLresult={r:#x}"));
-    }
+    })?;
+    engine.realize()?;
+    let eng_itf = engine.interface(3)?;
 
-    let cleanup = |objs: &[*mut c_void]| {
-        for &o in objs {
-            if !o.is_null() {
-                obj_destroy(o);
-            }
-        }
-    };
-
-    if let Err(e) = realize_for_test(engine) {
-        cleanup(&[engine]);
-        return Err(e);
-    }
-    let eng_itf = match get_interface_for_test(engine, 3) {
-        Ok(p) => p,
-        Err(e) => {
-            cleanup(&[engine]);
-            return Err(e);
-        }
-    };
-
-    let mut mix: *mut c_void = std::ptr::null_mut();
-
-    let r = unsafe {
-        let vt = *(eng_itf as *const *const EngineItfVtable);
-        ((*vt).create_output_mix)(
-            eng_itf,
-            std::ptr::addr_of_mut!(mix).cast(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if r != SL_RESULT_SUCCESS || mix.is_null() {
-        cleanup(&[engine]);
-        return Err(format!("CreateOutputMix failed: SLresult={r:#x}"));
-    }
-    if let Err(e) = realize_for_test(mix) {
-        cleanup(&[mix, engine]);
-        return Err(e);
-    }
+    let mix = TestObject::create("CreateOutputMix", |out| unsafe {
+        let vt = *(eng_itf.as_ptr() as *const *const EngineItfVtable);
+        ((*vt).create_output_mix)(eng_itf.as_ptr(), out, 0, std::ptr::null(), std::ptr::null())
+    })?;
+    mix.realize()?;
 
     let mut bq_loc = SlDataLocatorBufferQueue {
         locator_type: SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE,
@@ -1715,92 +1678,68 @@ pub fn run_audio_test() -> Result<String, String> {
     };
     let mut mix_loc = SlDataLocatorOutputMix {
         locator_type: SL_DATALOCATOR_OUTPUTMIX,
-        output_mix: mix,
+        output_mix: mix.0.as_ptr(),
     };
     let snk = SlDataSink {
         p_locator: std::ptr::addr_of_mut!(mix_loc).cast(),
         p_format: std::ptr::null(),
     };
-    let mut player: *mut c_void = std::ptr::null_mut();
 
-    let r = unsafe {
-        let vt = *(eng_itf as *const *const EngineItfVtable);
+    let player = TestObject::create("CreateAudioPlayer", |out| unsafe {
+        let vt = *(eng_itf.as_ptr() as *const *const EngineItfVtable);
         ((*vt).create_audio_player)(
-            eng_itf,
-            std::ptr::addr_of_mut!(player).cast(),
+            eng_itf.as_ptr(),
+            out,
             std::ptr::addr_of!(src) as *mut c_void,
             std::ptr::addr_of!(snk) as *mut c_void,
             0,
             std::ptr::null(),
             std::ptr::null(),
         )
-    };
-    if r != SL_RESULT_SUCCESS || player.is_null() {
-        cleanup(&[mix, engine]);
-        return Err(format!("CreateAudioPlayer failed: SLresult={r:#x}"));
-    }
-    if let Err(e) = realize_for_test(player) {
-        cleanup(&[player, mix, engine]);
-        return Err(e);
-    }
+    })?;
+    player.realize()?;
 
-    let has_device = player_has_host_stream(player).unwrap_or(false);
+    let has_device = player_has_host_stream(player.0.as_ptr()).unwrap_or(false);
 
-    let play_itf = match get_interface_for_test(player, 4) {
-        Ok(p) => p,
-        Err(e) => {
-            cleanup(&[player, mix, engine]);
-            return Err(e);
-        }
-    };
-    let bq_itf = match get_interface_for_test(player, 1) {
-        Ok(p) => p,
-        Err(e) => {
-            cleanup(&[player, mix, engine]);
-            return Err(e);
-        }
-    };
+    let play_itf = player.interface(4)?;
+    let bq_itf = player.interface(1)?;
 
     let r = unsafe {
-        let vt = *(bq_itf as *const *const BufferQueueItfVtable);
+        let vt = *(bq_itf.as_ptr() as *const *const BufferQueueItfVtable);
         ((*vt).register_callback)(
-            bq_itf,
+            bq_itf.as_ptr(),
             on_buffer_done as *const c_void,
             std::ptr::null_mut(),
         )
     };
     if r != SL_RESULT_SUCCESS {
-        cleanup(&[player, mix, engine]);
         return Err(format!("RegisterCallback failed: SLresult={r:#x}"));
     }
 
     let r = unsafe {
-        let vt = *(play_itf as *const *const PlayItfVtable);
-        ((*vt).set_play_state)(play_itf, SL_PLAYSTATE_PLAYING)
+        let vt = *(play_itf.as_ptr() as *const *const PlayItfVtable);
+        ((*vt).set_play_state)(play_itf.as_ptr(), SL_PLAYSTATE_PLAYING)
     };
     if r != SL_RESULT_SUCCESS {
-        cleanup(&[player, mix, engine]);
         return Err(format!("SetPlayState(PLAYING) failed: SLresult={r:#x}"));
     }
 
     let pcm_bytes = generate_sine_pcm16(440.0, 44_100, 2205);
 
     let r = unsafe {
-        let vt = *(bq_itf as *const *const BufferQueueItfVtable);
+        let vt = *(bq_itf.as_ptr() as *const *const BufferQueueItfVtable);
         ((*vt).enqueue)(
-            bq_itf,
+            bq_itf.as_ptr(),
             pcm_bytes.as_ptr() as *const c_void,
             pcm_bytes.len() as u32,
         )
     };
     if r != SL_RESULT_SUCCESS {
-        cleanup(&[player, mix, engine]);
         return Err(format!("Enqueue failed: SLresult={r:#x}"));
     }
 
     if !has_device {
-        let queued = player_queued_samples(player).unwrap_or(0);
-        cleanup(&[player, mix, engine]);
+        let queued = player_queued_samples(player.0.as_ptr()).unwrap_or(0);
         return Ok(format!(
             "SKIP (no host audio device): full OpenSL path built (engine→mix→player), \
              {} PCM samples enqueued with 0 SL errors; no device to play them",
@@ -1817,8 +1756,7 @@ pub fn run_audio_test() -> Result<String, String> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let drained = player_drained_buffers(player).unwrap_or(0);
-    cleanup(&[player, mix, engine]);
+    let drained = player_drained_buffers(player.0.as_ptr()).unwrap_or(0);
 
     if fires == 0 || drained == 0 {
         return Err(format!(
@@ -1833,6 +1771,59 @@ pub fn run_audio_test() -> Result<String, String> {
     ))
 }
 
+struct TestObject(NonNull<c_void>);
+
+impl TestObject {
+    fn create(name: &str, call: impl FnOnce(*mut c_void) -> u32) -> Result<Self, String> {
+        let mut out: Option<NonNull<c_void>> = None;
+        let r = call(std::ptr::addr_of_mut!(out).cast());
+        match out {
+            Some(handle) if r == SL_RESULT_SUCCESS => Ok(Self(handle)),
+            _ => Err(format!("{name} failed: SLresult={r:#x}")),
+        }
+    }
+
+    fn realize(&self) -> Result<(), String> {
+        let r = unsafe {
+            let vt = *(self.0.as_ptr() as *const *const ObjectItfVtable);
+            ((*vt).realize)(self.0.as_ptr(), SL_BOOLEAN_FALSE)
+        };
+        if r == SL_RESULT_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("Realize failed: SLresult={r:#x}"))
+        }
+    }
+
+    fn interface(&self, index: usize) -> Result<NonNull<c_void>, String> {
+        let iid_addr = crate::loader::native_provider::sl_iid_addr_for_test(index);
+
+        let iid_value = unsafe { *(iid_addr as *const *const c_void) };
+        let mut itf: Option<NonNull<c_void>> = None;
+
+        let r = unsafe {
+            let vt = *(self.0.as_ptr() as *const *const ObjectItfVtable);
+            ((*vt).get_interface)(
+                self.0.as_ptr(),
+                iid_value,
+                std::ptr::addr_of_mut!(itf).cast(),
+            )
+        };
+        match itf {
+            Some(itf) if r == SL_RESULT_SUCCESS => Ok(itf),
+            _ => Err(format!(
+                "GetInterface(index={index}) failed: SLresult={r:#x}"
+            )),
+        }
+    }
+}
+
+impl Drop for TestObject {
+    fn drop(&mut self) {
+        obj_destroy(self.0.as_ptr());
+    }
+}
+
 fn generate_sine_pcm16(freq: f32, rate: u32, frames: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(frames * 2);
     for n in 0..frames {
@@ -1842,36 +1833,6 @@ fn generate_sine_pcm16(freq: f32, rate: u32, frames: usize) -> Vec<u8> {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out
-}
-
-fn realize_for_test(obj: *mut c_void) -> Result<(), String> {
-    let r = unsafe {
-        let vt = *(obj as *const *const ObjectItfVtable);
-        ((*vt).realize)(obj, SL_BOOLEAN_FALSE)
-    };
-    if r == SL_RESULT_SUCCESS {
-        Ok(())
-    } else {
-        Err(format!("Realize failed: SLresult={r:#x}"))
-    }
-}
-
-fn get_interface_for_test(obj: *mut c_void, index: usize) -> Result<*mut c_void, String> {
-    let iid_addr = crate::loader::native_provider::sl_iid_addr_for_test(index);
-
-    let iid_value = unsafe { *(iid_addr as *const *const c_void) };
-    let mut itf: *mut c_void = std::ptr::null_mut();
-
-    let r = unsafe {
-        let vt = *(obj as *const *const ObjectItfVtable);
-        ((*vt).get_interface)(obj, iid_value, std::ptr::addr_of_mut!(itf).cast())
-    };
-    if r != SL_RESULT_SUCCESS || itf.is_null() {
-        return Err(format!(
-            "GetInterface(index={index}) failed: SLresult={r:#x}"
-        ));
-    }
-    Ok(itf)
 }
 
 fn player_has_host_stream(player: *mut c_void) -> Option<bool> {
