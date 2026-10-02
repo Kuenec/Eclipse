@@ -25,6 +25,12 @@ fn declared_constructor_count(output: &str) -> Option<u64> {
     count.strip_suffix(" constructors")?.parse().ok()
 }
 
+fn android_runtime_present() -> bool {
+    eclipse::runtime::find_libart().is_ok()
+        && eclipse::runtime::find_framework().is_ok()
+        && eclipse::runtime::find_boot_image().is_ok()
+}
+
 fn display_available() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some()
 }
@@ -160,6 +166,13 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
     if !display_available() {
         eprintln!(
             "SKIP: no display server (WAYLAND_DISPLAY/DISPLAY unset) — the CEF helper needs one"
+        );
+        return;
+    }
+    if !android_runtime_present() {
+        eprintln!(
+            "SKIP: Android runtime absent (ART, its boot image or the patched framework; set \
+             ECLIPSE_LIBART and ECLIPSE_ANDROID_FRAMEWORK_DIR)"
         );
         return;
     }
