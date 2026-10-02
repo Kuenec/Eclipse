@@ -36,6 +36,14 @@ pub(crate) enum LineMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LineMotion {
+    Up,
+    Down,
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Selection {
     Caret(usize),
     All,
@@ -163,6 +171,22 @@ struct LaidLine {
     left: f32,
     width: f32,
     boxes: Vec<ClusterBox>,
+}
+
+impl LaidLine {
+    fn caret_end(&self) -> usize {
+        if self.ends_paragraph {
+            return self.chars.end;
+        }
+        if self.visible_end < self.chars.end {
+            return self.visible_end;
+        }
+        self.boxes
+            .iter()
+            .map(|cluster| cluster.chars.start)
+            .max()
+            .unwrap_or(self.chars.start)
+    }
 }
 
 pub(crate) struct FieldLayout<'a> {
@@ -401,6 +425,29 @@ fn break_lines(clusters: &mut [Cluster], max_width: f32) -> Vec<LineSpan> {
     spans
 }
 
+fn visual_runs(levels: &[Level], line: Range<usize>) -> Vec<Range<usize>> {
+    let mut end = line.start;
+    let mut runs: Vec<Range<usize>> = levels[line]
+        .chunk_by(|a, b| a == b)
+        .map(|chunk| {
+            let run = end..end + chunk.len();
+            end = run.end;
+            run
+        })
+        .collect();
+    let level_of = |run: &Range<usize>| levels[run.start].number();
+    let lowest_odd = runs.iter().map(level_of).min().unwrap_or(0) | 1;
+    let highest = runs.iter().map(level_of).max().unwrap_or(0);
+    for level in (lowest_odd..=highest).rev() {
+        for sequence in runs.chunk_by_mut(|a, b| (level_of(a) >= level) == (level_of(b) >= level)) {
+            if level_of(&sequence[0]) >= level {
+                sequence.reverse();
+            }
+        }
+    }
+    runs
+}
+
 struct Typesetter<'a> {
     faces: FaceSet<'a>,
     ppem: f32,
@@ -528,9 +575,9 @@ impl<'a> Typesetter<'a> {
             return;
         };
         let line_index = self.lines.len();
-        let (levels, runs) = paragraph
-            .bidi
-            .visual_runs(info, first.bytes.start..last.bytes.end);
+        let line_bytes = first.bytes.start..last.bytes.end;
+        let levels = paragraph.bidi.reordered_levels(info, line_bytes.clone());
+        let runs = visual_runs(&levels, line_bytes);
         let mut pen_x = 0.0f32;
         for run in runs {
             let level = levels[run.start];
@@ -786,25 +833,48 @@ impl FieldLayout<'_> {
                 .iter()
                 .find(|cluster| cluster.chars.contains(&char_index))
         };
+        let (left, right) = (
+            |cluster: &ClusterBox| cluster.left - line.left,
+            |cluster: &ClusterBox| cluster.right - line.left,
+        );
         if index <= line.chars.start {
             return match containing(index) {
-                Some(cluster) if cluster.rtl => cluster.right,
-                Some(cluster) => cluster.left,
+                Some(cluster) if cluster.rtl => right(cluster),
+                Some(cluster) => left(cluster),
                 None => start_edge,
             };
         }
         match containing(index - 1) {
             Some(cluster) if cluster.chars.end > index => {
                 if cluster.rtl {
-                    cluster.right
+                    right(cluster)
                 } else {
-                    cluster.left
+                    left(cluster)
                 }
             }
-            Some(cluster) if cluster.rtl => cluster.left,
-            Some(cluster) => cluster.right,
+            Some(cluster) if cluster.rtl => left(cluster),
+            Some(cluster) => right(cluster),
             None if index >= line.visible_end => end_edge,
             None => start_edge,
+        }
+    }
+
+    pub(crate) fn line_motion(&self, index: usize, motion: LineMotion) -> usize {
+        let row = self.line_of(index);
+        let Some(line) = self.lines.get(row) else {
+            return index;
+        };
+        let at_caret_x = |target: usize| {
+            let x = line.left + self.caret_offset(row, index);
+            self.hit_test(x, self.lines[target].top + self.line_height * 0.5)
+        };
+        match motion {
+            LineMotion::Start => line.chars.start,
+            LineMotion::End => line.caret_end(),
+            LineMotion::Up if row == 0 => 0,
+            LineMotion::Up => at_caret_x(row - 1),
+            LineMotion::Down if row + 1 == self.lines.len() => line.chars.end,
+            LineMotion::Down => at_caret_x(row + 1),
         }
     }
 
@@ -818,11 +888,7 @@ impl FieldLayout<'_> {
         };
         let row = ((y - first.top) / self.line_height).floor().max(0.0) as usize;
         let line = &self.lines[row.min(self.lines.len() - 1)];
-        let line_end = if line.ends_paragraph {
-            line.chars.end
-        } else {
-            line.visible_end
-        };
+        let line_end = line.caret_end();
         let edge = |cluster: &ClusterBox, left_side: bool| {
             if left_side != cluster.rtl {
                 cluster.chars.start
@@ -1295,6 +1361,48 @@ mod tests {
     }
 
     #[test]
+    fn line_motions_and_clicks_follow_the_wrapped_lines_the_field_draws() {
+        let Some(chain) = host_chain() else {
+            return;
+        };
+        let field = style(120, 400, LineMode::Wrapped);
+        for text in [
+            "a".repeat(60),
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa".to_owned(),
+        ] {
+            let count = text.chars().count();
+            let at = |index| {
+                lay_out(
+                    &text,
+                    Selection::Caret(index),
+                    &field,
+                    chain,
+                    Scroll::default(),
+                )
+            };
+            let third = at(count).lines[2].chars.clone();
+            let index = third.start + 1;
+            let layout = at(index);
+            assert!(layout.lines.len() > 3, "{text}");
+
+            assert_eq!(layout.line_of(layout.line_motion(index, LineMotion::Up)), 1);
+            assert_eq!(
+                layout.line_of(layout.line_motion(index, LineMotion::Down)),
+                3
+            );
+            assert_eq!(layout.line_motion(index, LineMotion::Start), third.start);
+            let end = layout.line_motion(index, LineMotion::End);
+            assert!(end > index && layout.line_of(end) == 2, "{text}: end {end}");
+            let right_of_second = layout.hit_test(119.0, layout.lines[1].top + 1.0);
+            assert_eq!(layout.line_of(right_of_second), 1, "{text}");
+
+            assert_eq!(at(1).line_motion(1, LineMotion::Up), 0);
+            let last = layout.lines[layout.lines.len() - 1].chars.start;
+            assert_eq!(at(last).line_motion(last, LineMotion::Down), count);
+        }
+    }
+
+    #[test]
     fn tabs_advance_to_tab_stops_and_controls_draw_nothing() {
         let Some(chain) = host_chain() else {
             return;
@@ -1387,6 +1495,49 @@ mod tests {
         let glyphs: Vec<u32> = layout.glyphs.iter().map(|glyph| glyph.glyph).collect();
         assert_eq!(glyphs.len(), 3);
         assert_ne!(glyphs[0], glyphs[2], "initial and final forms differ");
+    }
+
+    #[test]
+    fn line_runs_are_reordered_like_unicode_bidi_orders_them() {
+        for text in [
+            "plain",
+            "abc \u{5D0}\u{5D1} 123 \u{5D2} def",
+            "\u{5D0} abc 12 \u{5D1}\u{5D2}",
+            "\u{202B}a\u{202A}b\u{5D0}\u{202C}c\u{202C}d",
+            "\u{2067}x \u{5D0} 7\u{2069} tail",
+        ] {
+            let bidi = BidiInfo::new(text, None);
+            let info = &bidi.paragraphs[0];
+            for line in [0..text.len(), 0..text.len() / 2, text.len() / 3..text.len()] {
+                if !text.is_char_boundary(line.start) || !text.is_char_boundary(line.end) {
+                    continue;
+                }
+                let levels = bidi.reordered_levels(info, line.clone());
+                assert_eq!(
+                    visual_runs(&levels, line.clone()),
+                    bidi.visual_runs(info, line.clone()).1,
+                    "{text:?} {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrapped_line_at_the_deepest_embedding_level_is_laid_out_left_to_right() {
+        let Some(chain) = host_chain() else {
+            return;
+        };
+        let text = "\u{202B}".repeat(63) + &"a".repeat(300);
+        let field = style(120, 400, LineMode::Wrapped);
+        let layout = lay_out(&text, at_end(&text), &field, chain, Scroll::default());
+        assert!(layout.lines.len() > 1);
+        for line in &layout.lines[1..] {
+            assert!(line.boxes.iter().all(|cluster| !cluster.rtl));
+            assert!(line
+                .boxes
+                .windows(2)
+                .all(|pair| pair[0].left < pair[1].left));
+        }
     }
 
     #[test]
