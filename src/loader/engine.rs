@@ -101,6 +101,8 @@ pub enum EngineLoadError {
     TextNotExecutable(String),
 
     ReadInitArray(String),
+
+    SignalChain(String),
 }
 
 impl std::fmt::Display for EngineLoadError {
@@ -117,6 +119,12 @@ impl std::fmt::Display for EngineLoadError {
             }
             Self::TextNotExecutable(d) => write!(f, "engine text segment not executable: {d}"),
             Self::ReadInitArray(e) => write!(f, "read DT_INIT_ARRAY entry: {e}"),
+            Self::SignalChain(e) => {
+                write!(
+                    f,
+                    "route the engine's signal calls through ART's sigchain: {e}"
+                )
+            }
         }
     }
 }
@@ -329,6 +337,7 @@ pub fn load_app_native_lib(
     java_vm: &JavaVM,
     log: &mut impl Write,
 ) -> Result<Option<PreloadedLib>, EngineLoadError> {
+    super::native_provider::bind_art_signal_chain().map_err(EngineLoadError::SignalChain)?;
     static EARLY_FAULT_TAP: std::sync::Once = std::sync::Once::new();
     EARLY_FAULT_TAP.call_once(|| {
         if let Err(e) = super::native_provider::install_early_fault_tap(libc::SIGSEGV) {

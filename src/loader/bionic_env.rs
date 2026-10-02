@@ -6,7 +6,7 @@ use super::native_provider::{
     last_dl_error, EclipseNativeProvider, HOST_EGL_SONAME, HOST_GLESV2_SONAME,
 };
 use super::reloc::{self, Rela};
-use super::resolve::{HostDlsymProvider, ResolvedSym, Scope, SymbolProvider};
+use super::resolve::{dlsym_bionic_import, HostDlsymProvider, ResolvedSym, Scope, SymbolProvider};
 
 pub const LIBROBLOX_DT_NEEDED: [&str; 10] = [
     "libc.so",
@@ -435,14 +435,7 @@ impl DlopenLibProvider {
 
 impl SymbolProvider for DlopenLibProvider {
     fn resolve(&self, name: &str) -> Option<ResolvedSym> {
-        let cname = CString::new(name).ok()?;
-
-        let ptr = unsafe { libc::dlsym(self.handle.0, cname.as_ptr()) };
-        if ptr.is_null() {
-            None
-        } else {
-            Some(ResolvedSym { addr: ptr as u64 })
-        }
+        unsafe { dlsym_bionic_import(self.handle.0, name) }
     }
 }
 
@@ -681,6 +674,27 @@ mod tests {
         assert_eq!(p.resolve("__eclipse_no_such_symbol_zzz__"), None);
 
         assert_eq!(p.resolve("bad\0name"), None);
+    }
+
+    #[test]
+    fn dlopen_provider_maps_long_double_names_its_dependencies_export_to_binary128() {
+        let p = DlopenLibProvider::open("libm.so.6").expect("glibc's libm must open");
+        let host = |name: &std::ffi::CStr| unsafe {
+            libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) as u64
+        };
+        assert_eq!(
+            p.resolve("strtold").map(|s| s.addr),
+            Some(host(c"strtof128")),
+            "libc's strtold reached through libm's NEEDED entry must be the binary128 parser"
+        );
+        for name in ["frexpl", "__isnanl", "logl"] {
+            assert_eq!(
+                p.resolve(name),
+                None,
+                "{name} must not bind to glibc's x87 version"
+            );
+        }
+        assert_eq!(p.resolve("cos").map(|s| s.addr), Some(host(c"cos")));
     }
 
     #[test]

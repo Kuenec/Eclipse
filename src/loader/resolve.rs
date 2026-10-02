@@ -89,16 +89,59 @@ impl SymbolProvider for LoadedObjectProvider {
 
 pub struct HostDlsymProvider;
 
+fn glibc_name_for_bionic(name: &str) -> Option<&str> {
+    match name {
+        "fmal" => Some("fmaf128"),
+        "powl" => Some("powf128"),
+        "strtold" => Some("strtof128"),
+        "strtold_l" => Some("strtof128_l"),
+        "wcstold" => Some("wcstof128"),
+        "__clog10l" | "__finitel" | "__fpclassifyl" | "__iscanonicall" | "__iseqsigl"
+        | "__isinfl" | "__isnanl" | "__issignalingl" | "__signbitl" | "__strtold_internal"
+        | "__strtold_l" | "__wcstold_internal" | "__wcstold_l" | "acoshl" | "acosl" | "acospil"
+        | "asinhl" | "asinl" | "asinpil" | "atan2l" | "atan2pil" | "atanhl" | "atanl"
+        | "atanpil" | "cabsl" | "cacoshl" | "cacosl" | "canonicalizel" | "cargl" | "casinhl"
+        | "casinl" | "catanhl" | "catanl" | "cbrtl" | "ccoshl" | "ccosl" | "ceill" | "cexpl"
+        | "cimagl" | "clog10l" | "clogl" | "compoundnl" | "conjl" | "copysignl" | "coshl"
+        | "cosl" | "cospil" | "cpowl" | "cprojl" | "creall" | "csinhl" | "csinl" | "csqrtl"
+        | "ctanhl" | "ctanl" | "daddl" | "ddivl" | "dfmal" | "dmull" | "dreml" | "dsqrtl"
+        | "dsubl" | "erfcl" | "erfl" | "exp10l" | "exp10m1l" | "exp2l" | "exp2m1l" | "expl"
+        | "expm1l" | "fabsl" | "faddl" | "fdiml" | "fdivl" | "ffmal" | "finitel" | "floorl"
+        | "fmaximum_mag_numl" | "fmaximum_magl" | "fmaximum_numl" | "fmaximuml" | "fmaxl"
+        | "fmaxmagl" | "fminimum_mag_numl" | "fminimum_magl" | "fminimum_numl" | "fminimuml"
+        | "fminl" | "fminmagl" | "fmodl" | "fmull" | "frexpl" | "fromfpl" | "fromfpxl"
+        | "fsqrtl" | "fsubl" | "gammal" | "getpayloadl" | "hypotl" | "ilogbl" | "isinfl"
+        | "isnanl" | "j0l" | "j1l" | "jnl" | "ldexpl" | "lgammal" | "lgammal_r" | "llogbl"
+        | "llrintl" | "llroundl" | "log10l" | "log10p1l" | "log1pl" | "log2l" | "log2p1l"
+        | "logbl" | "logl" | "logp1l" | "lrintl" | "lroundl" | "modfl" | "nanl" | "nearbyintl"
+        | "nextafterl" | "nextdownl" | "nexttoward" | "nexttowardf" | "nexttowardl" | "nextupl"
+        | "pownl" | "powrl" | "qecvt" | "qecvt_r" | "qfcvt" | "qfcvt_r" | "qgcvt"
+        | "remainderl" | "remquol" | "rintl" | "rootnl" | "roundevenl" | "roundl" | "rsqrtl"
+        | "scalbl" | "scalblnl" | "scalbnl" | "setpayloadl" | "setpayloadsigl" | "significandl"
+        | "sincosl" | "sinhl" | "sinl" | "sinpil" | "sqrtl" | "strfroml" | "tanhl" | "tanl"
+        | "tanpil" | "tgammal" | "totalorderl" | "totalordermagl" | "truncl" | "ufromfpl"
+        | "ufromfpxl" | "wcstold_l" | "y0l" | "y1l" | "ynl" => None,
+        other => Some(other),
+    }
+}
+
+pub(super) unsafe fn dlsym_bionic_import(
+    handle: *mut libc::c_void,
+    name: &str,
+) -> Option<ResolvedSym> {
+    let cname = CString::new(glibc_name_for_bionic(name)?).ok()?;
+
+    let ptr = unsafe { libc::dlsym(handle, cname.as_ptr()) };
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ResolvedSym { addr: ptr as u64 })
+    }
+}
+
 impl SymbolProvider for HostDlsymProvider {
     fn resolve(&self, name: &str) -> Option<ResolvedSym> {
-        let cname = CString::new(name).ok()?;
-
-        let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) };
-        if ptr.is_null() {
-            None
-        } else {
-            Some(ResolvedSym { addr: ptr as u64 })
-        }
+        unsafe { dlsym_bionic_import(libc::RTLD_DEFAULT, name) }
     }
 }
 
@@ -356,6 +399,142 @@ mod tests {
         );
 
         assert_eq!(p.resolve("bad\0name"), None);
+    }
+
+    fn binary128(high: u64) -> core::arch::x86_64::__m128 {
+        unsafe { std::mem::transmute::<[u64; 2], core::arch::x86_64::__m128>([0, high]) }
+    }
+
+    fn binary128_bits(value: core::arch::x86_64::__m128) -> [u64; 2] {
+        unsafe { std::mem::transmute::<core::arch::x86_64::__m128, [u64; 2]>(value) }
+    }
+
+    #[test]
+    fn bionic_long_double_imports_bind_to_glibc_binary128_entry_points() {
+        use core::arch::x86_64::__m128;
+        use std::ffi::{c_char, c_int};
+
+        const TWO: u64 = 0x4000_0000_0000_0000;
+        const THREE: u64 = 0x4000_8000_0000_0000;
+        const FOUR: u64 = 0x4001_0000_0000_0000;
+        const TEN: u64 = 0x4002_4000_0000_0000;
+        const ONE_HUNDRED: u64 = 0x4005_9000_0000_0000;
+        const ONE_THOUSAND_TWENTY_FOUR: u64 = 0x4009_0000_0000_0000;
+        const FIFTEEN_HUNDRED: u64 = 0x4009_7700_0000_0000;
+
+        let env = super::super::bionic_env::BionicEnv::with_host_baseline(true, true);
+        let addr = |name: &str| {
+            env.scope()
+                .resolve(name)
+                .unwrap_or_else(|| panic!("{name} must resolve"))
+                .addr as usize
+        };
+        let powl: extern "C" fn(__m128, __m128) -> __m128 =
+            unsafe { std::mem::transmute(addr("powl")) };
+        let fmal: extern "C" fn(__m128, __m128, __m128) -> __m128 =
+            unsafe { std::mem::transmute(addr("fmal")) };
+        let strtold: unsafe extern "C" fn(*const c_char, *mut *mut c_char) -> __m128 =
+            unsafe { std::mem::transmute(addr("strtold")) };
+        let strtold_l: unsafe extern "C" fn(
+            *const c_char,
+            *mut *mut c_char,
+            libc::locale_t,
+        ) -> __m128 = unsafe { std::mem::transmute(addr("strtold_l")) };
+        let wcstold: unsafe extern "C" fn(*const libc::wchar_t, *mut *mut libc::wchar_t) -> __m128 =
+            unsafe { std::mem::transmute(addr("wcstold")) };
+        let newlocale: unsafe extern "C" fn(
+            c_int,
+            *const c_char,
+            libc::locale_t,
+        ) -> libc::locale_t = unsafe { std::mem::transmute(addr("newlocale")) };
+
+        assert_eq!(
+            binary128_bits(powl(binary128(TEN), binary128(TWO))),
+            [0, ONE_HUNDRED]
+        );
+        assert_eq!(
+            binary128_bits(powl(binary128(TWO), binary128(TEN))),
+            [0, ONE_THOUSAND_TWENTY_FOUR]
+        );
+        assert_eq!(
+            binary128_bits(fmal(binary128(TWO), binary128(THREE), binary128(FOUR))),
+            [0, TEN]
+        );
+        assert_eq!(
+            binary128_bits(unsafe { strtold(c"1.5e3".as_ptr(), std::ptr::null_mut()) }),
+            [0, FIFTEEN_HUNDRED]
+        );
+        let locale = unsafe { newlocale(libc::LC_ALL_MASK, c"C".as_ptr(), std::ptr::null_mut()) };
+        assert!(!locale.is_null(), "the C locale must exist");
+        let parsed = unsafe { strtold_l(c"1.5e3".as_ptr(), std::ptr::null_mut(), locale) };
+        unsafe { libc::freelocale(locale) };
+        assert_eq!(binary128_bits(parsed), [0, FIFTEEN_HUNDRED]);
+        let wide: Vec<libc::wchar_t> = "1.5e3\0".chars().map(|c| c as libc::wchar_t).collect();
+        assert_eq!(
+            binary128_bits(unsafe { wcstold(wide.as_ptr(), std::ptr::null_mut()) }),
+            [0, FIFTEEN_HUNDRED]
+        );
+    }
+
+    #[test]
+    fn host_dlsym_refuses_glibc_x87_long_double_functions() {
+        let p = HostDlsymProvider;
+        for name in [
+            "logl",
+            "sqrtl",
+            "nexttoward",
+            "wcstold_l",
+            "cabsl",
+            "__isnanl",
+            "exp10l",
+            "roundevenl",
+            "nextupl",
+            "j0l",
+            "ynl",
+            "llogbl",
+            "totalorderl",
+            "canonicalizel",
+            "fromfpl",
+            "getpayloadl",
+            "clog10l",
+            "strfroml",
+            "__issignalingl",
+            "__strtold_internal",
+            "gammal",
+            "dreml",
+            "scalbl",
+            "faddl",
+            "dfmal",
+            "qecvt",
+            "qfcvt_r",
+            "qgcvt",
+        ] {
+            let cname = std::ffi::CString::new(name).unwrap();
+            assert!(
+                unsafe { !libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()).is_null() },
+                "glibc exports {name}"
+            );
+            assert_eq!(
+                p.resolve(name),
+                None,
+                "{name} must not bind to glibc's x87 version"
+            );
+        }
+        for name in [
+            "strtol",
+            "strtol_l",
+            "wcstol",
+            "wcstol_l",
+            "__strtol_internal",
+            "atol",
+            "labs",
+            "signal",
+        ] {
+            assert!(
+                p.resolve(name).is_some_and(|s| s.addr != 0),
+                "{name} still binds"
+            );
+        }
     }
 
     #[test]

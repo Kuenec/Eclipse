@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 const EBUSY: c_int = 16;
 
@@ -877,6 +877,12 @@ unsafe extern "C" fn eclipse_pthread_setspecific(key: c_int, value: *const c_voi
     let Some(cur_gen) = current_key_generation(k) else {
         return EINVAL;
     };
+    if !value.is_null() {
+        let armed = arm_key_destructors_at_thread_exit();
+        if armed != 0 {
+            return armed;
+        }
+    }
 
     match TLS_VALUES.try_with(|v| {
         v[k].set(TlsValue {
@@ -886,6 +892,30 @@ unsafe extern "C" fn eclipse_pthread_setspecific(key: c_int, value: *const c_voi
     }) {
         Ok(()) => 0,
         Err(_) => EINVAL,
+    }
+}
+
+static THREAD_EXIT_KEY: OnceLock<libc::pthread_key_t> = OnceLock::new();
+
+unsafe extern "C" fn run_key_destructors_at_thread_exit(_armed: *mut c_void) {
+    run_thread_key_destructors();
+}
+
+fn arm_key_destructors_at_thread_exit() -> c_int {
+    let key = *THREAD_EXIT_KEY.get_or_init(|| {
+        let mut key = 0;
+        let rc =
+            unsafe { libc::pthread_key_create(&mut key, Some(run_key_destructors_at_thread_exit)) };
+        assert_eq!(
+            rc, 0,
+            "creating the host pthread key that runs bionic key destructors at thread exit failed"
+        );
+        key
+    });
+    if unsafe { libc::pthread_getspecific(key) }.is_null() {
+        unsafe { libc::pthread_setspecific(key, std::ptr::dangling()) }
+    } else {
+        0
     }
 }
 
@@ -1965,7 +1995,7 @@ mod tests {
     }
 
     #[test]
-    fn key_destructor_runs_on_pthread_exit() {
+    fn key_destructor_runs_when_a_thread_eclipse_did_not_create_exits() {
         use std::sync::atomic::{AtomicUsize as AU, Ordering as O};
         static DTOR_VALUE: AU = AU::new(0);
         DTOR_VALUE.store(0, O::SeqCst);
@@ -1981,11 +2011,11 @@ mod tests {
         }
         let key_copy = key;
 
-        std::thread::spawn(move || {
-            unsafe {
-                eclipse_pthread_setspecific(key_copy, 0xABCD as *const c_void);
-            }
-            run_thread_key_destructors();
+        std::thread::spawn(move || unsafe {
+            assert_eq!(
+                eclipse_pthread_setspecific(key_copy, 0xABCD as *const c_void),
+                0
+            );
         })
         .join()
         .unwrap();
