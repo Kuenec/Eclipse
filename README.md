@@ -5,7 +5,6 @@
 **Play the official Roblox client on Linux.**
 
 [![Release](https://img.shields.io/github/v/release/Kuenec/Eclipse?color=7c3aed)](https://github.com/Kuenec/Eclipse/releases/latest)
-[![Flatpak](https://github.com/Kuenec/Eclipse/actions/workflows/flatpak.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/flatpak.yml)
 [![CI](https://github.com/Kuenec/Eclipse/actions/workflows/ci.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/ci.yml)
 [![E2E](https://github.com/Kuenec/Eclipse/actions/workflows/e2e.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/e2e.yml)
 [![Security](https://github.com/Kuenec/Eclipse/actions/workflows/security.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/security.yml)
