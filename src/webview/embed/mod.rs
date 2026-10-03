@@ -2,7 +2,7 @@ mod globals;
 mod positioner;
 mod session;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 mod wire;
 
 use std::cell::RefCell;
@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 use rustix::event::{eventfd, poll, EventfdFlags, PollFd, PollFlags, Timespec};
 use wayland_client::backend::protocol::{Argument, Interface, Message};
 use wayland_client::backend::smallvec::SmallVec;
-use wayland_client::backend::{Backend, InvalidId, ObjectData, ObjectId, WaylandError};
+use wayland_client::backend::{
+    Backend, InvalidId, ObjectData, ObjectId, ReadEventsGuard, WaylandError,
+};
 use wayland_client::protocol::{
     wl_callback::WlCallback, wl_display, wl_registry, wl_registry::WlRegistry, wl_shm,
     wl_shm::WlShm, wl_subcompositor, wl_subcompositor::WlSubcompositor, wl_surface::WlSurface,
@@ -622,14 +624,39 @@ impl Proxy {
                         %error,
                         "the game's Wayland connection failed; WebView embedding stops"
                     );
-                    return;
+                    break;
                 }
             }
         }
+        self.shut_down();
+    }
+
+    fn shut_down(mut self) {
         if let Some(session) = self.session.take() {
-            session.teardown(&self.up);
+            self.retire(session, None);
         }
         self.up.shutdown();
+    }
+
+    fn retire(&mut self, session: Session, end: Option<&SessionEnd>) {
+        let reads_held = self.settle_and_hold_reads();
+        match end {
+            Some(end) => session.disconnect(&self.up, end),
+            None => session.teardown(&self.up),
+        }
+        drop(reads_held);
+    }
+
+    fn settle_and_hold_reads(&mut self) -> Option<ReadEventsGuard> {
+        loop {
+            if self.up.backend.dispatch_inner_queue().is_err() {
+                return None;
+            }
+            self.route_events();
+            if let Some(guard) = self.up.backend.prepare_read() {
+                return Some(guard);
+            }
+        }
     }
 
     fn turn(&mut self) -> Result<Flow, WaylandError> {
@@ -674,13 +701,14 @@ impl Proxy {
                 fds.push(PollFd::new(fd, *flags));
             }
             match poll(&mut fds, None) {
-                Ok(_) => fds.iter().map(|fd| !fd.revents().is_empty()).collect(),
+                Ok(_) => fds.iter().map(PollFd::revents).collect(),
                 Err(rustix::io::Errno::INTR) => Vec::new(),
                 Err(error) => return Err(WaylandError::Io(error.into())),
             }
         };
-        let is_ready = |index: usize| ready.get(index).copied().unwrap_or(false);
-        if is_ready(0) {
+        let revents = |index: usize| ready.get(index).copied().unwrap_or(PollFlags::empty());
+        let is_ready = |index: usize| !revents(index).is_empty();
+        if revents(0).intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP) {
             match guard.read() {
                 Ok(_) => {}
                 Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -741,7 +769,7 @@ impl Proxy {
     fn attach(&mut self, stream: UnixStream) {
         if let Some(previous) = self.session.take() {
             tracing::info!("a new WebView helper replaces the previous one's embedded pages");
-            previous.teardown(&self.up);
+            self.retire(previous, None);
         }
         match Session::new(stream, self.size) {
             Ok(session) => self.session = Some(session),
@@ -762,7 +790,7 @@ impl Proxy {
                 "disconnected the WebView helper from the game window; its pages are gone"
             ),
         }
-        session.disconnect(&self.up, &end);
+        self.retire(session, Some(&end));
     }
 
     fn route_events(&mut self) {

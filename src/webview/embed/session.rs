@@ -1,3 +1,4 @@
+mod dmabuf;
 mod input;
 mod shell;
 
@@ -32,16 +33,21 @@ use wayland_protocols::wp::fifo::v1::client::wp_fifo_manager_v1::{self, WpFifoMa
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::{
     self, WpFractionalScaleManagerV1,
 };
-use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{
-    self, ZwpLinuxBufferParamsV1,
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+    zwp_linux_dmabuf_feedback_v1::{self, ZwpLinuxDmabufFeedbackV1},
 };
-use wayland_protocols::wp::linux_drm_syncobj::v1::client::wp_linux_drm_syncobj_manager_v1::{
-    self, WpLinuxDrmSyncobjManagerV1,
+use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
+    wp_linux_drm_syncobj_manager_v1::{self, WpLinuxDrmSyncobjManagerV1},
+    wp_linux_drm_syncobj_surface_v1::{self, WpLinuxDrmSyncobjSurfaceV1},
 };
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_hold_v1::{self, ZwpPointerGestureHoldV1},
     zwp_pointer_gesture_pinch_v1::{self, ZwpPointerGesturePinchV1},
     zwp_pointer_gesture_swipe_v1::{self, ZwpPointerGestureSwipeV1},
+};
+use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::{
+    self, WpSinglePixelBufferManagerV1,
 };
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{self, ZwpTextInputV3};
 use wayland_protocols::wp::viewporter::client::{
@@ -128,6 +134,8 @@ enum Class {
     Viewport,
     CursorShape,
     BufferParams,
+    DmabufFeedback,
+    Buffer,
 }
 
 fn class_of(interface: &Interface) -> Class {
@@ -164,6 +172,8 @@ fn class_of(interface: &Interface) -> Class {
         (WpViewport::interface(), Class::Viewport),
         (WpCursorShapeDeviceV1::interface(), Class::CursorShape),
         (ZwpLinuxBufferParamsV1::interface(), Class::BufferParams),
+        (ZwpLinuxDmabufFeedbackV1::interface(), Class::DmabufFeedback),
+        (WlBuffer::interface(), Class::Buffer),
     ];
     classes
         .into_iter()
@@ -199,6 +209,23 @@ fn creates_surface_extension(manager: &Interface, opcode: u16) -> bool {
         .any(|(interface, constructor)| interface.name == manager.name && constructor == opcode)
 }
 
+fn completes_a_commit(interface: &Interface, opcode: u16) -> bool {
+    let requests = [
+        (WlSurface::interface(), wl_surface::REQ_ATTACH_OPCODE),
+        (
+            WpLinuxDrmSyncobjSurfaceV1::interface(),
+            wp_linux_drm_syncobj_surface_v1::REQ_SET_ACQUIRE_POINT_OPCODE,
+        ),
+        (
+            WpLinuxDrmSyncobjSurfaceV1::interface(),
+            wp_linux_drm_syncobj_surface_v1::REQ_SET_RELEASE_POINT_OPCODE,
+        ),
+    ];
+    requests
+        .into_iter()
+        .any(|(known, request)| known.name == interface.name && request == opcode)
+}
+
 enum Kind {
     Display,
     Registry,
@@ -229,7 +256,62 @@ struct Surface {
     role: SurfaceRole,
     xdg_surface: Option<u32>,
     parent: Option<SurfaceLink>,
+    synchronized: bool,
     attached: Option<bool>,
+    content: Content,
+}
+
+#[derive(Clone, Copy)]
+struct Content {
+    buffer: Option<(i32, i32)>,
+    scale: i32,
+    transform: i32,
+    source: Option<[i32; 4]>,
+    destination: bool,
+}
+
+impl Default for Content {
+    fn default() -> Self {
+        Self {
+            buffer: None,
+            scale: 1,
+            transform: 0,
+            source: None,
+            destination: false,
+        }
+    }
+}
+
+impl Content {
+    fn refusal(&self, role: SurfaceRole) -> Option<&'static str> {
+        const FIXED_ONE: i64 = 256;
+        let whole = |fixed: i32| i64::from(fixed) % FIXED_ONE == 0;
+        if let Some([_, _, width, height]) = self.source {
+            if !self.destination && !(whole(width) && whole(height)) {
+                return Some("a fractional viewport source without a destination size");
+            }
+        }
+        let (width, height) = self.buffer?;
+        let scale = self.scale.max(1);
+        let Some([x, y, source_width, source_height]) = self.source else {
+            let checked = !matches!(role, SurfaceRole::None | SurfaceRole::Cursor);
+            let divisible = width % scale == 0 && height % scale == 0;
+            return (checked && !divisible)
+                .then_some("a buffer size that is not a multiple of the buffer scale");
+        };
+        let (mut surface_width, mut surface_height) = (width / scale, height / scale);
+        if self.transform % 2 == 1 {
+            std::mem::swap(&mut surface_width, &mut surface_height);
+        }
+        let fits = |start: i32, length: i32, limit: i32| {
+            i64::from(start) + i64::from(length) <= i64::from(limit) * FIXED_ONE
+        };
+        let inside = fits(x, source_width, surface_width)
+            && fits(y, source_height, surface_height)
+            && fits(x, source_width, width)
+            && fits(y, source_height, height);
+        (!inside).then_some("a viewport source outside the buffer")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -286,6 +368,8 @@ pub(super) struct Session {
     seats: HashMap<u32, u32>,
     shm_formats: HashSet<u32>,
     pools: HashMap<u32, Pool>,
+    buffers: HashMap<u32, (i32, i32)>,
+    dmabuf: dmabuf::Dmabuf,
     extensions: HashMap<u32, SurfaceLink>,
     exclusive: HashSet<(&'static str, u64)>,
     awaiting: Option<ImmediateBuffer>,
@@ -320,6 +404,8 @@ impl Session {
             seats: HashMap::new(),
             shm_formats: HashSet::new(),
             pools: HashMap::new(),
+            buffers: HashMap::new(),
+            dmabuf: dmabuf::Dmabuf::default(),
             extensions: HashMap::new(),
             exclusive: HashSet::new(),
             awaiting: None,
@@ -432,7 +518,9 @@ impl Session {
                             role: SurfaceRole::None,
                             xdg_surface: None,
                             parent: None,
+                            synchronized: false,
                             attached: None,
+                            content: Content::default(),
                         },
                     );
                 }
@@ -485,11 +573,21 @@ impl Session {
                     Class::ShmPool => {
                         self.pools.remove(&id);
                     }
+                    Class::Buffer => {
+                        self.buffers.remove(&id);
+                    }
+                    Class::BufferParams | Class::DmabufFeedback => self.dmabuf.forget(id),
                     class => self.input.forget(id, class),
                 }
                 if let Some(link) = self.extensions.remove(&id) {
                     self.exclusive
                         .remove(&(object.interface.name, link.instance));
+                    if class == Class::Viewport {
+                        if let Some(content) = self.live_content(link) {
+                            content.source = None;
+                            content.destination = false;
+                        }
+                    }
                 }
             }
             Kind::Registry => self.registries.retain(|registry| *registry != id),
@@ -718,9 +816,22 @@ impl Session {
         desc: &'static MessageDesc,
     ) -> Result<(), Violation> {
         if self.names_inert_object(&request) {
+            if completes_a_commit(interface, request.opcode) {
+                return Err(violation(
+                    request.object,
+                    interface,
+                    desc,
+                    "a buffer or timeline the game's connection does not hold",
+                ));
+            }
             return self.inert_request(request, interface, desc);
         }
         self.check_request(class, &request, interface, desc)?;
+        if class == Class::BufferParams {
+            let version = self.objects[&request.object].version;
+            self.buffer_params_request(version, &request)
+                .map_err(|reason| violation(request.object, interface, desc, reason))?;
+        }
         if class == Class::BufferParams
             && request.opcode == zwp_linux_buffer_params_v1::REQ_CREATE_IMMED_OPCODE
         {
@@ -827,27 +938,62 @@ impl Session {
             Some(buffer) => {
                 let kind = Kind::Upstream {
                     id: buffer.clone(),
-                    class: Class::Other,
+                    class: Class::Buffer,
                 };
                 self.adopt(awaited.buffer, WlBuffer::interface(), awaited.version, kind)
                     .inspect_err(|_| up.destroy(&buffer))
             }
-            None => {
-                self.send(
-                    awaited.params,
-                    zwp_linux_buffer_params_v1::EVT_FAILED_OPCODE,
-                    Vec::new(),
-                );
-                self.adopt(
-                    awaited.buffer,
-                    WlBuffer::interface(),
-                    awaited.version,
-                    Kind::Inert,
-                )
-            }
+            None => Err("the compositor could not import a dmabuf the helper made"),
         };
-        if let Err(reason) = adopted {
-            self.failed.get_or_insert(WireError::Backlog(reason));
+        match adopted {
+            Ok(()) => self.remember_dmabuf_size(awaited.params, awaited.buffer),
+            Err(reason) => {
+                self.failed.get_or_insert(WireError::Backlog(reason));
+            }
+        }
+    }
+
+    fn remember_dmabuf_size(&mut self, params: u32, buffer: u32) {
+        if let Some(size) = self.dmabuf.requested_size(params) {
+            self.buffers.insert(buffer, size);
+        }
+    }
+
+    fn buffer_params_request(
+        &mut self,
+        version: u32,
+        request: &Request,
+    ) -> Result<(), &'static str> {
+        let params = request.object;
+        let creation = |width: i32, height: i32, format: u32, flags: u32| dmabuf::Creation {
+            version,
+            width,
+            height,
+            format,
+            flags,
+        };
+        match (request.opcode, request.args.as_slice()) {
+            (
+                zwp_linux_buffer_params_v1::REQ_ADD_OPCODE,
+                [Argument::Fd(file), Argument::Uint(plane), Argument::Uint(offset), Argument::Uint(stride), Argument::Uint(high), Argument::Uint(low)],
+            ) => self.dmabuf.add(
+                params,
+                file.as_fd(),
+                *plane,
+                (*offset, *stride),
+                (u64::from(*high) << 32) | u64::from(*low),
+            ),
+            (
+                zwp_linux_buffer_params_v1::REQ_CREATE_OPCODE,
+                [Argument::Int(width), Argument::Int(height), Argument::Uint(format), Argument::Uint(flags)],
+            )
+            | (
+                zwp_linux_buffer_params_v1::REQ_CREATE_IMMED_OPCODE,
+                [_, Argument::Int(width), Argument::Int(height), Argument::Uint(format), Argument::Uint(flags)],
+            ) => self
+                .dmabuf
+                .create(params, &creation(*width, *height, *format, *flags)),
+            _ => Ok(()),
         }
     }
 
@@ -876,6 +1022,40 @@ impl Session {
     fn live_parent(&self, surface: u32) -> Option<u32> {
         let parent = self.surfaces.get(&surface)?.parent?;
         self.surface_alive(parent).then_some(parent.surface)
+    }
+
+    fn live_content(&mut self, link: SurfaceLink) -> Option<&mut Content> {
+        self.surfaces
+            .get_mut(&link.surface)
+            .filter(|surface| surface.instance == link.instance)
+            .map(|surface| &mut surface.content)
+    }
+
+    fn orphaned(&self, surface: u32) -> bool {
+        let mut current = surface;
+        for _ in 0..=self.surfaces.len() {
+            let Some(parent) = self.surfaces.get(&current).and_then(|state| state.parent) else {
+                return false;
+            };
+            if !self.surface_alive(parent) {
+                return true;
+            }
+            current = parent.surface;
+        }
+        true
+    }
+
+    fn check_commit(&self, surface: u32) -> Result<(), &'static str> {
+        let Some(state) = self.surfaces.get(&surface) else {
+            return Ok(());
+        };
+        let parent_alive = state
+            .parent
+            .is_some_and(|parent| self.surface_alive(parent));
+        if state.synchronized && parent_alive && self.orphaned(surface) {
+            return Err("a synchronized subsurface with a destroyed ancestor");
+        }
+        state.content.refusal(state.role).map_or(Ok(()), Err)
     }
 
     fn descends_from(&self, surface: u32, ancestor: u32) -> bool {
@@ -950,13 +1130,19 @@ impl Session {
                 if self.descends_from(*parent, *surface) {
                     return Err(fail("a subsurface of itself"));
                 }
-                let orphaned_parent = self
-                    .surfaces
-                    .get(parent)
-                    .and_then(|state| state.parent)
-                    .is_some_and(|grandparent| !self.surface_alive(grandparent));
-                if orphaned_parent {
-                    return Err(fail("a parent subsurface whose own parent is gone"));
+                if self.orphaned(*parent) {
+                    return Err(fail("a parent subsurface with a destroyed ancestor"));
+                }
+            }
+            (Class::Surface, wl_surface::REQ_COMMIT_OPCODE, _) => {
+                self.check_commit(request.object).map_err(fail)?;
+            }
+            (Class::Surface, wl_surface::REQ_DESTROY_OPCODE, _) => {
+                let subsurface_alive = self.surfaces.get(&request.object).is_some_and(|state| {
+                    state.role == SurfaceRole::Subsurface && state.parent.is_some()
+                });
+                if subsurface_alive {
+                    return Err(fail("a surface destroyed before its wl_subsurface"));
                 }
             }
             (
@@ -1133,8 +1319,24 @@ impl Session {
         let id = request.object;
         match (class, request.opcode, request.args.as_slice()) {
             (Class::Surface, wl_surface::REQ_ATTACH_OPCODE, [Argument::Object(buffer), ..]) => {
+                let size = self.buffers.get(buffer).copied();
                 if let Some(state) = self.surfaces.get_mut(&id) {
                     state.attached = Some(*buffer != 0);
+                    state.content.buffer = size;
+                }
+            }
+            (Class::Surface, wl_surface::REQ_SET_BUFFER_SCALE_OPCODE, [Argument::Int(scale)]) => {
+                if let Some(state) = self.surfaces.get_mut(&id) {
+                    state.content.scale = *scale;
+                }
+            }
+            (
+                Class::Surface,
+                wl_surface::REQ_SET_BUFFER_TRANSFORM_OPCODE,
+                [Argument::Int(transform)],
+            ) => {
+                if let Some(state) = self.surfaces.get_mut(&id) {
+                    state.content.transform = *transform;
                 }
             }
             (Class::Surface, wl_surface::REQ_COMMIT_OPCODE, _) => self.committed(up, id),
@@ -1149,8 +1351,61 @@ impl Session {
                 if let Some(state) = self.surfaces.get_mut(surface) {
                     state.role = SurfaceRole::Subsurface;
                     state.parent = Some(parent);
+                    state.synchronized = true;
                 }
                 self.subsurfaces.insert(*subsurface, link);
+            }
+            (
+                Class::Subsurface,
+                opcode
+                @ (wl_subsurface::REQ_SET_SYNC_OPCODE | wl_subsurface::REQ_SET_DESYNC_OPCODE),
+                _,
+            ) => {
+                let link = self.subsurfaces.get(&id).copied();
+                let state = link.and_then(|link| {
+                    self.surfaces
+                        .get_mut(&link.surface)
+                        .filter(|state| state.instance == link.instance)
+                });
+                if let Some(state) = state {
+                    state.synchronized = opcode == wl_subsurface::REQ_SET_SYNC_OPCODE;
+                }
+            }
+            (
+                Class::ShmPool,
+                wl_shm_pool::REQ_CREATE_BUFFER_OPCODE,
+                [Argument::NewId(buffer), _, Argument::Int(width), Argument::Int(height), ..],
+            ) => {
+                self.buffers.insert(*buffer, (*width, *height));
+            }
+            (
+                Class::Viewport,
+                wp_viewport::REQ_SET_SOURCE_OPCODE,
+                [Argument::Fixed(x), Argument::Fixed(y), Argument::Fixed(width), Argument::Fixed(height)],
+            ) => {
+                const UNSET: i32 = -256;
+                let source = [*x, *y, *width, *height];
+                let link = self.extensions.get(&id).copied();
+                if let Some(content) = link.and_then(|link| self.live_content(link)) {
+                    content.source = (source != [UNSET; 4]).then_some(source);
+                }
+            }
+            (
+                Class::Viewport,
+                wp_viewport::REQ_SET_DESTINATION_OPCODE,
+                [Argument::Int(width), Argument::Int(height)],
+            ) => {
+                let link = self.extensions.get(&id).copied();
+                if let Some(content) = link.and_then(|link| self.live_content(link)) {
+                    content.destination = (*width, *height) != (-1, -1);
+                }
+            }
+            (
+                _,
+                wp_single_pixel_buffer_manager_v1::REQ_CREATE_U32_RGBA_BUFFER_OPCODE,
+                [Argument::NewId(buffer), ..],
+            ) if interface.name == WpSinglePixelBufferManagerV1::interface().name => {
+                self.buffers.insert(*buffer, (1, 1));
             }
             (
                 Class::Pointer,
@@ -1309,6 +1564,26 @@ impl Session {
                     if self.shm_formats.len() < SHM_FORMAT_LIMIT {
                         self.shm_formats.insert(*format);
                     }
+                }
+                self.send(target, opcode, args);
+            }
+            Class::DmabufFeedback => {
+                match (opcode, args.as_slice()) {
+                    (
+                        zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE_OPCODE,
+                        [Argument::Fd(file), Argument::Uint(size)],
+                    ) => self.dmabuf.format_table(target, file.as_fd(), *size),
+                    (
+                        zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS_OPCODE,
+                        [Argument::Array(indices)],
+                    ) => self.dmabuf.tranche_formats(target, indices),
+                    _ => {}
+                }
+                self.send(target, opcode, args);
+            }
+            Class::BufferParams if opcode == zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE => {
+                if let [Argument::NewId(buffer)] = args.as_slice() {
+                    self.remember_dmabuf_size(target, *buffer);
                 }
                 self.send(target, opcode, args);
             }

@@ -155,6 +155,8 @@ struct Client {
     idle: JoinHandle<()>,
 
     generation: HelperGeneration,
+
+    embedded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +173,8 @@ impl HelperGeneration {
 static CLIENT: Mutex<ClientSlot> = Mutex::new(ClientSlot::Unspawned);
 
 static UNEXPECTED_EXITS: AtomicU32 = AtomicU32::new(0);
+
+static PAGES_EMBEDDED: AtomicBool = AtomicBool::new(false);
 
 static NEXT_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -417,7 +421,10 @@ enum GameWindow {
 
     Parent(ParentWindow),
 
-    Embedding(embed::Connector),
+    Embedding {
+        connector: embed::Connector,
+        dialog: Option<ParentWindow>,
+    },
 }
 
 struct ParentState {
@@ -432,6 +439,12 @@ struct HelperLink {
     introduction: Vec<ConsumerMsg>,
 }
 
+impl HelperLink {
+    fn embedded(&self) -> bool {
+        self.display.is_some()
+    }
+}
+
 impl ParentState {
     const fn new() -> Self {
         Self {
@@ -440,33 +453,64 @@ impl ParentState {
         }
     }
 
-    fn parent(&self) -> Option<ParentWindow> {
+    fn dialog_parent(&self) -> Option<ParentWindow> {
         match &self.window {
             GameWindow::Unknown => None,
             GameWindow::Parent(parent) => Some(parent.clone()),
-            GameWindow::Embedding(_) => Some(ParentWindow::Embedded),
+            GameWindow::Embedding { dialog, .. } => dialog.clone(),
         }
     }
 
     fn introduction(&self) -> Vec<ConsumerMsg> {
         let parent = self
-            .parent()
+            .dialog_parent()
             .map(|parent| ConsumerMsg::SetParent { parent });
         let size = self.size.map(|size| ConsumerMsg::ParentResized { size });
         parent.into_iter().chain(size).collect()
     }
 
-    fn link(&self) -> Result<HelperLink, ClientError> {
-        let display = match &self.window {
-            GameWindow::Embedding(connector) => Some(connector.helper_display().map_err(|e| {
-                ClientError::Spawn(format!("the game window cannot hold a WebView page: {e}"))
-            })?),
-            GameWindow::Unknown | GameWindow::Parent(_) => None,
-        };
-        Ok(HelperLink {
-            display,
+    fn link(&mut self) -> HelperLink {
+        if let GameWindow::Embedding { connector, .. } = &self.window {
+            match connector.helper_display() {
+                Ok(display) => {
+                    return HelperLink {
+                        display: Some(display),
+                        introduction: vec![ConsumerMsg::SetParent {
+                            parent: ParentWindow::Embedded,
+                        }],
+                    }
+                }
+                Err(error) => self.leave_embedding(&error),
+            }
+        }
+        HelperLink {
+            display: None,
             introduction: self.introduction(),
-        })
+        }
+    }
+
+    fn leave_embedding(&mut self, reason: &dyn std::fmt::Display) {
+        if !matches!(self.window, GameWindow::Embedding { .. }) {
+            return;
+        }
+        let dialog = self.dialog_parent();
+        tracing::warn!(
+            %reason,
+            dialog = dialog.is_some(),
+            "webview client: WebView pages open as windows of their own from now on because one \
+             could not be shown inside the game window"
+        );
+        self.window = dialog.map_or(GameWindow::Unknown, GameWindow::Parent);
+    }
+
+    fn embed(
+        &mut self,
+        connector: embed::Connector,
+        dialog: Option<ParentWindow>,
+    ) -> Option<ConsumerMsg> {
+        self.window = GameWindow::Embedding { connector, dialog };
+        self.dialog_parent()
+            .map(|parent| ConsumerMsg::SetParent { parent })
     }
 
     fn set_parent(&mut self, parent: ParentWindow) -> Option<ConsumerMsg> {
@@ -1136,12 +1180,13 @@ struct Spawned {
     upcall: JoinHandle<()>,
 }
 
-fn spawn_client(java_vm: jni::vm::JavaVM) -> Result<Client, ClientError> {
+fn spawn_client(java_vm: jni::vm::JavaVM, link: HelperLink) -> Result<Client, ClientError> {
     let generation = HelperGeneration::next();
+    let embedded = link.embedded();
     let (tx, rx) = mpsc::channel::<Result<Spawned, ClientError>>();
     let io = std::thread::Builder::new()
         .name("eclipse-webview-io".into())
-        .spawn(move || io_thread_main(&tx, java_vm, generation))
+        .spawn(move || io_thread_main(&tx, java_vm, generation, link))
         .map_err(|e| ClientError::Spawn(format!("io-thread spawn failed: {e}")))?;
     match rx.recv_timeout(SPAWN_RESULT_TIMEOUT) {
         Ok(Ok(spawned)) => {
@@ -1154,6 +1199,7 @@ fn spawn_client(java_vm: jni::vm::JavaVM) -> Result<Client, ClientError> {
                     upcall: spawned.upcall,
                     idle,
                     generation,
+                    embedded,
                 }),
                 Err(e) => {
                     let _ = child.kill();
@@ -1361,14 +1407,12 @@ fn io_thread_main(
     tx: &mpsc::Sender<Result<Spawned, ClientError>>,
     java_vm: jni::vm::JavaVM,
     generation: HelperGeneration,
+    link: HelperLink,
 ) {
-    let spawned = lock_parent()
-        .and_then(|parent| parent.link())
-        .and_then(|link| {
-            let storage = webview_storage()?;
-            let spawned = spawn_helper_process(&storage, link.display)?;
-            Ok((spawned, link.introduction))
-        });
+    let spawned = webview_storage().and_then(|storage| {
+        let spawned = spawn_helper_process(&storage, link.display)?;
+        Ok((spawned, link.introduction))
+    });
     let ((stream, mut child), introduction) = match spawned {
         Ok(spawned) => spawned,
         Err(e) => {
@@ -1461,14 +1505,17 @@ pub fn parent_resized(size: ParentSize) {
     update_game_window(|state| state.resize(size));
 }
 
-pub(crate) fn embed_in(connector: embed::Connector) {
-    match lock_parent() {
-        Ok(mut state) => state.window = GameWindow::Embedding(connector),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "webview client: new WebView pages will not open inside the game window"
-        ),
-    }
+pub(crate) fn embed_in(connector: embed::Connector, dialog: Option<ParentWindow>) {
+    update_game_window(|state| state.embed(connector, dialog));
+}
+
+pub(crate) fn pages_embedded() -> bool {
+    PAGES_EMBEDDED.load(Ordering::Acquire)
+}
+
+fn go_live(slot: &mut ClientSlot, client: Client) {
+    PAGES_EMBEDDED.store(client.embedded, Ordering::Release);
+    *slot = ClientSlot::Live(client);
 }
 
 fn update_game_window(change: impl FnOnce(&mut ParentState) -> Option<ConsumerMsg>) {
@@ -1477,8 +1524,11 @@ fn update_game_window(change: impl FnOnce(&mut ParentState) -> Option<ConsumerMs
             return Ok(());
         };
         match &*slot {
-            ClientSlot::Live(client) => client.send(&[encode(&msg)?]),
-            ClientSlot::Unspawned | ClientSlot::Restarting | ClientSlot::Failed(_) => Ok(()),
+            ClientSlot::Live(client) if !client.embedded => client.send(&[encode(&msg)?]),
+            ClientSlot::Live(_)
+            | ClientSlot::Unspawned
+            | ClientSlot::Restarting
+            | ClientSlot::Failed(_) => Ok(()),
         }
     });
     if let Err(e) = sent {
@@ -1492,18 +1542,37 @@ fn update_game_window(change: impl FnOnce(&mut ParentState) -> Option<ConsumerMs
 fn ensure_live(slot: &mut ClientSlot, java_vm: jni::vm::JavaVM) -> Result<(), ClientError> {
     match slot {
         ClientSlot::Live(_) => Ok(()),
-        ClientSlot::Unspawned => match spawn_client(java_vm) {
-            Ok(client) => {
-                *slot = ClientSlot::Live(client);
-                Ok(())
+        ClientSlot::Unspawned => {
+            match spawn_client_or_its_dialog(|link| spawn_client(java_vm.clone(), link)) {
+                Ok(client) => {
+                    go_live(slot, client);
+                    Ok(())
+                }
+                Err(e) => {
+                    *slot = ClientSlot::Failed(e.to_string());
+                    Err(e)
+                }
             }
-            Err(e) => {
-                *slot = ClientSlot::Failed(e.to_string());
-                Err(e)
-            }
-        },
+        }
         ClientSlot::Restarting | ClientSlot::Failed(_) => slot.live().map(|_| ()),
     }
+}
+
+fn spawn_client_or_its_dialog(
+    mut spawn: impl FnMut(HelperLink) -> Result<Client, ClientError>,
+) -> Result<Client, ClientError> {
+    let link = lock_parent()?.link();
+    if !link.embedded() {
+        return spawn(link);
+    }
+    spawn(link).or_else(|error| {
+        let link = {
+            let mut parent = lock_parent()?;
+            parent.leave_embedding(&error);
+            parent.link()
+        };
+        spawn(link)
+    })
 }
 
 pub struct NavigationRequest {
@@ -1887,6 +1956,11 @@ fn helper_lost(loss: Loss, upcalls: &mpsc::Sender<Upcall>, generation: HelperGen
     if let ClientSlot::Live(mut client) = std::mem::replace(&mut *slot, slot_after(loss)) {
         let _ = client.child.kill();
         let _ = client.child.wait();
+        if client.embedded {
+            if let Ok(mut parent) = lock_parent() {
+                parent.leave_embedding(&reason);
+            }
+        }
     }
     return_cookies_to_the_jar(generation);
     let visible_views = match VIEWS.lock() {
@@ -3562,6 +3636,7 @@ mod tests {
             upcall: std::thread::spawn(|| {}),
             idle: std::thread::spawn(|| {}),
             generation,
+            embedded: false,
         }
     }
 
@@ -4076,6 +4151,171 @@ mod tests {
                 },
             ],
             "an unchanged size is not sent again"
+        );
+    }
+
+    fn read_game_window_messages(helper_end: &UnixStream, count: usize) -> Vec<ConsumerMsg> {
+        helper_end
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        (0..count)
+            .map(|_| proto::read_consumer_msg(&mut &*helper_end).expect("a game window message"))
+            .collect()
+    }
+
+    fn embedded_introduction() -> Vec<ConsumerMsg> {
+        vec![ConsumerMsg::SetParent {
+            parent: ParentWindow::Embedded,
+        }]
+    }
+
+    #[test]
+    fn a_helper_started_before_the_game_window_becomes_its_dialog_and_keeps_its_input() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *PARENT.lock().expect("parent") = ParentState::new();
+        let game = embed::tests::Game::start();
+        let (host_end, helper_end) = UnixStream::pair().expect("socketpair");
+        go_live(
+            &mut CLIENT.lock().expect("client"),
+            stand_in_client(&host_end, HelperGeneration::next()),
+        );
+
+        embed_in(game.connector.clone(), Some(exported_game_window()));
+        parent_resized(game_window_size(1280, 720));
+        let seen = read_game_window_messages(&helper_end, 2);
+        let its_pages_embedded = pages_embedded();
+        let next = PARENT.lock().expect("parent").link();
+        *CLIENT.lock().expect("client") = ClientSlot::Unspawned;
+        *PARENT.lock().expect("parent") = ParentState::new();
+
+        assert_eq!(
+            seen,
+            [
+                ConsumerMsg::SetParent {
+                    parent: exported_game_window()
+                },
+                ConsumerMsg::ParentResized {
+                    size: game_window_size(1280, 720)
+                }
+            ],
+            "the running helper's windows become dialogs that cover the game window"
+        );
+        assert!(
+            !its_pages_embedded,
+            "its pages are windows of their own, so the game raises them instead of holding \
+             back every key and click"
+        );
+        assert!(
+            next.embedded(),
+            "the next helper draws inside the game window"
+        );
+        assert_eq!(next.introduction, embedded_introduction());
+    }
+
+    #[test]
+    fn an_embedded_helper_that_does_not_start_is_retried_as_a_dialog() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *PARENT.lock().expect("parent") = ParentState::new();
+        let game = embed::tests::Game::start();
+        embed_in(game.connector.clone(), Some(exported_game_window()));
+        let (host_end, _helper_end) = UnixStream::pair().expect("socketpair");
+        let mut attempts = Vec::new();
+        let spawned = spawn_client_or_its_dialog(|link| {
+            attempts.push((link.embedded(), link.introduction.clone()));
+            if link.embedded() {
+                Err(ClientError::Handshake(
+                    "GTK could not open the display".into(),
+                ))
+            } else {
+                Ok(stand_in_client(&host_end, HelperGeneration::next()))
+            }
+        });
+        *PARENT.lock().expect("parent") = ParentState::new();
+
+        assert!(spawned.is_ok_and(|client| !client.embedded));
+        assert_eq!(
+            attempts,
+            [
+                (true, embedded_introduction()),
+                (
+                    false,
+                    vec![ConsumerMsg::SetParent {
+                        parent: exported_game_window()
+                    }]
+                ),
+            ],
+            "a helper that cannot draw inside the game window still shows the login page"
+        );
+    }
+
+    #[test]
+    fn a_stopped_embedding_thread_sends_new_helpers_to_the_dialog() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *PARENT.lock().expect("parent") = ParentState::new();
+        let mut game = embed::tests::Game::start();
+        embed_in(game.connector.clone(), Some(exported_game_window()));
+        drop(game.embedder.take());
+        let link = PARENT.lock().expect("parent").link();
+        *PARENT.lock().expect("parent") = ParentState::new();
+
+        assert!(!link.embedded());
+        assert_eq!(
+            link.introduction,
+            [ConsumerMsg::SetParent {
+                parent: exported_game_window()
+            }]
+        );
+    }
+
+    #[test]
+    fn after_an_embedded_helper_is_lost_the_next_one_opens_dialogs() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+        *PARENT.lock().expect("parent") = ParentState::new();
+        let game = embed::tests::Game::start();
+        embed_in(game.connector.clone(), Some(exported_game_window()));
+        parent_resized(game_window_size(1600, 900));
+        let generation = HelperGeneration::next();
+        let dir = install_store("embedded-helper-lost", CookieOwner::Helper(generation));
+        let (host_end, helper_end) = UnixStream::pair().expect("socketpair");
+        go_live(
+            &mut CLIENT.lock().expect("client"),
+            Client {
+                embedded: true,
+                ..stand_in_client(&host_end, generation)
+            },
+        );
+
+        let (tx, _rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || reader_loop(&host_end, &tx, generation));
+        drop(helper_end);
+        reader.join().expect("reader");
+        let next = PARENT.lock().expect("parent").link();
+        *CLIENT.lock().expect("client") = ClientSlot::Unspawned;
+        *PARENT.lock().expect("parent") = ParentState::new();
+        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+        remove_store(&dir);
+
+        assert!(!next.embedded());
+        assert_eq!(
+            next.introduction,
+            [
+                ConsumerMsg::SetParent {
+                    parent: exported_game_window()
+                },
+                ConsumerMsg::ParentResized {
+                    size: game_window_size(1600, 900)
+                }
+            ],
+            "the next helper's windows are dialogs that cover the game window"
         );
     }
 
