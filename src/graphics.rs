@@ -35,6 +35,11 @@ const DISPLAY_REFRESH_POLL_INTERVAL: std::time::Duration = std::time::Duration::
 
 const POINTER_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
+const ENGINE_SURFACE_SIZE_FIRST_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+const ENGINE_SURFACE_SIZE_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 const TEXT_PX: f32 = 28.0;
 const TEXT_COLOR: [f32; 4] = [0.08, 0.09, 0.12, 1.0];
 
@@ -67,7 +72,7 @@ struct GameWindow<'vm> {
 
     handed_off: bool,
 
-    published_window_size: Option<(i32, i32)>,
+    engine_surface_size: EngineSurfaceSize,
 
     engine_tap_downtime: Option<i64>,
 
@@ -106,6 +111,8 @@ struct GameWindow<'vm> {
     next_display_refresh_poll: std::time::Instant,
 
     focused: bool,
+
+    fullscreen: bool,
 
     host_cursor: HostCursor,
 
@@ -192,17 +199,124 @@ fn surface_handoff(
     }
 }
 
+#[derive(Debug)]
+enum SurfaceSizeRefusal {
+    DisplaySize(crate::framework::FrameworkError),
+    NoSurfaceView,
+    SurfaceChanged(crate::framework::FrameworkError),
+}
+
+impl fmt::Display for SurfaceSizeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DisplaySize(e) => write!(f, "publishing the Android Display size failed: {e}"),
+            Self::NoSurfaceView => f.write_str("no engine SurfaceView takes surfaceChanged"),
+            Self::SurfaceChanged(e) => write!(f, "SurfaceView.surfaceChanged failed: {e}"),
+        }
+    }
+}
+
+fn surface_size_offer(
+    dispatched: Result<bool, crate::framework::FrameworkError>,
+) -> Result<(), SurfaceSizeRefusal> {
+    match dispatched {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SurfaceSizeRefusal::NoSurfaceView),
+        Err(e) => Err(SurfaceSizeRefusal::SurfaceChanged(e)),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SurfaceSizeRetry {
+    at: std::time::Instant,
+    delay: std::time::Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingSurfaceSize {
+    size: (i32, i32),
+    retry: Option<SurfaceSizeRetry>,
+}
+
+impl PendingSurfaceSize {
+    fn refused_before(self) -> bool {
+        self.retry.is_some()
+    }
+
+    fn after_offer(
+        self,
+        offer: &Result<(), SurfaceSizeRefusal>,
+        now: std::time::Instant,
+    ) -> EngineSurfaceSize {
+        if offer.is_ok() {
+            return EngineSurfaceSize::Accepted(self.size);
+        }
+        let delay = self
+            .retry
+            .map_or(ENGINE_SURFACE_SIZE_FIRST_RETRY_DELAY, |retry| {
+                retry
+                    .delay
+                    .saturating_mul(2)
+                    .min(ENGINE_SURFACE_SIZE_MAX_RETRY_DELAY)
+            });
+        EngineSurfaceSize::Pending(Self {
+            size: self.size,
+            retry: Some(SurfaceSizeRetry {
+                at: now + delay,
+                delay,
+            }),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EngineSurfaceSize {
+    Unrequested,
+    Accepted((i32, i32)),
+    Pending(PendingSurfaceSize),
+}
+
+impl EngineSurfaceSize {
+    fn requested(self, size: (i32, i32)) -> Self {
+        match self {
+            Self::Accepted(accepted) if accepted == size => self,
+            Self::Pending(pending) if pending.size == size => self,
+            Self::Unrequested | Self::Accepted(_) | Self::Pending(_) => {
+                Self::Pending(PendingSurfaceSize { size, retry: None })
+            }
+        }
+    }
+
+    fn due(self, now: std::time::Instant) -> Option<PendingSurfaceSize> {
+        match self {
+            Self::Pending(pending) if pending.retry.is_none_or(|retry| now >= retry.at) => {
+                Some(pending)
+            }
+            Self::Unrequested | Self::Accepted(_) | Self::Pending(_) => None,
+        }
+    }
+
+    fn retry_at(self) -> Option<std::time::Instant> {
+        match self {
+            Self::Pending(pending) => pending.retry.map(|retry| retry.at),
+            Self::Unrequested | Self::Accepted(_) => None,
+        }
+    }
+}
+
 fn loop_wake(
     main_looper: crate::framework::MainLooperDue,
     now: std::time::Instant,
     display_refresh_poll: std::time::Instant,
     main_thread_retry: Option<std::time::Instant>,
+    engine_surface_size_retry: Option<std::time::Instant>,
     pointer_lock: PointerLock,
 ) -> ControlFlow {
     next_wake([
         main_looper.deadline(now),
         Some(display_refresh_poll),
         main_thread_retry,
+        engine_surface_size_retry,
         pointer_lock_recheck(pointer_lock),
     ])
 }
@@ -392,6 +506,7 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
+                self.sync_fullscreen();
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.mark_resized(size.width, size.height);
                 }
@@ -434,6 +549,11 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
             }
 
             WindowEvent::Focused(focused) => {
+                match (self.focused, focused) {
+                    (false, true) => tracing::info!("game window gained keyboard focus"),
+                    (true, false) => tracing::info!("game window lost keyboard focus"),
+                    (false, false) | (true, true) => {}
+                }
                 self.focused = focused;
                 if !focused {
                     self.release_engine_input_for_focus_loss();
@@ -626,6 +746,7 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
         );
         self.sync_host_cursor();
         let now = std::time::Instant::now();
+        self.sync_engine_surface_size(now);
         if now >= self.next_display_refresh_poll {
             self.publish_engine_display_refresh_rates();
             self.next_display_refresh_poll = now + DISPLAY_REFRESH_POLL_INTERVAL;
@@ -639,6 +760,7 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
             now,
             self.next_display_refresh_poll,
             main_thread_retry,
+            self.engine_surface_size.retry_at(),
             self.pointer_lock,
         ));
     }
@@ -1132,8 +1254,16 @@ impl GameWindow<'_> {
 
     fn sync_web_view_window(&mut self) {
         let current = WebViewWindow::current();
-        if (self.web_view_window, current) == (WebViewWindow::Hidden, WebViewWindow::Shown) {
-            self.release_engine_input_for_focus_loss();
+        match (self.web_view_window, current) {
+            (WebViewWindow::Hidden, WebViewWindow::Shown) => {
+                tracing::info!("WebView window shown; game input is withheld until it closes");
+                self.release_engine_input_for_focus_loss();
+            }
+            (WebViewWindow::Shown, WebViewWindow::Hidden) => {
+                tracing::info!("WebView window hidden; game input resumes");
+            }
+            (WebViewWindow::Hidden, WebViewWindow::Hidden)
+            | (WebViewWindow::Shown, WebViewWindow::Shown) => {}
         }
         self.web_view_window = current;
     }
@@ -1153,32 +1283,49 @@ impl GameWindow<'_> {
     }
 
     fn propagate_window_resize(&mut self, width: i32, height: i32) {
-        if self.published_window_size == Some((width, height)) {
-            return;
-        }
-        self.published_window_size = Some((width, height));
+        self.engine_surface_size = self.engine_surface_size.requested((width, height));
+        self.sync_engine_surface_size(std::time::Instant::now());
+    }
+
+    fn sync_engine_surface_size(&mut self, now: std::time::Instant) {
         let Some(vm) = self.vm else { return };
-        if let Err(e) = crate::framework::publish_window_size(vm, width, height) {
-            tracing::warn!(error = %e, width, height, "Display window size publish failed (ignored)");
-        }
-        if !self.handed_off {
+        let Some(pending) = self.engine_surface_size.due(now) else {
             return;
-        }
-        match crate::framework::dispatch_surface_changed(vm, width, height) {
-            Ok(true) => tracing::info!(
+        };
+        let (width, height) = pending.size;
+        let offer = self.offer_surface_size(vm, width, height);
+        match &offer {
+            Ok(()) => tracing::info!(
                 width,
                 height,
-                "window resize dispatched to the engine SurfaceView (surfaceChanged)"
+                surface_view = self.handed_off,
+                "engine surface size accepted"
             ),
-            Ok(false) => tracing::debug!(
+            Err(refusal) if !pending.refused_before() => tracing::warn!(
+                %refusal,
                 width,
                 height,
-                "window resize: engine SurfaceView not dispatchable"
+                "engine surface size refused; retrying with backoff"
             ),
-            Err(e) => {
-                tracing::warn!(error = %e, "window resize: surfaceChanged dispatch failed (ignored)")
-            }
+            Err(_) => {}
         }
+        self.engine_surface_size = pending.after_offer(&offer, now);
+    }
+
+    fn offer_surface_size(
+        &self,
+        vm: &crate::runtime::Vm,
+        width: i32,
+        height: i32,
+    ) -> Result<(), SurfaceSizeRefusal> {
+        crate::framework::publish_window_size(vm, width, height)
+            .map_err(SurfaceSizeRefusal::DisplaySize)?;
+        if !self.handed_off {
+            return Ok(());
+        }
+        surface_size_offer(crate::framework::dispatch_surface_changed(
+            vm, width, height,
+        ))
     }
 
     fn publish_engine_display_refresh_rates(&mut self) {
@@ -1525,10 +1672,10 @@ impl GameWindow<'_> {
     }
 
     fn update_pointer_lock(&mut self, reasons: PointerLockReasons) {
-        self.pointer_lock_reasons = reasons;
+        let previous = std::mem::replace(&mut self.pointer_lock_reasons, reasons);
         match pointer_lock_step(self.pointer_lock, reasons, std::time::Instant::now()) {
             PointerLockStep::Acquire => self.acquire_pointer_lock(),
-            PointerLockStep::Release => self.release_pointer_lock(),
+            PointerLockStep::Release => self.release_pointer_lock(previous),
             PointerLockStep::Keep => {}
         }
     }
@@ -1537,13 +1684,24 @@ impl GameWindow<'_> {
         let (Some(window), Some(anchor)) = (self.window.as_ref(), self.cursor) else {
             return;
         };
+        let reasons = self.pointer_lock_reasons;
         self.pointer_lock = match grab_host_pointer(window) {
-            Ok(grab) => PointerLock::Held { anchor, grab },
+            Ok(grab) => {
+                tracing::info!(
+                    ?reasons,
+                    ?grab,
+                    focused = self.focused,
+                    "pointer lock requested"
+                );
+                PointerLock::Held { anchor, grab }
+            }
             Err(error) => {
                 if !matches!(self.pointer_lock, PointerLock::Refused { .. }) {
                     tracing::warn!(
                         %error,
-                        "host pointer lock failed; retrying while the lock reason holds"
+                        ?reasons,
+                        focused = self.focused,
+                        "pointer lock refused; retrying while a lock reason holds"
                     );
                 }
                 PointerLock::Refused {
@@ -1553,12 +1711,16 @@ impl GameWindow<'_> {
         };
     }
 
-    fn release_pointer_lock(&mut self) {
-        let PointerLock::Held { anchor, .. } =
-            std::mem::replace(&mut self.pointer_lock, PointerLock::Free)
-        else {
-            return;
+    fn release_pointer_lock(&mut self, ended: PointerLockReasons) {
+        let anchor = match std::mem::replace(&mut self.pointer_lock, PointerLock::Free) {
+            PointerLock::Held { anchor, .. } => anchor,
+            PointerLock::Refused { .. } => {
+                tracing::info!(reasons = ?ended, "pointer lock no longer wanted; it was refused");
+                return;
+            }
+            PointerLock::Free => return,
         };
+        tracing::info!(reasons = ?ended, "pointer lock released");
         self.return_cursor_to(anchor);
         let Some(window) = self.window.as_ref() else {
             return;
@@ -1773,7 +1935,25 @@ impl GameWindow<'_> {
 
     fn toggle_fullscreen(&self) {
         if let Some(window) = self.window.as_ref() {
-            window.set_fullscreen(next_fullscreen(window.fullscreen()));
+            let next = next_fullscreen(window.fullscreen());
+            tracing::info!(fullscreen = next.is_some(), "F11 toggles fullscreen");
+            window.set_fullscreen(next);
+        }
+    }
+
+    fn sync_fullscreen(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let fullscreen = window.fullscreen().is_some();
+        if fullscreen == self.fullscreen {
+            return;
+        }
+        self.fullscreen = fullscreen;
+        if fullscreen {
+            tracing::info!("game window entered fullscreen");
+        } else {
+            tracing::info!("game window left fullscreen");
         }
     }
 
@@ -2054,7 +2234,7 @@ pub fn run_windowed(
         engine_window: None,
         web_view_parent: None,
         handed_off: false,
-        published_window_size: None,
+        engine_surface_size: EngineSurfaceSize::Unrequested,
         engine_tap_downtime: None,
         handoff_at: None,
         engine_synthetic_tap_done: false,
@@ -2074,6 +2254,7 @@ pub fn run_windowed(
         published_display_refresh_profile: None,
         next_display_refresh_poll: std::time::Instant::now(),
         focused: false,
+        fullscreen: false,
         host_cursor: HostCursor::Shown,
         pointer_lock_reasons: PointerLockReasons::default(),
         pointer_lock: PointerLock::Free,
@@ -6924,6 +7105,7 @@ mod tests {
                 now,
                 refresh_poll,
                 None,
+                None,
                 PointerLock::Free
             ),
             ControlFlow::WaitUntil(delayed),
@@ -6935,6 +7117,7 @@ mod tests {
                 now,
                 refresh_poll,
                 Some(retry),
+                None,
                 PointerLock::Free
             ),
             ControlFlow::WaitUntil(retry),
@@ -6946,9 +7129,118 @@ mod tests {
                 now,
                 refresh_poll,
                 None,
+                None,
                 PointerLock::Free
             ),
             ControlFlow::WaitUntil(refresh_poll)
+        );
+    }
+
+    #[test]
+    fn a_refused_engine_surface_size_is_offered_again_until_the_engine_accepts_it() {
+        use crate::framework::MainLooperDue;
+
+        let now = std::time::Instant::now();
+        let fullscreen = (2560, 1440);
+        let requested = EngineSurfaceSize::Accepted((1280, 720)).requested(fullscreen);
+        let first = requested.due(now).expect("a new size is offered at once");
+        assert_eq!(first.size, fullscreen);
+        assert!(!first.refused_before());
+
+        let refused = first.after_offer(&surface_size_offer(Ok(false)), now);
+        assert_eq!(refused.due(now), None);
+        assert_eq!(
+            refused.requested(fullscreen),
+            refused,
+            "a repeated Resized keeps the backoff"
+        );
+        let retry_at = refused
+            .retry_at()
+            .expect("a refused size schedules a retry");
+        assert_eq!(retry_at, now + ENGINE_SURFACE_SIZE_FIRST_RETRY_DELAY);
+        assert_eq!(
+            loop_wake(
+                MainLooperDue::WhenWoken,
+                now,
+                now + DISPLAY_REFRESH_POLL_INTERVAL,
+                None,
+                refused.retry_at(),
+                PointerLock::Free
+            ),
+            ControlFlow::WaitUntil(retry_at)
+        );
+
+        let second = refused
+            .due(retry_at)
+            .expect("the refused size is offered again");
+        assert_eq!(second.size, fullscreen);
+        assert!(second.refused_before());
+
+        let accepted = second.after_offer(&surface_size_offer(Ok(true)), retry_at);
+        assert_eq!(accepted, EngineSurfaceSize::Accepted(fullscreen));
+        assert_eq!(accepted.requested(fullscreen), accepted);
+        assert_eq!(accepted.due(retry_at + DISPLAY_REFRESH_POLL_INTERVAL), None);
+        assert_eq!(accepted.retry_at(), None);
+    }
+
+    #[test]
+    fn engine_surface_size_retries_back_off_to_a_bound_and_a_new_size_goes_at_once() {
+        let mut at = std::time::Instant::now();
+        let mut size = EngineSurfaceSize::Unrequested.requested((1920, 1080));
+        let mut delays = Vec::new();
+        for _ in 0..7 {
+            size = size
+                .due(at)
+                .expect("the retry is due")
+                .after_offer(&Err(SurfaceSizeRefusal::NoSurfaceView), at);
+            let retry_at = size.retry_at().expect("a retry is scheduled");
+            delays.push((retry_at - at).as_millis());
+            at = retry_at;
+        }
+        assert_eq!(delays, [100, 200, 400, 800, 1600, 2000, 2000]);
+
+        let windowed = size.requested((1280, 720));
+        let offered = windowed.due(at).expect("a new size skips the backoff");
+        assert_eq!(offered.size, (1280, 720));
+        assert!(!offered.refused_before());
+    }
+
+    #[test]
+    fn only_a_surface_view_that_takes_the_size_settles_it() {
+        use crate::framework::FrameworkError;
+
+        let now = std::time::Instant::now();
+        let fullscreen = (2560, 1440);
+        let pending = EngineSurfaceSize::Accepted((1280, 720))
+            .requested(fullscreen)
+            .due(now)
+            .expect("a new size is offered at once");
+        let retried = EngineSurfaceSize::Pending(PendingSurfaceSize {
+            size: fullscreen,
+            retry: Some(SurfaceSizeRetry {
+                at: now + ENGINE_SURFACE_SIZE_FIRST_RETRY_DELAY,
+                delay: ENGINE_SURFACE_SIZE_FIRST_RETRY_DELAY,
+            }),
+        });
+
+        assert_eq!(
+            pending.after_offer(&surface_size_offer(Ok(true)), now),
+            EngineSurfaceSize::Accepted(fullscreen)
+        );
+        assert_eq!(
+            pending.after_offer(&surface_size_offer(Ok(false)), now),
+            retried
+        );
+        assert_eq!(
+            pending.after_offer(&surface_size_offer(Err(FrameworkError::Panicked)), now),
+            retried
+        );
+        assert_eq!(
+            pending.after_offer(
+                &Err(SurfaceSizeRefusal::DisplaySize(FrameworkError::Panicked)),
+                now
+            ),
+            retried
         );
     }
 
