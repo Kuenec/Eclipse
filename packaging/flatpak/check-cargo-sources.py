@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
 
 import json
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 SOURCES = Path("packaging/flatpak/cargo-sources.json")
-LOCKFILES = (
-    Path("Cargo.lock"),
-    Path("crates/eclipse-webview/Cargo.lock"),
-    Path("crates/libm-shim/Cargo.lock"),
-)
+LOCKFILE_PATHSPEC = ":(glob)**/Cargo.lock"
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 VENDOR_PREFIX = "cargo/vendor/"
 
 
+def tracked_lockfiles():
+    listing = subprocess.run(
+        ["git", "-C", REPO, "ls-files", "-z", "--", LOCKFILE_PATHSPEC],
+        stdout=subprocess.PIPE,
+        encoding="utf-8",
+        check=True,
+    )
+    lockfiles = [Path(name) for name in listing.stdout.split("\0") if name]
+    if not lockfiles:
+        sys.exit(f"git tracks no Cargo.lock in {REPO}")
+    return lockfiles
+
+
 def locked_crates(problems):
     crates = {}
-    for lockfile in LOCKFILES:
+    for lockfile in tracked_lockfiles():
         with open(REPO / lockfile, "rb") as handle:
             packages = tomllib.load(handle).get("package", [])
         for package in packages:

@@ -18,7 +18,7 @@ flatpak-builder --user --install-deps-from=flathub --install --force-clean \
   build/flatpak-app packaging/flatpak/io.github.kuenec.Eclipse.yml
 ```
 
-The Flatpak build is offline. After changing a `Cargo.lock`, run `packaging/flatpak/update-cargo-sources.sh`.
+The Flatpak build is offline. After changing a `Cargo.lock`, or staging a new one, run `packaging/flatpak/update-cargo-sources.sh`.
 
 ## Checks
 
@@ -28,7 +28,9 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 ```
 
-Tests that need the real client run when `ECLIPSE_ROBLOX_APK` points at an official APK set, and skip without it. CI runs these checks plus E2E, security audits and the Flatpak source check.
+Tests that need the real client run when `ECLIPSE_ROBLOX_APK` points at an official APK set, and skip without it. CI runs these checks plus E2E, security audits and the Flatpak source check. Pushes to main and pull requests that change more than docs or tests also build the Flatpak, which fails above the installed-size limit in `packaging/flatpak/check-installed-size.sh`.
+
+Packaging changes must pass `desktop-file-validate` and Flathub's `flatpak-builder-lint`. Each exception in `packaging/flatpak/lint-exceptions.json` has its reason here: `appstream-external-screenshot-url`, because screenshots are served from GitHub, not Flathub's media mirror.
 
 ## Layout
 
@@ -47,4 +49,4 @@ Tests that need the real client run when `ECLIPSE_ROBLOX_APK` points at an offic
 
 ## Releases
 
-Pushing a `vX.Y.Z` tag builds the release and publishes the signed Flatpak repository to GitHub Pages. It needs the `FLATPAK_GPG_PRIVATE_KEY` repository secret.
+Pushing a `vX.Y.Z` tag builds the release and publishes the signed Flatpak repository to GitHub Pages. It needs the `FLATPAK_GPG_PRIVATE_KEY` repository secret. The commit that bumps the version also adds its `<release>` entry and notes to the metainfo, which become the GitHub release notes. A tag build fails while a screenshot URL in the metainfo names `main`; point it at the new tag.

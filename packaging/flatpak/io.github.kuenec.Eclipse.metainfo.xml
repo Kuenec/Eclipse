@@ -21,27 +21,139 @@
     </p>
   </description>
   <launchable type="desktop-id">io.github.kuenec.Eclipse.desktop</launchable>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The launch window downloading the official Roblox client</caption>
+      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/main/packaging/flatpak/screenshots/first-launch.png</image>
+    </screenshot>
+  </screenshots>
   <url type="homepage">https://github.com/Kuenec/Eclipse</url>
   <url type="bugtracker">https://github.com/Kuenec/Eclipse/issues</url>
+  <url type="help">https://github.com/Kuenec/Eclipse/blob/main/docs/guide.md</url>
   <url type="vcs-browser">https://github.com/Kuenec/Eclipse</url>
   <categories>
     <category>Game</category>
   </categories>
+  <requires>
+    <internet>always</internet>
+  </requires>
+  <recommends>
+    <display_length compare="ge">600</display_length>
+    <memory>4096</memory>
+  </recommends>
   <supports>
     <control>keyboard</control>
     <control>pointing</control>
   </supports>
   <provides>
     <binary>eclipse</binary>
+    <mediatype>x-scheme-handler/roblox-player</mediatype>
+    <mediatype>x-scheme-handler/roblox</mediatype>
   </provides>
+  <branding>
+    <color type="primary" scheme_preference="light">#ffe3a3</color>
+    <color type="primary" scheme_preference="dark">#9e391b</color>
+  </branding>
   <releases>
-    <release version="0.1.6" date="2026-10-03"/>
-    <release version="0.1.5" date="2026-10-03"/>
-    <release version="0.1.4" date="2026-10-02"/>
-    <release version="0.1.3" date="2026-10-02"/>
-    <release version="0.1.2" date="2026-09-27"/>
-    <release version="0.1.1" date="2026-09-26"/>
-    <release version="0.1.0" date="2026-09-26"/>
+    <release version="0.1.6" date="2026-10-03">
+      <description>
+        <ul>
+          <li>
+            Sign-in and other Roblox web pages open as a dialog over the game; the game ignores your
+            keys and clicks until the page closes. Escape or the close button closes the page, and
+            the mouse's back button goes back.
+          </li>
+          <li>
+            After a resize or a switch to fullscreen, Eclipse keeps offering the game the new window
+            size until it takes it, so the game no longer stays drawn at the old size.
+          </li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.1.5" date="2026-10-03">
+      <description>
+        <p>
+          Sign-in and other Roblox web pages now open in a WebKitGTK window from the GNOME runtime
+          instead of a bundled Chromium, so Eclipse takes under 100 MB instead of more than 450 MB.
+          Your login carries over once from the old web engine; if it cannot, the log says why,
+          and you sign in again.
+        </p>
+        <ul>
+          <li>
+            A mistake in <code>config.json</code> no longer stops Eclipse: that setting keeps its
+            default, and the launch window and <code>eclipse config</code> name the problem.
+          </li>
+          <li>
+            Eclipse's log keeps only the site of each web address, so it carries no sign-in links.
+          </li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.1.4" date="2026-10-02">
+      <description>
+        <ul>
+          <li>
+            Text boxes edit correctly with input methods and right-to-left text, the client gets
+            your time zone, and its Android resources match your language.
+          </li>
+          <li>
+            The game keeps drawing when a monitor is connected or removed, and sound no longer
+            stays silent after the sound server fails a stream.
+          </li>
+          <li>
+            Launches no longer hang on a clipboard that never answers or a window that never
+            appears, and a Roblox update removes the files the new version dropped.
+          </li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.1.3" date="2026-10-02">
+      <description>
+        <p>
+          When APKCombo has no x86-64 build of the newest Roblox release yet, Eclipse installs the
+          newest release that has one instead of failing.
+        </p>
+      </description>
+    </release>
+    <release version="0.1.2" date="2026-09-27">
+      <description>
+        <ul>
+          <li>
+            A launch window shows the update check, the download and any error until Roblox opens.
+            Downloads resume where they stopped, and only one Roblox client runs at a time.
+          </li>
+          <li>
+            Roblox's Maximum Frame Rate setting appears, with limits up to 240 FPS, and the client
+            sees your monitor's refresh rates.
+          </li>
+          <li>
+            Text boxes work with input methods, the desktop clipboard and the usual editing keys,
+            F11 toggles fullscreen, and switching windows releases every held key.
+          </li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.1.1" date="2026-09-26">
+      <description>
+        <p>
+          The first release with a Flatpak. The 0.1.0 Flatpak build failed while unpacking the web
+          engine for sign-in pages, and this release fixes it.
+        </p>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-09-26">
+      <description>
+        <p>
+          The first release. Eclipse downloads the official Android Roblox client without an
+          account, installs it only when Roblox's signature verifies, and runs it with Vulkan
+          graphics, audio, and keyboard and mouse input.
+        </p>
+        <p>
+          The Play button on the Roblox website opens games in Eclipse through
+          <code>roblox://</code> and <code>roblox-player:</code> links.
+        </p>
+      </description>
+    </release>
   </releases>
   <content_rating type="oars-1.1">
     <content_attribute id="social-chat">intense</content_attribute>
