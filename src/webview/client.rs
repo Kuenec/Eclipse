@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
-use std::os::fd::AsFd as _;
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::cef_profile;
 use super::cookie_jar::{self, CookieJar, JarFileError};
+use super::embed;
 use super::proto::{
     self, ClearScope, ConsumerMsg, CookiePair, HelperMsg, LoadEvent, ParentSize, ParentWindow,
     StoredCookie, PROTO_VERSION,
@@ -411,34 +412,68 @@ impl Views {
     }
 }
 
+enum GameWindow {
+    Unknown,
+
+    Parent(ParentWindow),
+
+    Embedding(embed::Connector),
+}
+
 struct ParentState {
-    parent: Option<ParentWindow>,
+    window: GameWindow,
 
     size: Option<ParentSize>,
+}
+
+struct HelperLink {
+    display: Option<OwnedFd>,
+
+    introduction: Vec<ConsumerMsg>,
 }
 
 impl ParentState {
     const fn new() -> Self {
         Self {
-            parent: None,
+            window: GameWindow::Unknown,
             size: None,
+        }
+    }
+
+    fn parent(&self) -> Option<ParentWindow> {
+        match &self.window {
+            GameWindow::Unknown => None,
+            GameWindow::Parent(parent) => Some(parent.clone()),
+            GameWindow::Embedding(_) => Some(ParentWindow::Embedded),
         }
     }
 
     fn introduction(&self) -> Vec<ConsumerMsg> {
         let parent = self
-            .parent
-            .clone()
+            .parent()
             .map(|parent| ConsumerMsg::SetParent { parent });
         let size = self.size.map(|size| ConsumerMsg::ParentResized { size });
         parent.into_iter().chain(size).collect()
     }
 
+    fn link(&self) -> Result<HelperLink, ClientError> {
+        let display = match &self.window {
+            GameWindow::Embedding(connector) => Some(connector.helper_display().map_err(|e| {
+                ClientError::Spawn(format!("the game window cannot hold a WebView page: {e}"))
+            })?),
+            GameWindow::Unknown | GameWindow::Parent(_) => None,
+        };
+        Ok(HelperLink {
+            display,
+            introduction: self.introduction(),
+        })
+    }
+
     fn set_parent(&mut self, parent: ParentWindow) -> Option<ConsumerMsg> {
-        if self.parent.as_ref() == Some(&parent) {
+        if matches!(&self.window, GameWindow::Parent(current) if *current == parent) {
             return None;
         }
-        self.parent = Some(parent.clone());
+        self.window = GameWindow::Parent(parent.clone());
         Some(ConsumerMsg::SetParent { parent })
     }
 
@@ -676,11 +711,17 @@ fn webview_storage() -> Result<Storage, ClientError> {
     })
 }
 
-fn spawn_helper_process(storage: &Storage) -> Result<(UnixStream, Child), ClientError> {
+fn spawn_helper_process(
+    storage: &Storage,
+    display: Option<OwnedFd>,
+) -> Result<(UnixStream, Child), ClientError> {
     let helper = resolve_helper()?;
     let mut cmd = std::process::Command::new(&helper);
     cmd.env(DATA_DIR_ENV, &storage.data)
         .env(CACHE_DIR_ENV, &storage.cache);
+    if display.is_some() {
+        embed::hand_display_to(&mut cmd);
+    }
     for name in ACTIVATION_TOKEN_ENV {
         cmd.env_remove(name);
     }
@@ -690,7 +731,7 @@ fn spawn_helper_process(storage: &Storage) -> Result<(UnixStream, Child), Client
             None => cmd.env_remove("LD_PRELOAD"),
         };
     }
-    let spawned = spawn_with_control_socket(cmd)
+    let spawned = spawn_with_control_socket(cmd, display)
         .map_err(|e| ClientError::Spawn(format!("spawn {} failed: {e}", helper.display())))?;
     tracing::info!(
         helper = %helper.display(),
@@ -700,29 +741,40 @@ fn spawn_helper_process(storage: &Storage) -> Result<(UnixStream, Child), Client
     Ok(spawned)
 }
 
+const CONTROL_FD: RawFd = 3;
+
+const FIRST_UNINHERITED_FD: RawFd = 10;
+
 fn spawn_with_control_socket(
     mut cmd: std::process::Command,
+    display: Option<OwnedFd>,
 ) -> std::io::Result<(UnixStream, Child)> {
     use std::os::unix::process::CommandExt as _;
 
     let (parent_end, child_end) = UnixStream::pair()?;
-    let child_fd = child_end.as_fd().try_clone_to_owned()?;
-    cmd.arg("--ipc-fd=3");
+    let inherited = std::iter::once((OwnedFd::from(child_end), CONTROL_FD))
+        .chain(display.map(|fd| (fd, embed::HELPER_DISPLAY_FD)))
+        .map(|(fd, target)| {
+            rustix::io::fcntl_dupfd_cloexec(&fd, FIRST_UNINHERITED_FD).map(|high| (high, target))
+        })
+        .collect::<Result<Vec<(OwnedFd, RawFd)>, _>>()?;
+    let mapping: Vec<(RawFd, RawFd)> = inherited
+        .iter()
+        .map(|(fd, target)| (fd.as_raw_fd(), *target))
+        .collect();
+    cmd.arg(format!("--ipc-fd={CONTROL_FD}"));
     unsafe {
-        use std::os::fd::AsRawFd as _;
-        let raw = child_fd.as_raw_fd();
         cmd.pre_exec(move || {
-            if raw == 3 {
-                if libc::fcntl(3, libc::F_SETFD, 0) != 0 {
+            for &(source, target) in &mapping {
+                if libc::dup2(source, target) != target {
                     return Err(std::io::Error::last_os_error());
                 }
-            } else if libc::dup2(raw, 3) != 3 {
-                return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
     let child = cmd.spawn()?;
+    drop(inherited);
     Ok((parent_end, child))
 }
 
@@ -1310,15 +1362,26 @@ fn io_thread_main(
     java_vm: jni::vm::JavaVM,
     generation: HelperGeneration,
 ) {
-    let spawned = webview_storage().and_then(|storage| spawn_helper_process(&storage));
-    let (stream, mut child) = match spawned {
+    let spawned = lock_parent()
+        .and_then(|parent| parent.link())
+        .and_then(|link| {
+            let storage = webview_storage()?;
+            let spawned = spawn_helper_process(&storage, link.display)?;
+            Ok((spawned, link.introduction))
+        });
+    let ((stream, mut child), introduction) = match spawned {
         Ok(spawned) => spawned,
         Err(e) => {
             let _ = tx.send(Err(e));
             return;
         }
     };
-    if let Err(e) = start_helper(&stream, HANDSHAKE_TIMEOUT, COOKIE_IMPORT_TIMEOUT) {
+    if let Err(e) = start_helper(
+        &stream,
+        &introduction,
+        HANDSHAKE_TIMEOUT,
+        COOKIE_IMPORT_TIMEOUT,
+    ) {
         let _ = child.kill();
         let status = child.wait().ok();
         let _ = tx.send(Err(with_exit_status(e, status)));
@@ -1364,6 +1427,7 @@ fn io_thread_main(
 
 fn start_helper(
     stream: &UnixStream,
+    introduction: &[ConsumerMsg],
     handshake_timeout: Duration,
     import_timeout: Duration,
 ) -> Result<(), ClientError> {
@@ -1373,13 +1437,15 @@ fn start_helper(
         protocol = u64::from(PROTO_VERSION),
         "eclipse-webview helper handshake complete"
     );
-    describe_game_window(stream)?;
+    describe_game_window(stream, introduction)?;
     hand_over_cookies(stream, import_timeout)
 }
 
-fn describe_game_window(stream: &UnixStream) -> Result<(), ClientError> {
-    let introduction = lock_parent()?.introduction();
-    for msg in &introduction {
+fn describe_game_window(
+    stream: &UnixStream,
+    introduction: &[ConsumerMsg],
+) -> Result<(), ClientError> {
+    for msg in introduction {
         (&mut &*stream).write_all(&encode(msg)?).map_err(|e| {
             ClientError::Handshake(format!("describing the game window failed: {}", e.kind()))
         })?;
@@ -1393,6 +1459,16 @@ pub fn set_parent(parent: ParentWindow) {
 
 pub fn parent_resized(size: ParentSize) {
     update_game_window(|state| state.resize(size));
+}
+
+pub(crate) fn embed_in(connector: embed::Connector) {
+    match lock_parent() {
+        Ok(mut state) => state.window = GameWindow::Embedding(connector),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "webview client: new WebView pages will not open inside the game window"
+        ),
+    }
 }
 
 fn update_game_window(change: impl FnOnce(&mut ParentState) -> Option<ConsumerMsg>) {
@@ -2644,7 +2720,7 @@ mod tests {
                 "[ \"$1\" = --ipc-fd=3 ] && [ -S /proc/self/fd/3 ] && sleep 0.3 && exit 7",
                 "sh",
             ]);
-            spawn_with_control_socket(cmd).expect("spawn a stand-in helper")
+            spawn_with_control_socket(cmd, None).expect("spawn a stand-in helper")
         })
         .join()
         .expect("spawning thread");
@@ -2655,6 +2731,37 @@ mod tests {
             Some(7),
             "the helper must finish on its own after the io thread that started it exits: \
              {status:?}"
+        );
+    }
+
+    #[test]
+    fn an_embedded_helper_gets_the_game_display_on_its_own_socket_only() {
+        use std::io::Read as _;
+
+        let (ours, theirs) = UnixStream::pair().expect("display socketpair");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.env("WAYLAND_DISPLAY", "wayland-1")
+            .env("GDK_BACKEND", "x11");
+        embed::hand_display_to(&mut cmd);
+        cmd.args([
+            "-c",
+            "[ \"$WAYLAND_SOCKET\" = 4 ] && [ \"$GDK_BACKEND\" = wayland ] \
+             && [ -z \"${WAYLAND_DISPLAY+set}\" ] && [ -S /proc/self/fd/3 ] \
+             && printf embedded >&4",
+        ]);
+        let (_control, mut child) =
+            spawn_with_control_socket(cmd, Some(theirs.into())).expect("spawn a stand-in helper");
+        let status = child.wait().expect("wait for the stand-in helper");
+        ours.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut written = String::new();
+        (&ours)
+            .read_to_string(&mut written)
+            .expect("read the display socket");
+        assert!(status.success(), "{status:?}");
+        assert_eq!(
+            written, "embedded",
+            "fd 4 is the proxy's socket, and the helper cannot reach the compositor directly"
         );
     }
 
@@ -3902,7 +4009,13 @@ mod tests {
                 }
             }
         });
-        let started = start_helper(&client_end, Duration::from_secs(2), Duration::from_secs(2));
+        let introduction = PARENT.lock().expect("parent").introduction();
+        let started = start_helper(
+            &client_end,
+            &introduction,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
         let seen = helper.join().expect("fake helper");
         *PARENT.lock().expect("parent") = ParentState::new();
         remove_store(&dir);

@@ -3,7 +3,7 @@
 use std::io::Read;
 use std::num::NonZeroU32;
 
-pub const PROTO_VERSION: u16 = 8;
+pub const PROTO_VERSION: u16 = 9;
 
 pub const MAGIC: [u8; 4] = *b"ECWV";
 
@@ -333,6 +333,7 @@ pub struct CookiePair {
 pub enum ParentWindow {
     Wayland { handle: String },
     X11 { window: NonZeroU32 },
+    Embedded,
 }
 
 impl ParentWindow {
@@ -340,6 +341,7 @@ impl ParentWindow {
         match self {
             Self::Wayland { .. } => 0,
             Self::X11 { .. } => 1,
+            Self::Embedded => 2,
         }
     }
 }
@@ -886,6 +888,7 @@ impl ConsumerMsg {
                 match parent {
                     ParentWindow::Wayland { handle } => put_str(&mut b, handle),
                     ParentWindow::X11 { window } => put_u32(&mut b, window.get()),
+                    ParentWindow::Embedded => {}
                 }
                 ct::SET_PARENT
             }
@@ -1220,6 +1223,7 @@ impl<'a> Body<'a> {
             1 => Ok(ParentWindow::X11 {
                 window: self.nonzero_u32("X11 parent window (must not be 0)")?,
             }),
+            2 => Ok(ParentWindow::Embedded),
             _ => Err(self.bad("parent window kind")),
         }
     }
@@ -1659,6 +1663,9 @@ mod tests {
                     window: nonzero(0x0460_0003),
                 },
             },
+            ConsumerMsg::SetParent {
+                parent: ParentWindow::Embedded,
+            },
             ConsumerMsg::ParentResized {
                 size: ParentSize {
                     width: nonzero(1280),
@@ -1988,7 +1995,7 @@ mod tests {
         for bad in [
             empty_handle,
             frame(ct::SET_PARENT, vec![1, 0, 0, 0, 0]),
-            frame(ct::SET_PARENT, vec![2, 1, 0, 0, 0]),
+            frame(ct::SET_PARENT, vec![3, 1, 0, 0, 0]),
             frame(ct::PARENT_RESIZED, size(0, 720, 0)),
             frame(ct::PARENT_RESIZED, size(1280, 0, 1)),
             frame(ct::PARENT_RESIZED, size(1280, 720, 2)),
