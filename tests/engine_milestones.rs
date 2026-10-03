@@ -65,24 +65,41 @@ fn gl_env_unavailable(output: &str) -> bool {
         || output.contains("no available configs")
 }
 
-struct HarnessLibDir(PathBuf);
+struct HarnessDir(PathBuf);
 
-impl HarnessLibDir {
-    fn create() -> Self {
+impl HarnessDir {
+    fn create(name: &str) -> Self {
         let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("run-libroblox-init-{}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("create the harness lib dir");
+            .join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create the harness dir");
         Self(path)
     }
 }
 
-impl Drop for HarnessLibDir {
+impl Drop for HarnessDir {
     fn drop(&mut self) {
         let removed = std::fs::remove_dir_all(&self.0);
         if !std::thread::panicking() {
-            removed.expect("remove the harness lib dir");
+            removed.expect("remove the harness dir");
         }
     }
+}
+
+fn files_containing(dir: &std::path::Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("list the WebView storage") {
+        let path = entry.expect("a WebView storage entry").path();
+        if path.is_dir() {
+            found.extend(files_containing(&path, needle));
+        } else if std::fs::read(&path)
+            .expect("read a WebView storage file")
+            .windows(needle.len())
+            .any(|window| window == needle)
+        {
+            found.push(path);
+        }
+    }
+    found
 }
 
 #[test]
@@ -95,7 +112,7 @@ fn run_libroblox_init_runs_every_constructor() {
         return;
     }
 
-    let lib_dir = HarnessLibDir::create();
+    let lib_dir = HarnessDir::create("run-libroblox-init");
     let out = run_eclipse(
         "__run-libroblox-init",
         &[lib_dir.0.as_os_str()],
@@ -268,43 +285,76 @@ fn webview_test_drives_load_upcalls_the_bridge_and_cookies() {
         return;
     }
 
-    let out = run_eclipse("__webview-test", &[], ENGINE_LIMIT);
-    let text = combined(&out);
+    let app_data = HarnessDir::create("webview-test-app-data");
+    for persisted in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_eclipse"));
+        command
+            .arg("__webview-test")
+            .env("ECLIPSE_APP_DATA_DIR", &app_data.0);
+        if persisted {
+            command.env("ECLIPSE_WEBVIEW_EXPECT_PERSISTED_TEST_COOKIE", "1");
+        }
+        let out = bounded_child::output(&mut command, ENGINE_LIMIT);
+        let text = combined(&out);
 
-    if !out.status.success() && text.contains(eclipse::webview::client::HELPER_NOT_FOUND_MARKER) {
-        eprintln!("SKIP: no eclipse-webview helper on this host (env limitation)\n{text}");
-        return;
-    }
+        if !out.status.success() && text.contains(eclipse::webview::client::HELPER_NOT_FOUND_MARKER)
+        {
+            eprintln!("SKIP: no eclipse-webview helper on this host (env limitation)\n{text}");
+            return;
+        }
 
-    assert!(
-        out.status.success(),
-        "__webview-test exited non-zero ({:?}); WebView engine pipeline regression.\n{text}",
-        out.status.code()
-    );
-
-    assert!(
-        text.contains("WebView engine pipeline OK:") && text.contains("upcalls 3/3"),
-        "missing the WebView pipeline success marker (natives→socket→helper→upcall regression?).\n{text}"
-    );
-    for needle in [
-        "page URL OK",
-        "bridge round-trip OK",
-        "evaluateJavascript OK",
-        "honest UA OK",
-        "cookie set/get OK",
-        "cookie callback OK",
-        "cookie flush OK",
-    ] {
         assert!(
-            text.contains(needle),
-            "missing the marker substring {needle:?} (URL/bridge/eval/UA/cookie regression?).\n{text}"
+            out.status.success(),
+            "__webview-test exited non-zero ({:?}); WebView engine pipeline regression.\n{text}",
+            out.status.code()
+        );
+
+        assert!(
+            text.contains("WebView engine pipeline OK:") && text.contains("upcalls 3/3"),
+            "missing the WebView pipeline success marker (natives→socket→helper→upcall regression?).\n{text}"
+        );
+        for needle in [
+            "page URL OK",
+            "bridge round-trip OK",
+            "evaluateJavascript OK",
+            "honest UA OK",
+            "page cookies OK",
+            "jar answer posted OK",
+            "cookie set/get OK",
+            "cookie callback OK",
+            "cookie flush OK",
+            "idle stop OK",
+            "helper restart OK",
+        ] {
+            assert!(
+                text.contains(needle),
+                "missing the marker substring {needle:?} (URL/bridge/eval/UA/cookie regression?).\n{text}"
+            );
+        }
+        assert!(
+            text.lines().any(|line| {
+                line.contains("stopped the web engine helper because no WebView window was shown")
+                    && line.contains("status=exit status: 0")
+            }),
+            "the idle helper must exit with status 0 after its grace.\n{text}"
+        );
+        assert_eq!(
+            text.contains("persisted cookies OK"),
+            persisted,
+            "the second run must read the first run's cookies from the jar.\n{text}"
+        );
+        assert!(
+            text.contains("bound=12"),
+            "the WebView native registration count regressed (expected the live bound=12 line — \
+             load, history, reload, stopLoading, getUrl, destroy, evaluateJavascript and the \
+             JavaScript bridge natives).\n{text}"
         );
     }
-    assert!(
-        text.contains("bound=12"),
-        "the WebView native registration count regressed (expected the live bound=12 line — \
-         load, history, reload, stopLoading, getUrl, destroy, evaluateJavascript and the \
-         JavaScript bridge natives).\n{text}"
+    let webview_data = app_data.0.join("webview");
+    assert_eq!(
+        files_containing(&webview_data, b"ECLIPSE_HTTPONLY"),
+        [webview_data.join("cookies")],
+        "the cookie jar must be the only file that holds cookies"
     );
 }
 

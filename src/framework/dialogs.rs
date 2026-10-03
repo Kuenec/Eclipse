@@ -106,11 +106,11 @@ extern "system" fn dialog_native_set_content_view<'local>(
     dialog: jlong,
     widget: jlong,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
+    env.with_env(|env| -> jni::errors::Result<()> {
         let root = view_registry::with_view(widget, |_view| ())
             .is_ok()
             .then_some(widget);
-        if let Err(error) = set_dialog_root(dialog, root) {
+        if let Err(error) = set_dialog_root(env, dialog, root) {
             report("Dialog.nativeSetContentView", dialog, error);
         }
         Ok(())
@@ -119,6 +119,7 @@ extern "system" fn dialog_native_set_content_view<'local>(
 }
 
 pub(super) fn set_dialog_root(
+    env: &Env,
     dialog: window_registry::WindowHandle,
     root: Option<view_registry::ViewHandle>,
 ) -> Result<(), window_registry::WindowRegistryError> {
@@ -131,12 +132,13 @@ pub(super) fn set_dialog_root(
     if let Some(previous) = shown_root.filter(|&previous| previous != root) {
         show_window_root(previous, false);
         show_window_root(root, true);
-        crate::webview::client::refresh_visibility();
+        crate::webview::client::refresh_visibility(env);
     }
     Ok(())
 }
 
 fn set_shown(
+    env: &Env,
     dialog: window_registry::WindowHandle,
     shown: Option<Global<JObject<'static>>>,
 ) -> Result<(), window_registry::WindowRegistryError> {
@@ -147,7 +149,7 @@ fn set_shown(
     })?
     .ok_or(window_registry::WindowRegistryError::NotADialog)?;
     show_window_root(root, showing);
-    crate::webview::client::refresh_visibility();
+    crate::webview::client::refresh_visibility(env);
     Ok(())
 }
 
@@ -158,7 +160,7 @@ extern "system" fn dialog_native_show<'local>(
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let shown = env.new_global_ref(&this)?;
-        match set_shown(dialog, Some(shown)) {
+        match set_shown(env, dialog, Some(shown)) {
             Ok(()) => tracing::info!(
                 target: "android.app.Dialog",
                 dialog,
@@ -176,8 +178,8 @@ extern "system" fn dialog_native_close<'local>(
     _this: JObject<'local>,
     dialog: jlong,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
-        match set_shown(dialog, None) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        match set_shown(env, dialog, None) {
             Ok(()) => tracing::info!(
                 target: "android.app.Dialog",
                 dialog,

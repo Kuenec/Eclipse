@@ -382,6 +382,7 @@ fn emit_log(priority: c_int, tag: &str, msg: &str) {
     if tests::capture_emit(priority, tag, msg) {
         return;
     }
+    let msg = crate::webview::redact::redact_urls_for_log(msg);
     match priority {
         ANDROID_LOG_VERBOSE => tracing::trace!(target: "liblog", tag, "{msg}"),
         ANDROID_LOG_DEBUG => tracing::debug!(target: "liblog", tag, "{msg}"),
@@ -3277,6 +3278,31 @@ mod tests {
         assert_eq!(*prio, ANDROID_LOG_WARN);
         assert_eq!(got_tag, "", "a null tag becomes an empty string");
         assert_eq!(got_msg, "plain");
+    }
+
+    #[test]
+    fn forwarded_liblog_lines_keep_only_scheme_and_host_of_urls() {
+        use std::ffi::CString;
+
+        let tag = CString::new("Roblox").unwrap();
+        let fmt = CString::new("%s").unwrap();
+        let text = CString::new(
+            "HttpResponse status:401 url:{ \"https://www.roblox.com/login?token=abc&x=1\" } ip:1",
+        )
+        .unwrap();
+        let log = crate::diagnostics::captured_log_lines(|| {
+            let _ = unsafe {
+                __android_log_print(ANDROID_LOG_INFO, tag.as_ptr(), fmt.as_ptr(), text.as_ptr())
+            };
+        });
+        assert!(
+            log.contains(
+                " INFO liblog: HttpResponse status:401 url:{ \"https://www.roblox.com\" } ip:1 \
+                 tag=\"Roblox\"\n"
+            ),
+            "{log}"
+        );
+        assert!(!log.contains("token=") && !log.contains("abc"), "{log}");
     }
 
     #[test]
