@@ -8,7 +8,6 @@ use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY, SHA1_OUTPUT_LEN};
 use ureq::http::header::USER_AGENT;
 use ureq::http::{Request, Response, Uri};
 
-use super::https::{self, Download, DownloadError, Extent, Host, Resume};
 use super::store::{
     CheckOutcome, Committed, InstalledVersion, Release, Staging, Store, StoreError, UpdateCheck,
     UpdateOutcome,
@@ -16,6 +15,7 @@ use super::store::{
 use super::{
     ApkSet, ApkSetError, VersionCode, BASE_APK, MAX_APK_BYTES, ROBLOX_PACKAGE, TARGET_ABI,
 };
+use crate::https::{self, Download, DownloadError, Extent, Host, Resume};
 use crate::status::StatusSink;
 
 const SITE: &str = "https://apkcombo.com";

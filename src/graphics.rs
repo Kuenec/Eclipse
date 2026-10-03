@@ -138,6 +138,8 @@ struct GameWindow<'vm> {
     activation_token: Option<ActivationToken>,
 
     dialogs: dialog_window::DialogWindows,
+
+    commands: Option<&'vm std::sync::mpsc::Receiver<launch_window::WindowCommand>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -383,7 +385,7 @@ fn display_refresh_profile(window: &Window) -> Option<DisplayRefreshProfile> {
     )
 }
 
-impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
+impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let mut attrs = Window::default_attributes()
             .with_title(self.title.clone())
@@ -479,6 +481,7 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
 
         self.window = Some(window);
         self.publish_engine_display_refresh_rates();
+        self.run_window_commands(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -502,8 +505,7 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
         match event {
             WindowEvent::CloseRequested => {
                 tracing::info!("window close requested; stopping Android before event-loop exit");
-                self.shutdown_runtime();
-                event_loop.exit();
+                self.close(event_loop);
             }
             WindowEvent::Resized(size) => {
                 self.sync_fullscreen();
@@ -636,6 +638,13 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
                 crate::webview::client::activate(token.into_raw());
             }
             _ => {}
+        }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, wake: crate::framework::HostWake) {
+        match wake {
+            crate::framework::HostWake::MainLooper => {}
+            crate::framework::HostWake::Control => self.run_window_commands(event_loop),
         }
     }
 
@@ -1240,6 +1249,31 @@ fn grab_host_pointer(window: &Window) -> Result<PointerGrab, ExternalError> {
 }
 
 impl GameWindow<'_> {
+    fn close(&mut self, event_loop: &ActiveEventLoop) {
+        self.shutdown_runtime();
+        event_loop.exit();
+    }
+
+    fn run_window_commands(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(commands) = self.commands else {
+            return;
+        };
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                launch_window::WindowCommand::Raise { done } => {
+                    launch_window::raise(self.window.as_ref(), event_loop, done);
+                }
+                launch_window::WindowCommand::Close => {
+                    tracing::info!(
+                        "another Eclipse launch asked Roblox to close; stopping Android before \
+                         event-loop exit"
+                    );
+                    self.close(event_loop);
+                }
+            }
+        }
+    }
+
     fn activity_back(&self) {
         let Some(vm) = self.vm else {
             tracing::warn!("WebView window Back input has no JavaVM");
@@ -2203,7 +2237,7 @@ impl GameWindow<'_> {
     }
 }
 
-pub type HostEventLoop = EventLoop<crate::framework::MainLooperWake>;
+pub type HostEventLoop = EventLoop<crate::framework::HostWake>;
 
 pub fn host_event_loop() -> Result<&'static mut HostEventLoop, GraphicsError> {
     HostEventLoop::with_user_event()
@@ -2218,6 +2252,7 @@ pub fn run_windowed(
     title: &str,
     vm: Option<&crate::runtime::Vm>,
     touch_mode: eclipse_config::TouchMode,
+    commands: Option<&std::sync::mpsc::Receiver<launch_window::WindowCommand>>,
 ) -> Result<(), GraphicsError> {
     crate::framework::install_main_looper_waker(event_loop.create_proxy());
     let mut app = GameWindow {
@@ -2268,6 +2303,7 @@ pub fn run_windowed(
         clipboard: None,
         activation_token,
         dialogs: dialog_window::DialogWindows::default(),
+        commands,
     };
     let run = event_loop.run_app_on_demand(&mut app);
 

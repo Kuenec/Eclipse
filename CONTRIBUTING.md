@@ -35,6 +35,8 @@ Tests that need the real client run when `ECLIPSE_ROBLOX_APK` points at an offic
 | Path | Contents |
 |---|---|
 | `src/apk/` | APK parsing, signature verification, install store, downloads |
+| `src/https.rs` | Resumable HTTPS downloads from allow-listed hosts |
+| `src/links.rs` | Roblox link parsing, Android link rendering and join-code redaction |
 | `src/loader/` | ELF/Bionic loader, JNI, NDK, audio and graphics bridges |
 | `src/framework.rs` | Android framework natives and lifecycle |
 | `src/graphics.rs` | Window, presentation and input |

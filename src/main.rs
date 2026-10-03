@@ -7,13 +7,19 @@ use eclipse::apk::store::{
     CheckOutcome, Committed, InstalledVersion, Release, Store, UpdateCheck, UpdateOutcome,
 };
 use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode};
+use eclipse::framework::ActivityStart;
 use eclipse::graphics::launch_window::{LaunchWindow, WindowClosed};
+use eclipse::links::LaunchTarget;
 use eclipse::runtime::{ClientCacheDir, NativeLibRoot};
 use eclipse::status::{StatusSink, StatusUpdate};
 use eclipse::storage::Trim;
 
-mod browser_launch;
 mod desktop_integration;
+mod instance_control;
+mod supervisor;
+
+use instance_control::{ClientLock, HandOff, LaunchSlot, Request};
+use supervisor::{ClientEnd, ExitRecord, Supervision};
 
 const CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV: &str = "ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE";
 const CLIENT_SETTINGS_PATH_ENV: &str = "ECLIPSE_CLIENT_APP_SETTINGS_PATH";
@@ -22,6 +28,19 @@ const CLIENT_SETTINGS_PATH_SHIM_NAME: &str = "libeclipse_client_settings_path.so
 const CLIENT_SETTINGS_PATH_SHIM: &[u8] =
     include_bytes!(env!("ECLIPSE_CLIENT_SETTINGS_PATH_SHIM_SO"));
 const MAXIMUM_FRAME_RATE_ROW_FLAG: &str = "FFlagGameBasicSettingsFramerateCap5";
+
+const RUN_COMMAND: &str = "run";
+const OPEN_COMMAND: &str = "open";
+const LAUNCH_LINK_COMMAND: &str = "__launch-link";
+const LAUNCH_LINK_ENV: &str = "ECLIPSE_LAUNCH_LINK";
+const RUN_USAGE: &str = "usage: eclipse run [APK | DIRECTORY]";
+const OPEN_USAGE: &str = "usage: eclipse open <LINK | PLACE ID>";
+const OPEN_CONTEXT: &str = "eclipse open";
+const HAND_OFF_CONTEXT: &str = "eclipse launch";
+const SETTINGS_CONTEXT: &str = "eclipse Android settings setup";
+const UNSUPERVISED: &str = "the Android client must be started by Eclipse's supervisor; start \
+     Eclipse without ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE in its environment";
+const BROWSER_LAUNCH_CONTEXT: &str = "eclipse browser launch";
 
 const HELP: &str = "\
 eclipse — run the Android Roblox build on Linux (open-source, Rust)
@@ -35,7 +54,12 @@ COMMANDS:
                 download and any error: the first run downloads Roblox, and later runs check
                 for a Roblox update at most every 6 hours, or 30 minutes after a failed check.
                 PATH may be an APK file or a directory holding base.apk and
-                split_config.x86_64.apk. Only one Roblox client runs at a time.
+                split_config.x86_64.apk. Only one Roblox client runs at a time; running it
+                again asks its window to come to the front.
+    open <LINK>
+                Start Roblox as `run` does and open a Roblox link or place ID: a game, server,
+                private-server, friend or share link. While Roblox is starting, the link goes
+                to it instead.
     install <PATH>...
                 Verify and install the Roblox client: base.apk plus split_config.x86_64.apk,
                 a directory holding them, or an .apks/.xapk/.apkm bundle.
@@ -45,7 +69,7 @@ COMMANDS:
                 play-login instead.
     play-login  Sign in to Google Play with your own Google account (once, for update --play).
     install-url-handler
-                Register Eclipse for browser Play clicks (they start Roblox as `run` does).
+                Register Eclipse for browser Play clicks (they open the link as `open` does).
     config      Show effective configuration and its path
     help        Show this help
     --version   Show version
@@ -57,66 +81,47 @@ NOTE: Eclipse runs only the official, unmodified Roblox client signed by Roblox 
 ";
 
 fn main() -> ExitCode {
-    let args = match normalize_browser_launch(std::env::args_os().skip(1).collect()) {
-        Ok(args) => args,
+    let supervision = match supervisor::adopt() {
+        Ok(supervision) => supervision,
         Err(error) => {
-            eprintln!("eclipse browser launch: {error}");
-            show_error_window(
-                &format!("Eclipse cannot open this Roblox link: {error}"),
-                None,
-            );
+            eprintln!("eclipse: {error}");
             return ExitCode::FAILURE;
         }
     };
-    let command = args.first().map(|command| command.to_string_lossy());
-    let command = command.as_deref();
-    if is_android_run_command(command) {
-        let settings = match std::env::var_os(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV) {
-            None => install_client_settings_and_reexec(&args),
-            Some(_) => client_settings_path().map(drop).map_err(Into::into),
-        };
-        if let Err(error) = settings {
-            report_setup_failure(&args, "eclipse Android settings setup", &error.to_string());
+    let launch_link = take_launch_link();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let launch = match LaunchCommand::parse(&args, launch_link) {
+        Ok(launch) => launch,
+        Err(error) => {
+            error.report();
             return ExitCode::FAILURE;
         }
+    };
+    if let Some(launch) = launch {
+        if std::env::var_os(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV).is_some() {
+            return run_client(launch, supervision);
+        }
+        if matches!(launch, LaunchCommand::Link(_)) && args[0] != LAUNCH_LINK_COMMAND {
+            return restart_without_link_arguments(&launch);
+        }
+        return start_client(&launch);
     }
+    let command = args.first().map(|command| command.to_string_lossy());
+    let command = command.as_deref();
     if matches!(command, Some("__webview-test") | Some("__platform-test")) {
         if let Err(error) = eclipse::runtime::prepare_art_boot_environment() {
-            report_setup_failure(&args, "eclipse ART startup", &error.to_string());
+            eprintln!("eclipse ART startup: {error}");
             return ExitCode::FAILURE;
         }
     }
 
-    eclipse::diagnostics::init();
+    eclipse::diagnostics::init(eclipse::diagnostics::LogSink::Stderr);
 
     tracing::debug!(version = eclipse::VERSION, command, "eclipse starting");
     match command {
         Some("--version") | Some("-V") => {
             println!("eclipse {}", eclipse::VERSION);
             ExitCode::SUCCESS
-        }
-        Some("run") => {
-            let loaded = eclipse_config::load();
-            let status = match parse_run_path(&args[1..]) {
-                Ok(Some(path)) => run_file(path, &loaded),
-                Ok(None) => launch_in_window(Launch::Installed, &loaded),
-                Err(error) => {
-                    eprintln!("eclipse run: {error}");
-                    1
-                }
-            };
-            finish_android_process(status)
-        }
-        Some("__run-browser-place") => {
-            let loaded = eclipse_config::load();
-            let status = match parse_internal_place_id(&args[1..]) {
-                Ok(place_id) => launch_in_window(Launch::BrowserPlace(place_id), &loaded),
-                Err(error) => {
-                    eprintln!("eclipse browser launch: {error}");
-                    1
-                }
-            };
-            finish_android_process(status)
         }
         Some("install-url-handler") => match install_url_handler_command(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
@@ -242,58 +247,184 @@ fn main() -> ExitCode {
     }
 }
 
-fn is_android_run_command(command: Option<&str>) -> bool {
-    matches!(command, Some("run") | Some("__run-browser-place"))
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchCommand {
+    Run,
+    RunFile(PathBuf),
+    Link(LaunchTarget),
 }
 
-fn launches_in_window(args: &[OsString]) -> bool {
-    match args {
-        [command] => command == "run",
-        [command, _] => command == "__run-browser-place",
-        _ => false,
+impl LaunchCommand {
+    fn parse(
+        arguments: &[OsString],
+        launch_link: Option<OsString>,
+    ) -> Result<Option<Self>, LaunchCommandError> {
+        let Some((command, rest)) = arguments.split_first() else {
+            return Ok(None);
+        };
+        let launch = match command.to_str() {
+            Some(RUN_COMMAND) => match rest {
+                [] => Self::Run,
+                [path] => Self::RunFile(PathBuf::from(path)),
+                _ => return Err(LaunchCommandError::Usage(RUN_USAGE)),
+            },
+            Some(OPEN_COMMAND) => match rest {
+                [link] => Self::Link(link_target(OPEN_CONTEXT, link)?),
+                _ => return Err(LaunchCommandError::Usage(OPEN_USAGE)),
+            },
+            Some(desktop_integration::BROWSER_HANDLER_COMMAND) => match rest {
+                [link] => Self::Link(link_target(BROWSER_LAUNCH_CONTEXT, link)?),
+                _ => {
+                    return Err(LaunchCommandError::Link {
+                        context: BROWSER_LAUNCH_CONTEXT,
+                        message: "The Roblox link handler takes exactly one link.".to_owned(),
+                    })
+                }
+            },
+            Some(LAUNCH_LINK_COMMAND) => match (rest, launch_link) {
+                ([], Some(link)) => Self::Link(link_target(OPEN_CONTEXT, &link)?),
+                _ => {
+                    return Err(LaunchCommandError::Link {
+                        context: OPEN_CONTEXT,
+                        message: format!(
+                            "{LAUNCH_LINK_COMMAND} is internal and takes its link from \
+                             {LAUNCH_LINK_ENV}; open links with `eclipse open <LINK>`"
+                        ),
+                    })
+                }
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(launch))
+    }
+
+    fn launches_in_window(&self) -> bool {
+        !matches!(self, Self::RunFile(_))
+    }
+
+    fn launch(&self) -> Launch {
+        match self {
+            Self::Run => Launch::Installed,
+            Self::RunFile(_) => Launch::File,
+            Self::Link(target) => Launch::Link(target.clone()),
+        }
+    }
+
+    fn restart(&self, command: &mut std::process::Command) {
+        match self {
+            Self::Run => {
+                command.arg(RUN_COMMAND);
+            }
+            Self::RunFile(path) => {
+                command.arg(RUN_COMMAND).arg(path);
+            }
+            Self::Link(target) => {
+                command
+                    .arg(LAUNCH_LINK_COMMAND)
+                    .env(LAUNCH_LINK_ENV, target.android_uri());
+            }
+        }
     }
 }
 
-fn report_setup_failure(args: &[OsString], context: &str, error: &str) {
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchCommandError {
+    Usage(&'static str),
+    Link {
+        context: &'static str,
+        message: String,
+    },
+}
+
+impl LaunchCommandError {
+    fn report(&self) {
+        match self {
+            Self::Usage(usage) => eprintln!("{usage}"),
+            Self::Link { context, message } => {
+                eprintln!("{context}: {message}");
+                show_error_window(message, None);
+            }
+        }
+    }
+}
+
+fn link_target(
+    context: &'static str,
+    link: &std::ffi::OsStr,
+) -> Result<LaunchTarget, LaunchCommandError> {
+    let invalid = |message: String| LaunchCommandError::Link { context, message };
+    let link = link
+        .to_str()
+        .ok_or_else(|| invalid("The Roblox link is not valid UTF-8.".to_owned()))?;
+    eclipse::links::parse(link).map_err(|error| invalid(error.to_string()))
+}
+
+fn take_launch_link() -> Option<OsString> {
+    let link = std::env::var_os(LAUNCH_LINK_ENV)?;
+    unsafe { std::env::remove_var(LAUNCH_LINK_ENV) };
+    Some(link)
+}
+
+fn restart_without_link_arguments(launch: &LaunchCommand) -> ExitCode {
+    use std::os::unix::process::CommandExt as _;
+
+    let error = match std::env::current_exe() {
+        Ok(current_exe) => {
+            let mut eclipse = std::process::Command::new(current_exe);
+            launch.restart(&mut eclipse);
+            eclipse.exec()
+        }
+        Err(error) => error,
+    };
+    report_setup_failure(
+        launch,
+        HAND_OFF_CONTEXT,
+        &format!("cannot restart Eclipse to keep the link out of its command line: {error}"),
+    );
+    ExitCode::FAILURE
+}
+
+fn start_client(launch: &LaunchCommand) -> ExitCode {
+    match hand_off_before_restart(launch) {
+        Ok(HandOff::Boot) => supervise(launch),
+        Ok(HandOff::Delivered) => ExitCode::SUCCESS,
+        Err(error) => {
+            report_setup_failure(launch, HAND_OFF_CONTEXT, &error);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn hand_off_before_restart(launch: &LaunchCommand) -> Result<HandOff, String> {
+    let launch = launch.launch();
+    let Some(request) = launch.control_request() else {
+        return Ok(HandOff::Boot);
+    };
+    let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
+    let socket = instance_control::control_socket(&app_data_dir)?;
+    hand_off(&launch, &request, &socket, &app_data_dir.join(RUNTIME_DIR))
+}
+
+fn hand_off(
+    launch: &Launch,
+    request: &Request,
+    socket: &Path,
+    runtime_dir: &Path,
+) -> Result<HandOff, String> {
+    let handed = instance_control::hand_off(socket, runtime_dir, request, |lock| {
+        launch.already_running(lock)
+    })?;
+    if handed == HandOff::Delivered {
+        println!("{}", launch.handed_off());
+    }
+    Ok(handed)
+}
+
+fn report_setup_failure(launch: &LaunchCommand, context: &str, error: &str) {
     eprintln!("{context}: {error}");
-    if launches_in_window(args) {
+    if launch.launches_in_window() {
         show_error_window(error, None);
     }
-}
-
-fn normalize_browser_launch(mut arguments: Vec<OsString>) -> Result<Vec<OsString>, String> {
-    if !arguments
-        .first()
-        .is_some_and(|command| command == desktop_integration::BROWSER_HANDLER_COMMAND)
-    {
-        return Ok(arguments);
-    }
-    if arguments.len() != 2 {
-        return Err("the Roblox URL handler requires exactly one URL".to_string());
-    }
-
-    let url = arguments[1]
-        .to_str()
-        .ok_or("the Roblox URL is not valid UTF-8")?;
-    let place_id = browser_launch::place_id(url).map_err(|error| error.to_string())?;
-    arguments.clear();
-    arguments.push("__run-browser-place".into());
-    arguments.push(place_id.to_string().into());
-    Ok(arguments)
-}
-
-fn parse_internal_place_id(arguments: &[OsString]) -> Result<u64, String> {
-    let [place_id] = arguments else {
-        return Err("invalid internal browser launch request".to_string());
-    };
-    let place_id = place_id
-        .to_str()
-        .and_then(|place_id| place_id.parse::<u64>().ok())
-        .ok_or_else(|| "invalid internal browser launch request".to_string())?;
-    if place_id == 0 {
-        return Err("invalid internal browser launch request".to_string());
-    }
-    Ok(place_id)
 }
 
 fn client_settings_path() -> Result<PathBuf, String> {
@@ -322,56 +453,157 @@ fn verify_client_settings_redirect() -> Result<(), String> {
         })
 }
 
-fn install_client_settings_and_reexec(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::process::CommandExt as _;
-
-    let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
-    let runtime_dir = app_data_dir.join(RUNTIME_DIR);
-    std::fs::create_dir_all(&runtime_dir)
-        .map_err(|error| format!("cannot create {}: {error}", runtime_dir.display()))?;
-    stage_settings_shim(&runtime_dir)?;
-    let runtime_dir = runtime_dir
-        .canonicalize()
-        .map_err(|error| format!("cannot resolve {}: {error}", runtime_dir.display()))?;
-    if runtime_dir
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .any(|byte| matches!(byte, b':' | b';'))
-    {
-        return Err(format!(
-            "the Android client-settings bridge directory {} contains a colon or semicolon, \
-             which LD_LIBRARY_PATH cannot carry; set ECLIPSE_APP_DATA_DIR to a directory \
-             without colons or semicolons",
-            runtime_dir.display()
-        )
-        .into());
+fn supervise(launch: &LaunchCommand) -> ExitCode {
+    let bridge = match ClientSettingsBridge::locate() {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            report_setup_failure(launch, SETTINGS_CONTEXT, &error);
+            return ExitCode::FAILURE;
+        }
+    };
+    let target = launch.launch();
+    let run = match lock_run(&bridge.app_data_dir, &target) {
+        Ok(RunStart::Locked(run)) => run,
+        Ok(RunStart::HandedOff) => return ExitCode::SUCCESS,
+        Err(error) => {
+            report_setup_failure(launch, target.context(), &error);
+            return ExitCode::FAILURE;
+        }
+    };
+    let client = match bridge.client_command(launch) {
+        Ok(client) => client,
+        Err(error) => {
+            report_setup_failure(launch, SETTINGS_CONTEXT, &error);
+            return ExitCode::FAILURE;
+        }
+    };
+    let output = supervisor::Output {
+        stdout: std::io::stdout(),
+        stderr: std::io::stderr(),
+        echo_records: echo_client_records(),
+    };
+    match supervisor::run(client, run.lock, run.log, output) {
+        Ok(finished) => {
+            present_failure(launch, &target, &finished);
+            finished.exit_code()
+        }
+        Err(error) => {
+            report_setup_failure(launch, target.context(), &error);
+            ExitCode::FAILURE
+        }
     }
-    let settings_path = runtime_dir.join(CLIENT_SETTINGS_FILE);
+}
 
-    let current_exe = std::env::current_exe()
-        .map_err(|error| format!("cannot locate the Eclipse executable to restart it: {error}"))?;
-    let error = std::process::Command::new(current_exe)
-        .args(args)
-        .env(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV, "1")
-        .env(CLIENT_SETTINGS_PATH_ENV, &settings_path)
-        .env(
-            "LD_LIBRARY_PATH",
-            prepend_search_list_entry(runtime_dir.as_os_str(), std::env::var_os("LD_LIBRARY_PATH")),
-        )
-        .env(
-            "LD_PRELOAD",
-            prepend_search_list_entry(
-                std::ffi::OsStr::new(CLIENT_SETTINGS_PATH_SHIM_NAME),
-                std::env::var_os("LD_PRELOAD"),
-            ),
-        )
-        .exec();
-    Err(
-        format!("could not restart Eclipse with the Android client-settings path bridge: {error}")
-            .into(),
-    )
+fn echo_client_records() -> bool {
+    use std::io::IsTerminal as _;
+
+    std::io::stderr().is_terminal() || std::env::var_os("RUST_LOG").is_some()
+}
+
+fn present_failure(launch: &LaunchCommand, target: &Launch, finished: &supervisor::Finished) {
+    let Some(failure) = finished.failure() else {
+        return;
+    };
+    eprintln!("{}: {failure}", target.context());
+    if launch.launches_in_window() {
+        show_error_window(&failure, Some(&finished.log));
+    } else {
+        eprintln!("Details are in {}", finished.log.display());
+    }
+}
+
+struct ClientSettingsBridge {
+    app_data_dir: PathBuf,
+    runtime_dir: PathBuf,
+}
+
+impl ClientSettingsBridge {
+    fn locate() -> Result<Self, String> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
+        let runtime_dir = app_data_dir.join(RUNTIME_DIR);
+        std::fs::create_dir_all(&runtime_dir)
+            .map_err(|error| format!("cannot create {}: {error}", runtime_dir.display()))?;
+        let runtime_dir = runtime_dir
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve {}: {error}", runtime_dir.display()))?;
+        if runtime_dir
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b':' | b';'))
+        {
+            return Err(format!(
+                "the Android client-settings bridge directory {} contains a colon or semicolon, \
+                 which LD_LIBRARY_PATH cannot carry; set ECLIPSE_APP_DATA_DIR to a directory \
+                 without colons or semicolons",
+                runtime_dir.display()
+            ));
+        }
+        Ok(Self {
+            app_data_dir,
+            runtime_dir,
+        })
+    }
+
+    fn client_command(&self, launch: &LaunchCommand) -> Result<std::process::Command, String> {
+        stage_settings_shim(&self.runtime_dir)?;
+        let current_exe = std::env::current_exe().map_err(|error| {
+            format!("cannot locate the Eclipse executable to start Roblox: {error}")
+        })?;
+        let mut client = std::process::Command::new(current_exe);
+        launch.restart(&mut client);
+        client
+            .env(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV, "1")
+            .env(
+                CLIENT_SETTINGS_PATH_ENV,
+                self.runtime_dir.join(CLIENT_SETTINGS_FILE),
+            )
+            .env(
+                "LD_LIBRARY_PATH",
+                prepend_search_list_entry(
+                    self.runtime_dir.as_os_str(),
+                    std::env::var_os("LD_LIBRARY_PATH"),
+                ),
+            )
+            .env(
+                "LD_PRELOAD",
+                prepend_search_list_entry(
+                    std::ffi::OsStr::new(CLIENT_SETTINGS_PATH_SHIM_NAME),
+                    std::env::var_os("LD_PRELOAD"),
+                ),
+            );
+        Ok(client)
+    }
+}
+
+fn run_client(launch: LaunchCommand, supervision: Option<Supervision>) -> ExitCode {
+    if let Err(error) = client_settings_path() {
+        report_setup_failure(&launch, SETTINGS_CONTEXT, &error);
+        return match supervision {
+            Some(supervision) => finish_android_process(ClientEnd::FailureShown, supervision.exit),
+            None => ExitCode::FAILURE,
+        };
+    }
+    let Some(Supervision {
+        records,
+        exit,
+        run_log,
+    }) = supervision
+    else {
+        report_setup_failure(&launch, launch.launch().context(), UNSUPERVISED);
+        return ExitCode::FAILURE;
+    };
+    eclipse::diagnostics::init(eclipse::diagnostics::LogSink::Supervisor(records));
+    tracing::debug!(version = eclipse::VERSION, "eclipse client starting");
+    let loaded = eclipse_config::load();
+    let end = match launch {
+        LaunchCommand::Run => launch_in_window(&Launch::Installed, &loaded, &run_log),
+        LaunchCommand::RunFile(path) => run_file(&path, &loaded),
+        LaunchCommand::Link(target) => launch_in_window(&Launch::Link(target), &loaded, &run_log),
+    };
+    finish_android_process(end, exit)
 }
 
 fn prepend_search_list_entry(
@@ -432,13 +664,16 @@ fn replace_runtime_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Stri
     temp.persist(&path).map_err(write_error)
 }
 
-fn finish_android_process(status: libc::c_int) -> ! {
+fn finish_android_process(end: ClientEnd, exit: ExitRecord) -> ! {
     use std::io::Write as _;
 
+    if let Err(error) = exit.write(end) {
+        eprintln!("eclipse: cannot tell Eclipse's supervisor how Roblox ended: {error}");
+    }
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 
-    unsafe { libc::_exit(status) }
+    unsafe { libc::_exit(end.status()) }
 }
 
 fn report_config(loaded: &eclipse_config::Loaded, status: &StatusSink) {
@@ -484,8 +719,6 @@ const RUNTIME_DIR: &str = "runtime";
 
 const CLIENT_SETTINGS_FILE: &str = "ClientAppSettings.json";
 
-const CLIENT_LOCK_FILE: &str = "client.lock";
-
 const PLAY_LOGIN_STEPS: &str = "\
 Sign in to Google Play with your own Google account.
 
@@ -499,14 +732,6 @@ that uses one. Use a secondary Google account, not your main one.
    oauth_token (Storage or Application, then Cookies) and copy its value. It starts with
    oauth2_4/ and works only once.
 ";
-
-fn parse_run_path(arguments: &[OsString]) -> Result<Option<&std::path::Path>, String> {
-    match arguments {
-        [] => Ok(None),
-        [path] => Ok(Some(std::path::Path::new(path))),
-        _ => Err("usage: eclipse run [APK | DIRECTORY]".to_string()),
-    }
-}
 
 fn install_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     eclipse::runtime::android_cpu_baseline()?;
@@ -889,30 +1114,29 @@ fn remove_other_native_lib_versions(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Launch {
     Installed,
     File,
-    BrowserPlace(u64),
+    Link(LaunchTarget),
 }
 
 impl Launch {
-    fn context(self) -> &'static str {
+    fn context(&self) -> &'static str {
         match self {
             Self::Installed | Self::File => "eclipse run",
-            Self::BrowserPlace(_) => "eclipse browser launch",
+            Self::Link(_) => OPEN_CONTEXT,
         }
     }
 
-    fn already_running(self, lock: &Path) -> String {
+    fn already_running(&self, lock: &Path) -> String {
         let advice = match self {
             Self::Installed | Self::File => {
                 "switch to its window, or close it or wait for the install to finish before \
                  starting Roblox again"
             }
-            Self::BrowserPlace(_) => {
-                "this browser Play click did not start a second copy; close Roblox in Eclipse \
-                 or wait for the install to finish, then click Play again"
+            Self::Link(_) => {
+                "this link did not start a second copy; close Roblox in Eclipse or wait for the \
+                 install to finish, then open the link again"
             }
         };
         format!(
@@ -922,10 +1146,28 @@ impl Launch {
         )
     }
 
-    fn place_id(self) -> Option<u64> {
+    fn handed_off(&self) -> String {
         match self {
-            Self::BrowserPlace(place_id) => Some(place_id),
+            Self::Installed | Self::File => {
+                "Roblox is already running in Eclipse; its window was asked to come to the front"
+                    .to_owned()
+            }
+            Self::Link(target) => format!("Roblox in Eclipse is starting and will open {target}"),
+        }
+    }
+
+    fn target(&self) -> Option<&LaunchTarget> {
+        match self {
+            Self::Link(target) => Some(target),
             Self::Installed | Self::File => None,
+        }
+    }
+
+    fn control_request(&self) -> Option<Request> {
+        match self {
+            Self::Installed => Some(Request::Show {}),
+            Self::File => None,
+            Self::Link(target) => Some(Request::open(target)),
         }
     }
 }
@@ -935,101 +1177,153 @@ fn window_title() -> String {
 }
 
 fn show_error_window(message: &str, log: Option<&Path>) {
-    match LaunchWindow::open(&window_title()) {
-        Ok(mut window) => window.show_error(message, log),
-        Err(error) => eprintln!("eclipse: cannot open a window to show this error: {error}"),
+    if let Some(mut window) = open_error_window() {
+        window.show_error(message, log);
     }
 }
 
-fn report_failure(launch: Launch, error: &str) {
+fn open_error_window() -> Option<LaunchWindow> {
+    LaunchWindow::open(&window_title())
+        .inspect_err(|error| eprintln!("eclipse: cannot open a window to show this error: {error}"))
+        .ok()
+}
+
+fn report_failure(launch: &Launch, error: &str) {
     eprintln!("{}: {error}", launch.context());
     eclipse::diagnostics::record_status(tracing::Level::ERROR, error);
 }
 
-struct ClientRun {
-    _lock: std::fs::File,
-    log: PathBuf,
+struct LockedRun {
+    lock: std::fs::File,
+    log: eclipse::diagnostics::RunLog,
 }
 
-impl ClientRun {
-    fn start(launch: Launch, fflags: &BTreeMap<String, serde_json::Value>) -> Result<Self, String> {
-        let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
-        let client_settings = client_settings_path()?;
-        let run = Self::start_in(&app_data_dir, launch, &client_settings, fflags)?;
-        verify_client_settings_redirect()?;
-        println!(
-            "# Roblox Fast Flags staged at {} (Android {ANDROID_CLIENT_SETTINGS_PATH})",
-            client_settings.display()
-        );
-        Ok(run)
-    }
+enum RunStart {
+    Locked(LockedRun),
+    HandedOff,
+}
 
-    fn start_in(
-        app_data_dir: &Path,
-        launch: Launch,
-        client_settings: &Path,
-        fflags: &BTreeMap<String, serde_json::Value>,
-    ) -> Result<Self, String> {
-        let lock = lock_client_in(&app_data_dir.join(RUNTIME_DIR), |lock| {
-            launch.already_running(lock)
-        })?;
-        let log = eclipse::diagnostics::start_run_log(app_data_dir).map_err(|error| {
-            format!(
-                "cannot write Eclipse's log under {}: {error}",
-                app_data_dir.display()
-            )
-        })?;
-        write_client_settings(client_settings, fflags)?;
-        Ok(Self { _lock: lock, log })
+fn lock_run(app_data_dir: &Path, launch: &Launch) -> Result<RunStart, String> {
+    let control = match launch.control_request() {
+        Some(_) => Some(instance_control::control_socket(app_data_dir)?),
+        None => None,
+    };
+    lock_run_in(app_data_dir, launch, control.as_deref())
+}
+
+fn lock_run_in(
+    app_data_dir: &Path,
+    launch: &Launch,
+    control: Option<&Path>,
+) -> Result<RunStart, String> {
+    let runtime_dir = app_data_dir.join(RUNTIME_DIR);
+    let lock = match instance_control::lock_client(&runtime_dir)? {
+        ClientLock::Acquired(lock) => lock,
+        ClientLock::Held(lock) => {
+            let (Some(socket), Some(request)) = (control, launch.control_request()) else {
+                return Err(launch.already_running(&lock));
+            };
+            if hand_off(launch, &request, socket, &runtime_dir)? == HandOff::Delivered {
+                return Ok(RunStart::HandedOff);
+            }
+            match instance_control::lock_client(&runtime_dir)? {
+                ClientLock::Acquired(lock) => lock,
+                ClientLock::Held(lock) => return Err(launch.already_running(&lock)),
+            }
+        }
+    };
+    let log = eclipse::diagnostics::RunLog::start(app_data_dir).map_err(|error| {
+        format!(
+            "cannot write Eclipse's log under {}: {error}",
+            app_data_dir.display()
+        )
+    })?;
+    Ok(RunStart::Locked(LockedRun { lock, log }))
+}
+
+struct SetupFailure {
+    error: String,
+    listener: Option<std::os::unix::net::UnixListener>,
+}
+
+impl From<String> for SetupFailure {
+    fn from(error: String) -> Self {
+        Self {
+            error,
+            listener: None,
+        }
     }
+}
+
+fn start_client_run(
+    launch: &Launch,
+    fflags: &BTreeMap<String, serde_json::Value>,
+) -> Result<Option<std::os::unix::net::UnixListener>, SetupFailure> {
+    let control = match launch.control_request() {
+        Some(_) => {
+            let app_data_dir =
+                eclipse::framework::app_data_dir().ok_or_else(|| NO_APP_DATA_DIR.to_owned())?;
+            Some(instance_control::control_socket(&app_data_dir)?)
+        }
+        None => None,
+    };
+    start_client_run_in(control.as_deref(), client_settings_path(), fflags)
+}
+
+fn start_client_run_in(
+    control: Option<&Path>,
+    client_settings: Result<PathBuf, String>,
+    fflags: &BTreeMap<String, serde_json::Value>,
+) -> Result<Option<std::os::unix::net::UnixListener>, SetupFailure> {
+    let listener = control.map(instance_control::listen).transpose()?;
+    let prepared = client_settings
+        .and_then(|path| stage_client_settings(&path, fflags))
+        .and_then(|()| {
+            eclipse::runtime::prepare_art_boot_environment().map_err(|error| error.to_string())
+        });
+    match prepared {
+        Ok(()) => Ok(listener),
+        Err(error) => Err(SetupFailure { error, listener }),
+    }
+}
+
+fn stage_client_settings(
+    path: &Path,
+    fflags: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    write_client_settings(path, fflags)?;
+    verify_client_settings_redirect()?;
+    println!(
+        "# Roblox Fast Flags staged at {} (Android {ANDROID_CLIENT_SETTINGS_PATH})",
+        path.display()
+    );
+    Ok(())
 }
 
 fn lock_out_clients() -> Result<std::fs::File, String> {
     let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
-    lock_client_in(&app_data_dir.join(RUNTIME_DIR), |lock| {
-        format!(
+    match instance_control::lock_client(&app_data_dir.join(RUNTIME_DIR))? {
+        ClientLock::Acquired(lock) => Ok(lock),
+        ClientLock::Held(lock) => Err(format!(
             "Roblox is running in Eclipse, or another Eclipse is installing it; close Roblox or \
              wait for that install to finish, then try again (another Eclipse holds {})",
             lock.display()
-        )
-    })
-}
-
-fn lock_client_in(
-    runtime_dir: &Path,
-    held: impl FnOnce(&Path) -> String,
-) -> Result<std::fs::File, String> {
-    std::fs::create_dir_all(runtime_dir)
-        .map_err(|error| format!("cannot create {}: {error}", runtime_dir.display()))?;
-    let path = runtime_dir.join(CLIENT_LOCK_FILE);
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-    match lock.try_lock() {
-        Ok(()) => Ok(lock),
-        Err(std::fs::TryLockError::WouldBlock) => Err(held(&path)),
-        Err(std::fs::TryLockError::Error(error)) => {
-            Err(format!("cannot lock {}: {error}", path.display()))
-        }
+        )),
     }
 }
 
-fn run_file(path: &Path, loaded: &eclipse_config::Loaded) -> libc::c_int {
-    let _client = match ClientRun::start(Launch::File, &loaded.config.fflags) {
-        Ok(client) => client,
-        Err(error) => {
-            report_failure(Launch::File, &error);
-            return 1;
-        }
-    };
+fn run_file(path: &Path, loaded: &eclipse_config::Loaded) -> ClientEnd {
+    let staged = client_settings_path()
+        .and_then(|settings| stage_client_settings(&settings, &loaded.config.fflags));
+    if let Err(error) = staged {
+        report_failure(&Launch::File, &error);
+        return ClientEnd::FailureShown;
+    }
     match play_file(path, loaded) {
-        Ok(()) => 0,
+        Ok(()) => ClientEnd::Played,
         Err(error) => {
-            report_failure(Launch::File, &error.to_string());
-            1
+            report_failure(&Launch::File, &error.to_string());
+            ClientEnd::FailureShown
         }
     }
 }
@@ -1046,7 +1340,7 @@ fn play_file(
     let prepared = prepare_client(ApkSet::open(paths)?, &status)?;
     boot_and_play(
         prepared,
-        Launch::File,
+        None,
         &mut Host {
             status: &status,
             window: None,
@@ -1057,50 +1351,92 @@ fn play_file(
 
 type Preparation = std::thread::JoinHandle<Result<PreparedClient, String>>;
 
-fn launch_in_window(launch: Launch, loaded: &eclipse_config::Loaded) -> libc::c_int {
-    let client = match ClientRun::start(launch, &loaded.config.fflags) {
-        Ok(client) => client,
-        Err(error) => {
-            report_failure(launch, &error);
-            show_error_window(&error, None);
-            return 1;
-        }
-    };
+fn launch_in_window(launch: &Launch, loaded: &eclipse_config::Loaded, log: &Path) -> ClientEnd {
     let (sender, updates) = std::sync::mpsc::channel();
     let status = StatusSink::with_window(sender.clone());
     report_config(loaded, &status);
-    if let Err(error) = eclipse::runtime::prepare_art_boot_environment() {
-        let error = error.to_string();
-        report_failure(launch, &error);
-        show_error_window(&error, Some(&client.log));
-        return 1;
-    }
+    let listener = match start_client_run(launch, &loaded.config.fflags) {
+        Ok(listener) => listener,
+        Err(failure) => return show_setup_failure(launch, failure, log),
+    };
     let preparation = prepare_in_background(sender);
     let mut window = match LaunchWindow::open(&window_title()) {
         Ok(window) => window,
         Err(error) => {
             report_failure(launch, &format!("cannot open the Eclipse window: {error}"));
-            return 1;
+            return ClientEnd::FailureShown;
         }
     };
+    let slot = std::sync::Arc::new(LaunchSlot::new(launch.target().cloned()));
+    if let Some(listener) = listener {
+        let serving = instance_control::serve_in_background(
+            listener,
+            std::sync::Arc::clone(&slot),
+            window.control(),
+        );
+        if let Err(error) = serving {
+            let error = format!("cannot take launches from other Eclipse processes: {error}");
+            report_failure(launch, &error);
+            window.show_error(&error, Some(log));
+            return ClientEnd::FailureShown;
+        }
+    }
     let played = preparation.map_err(Into::into).and_then(|worker| {
         play_in_window(
             &mut window,
             &status,
             &updates,
             worker,
-            launch,
+            &slot,
             &loaded.config,
         )
     });
-    match played {
-        Ok(()) => 0,
-        Err(error) => {
-            let error = error.to_string();
-            report_failure(launch, &error);
-            window.show_error(&error, Some(&client.log));
-            1
+    let Err(error) = played else {
+        slot.end();
+        return ClientEnd::Played;
+    };
+    if slot.closing() {
+        tracing::info!("Roblox closed because another Eclipse launch asked it to");
+        return ClientEnd::ClosedForAnotherLaunch;
+    }
+    slot.end();
+    let text = error.to_string();
+    report_failure(launch, &text);
+    window.show_error(&text, Some(&eclipse::diagnostics::newest_run_part(log)));
+    if slot.closing() {
+        ClientEnd::ClosedForAnotherLaunch
+    } else if error.is::<WindowClosed>() {
+        ClientEnd::WindowClosed
+    } else {
+        ClientEnd::FailureShown
+    }
+}
+
+fn show_setup_failure(launch: &Launch, failure: SetupFailure, log: &Path) -> ClientEnd {
+    report_failure(launch, &failure.error);
+    let Some(mut window) = open_error_window() else {
+        return ClientEnd::FailureShown;
+    };
+    let slot = std::sync::Arc::new(LaunchSlot::new(None));
+    slot.end();
+    if let Some(listener) = failure.listener {
+        let serving = instance_control::serve_in_background(
+            listener,
+            std::sync::Arc::clone(&slot),
+            window.control(),
+        );
+        if let Err(error) = serving {
+            tracing::warn!(
+                %error,
+                "later Eclipse launches cannot close this error and will report Roblox as running"
+            );
         }
+    }
+    window.show_error(&failure.error, Some(log));
+    if slot.closing() {
+        ClientEnd::ClosedForAnotherLaunch
+    } else {
+        ClientEnd::FailureShown
     }
 }
 
@@ -1122,16 +1458,17 @@ fn play_in_window(
     status: &StatusSink,
     updates: &std::sync::mpsc::Receiver<StatusUpdate>,
     worker: Preparation,
-    launch: Launch,
+    slot: &LaunchSlot,
     config: &eclipse_config::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     window.wait_for(updates, &worker)?;
     let prepared = worker
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+    let target = slot.begin_play();
     boot_and_play(
         prepared,
-        launch,
+        target.as_ref(),
         &mut Host {
             status,
             window: Some((window, updates)),
@@ -1169,13 +1506,14 @@ impl Host<'_> {
     ) -> Result<(), eclipse::graphics::GraphicsError> {
         match &mut self.window {
             Some((window, _)) => {
-                let (event_loop, activation_token) = window.event_loop();
+                let (event_loop, activation_token, commands) = window.event_loop();
                 eclipse::graphics::run_windowed(
                     event_loop,
                     activation_token,
                     title,
                     Some(vm),
                     touch_mode,
+                    Some(commands),
                 )
             }
             None => eclipse::graphics::run_windowed(
@@ -1184,6 +1522,7 @@ impl Host<'_> {
                 title,
                 Some(vm),
                 touch_mode,
+                None,
             ),
         }
     }
@@ -1254,7 +1593,7 @@ fn prepare_client_cache(status: &StatusSink) -> Result<ClientCacheDir, Box<dyn s
 
 fn boot_and_play(
     prepared: PreparedClient,
-    launch: Launch,
+    target: Option<&LaunchTarget>,
     host: &mut Host<'_>,
     config: &eclipse_config::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1274,6 +1613,23 @@ fn boot_and_play(
     eclipse::webview::client::use_helper_path(config.webview_helper_path.clone())?;
     eclipse::performance::configure_engine_cpu_affinity(config.graphics_optimization_mode);
     let plan = eclipse::runtime::BootPlan::new(&manifest, config, client_cache);
+    let link = target.map(|target| (target, target.android_uri()));
+    let start = match &link {
+        None => ActivityStart::Launcher(&plan.launcher_activity),
+        Some((target, uri)) => {
+            let activity = manifest.resolve_view_activity(uri).ok_or_else(|| {
+                let version = apks.version_name().map_or_else(
+                    || format!("versionCode {}", apks.version_code()),
+                    str::to_owned,
+                );
+                format!(
+                    "Roblox {version} does not accept {} links; update Roblox or report this.",
+                    target.kind()
+                )
+            })?;
+            ActivityStart::View { activity, uri }
+        }
+    };
 
     println!("# ART boot plan for {apk_path}");
     println!("package:            {}", manifest.package);
@@ -1283,6 +1639,9 @@ fn boot_and_play(
         apks.version_code()
     );
     println!("launcher_activity:  {}", plan.launcher_activity);
+    if let Some((target, _)) = &link {
+        println!("link:               {target} via {}", start.activity());
+    }
     println!("sdk_int:            {}", plan.sdk_int);
     println!(
         "heap:               {} MiB (DisableHSpaceCompactForOOM={})",
@@ -1321,23 +1680,22 @@ fn boot_and_play(
     let _preloaded_libs = preload_app_native_libs(apks.native_libs(), &app_lib_dir)?;
     host.refresh()?;
 
+    if let Some((target, _)) = &link {
+        host.step(format!("Joining {target}…"))?;
+    }
     println!("# Driving the framework lifecycle (JNI; steps 1–7 to Activity.onResume / RESUMED)…");
-    let browser_place_id = launch.place_id();
-    let android_deep_link = browser_place_id.map(|place_id| format!("roblox://placeId={place_id}"));
     let progress = eclipse::framework::drive_application_lifecycle(
         &vm,
         &apk_path,
         &app_lib_dir,
         apks.signing_certificate_history(),
-        &plan.launcher_activity,
-        android_deep_link.as_deref(),
+        start,
     )?;
-    let activity_target = if browser_place_id.is_some() {
-        "resolved ACTION_VIEW activity"
-    } else {
-        plan.launcher_activity.as_str()
-    };
-    println!("framework lifecycle driven: {progress:?} (non-GTK Context/Window/View natives bound; launcher Activity = {activity_target}) ✓");
+    println!(
+        "framework lifecycle driven: {progress:?} (non-GTK Context/Window/View natives bound; \
+         started Activity = {}) ✓",
+        start.activity()
+    );
     host.refresh()?;
 
     if std::env::var("ECLIPSE_WEB_LOGIN").is_ok_and(|value| value == "1") {
@@ -1916,14 +2274,17 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 #[cfg(test)]
 mod tests {
     use super::{
-        finish_android_process, installed_client_note, installed_or_updated_set,
-        launches_in_window, lock_client_in, native_lib_dir, normalize_browser_launch,
-        parse_libroblox_init_lib_dir, parse_run_path, parse_update_source,
+        finish_android_process, installed_client_note, installed_or_updated_set, lock_run_in,
+        native_lib_dir, parse_libroblox_init_lib_dir, parse_update_source,
         remove_other_native_lib_versions, remove_other_version_oats, update_if_due,
-        url_handler_message, ClientRun, Launch, UpdateSource, NOT_INSTALLED,
+        url_handler_message, ClientEnd, ClientLock, ExitRecord, Launch, LaunchCommand,
+        LaunchCommandError, RunStart, UpdateSource, LAUNCH_LINK_COMMAND, LAUNCH_LINK_ENV,
+        NOT_INSTALLED, OPEN_USAGE, RUN_USAGE,
     };
+    use crate::desktop_integration::BROWSER_HANDLER_COMMAND;
     use eclipse::apk::store::{CheckOutcome, Release, Store, UpdateCheck};
     use eclipse::apk::VersionCode;
+    use eclipse::links::LaunchTarget;
     use eclipse::runtime::NativeLibRoot;
     use eclipse::status::StatusSink;
     use std::collections::BTreeMap;
@@ -1944,15 +2305,92 @@ mod tests {
         std::process::abort();
     }
 
+    fn launch_command(
+        arguments: &[&str],
+        launch_link: Option<&str>,
+    ) -> Result<Option<LaunchCommand>, LaunchCommandError> {
+        let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+        LaunchCommand::parse(&arguments, launch_link.map(OsString::from))
+    }
+
+    fn link(link: &str) -> LaunchCommand {
+        LaunchCommand::Link(eclipse::links::parse(link).unwrap())
+    }
+
     #[test]
     fn run_accepts_at_most_one_path_argument() {
-        let apk = OsString::from("roblox.apk");
-        assert_eq!(parse_run_path(&[]).unwrap(), None);
+        assert_eq!(launch_command(&["run"], None), Ok(Some(LaunchCommand::Run)));
         assert_eq!(
-            parse_run_path(std::slice::from_ref(&apk)).unwrap(),
-            Some(std::path::Path::new("roblox.apk"))
+            launch_command(&["run", "roblox.apk"], None),
+            Ok(Some(LaunchCommand::RunFile("roblox.apk".into())))
         );
-        assert!(parse_run_path(&[apk, "roblox://placeId=1".into()]).is_err());
+        assert_eq!(
+            launch_command(&["run", "roblox.apk", "roblox://placeId=1"], None),
+            Err(LaunchCommandError::Usage(RUN_USAGE))
+        );
+    }
+
+    #[test]
+    fn open_takes_exactly_one_link_or_place_id() {
+        assert_eq!(
+            launch_command(&["open", "1818"], None),
+            Ok(Some(link("roblox://placeId=1818")))
+        );
+        assert_eq!(
+            launch_command(
+                &[
+                    "open",
+                    "https://www.roblox.com/games/1818/Classic-Crossroads"
+                ],
+                None
+            ),
+            Ok(Some(link("roblox://placeId=1818")))
+        );
+        let private = "roblox://placeId=1818&linkCode=0042";
+        assert_eq!(
+            launch_command(&["open", private], None),
+            Ok(Some(link(private)))
+        );
+        for arguments in [&["open"][..], &["open", "1818", "1819"]] {
+            assert_eq!(
+                launch_command(arguments, None),
+                Err(LaunchCommandError::Usage(OPEN_USAGE))
+            );
+        }
+        assert!(OPEN_USAGE.starts_with("usage: eclipse open "));
+        assert_eq!(
+            launch_command(&["open", "https://www.roblox.com/catalog/1"], None),
+            Err(LaunchCommandError::Link {
+                context: "eclipse open",
+                message: "This is a Roblox shop link; Eclipse opens experience links. Open it \
+                          in a web browser."
+                    .to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn the_internal_link_launch_takes_its_link_only_from_the_environment() {
+        let place = "roblox://placeId=1818";
+        assert_eq!(
+            launch_command(&[LAUNCH_LINK_COMMAND], Some(place)),
+            Ok(Some(link(place)))
+        );
+        for (arguments, launch_link) in [
+            (&[LAUNCH_LINK_COMMAND][..], None),
+            (&[LAUNCH_LINK_COMMAND, place], None),
+            (&[LAUNCH_LINK_COMMAND, place], Some(place)),
+        ] {
+            let error = launch_command(arguments, launch_link).unwrap_err();
+            let LaunchCommandError::Link { message, .. } = &error else {
+                panic!("a bad internal launch is reported in a window: {error:?}");
+            };
+            assert!(message.contains(LAUNCH_LINK_ENV), "{message}");
+        }
+        assert_eq!(
+            launch_command(&["run"], Some(place)),
+            Ok(Some(LaunchCommand::Run))
+        );
     }
 
     #[test]
@@ -2095,47 +2533,66 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    fn answer_one_request(
+        socket: &std::path::Path,
+        reply: &'static str,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            stream.write_all(reply.as_bytes()).unwrap();
+            request
+        })
+    }
+
     #[test]
-    fn a_second_client_is_refused_while_the_first_one_runs() {
+    fn a_launch_that_cannot_hand_off_is_refused_while_the_first_one_runs() {
         let root = temp_root("client-lock");
-        let settings = root
-            .join(super::RUNTIME_DIR)
-            .join(super::CLIENT_SETTINGS_FILE);
-        let running_flags = BTreeMap::from([("FFlagEclipseFirst".to_owned(), true.into())]);
-        let second_flags = BTreeMap::from([("FFlagEclipseSecond".to_owned(), true.into())]);
-        let first = ClientRun::start_in(&root, Launch::Installed, &settings, &running_flags)
-            .expect("the first client starts");
-        assert_eq!(first.log, root.join("logs").join("eclipse.log"));
-        eclipse::diagnostics::record_status(tracing::Level::INFO, "the first client runs");
-        let desktop = ClientRun::start_in(&root, Launch::Installed, &settings, &second_flags)
-            .err()
+        let Ok(RunStart::Locked(mut first)) = lock_run_in(&root, &Launch::File, None) else {
+            panic!("the first client starts");
+        };
+        let first_log = first.log.head_path();
+        assert_eq!(
+            std::fs::canonicalize(root.join("logs").join("eclipse.log")).unwrap(),
+            std::fs::canonicalize(&first_log).unwrap()
+        );
+        first
+            .log
+            .record(
+                tracing::Level::INFO,
+                "eclipse::status",
+                "the first client runs",
+            )
             .unwrap();
-        assert!(desktop.contains("already running"), "{desktop}");
-        let browser =
-            ClientRun::start_in(&root, Launch::BrowserPlace(1818), &settings, &second_flags)
-                .err()
-                .unwrap();
-        assert!(browser.contains("click Play again"), "{browser}");
-        let log = std::fs::read_to_string(&first.log).unwrap();
+        first.log.flush().unwrap();
+        let file = lock_run_in(&root, &Launch::File, None).err().unwrap();
+        assert!(file.contains("already running"), "{file}");
+        let place = Launch::Link(eclipse::links::parse("1818").unwrap());
+        let link = lock_run_in(&root, &place, None).err().unwrap();
+        assert!(link.contains("open the link again"), "{link}");
+        let log = std::fs::read_to_string(&first_log).unwrap();
         assert!(
             log.contains("the first client runs"),
             "a refused launch leaves the running client's log alone: {log}"
         );
         assert_eq!(
-            std::fs::read(&settings).unwrap(),
-            super::client_app_settings_json(&running_flags),
-            "a refused launch leaves the running client's Fast Flags alone"
+            std::fs::canonicalize(root.join("logs").join("eclipse.log")).unwrap(),
+            std::fs::canonicalize(&first_log).unwrap(),
+            "a refused launch starts no run log"
         );
         drop(first);
         let concurrent_spawns_released_it = (0..100).find_map(|_| {
-            let lock = lock_client_in(&root.join(super::RUNTIME_DIR), |lock| {
-                Launch::File.already_running(lock)
-            })
-            .ok();
-            if lock.is_none() {
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            match super::instance_control::lock_client(&root.join(super::RUNTIME_DIR)).unwrap() {
+                ClientLock::Acquired(lock) => Some(lock),
+                ClientLock::Held(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                }
             }
-            lock
         });
         assert!(
             concurrent_spawns_released_it.is_some(),
@@ -2145,12 +2602,75 @@ mod tests {
     }
 
     #[test]
-    fn only_launches_with_a_launch_window_show_setup_failures_in_one() {
-        let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
-        assert!(launches_in_window(&args(&["run"])));
-        assert!(launches_in_window(&args(&["__run-browser-place", "1818"])));
-        assert!(!launches_in_window(&args(&["run", "/home/u/roblox"])));
-        assert!(!launches_in_window(&args(&["__webview-test"])));
+    fn a_launch_that_loses_the_race_for_the_lock_hands_its_link_to_the_winner() {
+        let root = super::instance_control::socket_test_root("hand-off");
+        let runtime = root.join(super::RUNTIME_DIR);
+        let ClientLock::Acquired(_running) =
+            super::instance_control::lock_client(&runtime).unwrap()
+        else {
+            panic!("the running client holds the lock");
+        };
+        let socket = root.join("c.sock");
+        let server = answer_one_request(&socket, r#""accepted""#);
+        let access_code = "8f3c2a10-5b6d-4e7f-9a1b-2c3d4e5f6a7b";
+        let link = format!("roblox://placeId=1818&accessCode={access_code}");
+        let target = eclipse::links::parse(&link).unwrap();
+
+        let started = lock_run_in(&root, &Launch::Link(target), Some(&socket));
+        assert!(matches!(started, Ok(RunStart::HandedOff)));
+        let request = server.join().unwrap();
+        assert_eq!(
+            request,
+            [
+                b"\x01{\"open\":{\"link\":\"".as_slice(),
+                link.as_bytes(),
+                b"\"}}"
+            ]
+            .concat()
+        );
+        assert!(
+            !root.join("logs").exists(),
+            "a handed-off launch writes no run log"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_launch_that_fails_its_setup_keeps_answering_later_launches() {
+        let root = super::instance_control::socket_test_root("setup-failure");
+        let socket = root.join("c.sock");
+        let failure = super::start_client_run_in(
+            Some(&socket),
+            Err("the client-settings bridge did not load".to_owned()),
+            &BTreeMap::new(),
+        )
+        .expect_err("setup fails without the client-settings bridge");
+        assert_eq!(failure.error, "the client-settings bridge did not load");
+        let listener = failure
+            .listener
+            .expect("the control socket is bound before any setup step can fail");
+        let _later_launch = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        listener.accept().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn every_launch_but_a_file_run_shows_setup_failures_in_a_window() {
+        let place = "roblox://placeId=1818";
+        for (arguments, launch_link) in [
+            (&["run"][..], None),
+            (&["open", place], None),
+            (&[BROWSER_HANDLER_COMMAND, place], None),
+            (&[LAUNCH_LINK_COMMAND], Some(place)),
+        ] {
+            let launch = launch_command(arguments, launch_link).unwrap().unwrap();
+            assert!(launch.launches_in_window(), "{arguments:?}");
+        }
+        let file_run = launch_command(&["run", "/home/u/roblox"], None);
+        assert!(!file_run.unwrap().unwrap().launches_in_window());
+        for arguments in [&["__webview-test"][..], &["install", "x"], &[]] {
+            assert_eq!(launch_command(arguments, None), Ok(None), "{arguments:?}");
+        }
     }
 
     #[test]
@@ -2383,17 +2903,75 @@ mod tests {
 
     #[test]
     fn browser_ticket_is_replaced_before_android_startup() {
-        let secret = "SUPER_SECRET_TICKET_4f9d8c";
-        let protocol = format!(
-            "roblox-player:1+launchmode:play+gameinfo:{secret}+placelauncherurl:https%3A%2F%2Fassetgame.roblox.com%2Fgame%2FPlaceLauncher.ashx%3Frequest%3DRequestGame%26placeId%3D90441122676618"
+        let ticket = "SUPER_SECRET_TICKET_4f9d8c";
+        let access_code = "8f3c2a10-5b6d-4e7f-9a1b-2c3d4e5f6a7b";
+        let link_code = "98765";
+        let click = format!(
+            "roblox-player:1+launchmode:play+gameinfo:{ticket}+placelauncherurl:https%3A%2F%2Fassetgame.roblox.com%2Fgame%2FPlaceLauncher.ashx%3Frequest%3DRequestPrivateGame%26placeId%3D1818%26accessCode%3D{access_code}%26linkCode%3D{link_code}"
         );
-        let normalized =
-            normalize_browser_launch(vec!["__handle-roblox-player-url".into(), protocol.into()])
-                .unwrap();
-        assert_eq!(normalized, ["__run-browser-place", "90441122676618"]);
-        assert!(!normalized
-            .iter()
-            .any(|argument| argument.to_string_lossy().contains(secret)));
+        let handler = launch_command(&[BROWSER_HANDLER_COMMAND, &click], None)
+            .unwrap()
+            .unwrap();
+
+        let mut restart = std::process::Command::new("eclipse");
+        handler.restart(&mut restart);
+        assert_eq!(
+            restart.get_args().collect::<Vec<_>>(),
+            [LAUNCH_LINK_COMMAND]
+        );
+        let environment: Vec<_> = restart.get_envs().collect();
+        let [(name, Some(launch_link))] = environment[..] else {
+            panic!("the restart passes exactly one link variable");
+        };
+        assert_eq!(name, LAUNCH_LINK_ENV);
+        assert!(!launch_link.to_string_lossy().contains(ticket));
+        let restarted = launch_command(&[LAUNCH_LINK_COMMAND], launch_link.to_str()).unwrap();
+        assert_eq!(restarted.as_ref(), Some(&handler));
+
+        let LaunchCommand::Link(target) = &handler else {
+            panic!("a private-server click is a link launch");
+        };
+        assert!(matches!(target, LaunchTarget::PrivateServer { .. }));
+        assert_eq!(target.to_string(), "place 1818 on a private server");
+        for logged in [
+            format!("{target:?}"),
+            Launch::Link(target.clone()).already_running(std::path::Path::new("client.lock")),
+        ] {
+            for secret in [ticket, access_code, link_code] {
+                assert!(!logged.contains(secret), "{logged}");
+            }
+        }
+    }
+
+    #[test]
+    fn handler_starts_every_link_kind_and_never_echoes_codes_in_its_errors() {
+        let ticket = "SUPER_SECRET_TICKET_4f9d8c";
+        for accepted in [
+            "roblox://placeId=1818&launchData=abc",
+            "roblox://userId=261",
+            "robloxmobile://placeId=1818",
+            "roblox://placeId=1818&gameInstanceId=3a5e0cf4-3e23-46a0-9dc7-887dad37e760",
+        ] {
+            assert_eq!(
+                launch_command(&[BROWSER_HANDLER_COMMAND, accepted], None),
+                Ok(Some(link(accepted))),
+                "{accepted}"
+            );
+        }
+        let studio = format!("roblox-player:1+launchmode:edit+gameinfo:{ticket}");
+        let error = launch_command(&[BROWSER_HANDLER_COMMAND, &studio], None).unwrap_err();
+        assert_eq!(
+            error,
+            LaunchCommandError::Link {
+                context: "eclipse browser launch",
+                message: "This link is for Roblox Studio, which Eclipse does not run.".to_owned(),
+            }
+        );
+        assert!(!format!("{error:?}").contains(ticket));
+        assert!(matches!(
+            launch_command(&[BROWSER_HANDLER_COMMAND], None),
+            Err(LaunchCommandError::Link { .. })
+        ));
     }
 
     #[test]
@@ -2402,12 +2980,18 @@ mod tests {
 
         let latin1 = OsString::from_vec(b"R\xf6blox.xapk".to_vec());
         assert_eq!(
-            parse_run_path(std::slice::from_ref(&latin1)).unwrap(),
-            Some(std::path::Path::new(&latin1))
+            LaunchCommand::parse(&["run".into(), latin1.clone()], None),
+            Ok(Some(LaunchCommand::RunFile(latin1.clone().into())))
         );
-        let error = normalize_browser_launch(vec!["__handle-roblox-player-url".into(), latin1])
-            .expect_err("a Roblox URL is text");
-        assert!(error.contains("UTF-8"), "{error}");
+        for command in ["open", BROWSER_HANDLER_COMMAND] {
+            let error = LaunchCommand::parse(&[command.into(), latin1.clone()], None)
+                .expect_err("a Roblox URL is text");
+            let LaunchCommandError::Link { message, .. } = &error else {
+                panic!("a non-UTF-8 link is reported in a window: {error:?}");
+            };
+            assert!(message.contains("UTF-8"), "{message}");
+        }
+        assert_eq!(LaunchCommand::parse(&[latin1], None), Ok(None));
     }
 
     #[test]
@@ -2571,7 +3155,11 @@ mod tests {
         if std::env::var_os(RAW_EXIT_CHILD).is_some() {
             let registered = unsafe { libc::atexit(abort_if_atexit_runs) };
             assert_eq!(registered, 0, "the child must register its atexit sentinel");
-            finish_android_process(0);
+            let discarded = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .unwrap();
+            finish_android_process(ClientEnd::Played, ExitRecord(discarded));
         }
 
         let output = std::process::Command::new(

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::error::OsError;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, AsyncRequestSerial};
+use winit::event_loop::{ActiveEventLoop, AsyncRequestSerial, EventLoopProxy};
 use winit::platform::pump_events::{EventLoopExtPumpEvents as _, PumpStatus};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
 use winit::platform::startup_notify::{
@@ -17,11 +17,11 @@ use winit::platform::startup_notify::{
     WindowExtStartupNotify as _,
 };
 use winit::platform::wayland::{ActiveEventLoopExtWayland as _, WindowAttributesExtWayland as _};
-use winit::window::{ActivationToken, Window, WindowId};
+use winit::window::{ActivationToken, UserAttentionType, Window, WindowId};
 
 use super::{GlyphAtlas, GraphicsError, HostEventLoop, TextMeasure, VulkanRenderer};
 use crate::framework::view_registry::{LayoutParams, RenderNode, MATCH_PARENT, WRAP_CONTENT};
-use crate::framework::MainLooperWake;
+use crate::framework::HostWake;
 use crate::status::{transfer_text, StatusUpdate};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -55,17 +55,60 @@ impl std::fmt::Display for WindowClosed {
 
 impl std::error::Error for WindowClosed {}
 
+pub enum WindowCommand {
+    Raise { done: Option<Sender<()>> },
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowGone;
+
+#[derive(Clone)]
+pub struct WindowControl {
+    commands: Sender<WindowCommand>,
+    wake: EventLoopProxy<HostWake>,
+}
+
+impl WindowControl {
+    pub fn send(&self, command: WindowCommand) -> Result<(), WindowGone> {
+        self.commands.send(command).map_err(|_| WindowGone)?;
+        self.wake
+            .send_event(HostWake::Control)
+            .map_err(|_| WindowGone)
+    }
+}
+
+pub(super) fn raise(
+    window: Option<&Window>,
+    event_loop: &ActiveEventLoop,
+    done: Option<Sender<()>>,
+) {
+    if let Some(window) = window {
+        if event_loop.is_wayland() {
+            window.request_user_attention(Some(UserAttentionType::Informational));
+        } else {
+            window.focus_window();
+        }
+    }
+    if let Some(done) = done {
+        done.send(()).ok();
+    }
+}
+
 pub struct LaunchWindow {
     event_loop: &'static mut HostEventLoop,
     screen: StatusScreen,
+    commands: Sender<WindowCommand>,
     pumping: bool,
 }
 
 impl LaunchWindow {
     pub fn open(title: &str) -> Result<Self, GraphicsError> {
+        let (commands, received) = mpsc::channel();
         let mut launch = Self {
             event_loop: super::host_event_loop()?,
-            screen: StatusScreen::new(title),
+            screen: StatusScreen::new(title, received),
+            commands,
             pumping: false,
         };
         launch.pump(Some(Duration::ZERO));
@@ -92,7 +135,7 @@ impl LaunchWindow {
             if self.pumping {
                 self.pump(Some(POLL_INTERVAL));
             } else {
-                std::thread::sleep(POLL_INTERVAL);
+                self.screen.wait_without_window(POLL_INTERVAL);
             }
         }
     }
@@ -106,7 +149,20 @@ impl LaunchWindow {
         }
     }
 
-    pub fn event_loop(&mut self) -> (&mut HostEventLoop, Option<ActivationToken>) {
+    pub fn control(&self) -> WindowControl {
+        WindowControl {
+            commands: self.commands.clone(),
+            wake: self.event_loop.create_proxy(),
+        }
+    }
+
+    pub fn event_loop(
+        &mut self,
+    ) -> (
+        &mut HostEventLoop,
+        Option<ActivationToken>,
+        &Receiver<WindowCommand>,
+    ) {
         if self.screen.request_activation() {
             let deadline = Instant::now() + ACTIVATION_WAIT;
             while self.pumping && self.screen.activation_pending() {
@@ -121,7 +177,7 @@ impl LaunchWindow {
         while self.pumping {
             self.pump(Some(Duration::ZERO));
         }
-        (&mut self.event_loop, token)
+        (&mut self.event_loop, token, &self.screen.commands)
     }
 
     pub fn show_error(&mut self, message: &str, log: Option<&Path>) {
@@ -195,10 +251,11 @@ struct StatusScreen {
     session: Session,
     scale: f64,
     activation: Activation,
+    commands: Receiver<WindowCommand>,
 }
 
 impl StatusScreen {
-    fn new(title: &str) -> Self {
+    fn new(title: &str, commands: Receiver<WindowCommand>) -> Self {
         Self {
             title: title.to_owned(),
             renderer: None,
@@ -208,6 +265,32 @@ impl StatusScreen {
             session: Session::Showing,
             scale: 1.0,
             activation: Activation::Unrequested,
+            commands,
+        }
+    }
+
+    fn dismiss(&mut self, event_loop: &ActiveEventLoop) {
+        self.close_window();
+        self.session = Session::Dismissed;
+        event_loop.exit();
+    }
+
+    fn wait_without_window(&mut self, timeout: Duration) {
+        match self.commands.recv_timeout(timeout) {
+            Ok(WindowCommand::Raise { done: Some(done) }) => {
+                done.send(()).ok();
+            }
+            Ok(WindowCommand::Raise { done: None }) | Err(_) => {}
+            Ok(WindowCommand::Close) => self.session = Session::Dismissed,
+        }
+    }
+
+    fn run_commands(&mut self, event_loop: &ActiveEventLoop) {
+        while let Ok(command) = self.commands.try_recv() {
+            match command {
+                WindowCommand::Raise { done } => raise(self.window.as_ref(), event_loop, done),
+                WindowCommand::Close => self.dismiss(event_loop),
+            }
         }
     }
 
@@ -330,7 +413,7 @@ impl StatusScreen {
     }
 }
 
-impl ApplicationHandler<MainLooperWake> for StatusScreen {
+impl ApplicationHandler<HostWake> for StatusScreen {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() || self.session != Session::Showing {
             return;
@@ -369,11 +452,7 @@ impl ApplicationHandler<MainLooperWake> for StatusScreen {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => {
-                self.close_window();
-                self.session = Session::Dismissed;
-                event_loop.exit();
-            }
+            WindowEvent::CloseRequested => self.dismiss(event_loop),
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.mark_resized(size.width, size.height);
@@ -395,6 +474,9 @@ impl ApplicationHandler<MainLooperWake> for StatusScreen {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.session == Session::Showing {
+            self.run_commands(event_loop);
+        }
         if self.session != Session::Showing {
             event_loop.exit();
         }
@@ -791,13 +873,31 @@ mod tests {
     #[test]
     fn a_window_that_cannot_map_without_drawing_ends_instead_of_waiting_for_a_close() {
         let error = GraphicsError::Vulkan("no physical device".to_owned());
-        let mut screen = StatusScreen::new("Eclipse");
+        let mut screen = StatusScreen::new("Eclipse", mpsc::channel().1);
         screen.renderer_unavailable(&error, WindowMapping::OnFirstFrame);
         assert_eq!(screen.session, Session::Ending);
 
-        let mut screen = StatusScreen::new("Eclipse");
+        let mut screen = StatusScreen::new("Eclipse", mpsc::channel().1);
         screen.renderer_unavailable(&error, WindowMapping::OnCreate);
         assert_eq!(screen.session, Session::Showing);
+    }
+
+    #[test]
+    fn a_launch_without_a_window_still_answers_raises_and_closes() {
+        let (commands, received) = mpsc::channel();
+        let mut screen = StatusScreen::new("Eclipse", received);
+        screen.end();
+        let (done, raised) = mpsc::channel();
+        commands
+            .send(WindowCommand::Raise { done: Some(done) })
+            .unwrap();
+        screen.wait_without_window(Duration::from_secs(5));
+        assert_eq!(raised.try_recv(), Ok(()));
+        screen.wait_without_window(Duration::from_millis(10));
+        assert_eq!(screen.session, Session::Ending);
+        commands.send(WindowCommand::Close).unwrap();
+        screen.wait_without_window(Duration::from_secs(5));
+        assert_eq!(screen.session, Session::Dismissed);
     }
 
     #[test]
@@ -807,7 +907,7 @@ mod tests {
             log: Some(PathBuf::from("/data/logs/eclipse.log")),
         };
 
-        let mut unmapped = StatusScreen::new("Eclipse");
+        let mut unmapped = StatusScreen::new("Eclipse", mpsc::channel().1);
         unmapped.content.error = Some(failure.clone());
         unmapped.renderer_unavailable(
             &GraphicsError::Vulkan("no physical device".to_owned()),
@@ -818,7 +918,7 @@ mod tests {
             Some(Path::new("/data/logs/eclipse.log"))
         );
 
-        let mut closed = StatusScreen::new("Eclipse");
+        let mut closed = StatusScreen::new("Eclipse", mpsc::channel().1);
         closed.content.error = Some(failure);
         closed.session = Session::Dismissed;
         assert_eq!(closed.log_of_unseen_failure(), None);

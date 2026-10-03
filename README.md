@@ -41,6 +41,7 @@ Start **Eclipse** from your app menu. From a terminal, use `flatpak run io.githu
 | Command | What it does |
 |---|---|
 | `run` | Start Roblox (the default from the app menu) |
+| `open <link>` | Start Roblox at a game, server, private-server, friend or share link, or a place ID |
 | `update` | Check for a newer Roblox now |
 | `install <files>` | Install Roblox from your own `base.apk` + `split_config.x86_64.apk`, or an `.apks`/`.xapk` bundle |
 | `config` | Show the settings file path, the values in effect and any problems in the file |
@@ -82,7 +83,7 @@ flowchart LR
 
 ## Troubleshooting
 
-- **Something failed?** The log of the last launch is in `~/.var/app/io.github.kuenec.Eclipse/data/eclipse/app-data/logs/eclipse.log`.
+- **Something failed?** Logs of the last five launches are in `~/.var/app/io.github.kuenec.Eclipse/data/eclipse/app-data/logs/`; `eclipse.log` is the newest, and a long launch continues in its `.tail.log` file.
 - **More detail:** `flatpak run --env=RUST_LOG=debug io.github.kuenec.Eclipse run`
 - **Signature error:** the files are not Roblox's official release. Install a clean copy.
 - **Logged out after updating from 0.1.4 or older?** Eclipse carries your login over from the old web engine once. If it could not, the log says why; sign in again.

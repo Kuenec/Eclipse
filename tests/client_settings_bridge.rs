@@ -1,6 +1,9 @@
 #[path = "../src/bounded_child.rs"]
 mod bounded_child;
 
+use std::io::{PipeReader, PipeWriter, Read as _};
+use std::os::fd::AsRawFd as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -10,6 +13,7 @@ const RUN_LIMIT: Duration = Duration::from_secs(60);
 const BRIDGE_INACTIVE: &str = "client-settings bridge did not load";
 const MISSING_APK: &str = "missing.apk";
 const SEARCH_PATH_SEPARATOR: &str = "contains a colon or semicolon";
+const UNSUPERVISED: &str = "must be started by Eclipse's supervisor";
 
 fn sandbox_without_config(tag: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("eclipse-settings-bridge-{tag}"));
@@ -92,19 +96,69 @@ fn a_restarted_run_without_the_bridge_stops_before_starting_android() {
     assert!(!stderr.contains(MISSING_APK), "{stderr}");
 }
 
+struct TestSupervisor {
+    records: PipeReader,
+    exit: PipeReader,
+    ends: [PipeWriter; 2],
+}
+
+impl TestSupervisor {
+    fn attach(command: &mut Command, run_log: &Path) -> Self {
+        let (records, records_end) = std::io::pipe().expect("create the record pipe");
+        let (exit, exit_end) = std::io::pipe().expect("create the exit pipe");
+        let inherited = [records_end.as_raw_fd(), exit_end.as_raw_fd()];
+        command
+            .env(
+                "ECLIPSE_SUPERVISOR_FDS",
+                format!("{},{}", inherited[0], inherited[1]),
+            )
+            .env("ECLIPSE_SUPERVISOR_RUN_LOG", run_log);
+        unsafe {
+            command.pre_exec(move || {
+                for fd in inherited {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        Self {
+            records,
+            exit,
+            ends: [records_end, exit_end],
+        }
+    }
+
+    fn collect(mut self) -> (String, String) {
+        drop(self.ends);
+        let (mut records, mut exit) = (String::new(), String::new());
+        self.records
+            .read_to_string(&mut records)
+            .expect("read the client's log records");
+        self.exit
+            .read_to_string(&mut exit)
+            .expect("read the client's exit record");
+        (records, exit)
+    }
+}
+
 #[test]
-fn a_restarted_run_without_the_preloaded_bridge_stops_and_logs_why() {
+fn a_restarted_run_without_the_preloaded_bridge_stops_and_tells_its_supervisor_why() {
     let root = sandbox("not-preloaded");
     let app_data = root.join("app-data");
+    let runtime = app_data.join("runtime");
+    std::fs::create_dir_all(&runtime).expect("create the runtime directory");
     let mut command = missing_apk_command(&root, &app_data);
     command
         .env("ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE", "1")
         .env(
             "ECLIPSE_CLIENT_APP_SETTINGS_PATH",
-            app_data.join("runtime").join("ClientAppSettings.json"),
+            runtime.join("ClientAppSettings.json"),
         );
+    let supervisor = TestSupervisor::attach(&mut command, &root.join("eclipse.log"));
     let output = bounded_child::output(&mut command, RUN_LIMIT);
-    let log = std::fs::read_to_string(app_data.join("logs").join("eclipse.log"));
+    let (records, exit) = supervisor.collect();
     std::fs::remove_dir_all(&root).ok();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -115,7 +169,34 @@ fn a_restarted_run_without_the_preloaded_bridge_stops_and_logs_why() {
     assert!(stderr.contains(unreadable), "{stderr}");
     assert!(!stderr.contains(MISSING_APK), "{stderr}");
     assert!(!stdout.contains("Roblox Fast Flags staged at"), "{stdout}");
-    assert!(log.expect("read eclipse.log").contains(unreadable));
+    assert!(
+        records
+            .lines()
+            .any(|line| line.contains(" ERROR eclipse::status: ") && line.contains(unreadable)),
+        "{records}"
+    );
+    assert_eq!(exit, "\"failure_shown\"\n");
+}
+
+#[test]
+fn a_restarted_run_without_its_supervisor_stops_before_staging_settings() {
+    let root = sandbox("unsupervised");
+    let app_data = root.join("app-data");
+    let settings = app_data.join("runtime").join("ClientAppSettings.json");
+    let mut command = missing_apk_command(&root, &app_data);
+    command
+        .env("ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE", "1")
+        .env("ECLIPSE_CLIENT_APP_SETTINGS_PATH", &settings)
+        .env_remove("ECLIPSE_SUPERVISOR_FDS");
+    let output = bounded_child::output(&mut command, RUN_LIMIT);
+    let staged = settings.exists();
+    std::fs::remove_dir_all(&root).ok();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(UNSUPERVISED), "{stderr}");
+    assert!(!stderr.contains(MISSING_APK), "{stderr}");
+    assert!(!staged, "an unsupervised client stages no settings");
 }
 
 #[test]

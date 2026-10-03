@@ -13,12 +13,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::https::{self, Download, DownloadError, Host, Resume};
 use super::store::{InstalledVersion, Store, StoreError, UpdateOutcome};
 use super::{
     ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, NATIVE_SPLIT_APK, NATIVE_SPLIT_NAME,
     ROBLOX_PACKAGE,
 };
+use crate::https::{self, Download, DownloadError, Host, Resume};
 use crate::status::StatusSink;
 use proto::{
     bytes_field, fixed64_field, message_at, repeated_bytes, string_field, varint_field, Encoder,
