@@ -10,6 +10,7 @@ use wayland_client::{Connection, Dispatch, DispatchError, Proxy, QueueHandle};
 use wayland_protocols::xdg::foreign::zv2::client::zxdg_exported_v2::{self, ZxdgExportedV2};
 use wayland_protocols::xdg::foreign::zv2::client::zxdg_exporter_v2::{self, ZxdgExporterV2};
 use winit::dpi::PhysicalSize;
+use winit::window::Window;
 
 use crate::webview::client;
 use crate::webview::proto::{ParentSize, ParentWindow, SizeUnit};
@@ -70,8 +71,8 @@ impl WebViewParent {
         }
     }
 
-    pub(crate) fn resized(&self, size: PhysicalSize<u32>, scale_factor: f64) {
-        if let Some(size) = parent_size(self.unit, size, scale_factor) {
+    pub(crate) fn resized(&self, window: &Window) {
+        if let Some(size) = parent_size(self.unit, window.outer_size(), window.scale_factor()) {
             client::parent_resized(size);
         }
     }

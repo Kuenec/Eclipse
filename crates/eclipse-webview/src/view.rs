@@ -20,8 +20,6 @@ const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/53
 
 const DEFAULT_SIZE: (i32, i32) = (960, 760);
 
-const WINDOW_SHARE_PERCENT: i32 = 85;
-
 const MIN_SIZE: (i32, i32) = (480, 360);
 
 const CLOSE_BUTTON_LAYOUT: &str = ":close";
@@ -62,6 +60,7 @@ struct ResourceThrottle {
 pub(crate) struct View {
     pub(crate) window: gtk::Window,
     pub(crate) web_view: webkit6::WebView,
+    pub(crate) show_order: Cell<Option<u64>>,
     content: webkit6::UserContentManager,
     bridges: RefCell<HashMap<String, webkit6::UserScript>>,
     navigation: RefCell<Option<Navigation>>,
@@ -268,16 +267,16 @@ fn set_x11_transient_for(
 pub(crate) fn window_size(parent: ParentSize, surface_scale: i32) -> (i32, i32) {
     let pixels_per_unit = match parent.unit {
         SizeUnit::Logical => 1,
-        SizeUnit::DevicePixels => i64::from(surface_scale.max(1)),
+        SizeUnit::DevicePixels => surface_scale.max(1).unsigned_abs(),
     };
-    let share = |length: NonZeroU32, minimum: i32| {
-        let shared =
-            i64::from(length.get()) / pixels_per_unit * i64::from(WINDOW_SHARE_PERCENT) / 100;
-        i32::try_from(shared).unwrap_or(i32::MAX).max(minimum)
+    let cover = |length: NonZeroU32, minimum: i32| {
+        i32::try_from(length.get().div_ceil(pixels_per_unit))
+            .unwrap_or(i32::MAX)
+            .max(minimum)
     };
     (
-        share(parent.width, MIN_SIZE.0),
-        share(parent.height, MIN_SIZE.1),
+        cover(parent.width, MIN_SIZE.0),
+        cover(parent.height, MIN_SIZE.1),
     )
 }
 
@@ -292,12 +291,8 @@ fn default_window_size() -> (i32, i32) {
     });
     match largest {
         Some(area) => (
-            DEFAULT_SIZE
-                .0
-                .min(area.width() * WINDOW_SHARE_PERCENT / 100),
-            DEFAULT_SIZE
-                .1
-                .min(area.height() * WINDOW_SHARE_PERCENT / 100),
+            DEFAULT_SIZE.0.min(area.width()),
+            DEFAULT_SIZE.1.min(area.height()),
         ),
         None => DEFAULT_SIZE,
     }
@@ -389,6 +384,7 @@ impl View {
         let view = Rc::new(View {
             window,
             web_view,
+            show_order: Cell::new(None),
             content,
             bridges: RefCell::default(),
             navigation: RefCell::default(),
@@ -524,6 +520,15 @@ impl View {
                 view.escape_held.set(false);
             }
         });
+        let weak = app.clone();
+        self.window
+            .frame_clock()
+            .expect("View::create realizes the window before connecting it")
+            .connect_after_paint(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    app.frame_painted(id);
+                }
+            });
 
         let back_button = gtk::GestureClick::builder()
             .button(BACK_BUTTON)
@@ -790,19 +795,24 @@ mod tests {
     }
 
     #[test]
-    fn web_windows_take_most_of_the_game_window_and_never_shrink_below_the_minimum() {
+    fn web_windows_cover_the_whole_game_window_and_never_shrink_below_the_minimum() {
         assert_eq!(
-            window_size(game_window(1280, 720, SizeUnit::Logical), 2),
-            (1088, 612),
+            window_size(game_window(1345, 886, SizeUnit::Logical), 2),
+            (1345, 886),
             "logical sizes are GTK's own units on every scale"
         );
         assert_eq!(
             window_size(game_window(3840, 2160, SizeUnit::DevicePixels), 2),
-            (1632, 918)
+            (1920, 1080)
         );
         assert_eq!(
             window_size(game_window(1920, 1080, SizeUnit::DevicePixels), 0),
-            (1632, 918)
+            (1920, 1080)
+        );
+        assert_eq!(
+            window_size(game_window(1345, 887, SizeUnit::DevicePixels), 2),
+            (673, 444),
+            "an odd device-pixel length rounds up so no strip of the game stays visible"
         );
         assert_eq!(
             window_size(game_window(320, 200, SizeUnit::Logical), 1),
