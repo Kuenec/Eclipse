@@ -13,6 +13,8 @@ use winit::platform::startup_notify::WindowAttributesExtStartupNotify as _;
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{ActivationToken, CursorGrabMode, Fullscreen, Window, WindowId};
 
+use crate::web_view_parent::{WebViewParent, WebViewPlacement};
+
 mod dialog_window;
 pub mod launch_window;
 
@@ -52,7 +54,7 @@ struct GameWindow<'vm> {
 
     engine_window: Option<crate::egl_engine::EngineNativeWindow>,
 
-    web_view_parent: Option<crate::web_view_parent::WebViewParent>,
+    web_view_parent: Option<WebViewParent>,
 
     window: Option<Window>,
 
@@ -734,7 +736,9 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
 
         self.sync_web_view_window();
         let web_view_hidden = self.web_view_window == WebViewWindow::Hidden;
-        if crate::webview::client::take_activation_request() {
+        if crate::webview::client::take_activation_request()
+            && self.web_view_placement() == WebViewPlacement::OwnWindow
+        {
             self.request_web_view_activation();
         }
         let text_box = if self.handed_off {
@@ -840,7 +844,7 @@ fn pass_key_to_engine(
     }
 }
 
-fn web_view_parent(window: &Window) -> Option<crate::web_view_parent::WebViewParent> {
+fn web_view_parent(window: &Window) -> Option<WebViewParent> {
     let (display, handle) = match (window.display_handle(), window.window_handle()) {
         (Ok(display), Ok(handle)) => (display.as_raw(), handle.as_raw()),
         (Err(error), _) | (_, Err(error)) => {
@@ -848,9 +852,7 @@ fn web_view_parent(window: &Window) -> Option<crate::web_view_parent::WebViewPar
             return None;
         }
     };
-    let parent = unsafe {
-        crate::web_view_parent::WebViewParent::for_window_whose_display_outlives_it(display, handle)
-    };
+    let parent = unsafe { WebViewParent::for_window_whose_display_outlives_it(display, handle) };
     parent.resized(window);
     Some(parent)
 }
@@ -876,6 +878,7 @@ fn host_clipboard(window: &Window) -> Option<crate::clipboard::HostClipboard> {
 enum WebViewWindow {
     Hidden,
     Shown,
+    Embedded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -888,11 +891,11 @@ enum HostInputRoute {
 }
 
 impl WebViewWindow {
-    fn current() -> Self {
-        if crate::webview::client::view_window_visible() {
-            Self::Shown
-        } else {
-            Self::Hidden
+    fn current(placement: WebViewPlacement) -> Self {
+        match (crate::webview::client::view_window_visible(), placement) {
+            (false, _) => Self::Hidden,
+            (true, WebViewPlacement::OwnWindow) => Self::Shown,
+            (true, WebViewPlacement::GameWindow) => Self::Embedded,
         }
     }
 
@@ -912,6 +915,7 @@ impl WebViewWindow {
                 HostInputRoute::RaiseWebView
             }
             (Self::Shown, _, _) => HostInputRoute::Withheld,
+            (Self::Embedded, _, _) => HostInputRoute::Withheld,
         }
     }
 
@@ -921,13 +925,14 @@ impl WebViewWindow {
             (Self::Shown, MouseButton::Back, ElementState::Pressed) => HostInputRoute::ActivityBack,
             (Self::Shown, _, ElementState::Pressed) => HostInputRoute::RaiseWebView,
             (Self::Shown, _, ElementState::Released) => HostInputRoute::Withheld,
+            (Self::Embedded, _, _) => HostInputRoute::Withheld,
         }
     }
 
     fn pointer_lock_reasons(self, game: impl FnOnce() -> PointerLockReasons) -> PointerLockReasons {
         match self {
             Self::Hidden => game(),
-            Self::Shown => PointerLockReasons::default(),
+            Self::Shown | Self::Embedded => PointerLockReasons::default(),
         }
     }
 }
@@ -1286,18 +1291,31 @@ impl GameWindow<'_> {
         }
     }
 
+    fn web_view_placement(&self) -> WebViewPlacement {
+        self.web_view_parent
+            .as_ref()
+            .map_or(WebViewPlacement::OwnWindow, WebViewParent::placement)
+    }
+
     fn sync_web_view_window(&mut self) {
-        let current = WebViewWindow::current();
+        let current = WebViewWindow::current(self.web_view_placement());
         match (self.web_view_window, current) {
             (WebViewWindow::Hidden, WebViewWindow::Shown) => {
                 tracing::info!("WebView window shown; game input is withheld until it closes");
                 self.release_engine_input_for_focus_loss();
             }
-            (WebViewWindow::Shown, WebViewWindow::Hidden) => {
+            (WebViewWindow::Hidden, WebViewWindow::Embedded) => {
+                tracing::info!(
+                    "WebView page shown inside the game window; game input is withheld until it \
+                     closes"
+                );
+                self.release_engine_input_for_focus_loss();
+            }
+            (WebViewWindow::Shown | WebViewWindow::Embedded, WebViewWindow::Hidden) => {
                 tracing::info!("WebView window hidden; game input resumes");
             }
             (WebViewWindow::Hidden, WebViewWindow::Hidden)
-            | (WebViewWindow::Shown, WebViewWindow::Shown) => {}
+            | (WebViewWindow::Shown | WebViewWindow::Embedded, _) => {}
         }
         self.web_view_window = current;
     }
@@ -6775,6 +6793,43 @@ mod tests {
                 HostInputRoute::Withheld
             );
         }
+    }
+
+    #[test]
+    fn a_page_inside_the_game_window_takes_every_key_and_click_itself() {
+        use eclipse_config::TouchMode;
+        use winit::keyboard::{Key, NamedKey};
+
+        let keys = sample_keys()
+            .into_iter()
+            .chain([Key::Named(NamedKey::Escape), Key::Named(NamedKey::F11)]);
+        for key in keys {
+            for edge in KEY_EDGES {
+                assert_eq!(
+                    WebViewWindow::Embedded.key_route(&key, edge),
+                    HostInputRoute::Withheld,
+                    "the page handles Escape and every other key itself: {key:?}"
+                );
+            }
+        }
+        for button in MOUSE_BUTTONS {
+            for state in [ElementState::Pressed, ElementState::Released] {
+                assert_eq!(
+                    WebViewWindow::Embedded.button_route(button, state),
+                    HostInputRoute::Withheld,
+                    "the page handles Back and every other button itself: {button:?}"
+                );
+            }
+        }
+        assert_eq!(
+            WebViewWindow::Embedded
+                .pointer_lock_reasons(|| panic!("the engine is asked for its mouse lock")),
+            PointerLockReasons::default()
+        );
+        assert_eq!(
+            host_cursor(true, TouchMode::Off, WebViewWindow::Embedded),
+            HostCursor::Shown
+        );
     }
 
     #[test]

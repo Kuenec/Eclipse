@@ -13,12 +13,25 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::webview::client;
+use crate::webview::embed::Embedder;
 use crate::webview::proto::{ParentSize, ParentWindow, SizeUnit};
 
-pub(crate) struct WebViewParent {
-    _export: Option<ExportedToplevel>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WebViewPlacement {
+    OwnWindow,
+    GameWindow,
+}
 
-    unit: SizeUnit,
+pub(crate) struct WebViewParent {
+    placement: Placement,
+}
+
+enum Placement {
+    Embedded(Embedder),
+    Dialog {
+        _export: Option<ExportedToplevel>,
+        unit: SizeUnit,
+    },
 }
 
 impl WebViewParent {
@@ -26,56 +39,109 @@ impl WebViewParent {
         display: RawDisplayHandle,
         window: RawWindowHandle,
     ) -> Self {
-        match game_surface(display, window) {
+        let placement = match game_surface(display, window) {
             GameSurface::Wayland { display, surface } => {
-                let exported = unsafe {
-                    ExportedToplevel::for_surface_whose_display_outlives_it(display, surface)
-                };
-                let export = match exported {
-                    Ok(export) => {
-                        client::set_parent(ParentWindow::Wayland {
-                            handle: export.handle.clone(),
-                        });
-                        Some(export)
-                    }
-                    Err(error) => {
+                let embedded =
+                    unsafe { Embedder::for_surface_whose_display_outlives_it(display, surface) };
+                match embedded {
+                    Ok((embedder, connector)) => {
                         tracing::info!(
-                            %error,
-                            "WebView windows open as normal windows, not as dialogs of the game window"
+                            "WebView pages open inside the game window as a Wayland subsurface"
                         );
-                        None
+                        client::embed_in(connector);
+                        Placement::Embedded(embedder)
                     }
-                };
-                Self {
-                    _export: export,
-                    unit: SizeUnit::Logical,
+                    Err(embed_error) => unsafe { dialog_placement(display, surface, &embed_error) },
                 }
             }
             GameSurface::X11 { window } => {
+                tracing::info!(
+                    "WebView pages open as dialog windows of the game window: embedding them \
+                     needs Wayland and this is an X11 window"
+                );
                 client::set_parent(ParentWindow::X11 { window });
-                Self {
+                Placement::Dialog {
                     _export: None,
                     unit: SizeUnit::DevicePixels,
                 }
             }
             GameSurface::Unsupported => {
                 tracing::info!(
-                    "the game window is neither a Wayland nor an X11 window; WebView windows open as \
-                     normal windows"
+                    "WebView pages open as normal windows: the game window is neither a Wayland \
+                     nor an X11 window"
                 );
-                Self {
+                Placement::Dialog {
                     _export: None,
                     unit: SizeUnit::DevicePixels,
                 }
             }
+        };
+        Self { placement }
+    }
+
+    pub(crate) fn placement(&self) -> WebViewPlacement {
+        match self.placement {
+            Placement::Embedded(_) => WebViewPlacement::GameWindow,
+            Placement::Dialog { .. } => WebViewPlacement::OwnWindow,
         }
     }
 
     pub(crate) fn resized(&self, window: &Window) {
-        if let Some(size) = parent_size(self.unit, window.outer_size(), window.scale_factor()) {
-            client::parent_resized(size);
+        match &self.placement {
+            Placement::Embedded(embedder) => {
+                if let Some((width, height)) =
+                    embedded_size(window.inner_size(), window.scale_factor())
+                {
+                    embedder.resize(width, height);
+                }
+            }
+            Placement::Dialog { unit, .. } => {
+                if let Some(size) = parent_size(*unit, window.outer_size(), window.scale_factor()) {
+                    client::parent_resized(size);
+                }
+            }
         }
     }
+}
+
+unsafe fn dialog_placement(
+    display: NonNull<c_void>,
+    surface: NonNull<c_void>,
+    embed_error: &crate::webview::embed::StartError,
+) -> Placement {
+    let exported =
+        unsafe { ExportedToplevel::for_surface_whose_display_outlives_it(display, surface) };
+    let export = match exported {
+        Ok(export) => {
+            tracing::info!(
+                reason = %embed_error,
+                "WebView pages open as dialog windows of the game window because they cannot be \
+                 embedded in it"
+            );
+            client::set_parent(ParentWindow::Wayland {
+                handle: export.handle.clone(),
+            });
+            Some(export)
+        }
+        Err(export_error) => {
+            tracing::info!(
+                reason = %embed_error,
+                %export_error,
+                "WebView pages open as normal windows: they can neither be embedded in the game \
+                 window nor parented to it"
+            );
+            None
+        }
+    };
+    Placement::Dialog {
+        _export: export,
+        unit: SizeUnit::Logical,
+    }
+}
+
+fn embedded_size(size: PhysicalSize<u32>, scale_factor: f64) -> Option<(i32, i32)> {
+    let logical = size.to_logical::<i32>(scale_factor);
+    (logical.width > 0 && logical.height > 0).then_some((logical.width, logical.height))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -347,6 +413,23 @@ mod tests {
                 "{display:?} {window:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_embedded_page_takes_the_game_surface_size_in_logical_pixels() {
+        assert_eq!(
+            embedded_size(PhysicalSize::new(2560, 1440), 2.0),
+            Some((1280, 720))
+        );
+        assert_eq!(
+            embedded_size(PhysicalSize::new(1920, 1080), 1.5),
+            Some((1280, 720))
+        );
+        assert_eq!(
+            embedded_size(PhysicalSize::new(0, 1080), 1.0),
+            None,
+            "a minimised game window keeps the page at its last size"
+        );
     }
 
     #[test]

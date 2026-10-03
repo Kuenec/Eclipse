@@ -70,6 +70,7 @@ pub(crate) struct View {
     failed_url: RefCell<Option<String>>,
     composing: Cell<bool>,
     escape_held: Cell<bool>,
+    watched_popover: RefCell<glib::WeakRef<gtk::Popover>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +84,7 @@ pub(crate) enum DisplayBackend {
 pub(crate) enum Parenting<'a> {
     Exported(&'a str),
     TransientFor(NonZeroU32),
+    Embedded,
     Unparented(Unparented),
 }
 
@@ -194,7 +196,7 @@ pub(crate) fn display_backend(display: &gdk::Display) -> DisplayBackend {
 
 fn game_backend(parent: &ParentWindow) -> DisplayBackend {
     match parent {
-        ParentWindow::Wayland { .. } => DisplayBackend::Wayland,
+        ParentWindow::Wayland { .. } | ParentWindow::Embedded => DisplayBackend::Wayland,
         ParentWindow::X11 { .. } => DisplayBackend::X11,
     }
 }
@@ -208,6 +210,7 @@ pub(crate) fn parenting(backend: DisplayBackend, parent: Option<&ParentWindow>) 
         (DisplayBackend::X11, Some(ParentWindow::X11 { window })) => {
             Parenting::TransientFor(*window)
         }
+        (DisplayBackend::Wayland, Some(ParentWindow::Embedded)) => Parenting::Embedded,
         (gtk, Some(parent)) => Parenting::Unparented(Unparented::BackendMismatch {
             gtk,
             game: game_backend(parent),
@@ -240,6 +243,10 @@ pub(crate) fn adopt_parent(
                 return Err(Unparented::NoSurface);
             };
             set_x11_transient_for(display, surface, parent)
+        }
+        Parenting::Embedded => {
+            window.set_modal(false);
+            Ok(())
         }
         Parenting::Unparented(reason) => Err(reason),
     }
@@ -394,6 +401,7 @@ impl View {
             failed_url: RefCell::default(),
             composing: Cell::new(false),
             escape_held: Cell::new(false),
+            watched_popover: RefCell::default(),
         });
         view.fit(app.parent_size());
         view.set_user_agent("");
@@ -413,6 +421,27 @@ impl View {
             None => default_window_size(),
         };
         self.window.set_default_size(width, height);
+    }
+
+    fn keep_page_focus_after(&self, popover: &gtk::Popover) {
+        if self.watched_popover.borrow().upgrade().as_ref() == Some(popover) {
+            return;
+        }
+        self.watched_popover.replace(popover.downgrade());
+        let window = self.window.downgrade();
+        let web_view = self.web_view.downgrade();
+        popover.connect_local("closed", true, move |_| {
+            let (Some(window), Some(web_view)) = (window.upgrade(), web_view.upgrade()) else {
+                return None;
+            };
+            let focus_in_window = GtkWindowExt::focus(&window)
+                .and_then(|focus| focus.root())
+                .is_some_and(|root| root == *window.upcast_ref::<gtk::Root>());
+            if !focus_in_window {
+                web_view.grab_focus();
+            }
+            None
+        });
     }
 
     fn escape_target(&self) -> EscapeTarget {
@@ -514,6 +543,16 @@ impl View {
             }
         });
         self.window.add_controller(keys);
+        let weak = app.clone();
+        self.window.connect_focus_widget_notify(move |window| {
+            let popover = GtkWindowExt::focus(window)
+                .and_then(|focus| focus.ancestor(gtk::Popover::static_type()))
+                .and_then(|popover| popover.downcast::<gtk::Popover>().ok());
+            let view = weak.upgrade().and_then(|app| app.view(id));
+            if let (Some(popover), Some(view)) = (popover, view) {
+                view.keep_page_focus_after(&popover);
+            }
+        });
         let weak = app.clone();
         self.window.connect_hide(move |_| {
             if let Some(view) = weak.upgrade().and_then(|app| app.view(id)) {
@@ -836,6 +875,11 @@ mod tests {
             Parenting::Exported("game-window-export")
         );
         assert_eq!(
+            parenting(DisplayBackend::Wayland, Some(&ParentWindow::Embedded)),
+            Parenting::Embedded,
+            "an embedded page is a subsurface of the game window, so it imports nothing"
+        );
+        assert_eq!(
             parenting(DisplayBackend::X11, Some(&x11)),
             Parenting::TransientFor(xid)
         );
@@ -843,6 +887,11 @@ mod tests {
             (DisplayBackend::Wayland, &x11, DisplayBackend::X11),
             (DisplayBackend::X11, &wayland, DisplayBackend::Wayland),
             (DisplayBackend::Other, &wayland, DisplayBackend::Wayland),
+            (
+                DisplayBackend::X11,
+                &ParentWindow::Embedded,
+                DisplayBackend::Wayland,
+            ),
         ] {
             assert_eq!(
                 parenting(gtk, Some(parent)),
