@@ -15,8 +15,11 @@ use winit::window::{ActivationToken, CursorGrabMode, Fullscreen, Window, WindowI
 
 use crate::web_view_parent::WebViewParent;
 
+pub mod activation;
 mod dialog_window;
 pub mod launch_window;
+pub(crate) mod title_suffix;
+pub mod window_state;
 
 const CLEAR_COLOR: [f32; 4] = [0.149, 0.408, 0.722, 1.0];
 
@@ -106,6 +109,8 @@ struct GameWindow<'vm> {
 
     runtime_shutdown_started: bool,
 
+    last_activity: crate::framework::lifecycle::LastActivityCheck,
+
     modifiers: winit::keyboard::ModifiersState,
 
     published_display_refresh_profile: Option<DisplayRefreshProfile>,
@@ -119,6 +124,10 @@ struct GameWindow<'vm> {
     on_screen_keyboard: crate::on_screen_keyboard::OnScreenKeyboard,
 
     fullscreen: bool,
+
+    window_state: window_state::WindowStateFile,
+
+    fullscreen_shortcut: FullscreenShortcut,
 
     host_cursor: HostCursor,
 
@@ -393,9 +402,12 @@ fn display_refresh_profile(window: &Window) -> Option<DisplayRefreshProfile> {
 
 impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let mut attrs = Window::default_attributes()
-            .with_title(self.title.clone())
-            .with_name(crate::APP_ID, "eclipse");
+        let mut attrs = self.window_state.window_attributes(
+            Window::default_attributes()
+                .with_title(self.title.clone())
+                .with_name(crate::APP_ID, "eclipse"),
+            event_loop.available_monitors(),
+        );
         if let Some(token) = self.activation_token.take() {
             attrs = attrs.with_activation_token(token);
         }
@@ -515,6 +527,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
             }
             WindowEvent::Resized(size) => {
                 self.sync_fullscreen();
+                self.observe_window_state();
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.mark_resized(size.width, size.height);
                 }
@@ -613,10 +626,13 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
 
             WindowEvent::KeyboardInput { event, .. } => {
-                match self
-                    .web_view_window
-                    .key_route(&event.logical_key, key_edge(&event))
-                {
+                match self.fullscreen_shortcut.key_route(
+                    self.web_view_window,
+                    &event.logical_key,
+                    event.physical_key,
+                    key_edge(&event),
+                    self.modifiers,
+                ) {
                     HostInputRoute::ToggleFullscreen => self.toggle_fullscreen(),
                     HostInputRoute::Engine if self.handed_off => self.engine_key(&event),
                     HostInputRoute::ActivityBack => self.activity_back(),
@@ -657,6 +673,11 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.flush_pointer_motion();
+        if let Some(window) = &self.window {
+            if let Some(requested) = title_suffix::take_request() {
+                window.set_title(&requested.title(&self.title));
+            }
+        }
         if std::mem::take(&mut self.loopers_need_wake) {
             crate::loader::ndk_registry::wake_all_loopers();
         }
@@ -670,6 +691,19 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                 )
             }
         };
+        if let Some(reason) = crate::framework::lifecycle::take_quit_request() {
+            self.quit(event_loop, reason);
+            return;
+        }
+        if !self.runtime_shutdown_started
+            && self
+                .last_activity
+                .client_finished(vm, main_looper, std::time::Instant::now())
+        {
+            tracing::info!("Roblox finished its last activity; closing Eclipse");
+            self.close(event_loop);
+            return;
+        }
         match crate::framework::window_registry::showing_dialogs() {
             Ok(showing) => self.dialogs.sync(event_loop, &showing),
             Err(e) => tracing::error!(error = %e, "the showing dialogs could not be read"),
@@ -768,6 +802,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
         crate::framework::keep_screen_on::sync_idle_inhibit(&mut self.idle_inhibit, self.focused);
         let now = std::time::Instant::now();
         self.sync_engine_surface_size(now);
+        self.window_state.save_if_due(now);
         if now >= self.next_display_refresh_poll {
             self.publish_engine_display_refresh_rates();
             self.next_display_refresh_poll = now + DISPLAY_REFRESH_POLL_INTERVAL;
@@ -816,6 +851,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.window_state.save();
         self.shutdown_runtime();
         self.clipboard = None;
         self.web_view_parent = None;
@@ -912,10 +948,6 @@ impl WebViewWindow {
         use crate::input::KeyEdge;
         use winit::keyboard::{Key, NamedKey};
         match (self, key, edge) {
-            (Self::Hidden, Key::Named(NamedKey::F11), KeyEdge::Press) => {
-                HostInputRoute::ToggleFullscreen
-            }
-            (Self::Hidden, Key::Named(NamedKey::F11), _) => HostInputRoute::Withheld,
             (Self::Hidden, _, _) => HostInputRoute::Engine,
             (Self::Shown, Key::Named(NamedKey::Escape), KeyEdge::Press) => {
                 HostInputRoute::ActivityBack
@@ -973,6 +1005,59 @@ fn next_fullscreen(current: Option<Fullscreen>) -> Option<Fullscreen> {
     match current {
         Some(_) => None,
         None => Some(Fullscreen::Borderless(None)),
+    }
+}
+
+fn fullscreen_shortcut(
+    key: &winit::keyboard::Key,
+    modifiers: winit::keyboard::ModifiersState,
+) -> bool {
+    use winit::keyboard::{Key, NamedKey};
+    match key {
+        Key::Named(NamedKey::F11) => true,
+        Key::Named(NamedKey::Enter) => {
+            modifiers.alt_key()
+                && !modifiers.control_key()
+                && !modifiers.super_key()
+                && !modifiers.shift_key()
+        }
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct FullscreenShortcut {
+    held: Option<winit::keyboard::PhysicalKey>,
+}
+
+impl FullscreenShortcut {
+    fn key_route(
+        &mut self,
+        window: WebViewWindow,
+        key: &winit::keyboard::Key,
+        physical: winit::keyboard::PhysicalKey,
+        edge: crate::input::KeyEdge,
+        modifiers: winit::keyboard::ModifiersState,
+    ) -> HostInputRoute {
+        use crate::input::KeyEdge;
+        if self.held == Some(physical) {
+            match edge {
+                KeyEdge::Repeat => return HostInputRoute::Withheld,
+                KeyEdge::Release => {
+                    self.held = None;
+                    return HostInputRoute::Withheld;
+                }
+                KeyEdge::Press => self.held = None,
+            }
+        }
+        if window == WebViewWindow::Hidden
+            && edge == KeyEdge::Press
+            && fullscreen_shortcut(key, modifiers)
+        {
+            self.held = Some(physical);
+            return HostInputRoute::ToggleFullscreen;
+        }
+        window.key_route(key, edge)
     }
 }
 
@@ -1264,8 +1349,34 @@ fn grab_host_pointer(window: &Window) -> Result<PointerGrab, ExternalError> {
 
 impl GameWindow<'_> {
     fn close(&mut self, event_loop: &ActiveEventLoop) {
+        self.window_state.save();
         self.shutdown_runtime();
         event_loop.exit();
+    }
+
+    fn quit(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        reason: crate::framework::lifecycle::QuitReason,
+    ) {
+        match reason {
+            crate::framework::lifecycle::QuitReason::ClientExit { status } => {
+                crate::framework::lifecycle::finish_after_client_exit(status)
+            }
+            crate::framework::lifecycle::QuitReason::AnotherLaunch => {
+                tracing::info!(
+                    "another Eclipse launch asked Roblox to close; stopping Android before \
+                     event-loop exit"
+                );
+                self.close(event_loop);
+            }
+            crate::framework::lifecycle::QuitReason::LeftExperience => {
+                tracing::info!(
+                    "Roblox left the experience for its home screen; close_on_leave closes Eclipse"
+                );
+                self.close(event_loop);
+            }
+        }
     }
 
     fn run_window_commands(&mut self, event_loop: &ActiveEventLoop) {
@@ -1274,15 +1385,14 @@ impl GameWindow<'_> {
         };
         while let Ok(command) = commands.try_recv() {
             match command {
-                launch_window::WindowCommand::Raise { done } => {
-                    launch_window::raise(self.window.as_ref(), event_loop, done);
+                launch_window::WindowCommand::Raise { token, done } => {
+                    launch_window::raise(self.window.as_ref(), token.as_ref(), done);
                 }
                 launch_window::WindowCommand::Close => {
-                    tracing::info!(
-                        "another Eclipse launch asked Roblox to close; stopping Android before \
-                         event-loop exit"
+                    self.quit(
+                        event_loop,
+                        crate::framework::lifecycle::QuitReason::AnotherLaunch,
                     );
-                    self.close(event_loop);
                 }
             }
         }
@@ -1434,20 +1544,7 @@ impl GameWindow<'_> {
                 "host shutdown: Android lifecycle reported an error; continuing remaining teardown"
             );
         }
-        if crate::webview::client::needs_cookie_flush_before_shutdown() {
-            if let Err(error) = crate::framework::cookie_manager_flush(vm) {
-                tracing::warn!(
-                    error = %error,
-                    "host shutdown: CookieManager.flush dispatch failed; continuing helper teardown"
-                );
-            }
-        }
-        let report = crate::webview::client::shutdown(vm, std::time::Duration::from_secs(10));
-        tracing::info!(
-            helper_exit = report.helper_exit,
-            reader_joined = report.reader_joined,
-            "host shutdown: web engine retired before the host window is destroyed"
-        );
+        crate::framework::lifecycle::retire_web_engine(vm, std::time::Duration::from_secs(10));
     }
 
     fn handle_primary_press(&mut self) {
@@ -1988,11 +2085,21 @@ impl GameWindow<'_> {
         self.ime = HostIme::after_sending(wanted);
     }
 
-    fn toggle_fullscreen(&self) {
+    fn toggle_fullscreen(&mut self) {
         if let Some(window) = self.window.as_ref() {
             let next = next_fullscreen(window.fullscreen());
-            tracing::info!(fullscreen = next.is_some(), "F11 toggles fullscreen");
+            tracing::info!(
+                fullscreen = next.is_some(),
+                "the fullscreen shortcut toggles fullscreen"
+            );
             window.set_fullscreen(next);
+        }
+        self.observe_window_state();
+    }
+
+    fn observe_window_state(&mut self) {
+        if let Some(window) = self.window.as_ref() {
+            self.window_state.observe(window, std::time::Instant::now());
         }
     }
 
@@ -2274,7 +2381,9 @@ pub fn run_windowed(
     vm: Option<&crate::runtime::Vm>,
     touch_mode: eclipse_config::TouchMode,
     commands: Option<&std::sync::mpsc::Receiver<launch_window::WindowCommand>>,
+    window_state: window_state::WindowStateFile,
 ) -> Result<(), GraphicsError> {
+    let _event_loop_thread = crate::framework::lifecycle::EventLoopThread::enter();
     crate::framework::install_main_looper_waker(event_loop.create_proxy());
     let mut app = GameWindow {
         title: title.to_owned(),
@@ -2306,6 +2415,7 @@ pub fn run_windowed(
         engine_reflect_done: false,
         web_view_window: WebViewWindow::Hidden,
         runtime_shutdown_started: false,
+        last_activity: crate::framework::lifecycle::LastActivityCheck::default(),
         modifiers: winit::keyboard::ModifiersState::default(),
         published_display_refresh_profile: None,
         next_display_refresh_poll: std::time::Instant::now(),
@@ -2313,6 +2423,8 @@ pub fn run_windowed(
         idle_inhibit: crate::portal::IdleInhibit::Release,
         on_screen_keyboard: crate::on_screen_keyboard::OnScreenKeyboard::from_environment(),
         fullscreen: false,
+        window_state,
+        fullscreen_shortcut: FullscreenShortcut::default(),
         host_cursor: HostCursor::Shown,
         pointer_lock_reasons: PointerLockReasons::default(),
         pointer_lock: PointerLock::Free,
@@ -7434,34 +7546,128 @@ mod tests {
     }
 
     #[test]
-    fn f11_toggles_borderless_fullscreen_only_without_a_web_view_window() {
-        use crate::input::KeyEdge;
-        use winit::keyboard::{Key, NamedKey};
+    fn f11_and_alt_enter_are_the_fullscreen_shortcut() {
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
 
         let f11 = Key::Named(NamedKey::F11);
-        assert_eq!(
-            WebViewWindow::Hidden.key_route(&f11, KeyEdge::Press),
-            HostInputRoute::ToggleFullscreen
-        );
-        for edge in [KeyEdge::Repeat, KeyEdge::Release] {
-            assert_eq!(
-                WebViewWindow::Hidden.key_route(&f11, edge),
-                HostInputRoute::Withheld
+        let enter = Key::Named(NamedKey::Enter);
+        let alt = ModifiersState::ALT;
+        for modifiers in [ModifiersState::empty(), alt, ModifiersState::CONTROL] {
+            assert!(fullscreen_shortcut(&f11, modifiers), "{modifiers:?}");
+        }
+        assert!(fullscreen_shortcut(&enter, alt));
+        for modifiers in [
+            ModifiersState::empty(),
+            ModifiersState::CONTROL | alt,
+            ModifiersState::SHIFT | alt,
+            ModifiersState::SUPER | alt,
+        ] {
+            assert!(
+                !fullscreen_shortcut(&enter, modifiers),
+                "Enter with {modifiers:?} reaches the game"
             );
         }
-        assert_eq!(
-            WebViewWindow::Shown.key_route(&f11, KeyEdge::Press),
-            HostInputRoute::RaiseWebView,
-            "a fullscreen game would cover the WebView window"
-        );
         for key in [Key::Named(NamedKey::F10), Key::Character("f".into())] {
-            assert_eq!(
-                WebViewWindow::Hidden.key_route(&key, KeyEdge::Press),
-                HostInputRoute::Engine
-            );
+            assert!(!fullscreen_shortcut(&key, alt), "{key:?}");
         }
         assert_eq!(next_fullscreen(None), Some(Fullscreen::Borderless(None)));
         assert_eq!(next_fullscreen(Some(Fullscreen::Borderless(None))), None);
+    }
+
+    #[test]
+    fn the_fullscreen_shortcut_keeps_its_key_from_the_game_until_released() {
+        use crate::input::KeyEdge;
+        use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+
+        let enter = Key::Named(NamedKey::Enter);
+        let enter_key = PhysicalKey::Code(KeyCode::Enter);
+        let f11 = Key::Named(NamedKey::F11);
+        let f11_key = PhysicalKey::Code(KeyCode::F11);
+        let alt = ModifiersState::ALT;
+        let none = ModifiersState::empty();
+        let mut shortcut = FullscreenShortcut::default();
+        let mut route = |key: &Key, physical, edge, modifiers| {
+            shortcut.key_route(WebViewWindow::Hidden, key, physical, edge, modifiers)
+        };
+
+        assert_eq!(
+            route(&enter, enter_key, KeyEdge::Press, alt),
+            HostInputRoute::ToggleFullscreen
+        );
+        assert_eq!(
+            route(&enter, enter_key, KeyEdge::Repeat, alt),
+            HostInputRoute::Withheld
+        );
+        assert_eq!(
+            route(&enter, enter_key, KeyEdge::Release, none),
+            HostInputRoute::Withheld,
+            "the Enter release is withheld even after Alt was let go"
+        );
+        for edge in [KeyEdge::Press, KeyEdge::Release] {
+            assert_eq!(
+                route(&enter, enter_key, edge, none),
+                HostInputRoute::Engine,
+                "a later plain Enter reaches the game"
+            );
+        }
+
+        assert_eq!(
+            route(&f11, f11_key, KeyEdge::Press, none),
+            HostInputRoute::ToggleFullscreen
+        );
+        for edge in [KeyEdge::Repeat, KeyEdge::Release] {
+            assert_eq!(route(&f11, f11_key, edge, none), HostInputRoute::Withheld);
+        }
+
+        assert_eq!(
+            route(&enter, enter_key, KeyEdge::Press, alt),
+            HostInputRoute::ToggleFullscreen
+        );
+        assert_eq!(
+            route(&enter, enter_key, KeyEdge::Press, none),
+            HostInputRoute::Engine,
+            "a new press after a release Eclipse never saw goes to the game"
+        );
+        assert_eq!(
+            route(&enter, enter_key, KeyEdge::Release, none),
+            HostInputRoute::Engine
+        );
+    }
+
+    #[test]
+    fn the_fullscreen_shortcut_waits_while_a_web_view_page_shows() {
+        use crate::input::KeyEdge;
+        use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+
+        for (key, physical, modifiers) in [
+            (
+                Key::Named(NamedKey::F11),
+                PhysicalKey::Code(KeyCode::F11),
+                ModifiersState::empty(),
+            ),
+            (
+                Key::Named(NamedKey::Enter),
+                PhysicalKey::Code(KeyCode::Enter),
+                ModifiersState::ALT,
+            ),
+        ] {
+            for (window, expected) in [
+                (WebViewWindow::Shown, HostInputRoute::RaiseWebView),
+                (WebViewWindow::Embedded, HostInputRoute::Withheld),
+            ] {
+                assert_eq!(
+                    FullscreenShortcut::default().key_route(
+                        window,
+                        &key,
+                        physical,
+                        KeyEdge::Press,
+                        modifiers
+                    ),
+                    expected,
+                    "a fullscreen game would cover the WebView page: {key:?} on {window:?}"
+                );
+            }
+        }
     }
 
     #[test]

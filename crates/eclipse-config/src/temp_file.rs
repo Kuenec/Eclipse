@@ -64,6 +64,12 @@ impl Drop for TempFile {
     }
 }
 
+pub fn replace(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let mut temp = TempFile::create(dir, name)?;
+    temp.write_all(bytes)?;
+    temp.persist(&dir.join(name))
+}
+
 fn unique_name(name: &str) -> String {
     let unique = RandomState::new().build_hasher().finish();
     format!("{name}.{unique:016x}{SUFFIX}")
@@ -134,6 +140,16 @@ mod tests {
             ["settings.json"],
             "an unused temporary is removed"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replace_swaps_in_the_new_bytes_and_leaves_no_temporary() {
+        let dir = temp_dir("replace");
+        replace(&dir, "session.json", b"first").unwrap();
+        replace(&dir, "session.json", b"second").unwrap();
+        assert_eq!(fs::read(dir.join("session.json")).unwrap(), b"second");
+        assert_eq!(names(&dir), ["session.json"]);
         fs::remove_dir_all(&dir).ok();
     }
 

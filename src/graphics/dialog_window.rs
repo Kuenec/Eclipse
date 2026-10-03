@@ -5,8 +5,8 @@ use winit::keyboard::{Key, NamedKey};
 use winit::platform::wayland::WindowAttributesExtWayland as _;
 use winit::window::{Window, WindowId};
 
-use super::launch_window::{displayable, node, scaled, wrap};
-use super::{layout_views, GlyphAtlas, TextMeasure, VulkanRenderer};
+use super::launch_window::{action_at, displayable, node, scaled, wrap, BUTTON_BACKGROUND};
+use super::{GlyphAtlas, TextMeasure, VulkanRenderer};
 use crate::framework::dialogs::{dispatch_dialog_action, DialogAction};
 use crate::framework::view_registry::{self, LayoutParams, RenderNode, MATCH_PARENT, WRAP_CONTENT};
 use crate::framework::window_registry::{DialogView, WindowHandle};
@@ -17,7 +17,6 @@ const PADDING: i32 = 24;
 const GAP: i32 = 12;
 const BACKGROUND: i32 = 0xFFF3_F5F8_u32 as i32;
 const ITEM_BACKGROUND: i32 = 0xFFE4_E8EF_u32 as i32;
-const BUTTON_BACKGROUND: i32 = 0xFFC9_D8F2_u32 as i32;
 const LINEAR_LAYOUT: &str = "android.widget.LinearLayout";
 const TEXT_VIEW: &str = "android.widget.TextView";
 const DEFAULT_TITLE: &str = "Roblox";
@@ -193,28 +192,6 @@ impl Sheet {
         }
         self.nodes[0].children.push(offset);
     }
-}
-
-fn action_at(
-    nodes: &[RenderNode],
-    actions: &[Option<DialogAction>],
-    atlas: &GlyphAtlas,
-    extent: ash::vk::Extent2D,
-    (x, y): (f32, f32),
-) -> Option<DialogAction> {
-    let views = layout_views(nodes, extent, Some(TextMeasure { atlas }));
-    views
-        .iter()
-        .zip(actions)
-        .rev()
-        .find(|(view, action)| {
-            action.is_some()
-                && x >= view.x
-                && x < view.x + view.w
-                && y >= view.y
-                && y < view.y + view.h
-        })
-        .and_then(|(_, action)| *action)
 }
 
 struct OpenDialog {
@@ -400,7 +377,7 @@ impl DialogWindows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graphics::GlyphInfo;
+    use crate::graphics::{layout_views, GlyphInfo};
 
     fn monospace_atlas() -> GlyphAtlas {
         let glyph = GlyphInfo {

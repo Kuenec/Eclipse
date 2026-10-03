@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 use eclipse::diagnostics::{
     newest_run_part, record_head, RawStream, RecordHead, RunLog, RAW_LINE_BYTES, STATUS_TARGET,
 };
+use eclipse::framework::lifecycle::{report_exit_to, ClientEnd};
 use eclipse::links::redact_join_secrets;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::{Errno, FdFlags};
 use rustix::process::Pid;
-use serde::{Deserialize, Serialize};
 use tracing::Level;
 
 const FDS_ENV: &str = "ECLIPSE_SUPERVISOR_FDS";
@@ -33,38 +33,9 @@ const PROC_CGROUP: &str = "/proc/self/cgroup";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const MEMORY_EVENTS: &str = "memory.events";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ClientEnd {
-    Played,
-    WindowClosed,
-    ClosedForAnotherLaunch,
-    FailureShown,
-}
-
-impl ClientEnd {
-    pub(crate) fn status(self) -> i32 {
-        match self {
-            Self::Played | Self::ClosedForAnotherLaunch => 0,
-            Self::WindowClosed | Self::FailureShown => 1,
-        }
-    }
-}
-
 pub(crate) struct Supervision {
     pub(crate) records: File,
-    pub(crate) exit: ExitRecord,
     pub(crate) run_log: PathBuf,
-}
-
-pub(crate) struct ExitRecord(pub(crate) File);
-
-impl ExitRecord {
-    pub(crate) fn write(mut self, end: ClientEnd) -> io::Result<()> {
-        let mut record = serde_json::to_vec(&end)?;
-        record.push(b'\n');
-        self.0.write_all(&record)
-    }
 }
 
 pub(crate) fn adopt() -> Result<Option<Supervision>, String> {
@@ -90,11 +61,9 @@ pub(crate) fn adopt() -> Result<Option<Supervision>, String> {
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| format!("{RUN_LOG_ENV} must name the run log"))?;
-    Ok(Some(Supervision {
-        records: adopt_pipe(records)?,
-        exit: ExitRecord(adopt_pipe(exit)?),
-        run_log,
-    }))
+    let records = adopt_pipe(records)?;
+    report_exit_to(adopt_pipe(exit)?);
+    Ok(Some(Supervision { records, run_log }))
 }
 
 fn adopt_pipe(fd: RawFd) -> Result<File, String> {
@@ -228,6 +197,9 @@ pub(crate) fn classify(
             ClientEnd::Played | ClientEnd::WindowClosed | ClientEnd::ClosedForAnotherLaunch => {
                 RunEnd::Ended
             }
+            ClientEnd::ClientExited { status } => {
+                exit_status_end(status, uncaught_exception_recent)
+            }
         };
     }
     if let Some(signal) = status.signal() {
@@ -238,10 +210,18 @@ pub(crate) fn classify(
         };
     }
     match status.code() {
-        Some(0) if !uncaught_exception_recent => RunEnd::ClosedItself,
-        code => RunEnd::ExitedUnexpectedly {
-            status: code.unwrap_or(status.into_raw()),
+        Some(code) => exit_status_end(code, uncaught_exception_recent),
+        None => RunEnd::ExitedUnexpectedly {
+            status: status.into_raw(),
         },
+    }
+}
+
+fn exit_status_end(status: i32, uncaught_exception_recent: bool) -> RunEnd {
+    if status == 0 && !uncaught_exception_recent {
+        RunEnd::ClosedItself
+    } else {
+        RunEnd::ExitedUnexpectedly { status }
     }
 }
 
@@ -283,6 +263,7 @@ pub(crate) struct Output<O, E> {
 pub(crate) fn run<O: Write, E: Write>(
     mut command: Command,
     lock: File,
+    runtime_dir: &Path,
     log: RunLog,
     output: Output<O, E>,
 ) -> Result<Finished, String> {
@@ -314,6 +295,9 @@ pub(crate) fn run<O: Write, E: Write>(
         sink,
     };
     let waited = drain.until_exit(&mut child);
+    if let Err(error) = eclipse::session::clear(runtime_dir) {
+        drain.sink.note(Level::WARN, &error.to_string());
+    }
     drop(lock);
     let (status, gone_at) = match waited {
         Ok(waited) => waited,
@@ -771,6 +755,7 @@ fn oom_kill_count(memory_events: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use eclipse::diagnostics::LogSink;
+    use eclipse::framework::lifecycle::finish_android_process;
     use std::sync::atomic::{AtomicI32, Ordering};
 
     const CHILD: &str = "ECLIPSE_TEST_SUPERVISED_CHILD";
@@ -779,6 +764,7 @@ mod tests {
     const FLOOD_RECORDS: usize = 100_000;
     const FLOOD_LONG_BYTES: usize = 5_000;
     const PIPE_BUF: usize = 4_096;
+    const SESSION_FILE: &str = "session.json";
 
     struct Supervised {
         finished: Finished,
@@ -786,10 +772,15 @@ mod tests {
         stderr: Vec<u8>,
         log: String,
         newest_part: String,
+        session_file_left: bool,
+    }
+
+    fn test_dir(test: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("eclipse-supervisor-{test}"))
     }
 
     fn temp_dir(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("eclipse-supervisor-{test}"));
+        let dir = test_dir(test);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -817,7 +808,7 @@ mod tests {
             stderr: &mut stderr,
             echo_records: false,
         };
-        let finished = run(child_command(test), lock_in(&dir), log, output).unwrap();
+        let finished = run(child_command(test), lock_in(&dir), &dir, log, output).unwrap();
         let mut log = String::new();
         for suffix in [".log", ".tail.log.1", ".tail.log"] {
             let part = finished
@@ -828,6 +819,7 @@ mod tests {
             }
         }
         let newest_part = std::fs::read_to_string(&finished.log).unwrap();
+        let session_file_left = dir.join(SESSION_FILE).exists();
         std::fs::remove_dir_all(&dir).ok();
         Supervised {
             finished,
@@ -835,6 +827,7 @@ mod tests {
             stderr,
             log,
             newest_part,
+            session_file_left,
         }
     }
 
@@ -846,15 +839,13 @@ mod tests {
             .to_owned()
     }
 
-    struct TestChild {
-        exit: ExitRecord,
-    }
-
-    fn supervised_child() -> Option<TestChild> {
-        std::env::var_os(CHILD)?;
-        let Supervision { records, exit, .. } = adopt().unwrap().unwrap();
+    fn supervised_child() -> bool {
+        if std::env::var_os(CHILD).is_none() {
+            return false;
+        }
+        let Supervision { records, .. } = adopt().unwrap().unwrap();
         eclipse::diagnostics::init(LogSink::Supervisor(records));
-        Some(TestChild { exit })
+        true
     }
 
     fn write_raw(stream: RawStream, bytes: &[u8]) {
@@ -896,11 +887,11 @@ mod tests {
     fn a_client_that_played_ends_with_its_output_copied_and_every_line_in_the_log() {
         const STDOUT: &[u8] = b"# Booting the ART VM\nboot line two\n";
         const STDERR: &[u8] = b"\0W/eclipse (    2): art line\nlast words without a newline";
-        if let Some(child) = supervised_child() {
+        if supervised_child() {
             write_raw(RawStream::Stdout, STDOUT);
             write_raw(RawStream::Stderr, STDERR);
             tracing::info!(target: "liblog", "a client record");
-            crate::finish_android_process(ClientEnd::Played, child.exit);
+            finish_android_process(ClientEnd::Played);
         }
 
         let run =
@@ -942,7 +933,7 @@ mod tests {
 
     #[test]
     fn a_segfault_is_a_crash_named_with_its_signal() {
-        if supervised_child().is_some() {
+        if supervised_child() {
             write_raw(RawStream::Stderr, b"F/libc: about to fault\n");
             die_by(libc::SIGSEGV);
         }
@@ -971,8 +962,21 @@ mod tests {
     }
 
     #[test]
+    fn the_session_file_is_removed_once_the_client_is_gone_even_after_a_crash() {
+        const TEST: &str = "the_session_file_is_removed_once_the_client_is_gone_even_after_a_crash";
+        if supervised_child() {
+            std::fs::write(test_dir(TEST).join(SESSION_FILE), "{}\n").unwrap();
+            die_by(libc::SIGSEGV);
+        }
+
+        let run = supervise(TEST);
+        assert_eq!(run.finished.end, RunEnd::Crashed(Signal(libc::SIGSEGV)));
+        assert!(!run.session_file_left);
+    }
+
+    #[test]
     fn android_and_engine_errors_before_a_crash_are_never_its_detail() {
-        if supervised_child().is_some() {
+        if supervised_child() {
             tracing::error!(
                 target: "android.util.Log",
                 tag = "CookieProtocol",
@@ -1000,7 +1004,7 @@ mod tests {
 
     #[test]
     fn a_status_error_is_the_detail_before_any_other_error() {
-        if supervised_child().is_some() {
+        if supervised_child() {
             eclipse::diagnostics::record_status(Level::ERROR, "Roblox stopped: out of memory");
             tracing::error!(target: "liblog", "a later engine error");
             unsafe { libc::_exit(1) }
@@ -1020,7 +1024,7 @@ mod tests {
 
     #[test]
     fn a_quiet_exit_without_a_record_is_the_client_closing_itself() {
-        if supervised_child().is_some() {
+        if supervised_child() {
             unsafe { libc::_exit(0) }
         }
 
@@ -1035,8 +1039,20 @@ mod tests {
     }
 
     #[test]
+    fn a_client_exit_record_keeps_the_status_roblox_asked_for() {
+        if supervised_child() {
+            finish_android_process(ClientEnd::ClientExited { status: 10 });
+        }
+
+        let run = supervise("a_client_exit_record_keeps_the_status_roblox_asked_for");
+        assert_eq!(run.finished.end, RunEnd::ExitedUnexpectedly { status: 10 });
+        assert_eq!(run.finished.exit_code(), ExitCode::from(10));
+        assert!(!run.log.contains("ignored an exit record"), "{}", run.log);
+    }
+
+    #[test]
     fn an_uncaught_java_exception_before_a_clean_exit_is_unexpected() {
-        if supervised_child().is_some() {
+        if supervised_child() {
             write_raw(
                 RawStream::Stderr,
                 b"Exception in thread \"main\" java.lang.RuntimeException: boom\n\
@@ -1052,7 +1068,7 @@ mod tests {
 
     #[test]
     fn a_terminated_client_was_stopped_and_a_killed_one_is_shown() {
-        if supervised_child().is_some() {
+        if supervised_child() {
             die_by(match std::env::var("ECLIPSE_TEST_SIGNAL").as_deref() {
                 Ok("TERM") => libc::SIGTERM,
                 _ => libc::SIGKILL,
@@ -1078,7 +1094,13 @@ mod tests {
                 stderr: Vec::new(),
                 echo_records: false,
             };
-            let finished = run(command, lock_in(&dir), RunLog::start(&dir).unwrap(), output);
+            let finished = run(
+                command,
+                lock_in(&dir),
+                &dir,
+                RunLog::start(&dir).unwrap(),
+                output,
+            );
             std::fs::remove_dir_all(&dir).ok();
             let finished = finished.unwrap();
             assert_eq!(finished.end, end, "{signal}");
@@ -1088,10 +1110,10 @@ mod tests {
 
     #[test]
     fn records_are_echoed_to_a_terminal_except_status_records() {
-        if let Some(child) = supervised_child() {
+        if supervised_child() {
             tracing::warn!(target: "liblog", "first line\ncontinued line");
             eclipse::diagnostics::record_status(Level::WARN, "printed by the status sink");
-            crate::finish_android_process(ClientEnd::Played, child.exit);
+            finish_android_process(ClientEnd::Played);
         }
 
         let dir = temp_dir("echo");
@@ -1102,7 +1124,13 @@ mod tests {
             echo_records: true,
         };
         let command = child_command("records_are_echoed_to_a_terminal_except_status_records");
-        let finished = run(command, lock_in(&dir), RunLog::start(&dir).unwrap(), output);
+        let finished = run(
+            command,
+            lock_in(&dir),
+            &dir,
+            RunLog::start(&dir).unwrap(),
+            output,
+        );
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(finished.unwrap().end, RunEnd::Ended);
         let stderr = String::from_utf8(stderr).unwrap();
@@ -1118,7 +1146,7 @@ mod tests {
         const ACCESS: &str = "8f3c2a10-5b6d-4e7f-9a1b-2c3d4e5f6a7b";
         const LINK: &str = "linkCode=123";
         const SHARE: &str = "2f4c6e8a0b1d3f5a7c9e1b3d5f7a9c0e";
-        if let Some(child) = supervised_child() {
+        if supervised_child() {
             tracing::info!(
                 target: "android.util.Log",
                 tag = "ContextImpl",
@@ -1133,7 +1161,7 @@ mod tests {
                 Level::WARN,
                 &format!("joining with accessCode={ACCESS}"),
             );
-            crate::finish_android_process(ClientEnd::Played, child.exit);
+            finish_android_process(ClientEnd::Played);
         }
 
         let dir = temp_dir("join-codes");
@@ -1145,7 +1173,13 @@ mod tests {
         };
         let command =
             child_command("join_codes_in_client_records_reach_neither_the_log_nor_the_terminal");
-        let finished = run(command, lock_in(&dir), RunLog::start(&dir).unwrap(), output);
+        let finished = run(
+            command,
+            lock_in(&dir),
+            &dir,
+            RunLog::start(&dir).unwrap(),
+            output,
+        );
         let log = finished
             .as_ref()
             .ok()
@@ -1190,7 +1224,7 @@ mod tests {
     fn a_client_gets_sigterm_within_two_seconds_of_its_supervisor_dying() {
         const TEST: &str = "a_client_gets_sigterm_within_two_seconds_of_its_supervisor_dying";
         const MARKER: &str = "ECLIPSE_TEST_SIGTERM_MARKER";
-        if supervised_child().is_some() {
+        if supervised_child() {
             let marker = File::create(std::env::var_os(MARKER).unwrap()).unwrap();
             SIGTERM_MARKER.store(
                 std::os::fd::IntoRawFd::into_raw_fd(marker),
@@ -1215,7 +1249,13 @@ mod tests {
                 stderr: io::stderr(),
                 echo_records: false,
             };
-            let finished = run(command, lock_in(&dir), RunLog::start(&dir).unwrap(), output);
+            let finished = run(
+                command,
+                lock_in(&dir),
+                &dir,
+                RunLog::start(&dir).unwrap(),
+                output,
+            );
             panic!(
                 "the supervisor outlived the test: {:?}",
                 finished.map(|run| run.end)
@@ -1280,7 +1320,7 @@ mod tests {
 
     #[test]
     fn a_flood_from_four_threads_arrives_whole_and_complete() {
-        if let Some(child) = supervised_child() {
+        if supervised_child() {
             let per_thread = FLOOD_RECORDS / FLOOD_THREADS;
             std::thread::scope(|scope| {
                 for thread in 0..FLOOD_THREADS {
@@ -1296,7 +1336,7 @@ mod tests {
                     });
                 }
             });
-            crate::finish_android_process(ClientEnd::Played, child.exit);
+            finish_android_process(ClientEnd::Played);
         }
 
         let run = supervise("a_flood_from_four_threads_arrives_whole_and_complete");
@@ -1358,6 +1398,27 @@ mod tests {
                 false,
                 None,
                 RunEnd::FailureShown,
+            ),
+            (
+                Some(ClientEnd::ClientExited { status: 0 }),
+                exited(0),
+                false,
+                None,
+                RunEnd::ClosedItself,
+            ),
+            (
+                Some(ClientEnd::ClientExited { status: 0 }),
+                exited(0),
+                true,
+                None,
+                RunEnd::ExitedUnexpectedly { status: 0 },
+            ),
+            (
+                Some(ClientEnd::ClientExited { status: 10 }),
+                exited(10),
+                false,
+                None,
+                RunEnd::ExitedUnexpectedly { status: 10 },
             ),
             (
                 None,

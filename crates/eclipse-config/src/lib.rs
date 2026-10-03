@@ -14,6 +14,8 @@ pub use load::{load, load_from, Loaded, Problem};
 
 const SOBER_FAKE_OFF: &str = "fake_off";
 
+const LINK_LAUNCHES: &str = "browser";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GraphicsOptimizationMode {
     Quality,
@@ -79,6 +81,45 @@ impl Serialize for TouchMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseOnLeave {
+    Never,
+    #[default]
+    LinkLaunches,
+    Always,
+}
+
+impl CloseOnLeave {
+    const ALL: [Self; 3] = [Self::Never, Self::LinkLaunches, Self::Always];
+
+    const fn json_form(self) -> &'static str {
+        match self {
+            Self::Never => "false",
+            Self::LinkLaunches => "\"browser\"",
+            Self::Always => "true",
+        }
+    }
+
+    fn from_json(value: &serde_json::Value) -> Option<Self> {
+        match value {
+            serde_json::Value::Bool(false) => Some(Self::Never),
+            serde_json::Value::Bool(true) => Some(Self::Always),
+            serde_json::Value::String(name) if name == LINK_LAUNCHES => Some(Self::LinkLaunches),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for CloseOnLeave {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Never => serializer.serialize_bool(false),
+            Self::LinkLaunches => serializer.serialize_str(LINK_LAUNCHES),
+            Self::Always => serializer.serialize_bool(true),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Config {
     pub graphics_optimization_mode: GraphicsOptimizationMode,
@@ -88,6 +129,10 @@ pub struct Config {
     pub enable_gamemode: bool,
 
     pub roblox_auto_update: bool,
+
+    pub close_on_leave: CloseOnLeave,
+
+    pub server_location_indicator_enabled: bool,
 
     pub fflags: BTreeMap<String, serde_json::Value>,
 
@@ -101,6 +146,8 @@ impl Default for Config {
             touch_mode: TouchMode::default(),
             enable_gamemode: true,
             roblox_auto_update: true,
+            close_on_leave: CloseOnLeave::default(),
+            server_location_indicator_enabled: false,
             fflags: BTreeMap::new(),
             webview_helper_path: None,
         }
@@ -116,6 +163,10 @@ impl Config {
                 Setting::GraphicsOptimizationMode(mode) => self.graphics_optimization_mode = mode,
                 Setting::EnableGamemode(enabled) => self.enable_gamemode = enabled,
                 Setting::RobloxAutoUpdate(enabled) => self.roblox_auto_update = enabled,
+                Setting::CloseOnLeave(policy) => self.close_on_leave = policy,
+                Setting::ServerLocationIndicatorEnabled(enabled) => {
+                    self.server_location_indicator_enabled = enabled;
+                }
             },
             Key::FileOnly(FileOnlyKey::Fflags) => {
                 self.fflags = serde_json::from_value(value).map_err(reason)?;
@@ -137,6 +188,8 @@ pub enum Setting {
     GraphicsOptimizationMode(GraphicsOptimizationMode),
     EnableGamemode(bool),
     RobloxAutoUpdate(bool),
+    CloseOnLeave(CloseOnLeave),
+    ServerLocationIndicatorEnabled(bool),
 }
 
 impl Setting {
@@ -147,6 +200,8 @@ impl Setting {
             Self::GraphicsOptimizationMode(_) => SettingKey::GraphicsOptimizationMode,
             Self::EnableGamemode(_) => SettingKey::EnableGamemode,
             Self::RobloxAutoUpdate(_) => SettingKey::RobloxAutoUpdate,
+            Self::CloseOnLeave(_) => SettingKey::CloseOnLeave,
+            Self::ServerLocationIndicatorEnabled(_) => SettingKey::ServerLocationIndicatorEnabled,
         }
     }
 }
@@ -157,14 +212,18 @@ pub enum SettingKey {
     GraphicsOptimizationMode,
     EnableGamemode,
     RobloxAutoUpdate,
+    CloseOnLeave,
+    ServerLocationIndicatorEnabled,
 }
 
 impl SettingKey {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 6] = [
         Self::TouchMode,
         Self::GraphicsOptimizationMode,
         Self::EnableGamemode,
         Self::RobloxAutoUpdate,
+        Self::CloseOnLeave,
+        Self::ServerLocationIndicatorEnabled,
     ];
 
     #[must_use]
@@ -174,6 +233,8 @@ impl SettingKey {
             Self::GraphicsOptimizationMode => "graphics_optimization_mode",
             Self::EnableGamemode => "enable_gamemode",
             Self::RobloxAutoUpdate => "roblox_auto_update",
+            Self::CloseOnLeave => "close_on_leave",
+            Self::ServerLocationIndicatorEnabled => "server_location_indicator_enabled",
         }
     }
 
@@ -199,6 +260,10 @@ impl SettingKey {
                 .map(Setting::GraphicsOptimizationMode),
             Self::EnableGamemode => value.as_bool().map(Setting::EnableGamemode),
             Self::RobloxAutoUpdate => value.as_bool().map(Setting::RobloxAutoUpdate),
+            Self::CloseOnLeave => CloseOnLeave::from_json(value).map(Setting::CloseOnLeave),
+            Self::ServerLocationIndicatorEnabled => {
+                value.as_bool().map(Setting::ServerLocationIndicatorEnabled)
+            }
         };
         setting.ok_or_else(|| format!("expected one of {}", self.accepted_values()))
     }
@@ -209,7 +274,10 @@ impl SettingKey {
             Self::GraphicsOptimizationMode => {
                 &GraphicsOptimizationMode::ALL.map(GraphicsOptimizationMode::as_str)
             }
-            Self::EnableGamemode | Self::RobloxAutoUpdate => &["true", "false"],
+            Self::EnableGamemode
+            | Self::RobloxAutoUpdate
+            | Self::ServerLocationIndicatorEnabled => &["true", "false"],
+            Self::CloseOnLeave => &CloseOnLeave::ALL.map(CloseOnLeave::json_form),
         };
         let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
         quoted.join(", ")
@@ -324,7 +392,8 @@ mod tests {
         assert_eq!(
             SettingError::UnknownKey("use_opengl".to_owned()).to_string(),
             "`use_opengl` is not a setting; the settings are `touch_mode`, \
-             `graphics_optimization_mode`, `enable_gamemode`, `roblox_auto_update`"
+             `graphics_optimization_mode`, `enable_gamemode`, `roblox_auto_update`, \
+             `close_on_leave`, `server_location_indicator_enabled`"
         );
     }
 
@@ -451,6 +520,59 @@ mod tests {
     }
 
     #[test]
+    fn server_location_indicator_enabled_takes_only_a_json_boolean() {
+        let key = SettingKey::ServerLocationIndicatorEnabled;
+        for enabled in [true, false] {
+            let setting = key.parse(enabled.into()).expect("a boolean");
+            assert_eq!(setting, Setting::ServerLocationIndicatorEnabled(enabled));
+            assert_eq!(setting.key(), key);
+            assert_eq!(
+                serde_json::to_string(&setting).expect("serialize"),
+                enabled.to_string()
+            );
+        }
+        assert_eq!(
+            key.parse(serde_json::json!("true")),
+            Err(SettingError::Invalid {
+                key,
+                message: "expected one of `true`, `false`".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn close_on_leave_takes_sober_booleans_and_browser() {
+        for (json, policy) in [
+            (serde_json::json!(false), CloseOnLeave::Never),
+            (serde_json::json!("browser"), CloseOnLeave::LinkLaunches),
+            (serde_json::json!(true), CloseOnLeave::Always),
+        ] {
+            let setting = SettingKey::CloseOnLeave
+                .parse(json.clone())
+                .expect("a close_on_leave value");
+            assert_eq!(setting, Setting::CloseOnLeave(policy));
+            assert_eq!(setting.key(), SettingKey::CloseOnLeave);
+            assert_eq!(serde_json::to_value(setting).expect("serialize"), json);
+            assert_eq!(json.to_string(), policy.json_form());
+        }
+        for value in [
+            serde_json::json!("always"),
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            assert_eq!(
+                SettingKey::CloseOnLeave.parse(value.clone()),
+                Err(SettingError::Invalid {
+                    key: SettingKey::CloseOnLeave,
+                    message: "expected one of `false`, `\"browser\"`, `true`".to_owned(),
+                }),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn every_schema_key_is_a_setting_or_file_only() {
         let written = serde_json::to_value(Config::default()).expect("serialize");
         let mut schema: Vec<&str> = written
@@ -484,6 +606,8 @@ mod tests {
         assert_eq!(default_json("graphics_optimization_mode"), r#""balanced""#);
         assert_eq!(default_json("enable_gamemode"), "true");
         assert_eq!(default_json("roblox_auto_update"), "true");
+        assert_eq!(default_json("close_on_leave"), r#""browser""#);
+        assert_eq!(default_json("server_location_indicator_enabled"), "false");
         assert_eq!(default_json("fflags"), "{}");
         assert_eq!(default_json("webview_helper_path"), "null");
     }

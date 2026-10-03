@@ -119,7 +119,7 @@ GAME = "org.example.Game"
 LAUNCH_LINE = "# Launching the installed Roblox 2.740.931 (versionCode 3170)"
 WINDOW_RECORD = (
     "2026-10-03T09:20:06.187965Z  INFO eclipse::graphics: host window created "
-    "(winit, no GTK) title=Eclipse — com.roblox.client"
+    "(winit, no GTK) title=Eclipse — Roblox"
 )
 FIRST_FRAME_RECORD = (
     "2026-10-03T09:20:06.910230Z  INFO eclipse::loader::vk_overlay: vk-overlay: "

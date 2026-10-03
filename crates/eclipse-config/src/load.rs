@@ -327,7 +327,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
-    use crate::{GraphicsOptimizationMode, TouchMode};
+    use crate::{CloseOnLeave, GraphicsOptimizationMode, TouchMode};
 
     const FLATPAK_ID: &str = "io.github.kuenec.Eclipse";
 
@@ -775,20 +775,25 @@ mod tests {
                 "use_opengl": true,
                 "touch_mode": "fake_off",
                 "close_on_leave": false,
+                "use_console_experience": false,
                 "enable_mobile_home_screen": false
             }"#,
         );
         assert_eq!(loaded.problems, []);
         assert_eq!(
             loaded.unused_keys,
-            ["use_opengl", "close_on_leave", "enable_mobile_home_screen"]
+            [
+                "use_opengl",
+                "use_console_experience",
+                "enable_mobile_home_screen"
+            ]
         );
         assert_eq!(
             loaded.unused_keys_message().as_deref(),
             Some(
                 format!(
-                    "{}: Eclipse does not use these keys: \"use_opengl\", \"close_on_leave\", \
-                     \"enable_mobile_home_screen\"",
+                    "{}: Eclipse does not use these keys: \"use_opengl\", \
+                     \"use_console_experience\", \"enable_mobile_home_screen\"",
                     path.display()
                 )
                 .as_str()
@@ -798,6 +803,7 @@ mod tests {
             loaded.config,
             Config {
                 touch_mode: TouchMode::FakeOff,
+                close_on_leave: CloseOnLeave::Never,
                 ..Config::default()
             }
         );
@@ -824,8 +830,14 @@ mod tests {
                 touch_mode: TouchMode::FakeOff,
                 enable_gamemode: false,
                 roblox_auto_update: false,
+                close_on_leave: CloseOnLeave::Never,
+                server_location_indicator_enabled: true,
                 fflags: BTreeMap::from([("DFIntExample".to_owned(), 42.into())]),
                 webview_helper_path: Some(PathBuf::from("/opt/eclipse-webview")),
+            },
+            Config {
+                close_on_leave: CloseOnLeave::Always,
+                ..Config::default()
             },
         ];
         for (index, config) in configs.into_iter().enumerate() {
@@ -836,6 +848,19 @@ mod tests {
             assert_eq!(loaded.unused_keys_message(), None, "{json}");
             assert_eq!(loaded.config, config, "{json}");
         }
+    }
+
+    #[test]
+    fn a_sober_server_location_indicator_switch_is_read() {
+        let (_, loaded) = load_bytes(
+            "server-location-on",
+            br#"{"server_location_indicator_enabled": true}"#,
+        );
+        assert_eq!(loaded.problems, []);
+        assert!(loaded.unused_keys.is_empty(), "{:?}", loaded.unused_keys);
+        assert!(loaded.config.server_location_indicator_enabled);
+        let (_, loaded) = load_bytes("server-location-absent", b"{}");
+        assert!(!loaded.config.server_location_indicator_enabled);
     }
 
     #[test]
@@ -889,6 +914,42 @@ mod tests {
             [format!(
                 "{}:1:24: roblox_auto_update: expected one of `true`, `false`; Eclipse uses the \
                  default (true)",
+                path.display()
+            )]
+        );
+    }
+
+    #[test]
+    fn close_on_leave_reads_sober_booleans_and_browser() {
+        for (json, policy) in [
+            (r#"{"close_on_leave": true}"#, CloseOnLeave::Always),
+            (r#"{"close_on_leave": false}"#, CloseOnLeave::Never),
+            (
+                r#"{"close_on_leave": "browser"}"#,
+                CloseOnLeave::LinkLaunches,
+            ),
+            ("{}", CloseOnLeave::LinkLaunches),
+        ] {
+            let (_, loaded) = load_bytes("close-on-leave", json.as_bytes());
+            assert_eq!(loaded.problems, [], "{json}");
+            assert!(loaded.unused_keys.is_empty(), "{json}");
+            assert_eq!(loaded.config.close_on_leave, policy, "{json}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_close_on_leave_closes_only_after_link_launches() {
+        let (path, loaded) = load_bytes("close-on-leave-bad", br#"{"close_on_leave": "always"}"#);
+        assert_eq!(loaded.config.close_on_leave, CloseOnLeave::LinkLaunches);
+        assert_eq!(
+            loaded
+                .problems
+                .iter()
+                .map(Problem::to_string)
+                .collect::<Vec<_>>(),
+            [format!(
+                "{}:1:20: close_on_leave: expected one of `false`, `\"browser\"`, `true`; \
+                 Eclipse uses the default (\"browser\")",
                 path.display()
             )]
         );
