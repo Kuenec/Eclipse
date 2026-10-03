@@ -1,10 +1,12 @@
 use crate::cookies;
 use crate::logging::{self, Redacted};
-use crate::view::{self, Route, View};
+use crate::view::{self, Route, Unparented, View};
 use crate::wire::{Inbound, Wire};
 use eclipse_webview::proto::{
-    ClearScope, ConsumerMsg, CookiePair, HelperMsg, ProtoError, StoredCookie,
+    ClearScope, ConsumerMsg, CookiePair, HelperMsg, ParentSize, ParentWindow, ProtoError,
+    StoredCookie,
 };
+use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::{gio, glib};
 use std::cell::{Cell, RefCell};
@@ -94,6 +96,9 @@ pub(crate) struct App {
     snapshot_scheduled: Cell<bool>,
     exit: Cell<Option<u8>>,
     main_loop: glib::MainLoop,
+    parent: RefCell<Option<ParentWindow>>,
+    parent_size: Cell<Option<ParentSize>>,
+    unparented_logged: Cell<bool>,
 }
 
 fn failure_reply(msg: &HelperMsg) -> Option<HelperMsg> {
@@ -133,6 +138,9 @@ impl App {
             snapshot_scheduled: Cell::new(false),
             exit: Cell::new(None),
             main_loop,
+            parent: RefCell::default(),
+            parent_size: Cell::new(None),
+            unparented_logged: Cell::new(false),
         });
         let weak = Rc::downgrade(&app);
         app.engine.cookie_manager().connect_changed(move |_| {
@@ -169,6 +177,47 @@ impl App {
 
     pub(crate) fn view(&self, id: i64) -> Option<Rc<View>> {
         self.views.borrow().get(&id).cloned()
+    }
+
+    fn all_views(&self) -> Vec<Rc<View>> {
+        self.views.borrow().values().cloned().collect()
+    }
+
+    pub(crate) fn parent_size(&self) -> Option<ParentSize> {
+        self.parent_size.get()
+    }
+
+    fn adopt_parent(&self, window: &gtk::Window) {
+        let Err(reason) = view::adopt_parent(window, self.parent.borrow().as_ref()) else {
+            return;
+        };
+        if self.unparented_logged.replace(true) {
+            return;
+        }
+        let log: fn(std::fmt::Arguments<'_>) = match reason {
+            Unparented::NoGameWindow => logging::info,
+            Unparented::BackendMismatch { .. }
+            | Unparented::NoSurface
+            | Unparented::ImportRefused
+            | Unparented::NoXlib(_) => logging::warn,
+        };
+        log(format_args!(
+            "WebView windows open as normal windows, not as dialogs of the game window: {reason}"
+        ));
+    }
+
+    fn set_parent(&self, parent: ParentWindow) {
+        *self.parent.borrow_mut() = Some(parent);
+        for view in self.all_views() {
+            self.adopt_parent(&view.window);
+        }
+    }
+
+    fn parent_resized(&self, size: ParentSize) {
+        self.parent_size.set(Some(size));
+        for view in self.all_views() {
+            view.fit(Some(size));
+        }
     }
 
     fn next_id(&self) -> u32 {
@@ -265,6 +314,7 @@ impl App {
                 if !visible {
                     view.window.set_visible(false);
                 } else if !view.window.is_visible() {
+                    self.adopt_parent(&view.window);
                     view.window.present();
                 }
             }),
@@ -348,6 +398,8 @@ impl App {
                 logging::info(format_args!("shutdown requested by the host"));
                 self.stop(EXIT_REQUESTED);
             }
+            ConsumerMsg::SetParent { parent } => self.set_parent(parent),
+            ConsumerMsg::ParentResized { size } => self.parent_resized(size),
         }
     }
 

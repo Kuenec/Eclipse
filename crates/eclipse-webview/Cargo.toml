@@ -8,6 +8,8 @@ publish = false
 description = "WebKitGTK helper that shows each Android WebView the Roblox client opens as its own window"
 
 [dependencies]
+gdk4-wayland = "0.11"
+gdk4-x11 = { version = "0.11", features = ["xlib"] }
 gtk4 = { version = "0.11", features = ["v4_10"] }
 webkit6 = { version = "0.6", features = ["v2_42"] }
 

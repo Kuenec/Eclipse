@@ -634,6 +634,8 @@ dependencies = [
  "unicode-properties",
  "unicode-segmentation",
  "ureq",
+ "wayland-client",
+ "wayland-protocols",
  "winit",
  "x11-clipboard",
  "yeslogic-fontconfig-sys",
