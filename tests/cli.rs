@@ -36,7 +36,7 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn a_malformed_config_is_reported_with_its_path() {
+fn a_malformed_config_is_reported_with_its_position_and_the_launch_continues() {
     let root = sandbox("malformed-config");
     let config = root.join("config").join("eclipse").join("config.json");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -50,9 +50,18 @@ fn a_malformed_config_is_reported_with_its_path() {
     );
     std::fs::remove_dir_all(&root).ok();
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = stderr(&output);
+    let position = format!("{}:1:21: ", config.display());
+    assert!(stderr.contains(&position), "{stderr}");
+    assert!(
+        stderr.contains("Eclipse uses the default for every setting"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Android settings setup"), "{stderr}");
+    assert!(stdout.contains("Roblox Fast Flags staged at"), "{stdout}");
+    assert!(stderr.contains(&missing.display().to_string()), "{stderr}");
     assert!(!output.status.success(), "{stderr}");
-    assert!(stderr.contains(&config.display().to_string()), "{stderr}");
 }
 
 #[test]

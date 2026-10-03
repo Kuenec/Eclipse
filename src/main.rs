@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,6 +20,7 @@ const ANDROID_CLIENT_SETTINGS_PATH: &str = "/data/local/tmp/ClientAppSettings.js
 const CLIENT_SETTINGS_PATH_SHIM_NAME: &str = "libeclipse_client_settings_path.so";
 const CLIENT_SETTINGS_PATH_SHIM: &[u8] =
     include_bytes!(env!("ECLIPSE_CLIENT_SETTINGS_PATH_SHIM_SO"));
+const MAXIMUM_FRAME_RATE_ROW_FLAG: &str = "FFlagGameBasicSettingsFramerateCap5";
 
 const HELP: &str = "\
 eclipse — run the Android Roblox build on Linux (open-source, Rust)
@@ -70,14 +72,14 @@ fn main() -> ExitCode {
     if is_android_run_command(command) {
         let settings = match std::env::var_os(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV) {
             None => install_client_settings_and_reexec(&args),
-            Some(_) => verify_client_settings_redirect().map_err(Into::into),
+            Some(_) => client_settings_path().map(drop).map_err(Into::into),
         };
         if let Err(error) = settings {
             report_setup_failure(&args, "eclipse Android settings setup", &error.to_string());
             return ExitCode::FAILURE;
         }
     }
-    if is_android_run_command(command) || matches!(command, Some("__webview-test")) {
+    if matches!(command, Some("__webview-test")) {
         if let Err(error) = eclipse::runtime::prepare_art_boot_environment() {
             report_setup_failure(&args, "eclipse ART startup", &error.to_string());
             return ExitCode::FAILURE;
@@ -93,9 +95,10 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("run") => {
+            let loaded = eclipse_config::load();
             let status = match parse_run_path(&args[1..]) {
-                Ok(Some(path)) => run_file(path),
-                Ok(None) => launch_in_window(Launch::Installed),
+                Ok(Some(path)) => run_file(path, &loaded),
+                Ok(None) => launch_in_window(Launch::Installed, &loaded),
                 Err(error) => {
                     eprintln!("eclipse run: {error}");
                     1
@@ -104,8 +107,9 @@ fn main() -> ExitCode {
             finish_android_process(status)
         }
         Some("__run-browser-place") => {
+            let loaded = eclipse_config::load();
             let status = match parse_internal_place_id(&args[1..]) {
-                Ok(place_id) => launch_in_window(Launch::BrowserPlace(place_id)),
+                Ok(place_id) => launch_in_window(Launch::BrowserPlace(place_id), &loaded),
                 Err(error) => {
                     eprintln!("eclipse browser launch: {error}");
                     1
@@ -141,13 +145,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("config") => match show_config() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("eclipse config: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        Some("config") => show_config(),
 
         Some("__run-libroblox-init") => {
             let outcome = parse_libroblox_init_lib_dir(&args[1..]).and_then(|lib_dir| {
@@ -284,6 +282,19 @@ fn parse_internal_place_id(arguments: &[OsString]) -> Result<u64, String> {
     Ok(place_id)
 }
 
+fn client_settings_path() -> Result<PathBuf, String> {
+    std::env::var_os(CLIENT_SETTINGS_PATH_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            format!(
+                "the Android client-settings bridge did not load into the restarted Eclipse \
+                 ({CLIENT_SETTINGS_PATH_ENV} is not set); start Eclipse without \
+                 {CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV} in its environment"
+            )
+        })
+}
+
 fn verify_client_settings_redirect() -> Result<(), String> {
     std::fs::File::open(ANDROID_CLIENT_SETTINGS_PATH)
         .map(drop)
@@ -301,17 +312,14 @@ fn install_client_settings_and_reexec(args: &[OsString]) -> Result<(), Box<dyn s
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::process::CommandExt as _;
 
-    let json = eclipse::config::Config::load()?.client_app_settings_json()?;
     let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
     let runtime_dir = app_data_dir.join(RUNTIME_DIR);
     std::fs::create_dir_all(&runtime_dir)
         .map_err(|error| format!("cannot create {}: {error}", runtime_dir.display()))?;
-    let resolve = |path: &Path| {
-        path.canonicalize()
-            .map_err(|error| format!("cannot resolve {}: {error}", path.display()))
-    };
-    let settings_path = resolve(&stage_client_settings(&runtime_dir, &json)?)?;
-    let runtime_dir = resolve(&runtime_dir)?;
+    stage_settings_shim(&runtime_dir)?;
+    let runtime_dir = runtime_dir
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", runtime_dir.display()))?;
     if runtime_dir
         .as_os_str()
         .as_bytes()
@@ -326,14 +334,7 @@ fn install_client_settings_and_reexec(args: &[OsString]) -> Result<(), Box<dyn s
         )
         .into());
     }
-
-    println!(
-        "# Roblox Fast Flags staged at {} (Android {ANDROID_CLIENT_SETTINGS_PATH})",
-        settings_path.display()
-    );
-
-    use std::io::Write as _;
-    let _ = std::io::stdout().flush();
+    let settings_path = runtime_dir.join(CLIENT_SETTINGS_FILE);
 
     let current_exe = std::env::current_exe()
         .map_err(|error| format!("cannot locate the Eclipse executable to restart it: {error}"))?;
@@ -371,8 +372,16 @@ fn prepend_search_list_entry(
     value
 }
 
-fn stage_client_settings(runtime_dir: &Path, json: &[u8]) -> Result<PathBuf, String> {
-    let settings = replace_runtime_file(runtime_dir, CLIENT_SETTINGS_FILE, json)?;
+fn client_app_settings_json(fflags: &BTreeMap<String, serde_json::Value>) -> Vec<u8> {
+    let mut settings = serde_json::Map::from_iter([(
+        MAXIMUM_FRAME_RATE_ROW_FLAG.to_owned(),
+        serde_json::Value::from("True"),
+    )]);
+    settings.extend(fflags.clone());
+    format!("{:#}\n", serde_json::Value::Object(settings)).into_bytes()
+}
+
+fn stage_settings_shim(runtime_dir: &Path) -> Result<(), String> {
     let shim_is_current = std::fs::read(runtime_dir.join(CLIENT_SETTINGS_PATH_SHIM_NAME))
         .is_ok_and(|bytes| bytes.as_slice() == CLIENT_SETTINGS_PATH_SHIM);
     if !shim_is_current {
@@ -382,16 +391,31 @@ fn stage_client_settings(runtime_dir: &Path, json: &[u8]) -> Result<PathBuf, Str
             CLIENT_SETTINGS_PATH_SHIM,
         )?;
     }
-    Ok(settings)
+    Ok(())
 }
 
-fn replace_runtime_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+fn write_client_settings(
+    path: &Path,
+    fflags: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let (Some(dir), Some(name)) = (
+        path.parent(),
+        path.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return Err(format!(
+            "{CLIENT_SETTINGS_PATH_ENV} does not name a file: {}",
+            path.display()
+        ));
+    };
+    replace_runtime_file(dir, name, &client_app_settings_json(fflags))
+}
+
+fn replace_runtime_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     let path = dir.join(name);
     let write_error = |error: std::io::Error| format!("cannot write {}: {error}", path.display());
-    let mut temp = eclipse::temp_file::TempFile::create(dir, name).map_err(write_error)?;
+    let mut temp = eclipse_config::temp_file::TempFile::create(dir, name).map_err(write_error)?;
     temp.write_all(bytes).map_err(write_error)?;
-    temp.persist(&path).map_err(write_error)?;
-    Ok(path)
+    temp.persist(&path).map_err(write_error)
 }
 
 fn finish_android_process(status: libc::c_int) -> ! {
@@ -403,12 +427,35 @@ fn finish_android_process(status: libc::c_int) -> ! {
     unsafe { libc::_exit(status) }
 }
 
-fn show_config() -> Result<(), eclipse::config::ConfigError> {
-    let path = eclipse::config::Config::config_path()?;
-    let config = eclipse::config::Config::load()?;
-    println!("# {}", path.display());
-    println!("{}", config.to_json_pretty()?);
-    Ok(())
+fn report_config(loaded: &eclipse_config::Loaded, status: &StatusSink) {
+    for problem in &loaded.problems {
+        status.warning(problem.to_string());
+    }
+    if let Some(message) = loaded.unused_keys_message() {
+        eclipse::diagnostics::record_status(tracing::Level::WARN, &message);
+    }
+}
+
+fn show_config() -> ExitCode {
+    let loaded = eclipse_config::load();
+    if let Some(path) = &loaded.path {
+        println!("# {}", path.display());
+    }
+    match serde_json::to_string_pretty(&loaded.config) {
+        Ok(json) => println!("{json}"),
+        Err(error) => {
+            eprintln!("eclipse config: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    for problem in &loaded.problems {
+        eprintln!("eclipse config: {problem}");
+    }
+    if loaded.problems.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 const NOT_INSTALLED: &str = "Roblox is not installed; run `eclipse update` to download it, or \
@@ -891,12 +938,24 @@ struct ClientRun {
 }
 
 impl ClientRun {
-    fn start(launch: Launch) -> Result<Self, String> {
+    fn start(launch: Launch, fflags: &BTreeMap<String, serde_json::Value>) -> Result<Self, String> {
         let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
-        Self::start_in(&app_data_dir, launch)
+        let client_settings = client_settings_path()?;
+        let run = Self::start_in(&app_data_dir, launch, &client_settings, fflags)?;
+        verify_client_settings_redirect()?;
+        println!(
+            "# Roblox Fast Flags staged at {} (Android {ANDROID_CLIENT_SETTINGS_PATH})",
+            client_settings.display()
+        );
+        Ok(run)
     }
 
-    fn start_in(app_data_dir: &Path, launch: Launch) -> Result<Self, String> {
+    fn start_in(
+        app_data_dir: &Path,
+        launch: Launch,
+        client_settings: &Path,
+        fflags: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<Self, String> {
         let lock = lock_client_in(&app_data_dir.join(RUNTIME_DIR), |lock| {
             launch.already_running(lock)
         })?;
@@ -906,6 +965,7 @@ impl ClientRun {
                 app_data_dir.display()
             )
         })?;
+        write_client_settings(client_settings, fflags)?;
         Ok(Self { _lock: lock, log })
     }
 }
@@ -943,15 +1003,15 @@ fn lock_client_in(
     }
 }
 
-fn run_file(path: &Path) -> libc::c_int {
-    let _client = match ClientRun::start(Launch::File) {
+fn run_file(path: &Path, loaded: &eclipse_config::Loaded) -> libc::c_int {
+    let _client = match ClientRun::start(Launch::File, &loaded.config.fflags) {
         Ok(client) => client,
         Err(error) => {
-            eprintln!("{}: {error}", Launch::File.context());
+            report_failure(Launch::File, &error);
             return 1;
         }
     };
-    match play_file(path) {
+    match play_file(path, loaded) {
         Ok(()) => 0,
         Err(error) => {
             report_failure(Launch::File, &error.to_string());
@@ -960,9 +1020,14 @@ fn run_file(path: &Path) -> libc::c_int {
     }
 }
 
-fn play_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn play_file(
+    path: &Path,
+    loaded: &eclipse_config::Loaded,
+) -> Result<(), Box<dyn std::error::Error>> {
     let status = StatusSink::terminal();
+    report_config(loaded, &status);
     let paths = ApkSetPaths::locate(path)?;
+    eclipse::runtime::prepare_art_boot_environment()?;
     status.step(VERIFYING_SIGNATURE);
     let prepared = prepare_client(ApkSet::open(paths)?, &status)?;
     boot_and_play(
@@ -972,22 +1037,30 @@ fn play_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             status: &status,
             window: None,
         },
+        &loaded.config,
     )
 }
 
 type Preparation = std::thread::JoinHandle<Result<PreparedClient, String>>;
 
-fn launch_in_window(launch: Launch) -> libc::c_int {
-    let client = match ClientRun::start(launch) {
+fn launch_in_window(launch: Launch, loaded: &eclipse_config::Loaded) -> libc::c_int {
+    let client = match ClientRun::start(launch, &loaded.config.fflags) {
         Ok(client) => client,
         Err(error) => {
-            eprintln!("{}: {error}", launch.context());
+            report_failure(launch, &error);
             show_error_window(&error, None);
             return 1;
         }
     };
     let (sender, updates) = std::sync::mpsc::channel();
     let status = StatusSink::with_window(sender.clone());
+    report_config(loaded, &status);
+    if let Err(error) = eclipse::runtime::prepare_art_boot_environment() {
+        let error = error.to_string();
+        report_failure(launch, &error);
+        show_error_window(&error, Some(&client.log));
+        return 1;
+    }
     let preparation = prepare_in_background(sender);
     let mut window = match LaunchWindow::open(&window_title()) {
         Ok(window) => window,
@@ -996,9 +1069,16 @@ fn launch_in_window(launch: Launch) -> libc::c_int {
             return 1;
         }
     };
-    let played = preparation
-        .map_err(Into::into)
-        .and_then(|worker| play_in_window(&mut window, &status, &updates, worker, launch));
+    let played = preparation.map_err(Into::into).and_then(|worker| {
+        play_in_window(
+            &mut window,
+            &status,
+            &updates,
+            worker,
+            launch,
+            &loaded.config,
+        )
+    });
     match played {
         Ok(()) => 0,
         Err(error) => {
@@ -1029,6 +1109,7 @@ fn play_in_window(
     updates: &std::sync::mpsc::Receiver<StatusUpdate>,
     worker: Preparation,
     launch: Launch,
+    config: &eclipse_config::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     window.wait_for(updates, &worker)?;
     let prepared = worker
@@ -1041,6 +1122,7 @@ fn play_in_window(
             status,
             window: Some((window, updates)),
         },
+        config,
     )
 }
 
@@ -1069,7 +1151,7 @@ impl Host<'_> {
         &mut self,
         title: &str,
         vm: &eclipse::runtime::Vm,
-        touch_mode: eclipse::config::TouchMode,
+        touch_mode: eclipse_config::TouchMode,
     ) -> Result<(), eclipse::graphics::GraphicsError> {
         match &mut self.window {
             Some((window, _)) => {
@@ -1135,6 +1217,7 @@ fn boot_and_play(
     prepared: PreparedClient,
     launch: Launch,
     host: &mut Host<'_>,
+    config: &eclipse_config::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let PreparedClient { apks, app_lib_dir } = prepared;
     let base_path = apks.base_path().to_path_buf();
@@ -1145,9 +1228,9 @@ fn boot_and_play(
 
     eclipse::loader::ndk_registry::set_apk_path(base_path.clone());
     let manifest = apks.manifest().clone();
-    let config = eclipse::config::Config::load()?;
+    eclipse::webview::client::use_helper_path(config.webview_helper_path.clone())?;
     eclipse::performance::configure_engine_cpu_affinity(config.graphics_optimization_mode);
-    let plan = eclipse::runtime::BootPlan::new(&manifest, &config);
+    let plan = eclipse::runtime::BootPlan::new(&manifest, config);
 
     println!("# ART boot plan for {apk_path}");
     println!("package:            {}", manifest.package);
@@ -1162,7 +1245,6 @@ fn boot_and_play(
         "heap:               {} MiB (DisableHSpaceCompactForOOM={})",
         plan.heap_mib, plan.disable_hspace_compact
     );
-    println!("graphics_backend:   {}", plan.graphics_backend.as_str());
     println!("instruction_set:    {}", plan.instruction_set_features);
 
     println!("\n# VM options (-> JNI_CreateJavaVM):");
@@ -1381,8 +1463,10 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
          no lifecycle, no window)…",
         apks.base_path().display()
     );
-    let config = eclipse::config::Config::load()?;
-    let plan = eclipse::runtime::BootPlan::new(apks.manifest(), &config);
+    let loaded = eclipse_config::load();
+    report_config(&loaded, &StatusSink::terminal());
+    client::use_helper_path(loaded.config.webview_helper_path.clone())?;
+    let plan = eclipse::runtime::BootPlan::new(apks.manifest(), &loaded.config);
     let vm = eclipse::runtime::boot(&plan, Some(apks.base_path()), None)?;
 
     eclipse::framework::register_engine_preload_natives(&vm)?;
@@ -1600,6 +1684,7 @@ mod tests {
     use eclipse::apk::VersionCode;
     use eclipse::runtime::NativeLibRoot;
     use eclipse::status::StatusSink;
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
@@ -1771,19 +1856,33 @@ mod tests {
     #[test]
     fn a_second_client_is_refused_while_the_first_one_runs() {
         let root = temp_root("client-lock");
-        let first = ClientRun::start_in(&root, Launch::Installed).expect("the first client starts");
+        let settings = root
+            .join(super::RUNTIME_DIR)
+            .join(super::CLIENT_SETTINGS_FILE);
+        let running_flags = BTreeMap::from([("FFlagEclipseFirst".to_owned(), true.into())]);
+        let second_flags = BTreeMap::from([("FFlagEclipseSecond".to_owned(), true.into())]);
+        let first = ClientRun::start_in(&root, Launch::Installed, &settings, &running_flags)
+            .expect("the first client starts");
         assert_eq!(first.log, root.join("logs").join("eclipse.log"));
         eclipse::diagnostics::record_status(tracing::Level::INFO, "the first client runs");
-        let desktop = ClientRun::start_in(&root, Launch::Installed).err().unwrap();
-        assert!(desktop.contains("already running"), "{desktop}");
-        let browser = ClientRun::start_in(&root, Launch::BrowserPlace(1818))
+        let desktop = ClientRun::start_in(&root, Launch::Installed, &settings, &second_flags)
             .err()
             .unwrap();
+        assert!(desktop.contains("already running"), "{desktop}");
+        let browser =
+            ClientRun::start_in(&root, Launch::BrowserPlace(1818), &settings, &second_flags)
+                .err()
+                .unwrap();
         assert!(browser.contains("click Play again"), "{browser}");
         let log = std::fs::read_to_string(&first.log).unwrap();
         assert!(
             log.contains("the first client runs"),
             "a refused launch leaves the running client's log alone: {log}"
+        );
+        assert_eq!(
+            std::fs::read(&settings).unwrap(),
+            super::client_app_settings_json(&running_flags),
+            "a refused launch leaves the running client's Fast Flags alone"
         );
         drop(first);
         let concurrent_spawns_released_it = (0..100).find_map(|_| {
@@ -2153,21 +2252,24 @@ mod tests {
         const ROUNDS: usize = 1000;
         let root = temp_root("settings-staging");
         std::fs::create_dir_all(&root).unwrap();
-        let contents = [
-            "{\"FFlagEclipseFirst\":true}",
-            "{\"FFlagEclipseSecond\":true}",
-        ];
+        let settings = root.join(super::CLIENT_SETTINGS_FILE);
+        let fflags = ["FFlagEclipseFirst", "FFlagEclipseSecond"]
+            .map(|flag| BTreeMap::from([(flag.to_owned(), serde_json::Value::Bool(true))]));
+        let contents = fflags
+            .clone()
+            .map(|fflags| super::client_app_settings_json(&fflags));
         std::thread::scope(|scope| {
-            let launches = contents.map(|json| {
-                let root = &root;
+            let launches = fflags.map(|fflags| {
+                let (settings, contents) = (&settings, &contents);
                 scope.spawn(move || {
                     for _ in 0..ROUNDS {
-                        super::stage_client_settings(root, json.as_bytes())?;
-                        let staged =
-                            std::fs::read_to_string(root.join(super::CLIENT_SETTINGS_FILE))
-                                .map_err(|error| error.to_string())?;
-                        if !contents.contains(&staged.as_str()) {
-                            return Err(format!("a launch read incomplete settings {staged:?}"));
+                        super::write_client_settings(settings, &fflags)?;
+                        let staged = std::fs::read(settings).map_err(|error| error.to_string())?;
+                        if !contents.contains(&staged) {
+                            return Err(format!(
+                                "a launch read incomplete settings {:?}",
+                                String::from_utf8_lossy(&staged)
+                            ));
                         }
                     }
                     Ok(())
@@ -2181,6 +2283,45 @@ mod tests {
             }
         });
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn client_app_settings(fflags: &BTreeMap<String, serde_json::Value>) -> serde_json::Value {
+        serde_json::from_slice(&super::client_app_settings_json(fflags)).unwrap()
+    }
+
+    #[test]
+    fn client_app_settings_enable_only_the_maximum_frame_rate_row_by_default() {
+        assert_eq!(
+            client_app_settings(&BTreeMap::new()),
+            serde_json::json!({"FFlagGameBasicSettingsFramerateCap5": "True"})
+        );
+    }
+
+    #[test]
+    fn client_app_settings_add_the_user_fflags_to_the_default() {
+        let fflags = BTreeMap::from([(
+            "DFIntExample".to_owned(),
+            serde_json::Value::Number(42.into()),
+        )]);
+        assert_eq!(
+            client_app_settings(&fflags),
+            serde_json::json!({
+                "DFIntExample": 42,
+                "FFlagGameBasicSettingsFramerateCap5": "True",
+            })
+        );
+    }
+
+    #[test]
+    fn user_fflags_override_the_default_flag() {
+        let fflags = BTreeMap::from([(
+            "FFlagGameBasicSettingsFramerateCap5".to_owned(),
+            serde_json::Value::from("False"),
+        )]);
+        assert_eq!(
+            client_app_settings(&fflags),
+            serde_json::json!({"FFlagGameBasicSettingsFramerateCap5": "False"})
+        );
     }
 
     #[test]

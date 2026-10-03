@@ -39,6 +39,7 @@ Tests that need the real client run when `ECLIPSE_ROBLOX_APK` points at an offic
 | `src/framework.rs` | Android framework natives and lifecycle |
 | `src/graphics.rs` | Window, presentation and input |
 | `src/webview/`, `crates/eclipse-webview/` | WebView helper and its protocol |
+| `crates/eclipse-config/` | Settings schema and config.json loading |
 | `tools/framework-overlay/` | Android framework patches and probes |
 | `packaging/flatpak/` | Flatpak manifest and metadata |
 

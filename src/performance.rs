@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use crate::config::GraphicsOptimizationMode;
+use eclipse_config::GraphicsOptimizationMode;
 
 const MIN_PHYSICAL_CORES: usize = 8;
 

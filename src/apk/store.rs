@@ -4,6 +4,7 @@ use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use eclipse_config::temp_file::{self, TempFile};
 use ring::digest::SHA1_OUTPUT_LEN;
 use serde::{Deserialize, Serialize};
 use zip::result::ZipError;
@@ -15,7 +16,6 @@ use super::{
     VersionCode, BASE_APK, MAX_APK_BYTES, NATIVE_SPLIT_APK, NATIVE_SPLIT_NAME, ROBLOX_PACKAGE,
 };
 use crate::status::StatusSink;
-use crate::temp_file::{self, TempFile};
 
 const STORE_DIR: &str = "roblox";
 const CURRENT_FILE: &str = "current.json";

@@ -5,7 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{mpsc, Mutex, MutexGuard};
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -408,19 +408,19 @@ fn resolve_helper_from(
     Err(ClientError::HelperNotFound { probed })
 }
 
+static CONFIG_HELPER_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+pub fn use_helper_path(path: Option<PathBuf>) -> Result<(), ClientError> {
+    CONFIG_HELPER_PATH
+        .set(path)
+        .map_err(|_| ClientError::Internal("the helper path is chosen once per process"))
+}
+
 fn resolve_helper() -> Result<PathBuf, ClientError> {
-    let config_path = crate::config::Config::load()
-        .ok()
-        .and_then(|c| c.webview_helper_path)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+    let config_path = CONFIG_HELPER_PATH.get().and_then(Option::as_deref);
     let env_override = std::env::var_os("ECLIPSE_WEBVIEW_HELPER");
     let exe = std::env::current_exe().ok();
-    resolve_helper_from(
-        config_path.as_deref(),
-        env_override.as_deref(),
-        exe.as_deref(),
-    )
+    resolve_helper_from(config_path, env_override.as_deref(), exe.as_deref())
 }
 
 fn helper_ld_preload(inherited: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
@@ -2033,6 +2033,25 @@ mod tests {
         );
         assert!(text.contains("ECLIPSE_WEBVIEW_HELPER"), "{text}");
         assert!(!text.contains("CEF"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_launch_chooses_the_config_helper_path_once() {
+        let root = temp_dir("chosen-helper");
+        let chosen = root.join("config-helper");
+        touch(&chosen);
+
+        use_helper_path(Some(chosen.clone())).expect("the launch chooses the helper path");
+        assert_eq!(
+            resolve_helper().expect("the chosen helper resolves"),
+            chosen
+        );
+        assert!(matches!(
+            use_helper_path(None),
+            Err(ClientError::Internal(_))
+        ));
+        assert_eq!(resolve_helper().expect("the first choice stays"), chosen);
         let _ = std::fs::remove_dir_all(&root);
     }
 

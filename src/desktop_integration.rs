@@ -1,5 +1,5 @@
 use directories::BaseDirs;
-use eclipse::temp_file::TempFile;
+use eclipse_config::temp_file::TempFile;
 use std::ffi::OsStr;
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
