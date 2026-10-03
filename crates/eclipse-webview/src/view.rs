@@ -1,11 +1,13 @@
 use crate::app::App;
 use crate::bridge;
-use eclipse_webview::proto::{HelperMsg, LoadError, LoadEvent};
+use eclipse_webview::proto::{HelperMsg, LoadError, LoadEvent, ParentSize, ParentWindow, SizeUnit};
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::{gdk, gio, glib};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::fmt;
+use std::num::NonZeroU32;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 use webkit6::prelude::*;
@@ -18,7 +20,13 @@ const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/53
 
 const DEFAULT_SIZE: (i32, i32) = (960, 760);
 
-const MONITOR_SHARE_PERCENT: i32 = 85;
+const WINDOW_SHARE_PERCENT: i32 = 85;
+
+const MIN_SIZE: (i32, i32) = (480, 360);
+
+const CLOSE_BUTTON_LAYOUT: &str = ":close";
+
+const BACK_BUTTON: u32 = 8;
 
 const RESOURCE_EVENT_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -61,6 +69,66 @@ pub(crate) struct View {
     resources: ResourceThrottle,
     app_load: RefCell<Option<String>>,
     failed_url: RefCell<Option<String>>,
+    composing: Cell<bool>,
+    escape_held: Cell<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisplayBackend {
+    Wayland,
+    X11,
+    Other,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Parenting<'a> {
+    Exported(&'a str),
+    TransientFor(NonZeroU32),
+    Unparented(Unparented),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Unparented {
+    NoGameWindow,
+    BackendMismatch {
+        gtk: DisplayBackend,
+        game: DisplayBackend,
+    },
+    NoSurface,
+    ImportRefused,
+    NoXlib(String),
+}
+
+impl fmt::Display for Unparented {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoGameWindow => f.write_str("the host sent no game window handle"),
+            Self::BackendMismatch { gtk, game } => write!(
+                f,
+                "GTK runs on {gtk:?} but the game window is a {game:?} window"
+            ),
+            Self::NoSurface => f.write_str("the WebView window has no toplevel surface"),
+            Self::ImportRefused => {
+                f.write_str("GTK could not import the game window's xdg-foreign handle")
+            }
+            Self::NoXlib(error) => write!(f, "Xlib is unavailable: {error}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EscapeTarget {
+    Window,
+    InputMethod,
+    Popup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyResponse {
+    ClosePage,
+    Dismiss,
+    Swallow,
+    PassToPage,
 }
 
 pub(crate) fn window_title(page_title: Option<&str>) -> String {
@@ -104,6 +172,115 @@ pub(crate) fn navigation_route(
     Route::App
 }
 
+pub(crate) fn key_response(key: gdk::Key, target: EscapeTarget, escape_held: bool) -> KeyResponse {
+    if key != gdk::Key::Escape {
+        return KeyResponse::PassToPage;
+    }
+    match (target, escape_held) {
+        (EscapeTarget::InputMethod | EscapeTarget::Popup, _) => KeyResponse::Dismiss,
+        (EscapeTarget::Window, true) => KeyResponse::Swallow,
+        (EscapeTarget::Window, false) => KeyResponse::ClosePage,
+    }
+}
+
+pub(crate) fn display_backend(display: &gdk::Display) -> DisplayBackend {
+    if display.is::<gdk4_wayland::WaylandDisplay>() {
+        DisplayBackend::Wayland
+    } else if display.is::<gdk4_x11::X11Display>() {
+        DisplayBackend::X11
+    } else {
+        DisplayBackend::Other
+    }
+}
+
+fn game_backend(parent: &ParentWindow) -> DisplayBackend {
+    match parent {
+        ParentWindow::Wayland { .. } => DisplayBackend::Wayland,
+        ParentWindow::X11 { .. } => DisplayBackend::X11,
+    }
+}
+
+pub(crate) fn parenting(backend: DisplayBackend, parent: Option<&ParentWindow>) -> Parenting<'_> {
+    match (backend, parent) {
+        (_, None) => Parenting::Unparented(Unparented::NoGameWindow),
+        (DisplayBackend::Wayland, Some(ParentWindow::Wayland { handle })) => {
+            Parenting::Exported(handle)
+        }
+        (DisplayBackend::X11, Some(ParentWindow::X11 { window })) => {
+            Parenting::TransientFor(*window)
+        }
+        (gtk, Some(parent)) => Parenting::Unparented(Unparented::BackendMismatch {
+            gtk,
+            game: game_backend(parent),
+        }),
+    }
+}
+
+pub(crate) fn adopt_parent(
+    window: &gtk::Window,
+    parent: Option<&ParentWindow>,
+) -> Result<(), Unparented> {
+    let display = WidgetExt::display(window);
+    let surface = window.surface().ok_or(Unparented::NoSurface)?;
+    match parenting(display_backend(&display), parent) {
+        Parenting::Exported(handle) => {
+            let toplevel = surface
+                .downcast_ref::<gdk4_wayland::WaylandToplevel>()
+                .ok_or(Unparented::NoSurface)?;
+            if toplevel.set_transient_for_exported(handle) {
+                Ok(())
+            } else {
+                Err(Unparented::ImportRefused)
+            }
+        }
+        Parenting::TransientFor(parent) => {
+            let (Some(display), Some(surface)) = (
+                display.downcast_ref::<gdk4_x11::X11Display>(),
+                surface.downcast_ref::<gdk4_x11::X11Surface>(),
+            ) else {
+                return Err(Unparented::NoSurface);
+            };
+            set_x11_transient_for(display, surface, parent)
+        }
+        Parenting::Unparented(reason) => Err(reason),
+    }
+}
+
+fn set_x11_transient_for(
+    display: &gdk4_x11::X11Display,
+    surface: &gdk4_x11::X11Surface,
+    parent: NonZeroU32,
+) -> Result<(), Unparented> {
+    let xlib =
+        gdk4_x11::x11::xlib::Xlib::open().map_err(|error| Unparented::NoXlib(error.to_string()))?;
+    display.error_trap_push();
+    unsafe {
+        (xlib.XSetTransientForHint)(
+            display.xdisplay(),
+            surface.xid(),
+            std::ffi::c_ulong::from(parent.get()),
+        );
+    }
+    display.error_trap_pop_ignored();
+    Ok(())
+}
+
+pub(crate) fn window_size(parent: ParentSize, surface_scale: i32) -> (i32, i32) {
+    let pixels_per_unit = match parent.unit {
+        SizeUnit::Logical => 1,
+        SizeUnit::DevicePixels => i64::from(surface_scale.max(1)),
+    };
+    let share = |length: NonZeroU32, minimum: i32| {
+        let shared =
+            i64::from(length.get()) / pixels_per_unit * i64::from(WINDOW_SHARE_PERCENT) / 100;
+        i32::try_from(shared).unwrap_or(i32::MAX).max(minimum)
+    };
+    (
+        share(parent.width, MIN_SIZE.0),
+        share(parent.height, MIN_SIZE.1),
+    )
+}
+
 fn default_window_size() -> (i32, i32) {
     let largest = gdk::Display::default().and_then(|display| {
         display
@@ -117,10 +294,10 @@ fn default_window_size() -> (i32, i32) {
         Some(area) => (
             DEFAULT_SIZE
                 .0
-                .min(area.width() * MONITOR_SHARE_PERCENT / 100),
+                .min(area.width() * WINDOW_SHARE_PERCENT / 100),
             DEFAULT_SIZE
                 .1
-                .min(area.height() * MONITOR_SHARE_PERCENT / 100),
+                .min(area.height() * WINDOW_SHARE_PERCENT / 100),
         ),
         None => DEFAULT_SIZE,
     }
@@ -139,10 +316,6 @@ fn x11_raise_id(token: &str, x11: bool) -> Option<String> {
         return None;
     }
     x11_user_time(token).map(|time| format!("_TIME{time}"))
-}
-
-fn on_x11(display: &gdk::Display) -> bool {
-    glib::Type::from_name("GdkX11Display").is_some_and(|x11| display.type_().is_a(x11))
 }
 
 pub(crate) fn load_error(error: &glib::Error) -> Option<LoadError> {
@@ -202,13 +375,17 @@ impl View {
             .network_session(app.session())
             .user_content_manager(&content)
             .build();
-        let (width, height) = default_window_size();
+        let title_bar = gtk::HeaderBar::builder()
+            .decoration_layout(CLOSE_BUTTON_LAYOUT)
+            .build();
         let window = gtk::Window::builder()
             .title(window_title(None))
-            .default_width(width)
-            .default_height(height)
+            .titlebar(&title_bar)
+            .modal(true)
             .child(&web_view)
             .build();
+        gtk::WindowGroup::new().add_window(&window);
+        WidgetExt::realize(&window);
         let view = Rc::new(View {
             window,
             web_view,
@@ -219,10 +396,41 @@ impl View {
             resources: ResourceThrottle::default(),
             app_load: RefCell::default(),
             failed_url: RefCell::default(),
+            composing: Cell::new(false),
+            escape_held: Cell::new(false),
         });
+        view.fit(app.parent_size());
         view.set_user_agent("");
         view.connect(Rc::downgrade(app), id);
         view
+    }
+
+    pub(crate) fn fit(&self, parent: Option<ParentSize>) {
+        let (width, height) = match parent {
+            Some(parent) => {
+                let scale = self
+                    .window
+                    .surface()
+                    .map_or(1, |surface| surface.scale_factor());
+                window_size(parent, scale)
+            }
+            None => default_window_size(),
+        };
+        self.window.set_default_size(width, height);
+    }
+
+    fn escape_target(&self) -> EscapeTarget {
+        if self.composing.get() {
+            return EscapeTarget::InputMethod;
+        }
+        let focus_in_popup = GtkWindowExt::focus(&self.window)
+            .and_then(|focus| focus.ancestor(gtk::Popover::static_type()))
+            .is_some();
+        if focus_in_popup {
+            EscapeTarget::Popup
+        } else {
+            EscapeTarget::Window
+        }
     }
 
     pub(crate) fn set_user_agent(&self, requested: &str) {
@@ -236,7 +444,8 @@ impl View {
         if !self.window.is_visible() {
             return;
         }
-        if let Some(raise) = x11_raise_id(token, on_x11(&WidgetExt::display(&self.window))) {
+        let x11 = display_backend(&WidgetExt::display(&self.window)) == DisplayBackend::X11;
+        if let Some(raise) = x11_raise_id(token, x11) {
             self.window.set_startup_id(&raise);
         }
     }
@@ -274,6 +483,75 @@ impl View {
             }
             glib::Propagation::Stop
         });
+
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = app.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            let Some(app) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let Some(view) = app.view(id) else {
+                return glib::Propagation::Proceed;
+            };
+            match key_response(key, view.escape_target(), view.escape_held.get()) {
+                KeyResponse::PassToPage => glib::Propagation::Proceed,
+                KeyResponse::Swallow => glib::Propagation::Stop,
+                KeyResponse::Dismiss => {
+                    view.escape_held.set(true);
+                    glib::Propagation::Proceed
+                }
+                KeyResponse::ClosePage => {
+                    view.escape_held.set(true);
+                    app.send(HelperMsg::CloseRequested { view: id });
+                    glib::Propagation::Stop
+                }
+            }
+        });
+        let weak = app.clone();
+        keys.connect_key_released(move |_, key, _, _| {
+            if key != gdk::Key::Escape {
+                return;
+            }
+            if let Some(view) = weak.upgrade().and_then(|app| app.view(id)) {
+                view.escape_held.set(false);
+            }
+        });
+        self.window.add_controller(keys);
+        let weak = app.clone();
+        self.window.connect_hide(move |_| {
+            if let Some(view) = weak.upgrade().and_then(|app| app.view(id)) {
+                view.escape_held.set(false);
+            }
+        });
+
+        let back_button = gtk::GestureClick::builder()
+            .button(BACK_BUTTON)
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        let weak = app.clone();
+        back_button.connect_pressed(move |gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            if let Some(app) = weak.upgrade() {
+                app.send(HelperMsg::BackRequested { view: id });
+            }
+        });
+        self.window.add_controller(back_button);
+
+        if let Some(input_method) = self.web_view.input_method_context() {
+            let weak = app.clone();
+            input_method.connect_preedit_started(move |_| {
+                if let Some(view) = weak.upgrade().and_then(|app| app.view(id)) {
+                    view.composing.set(true);
+                }
+            });
+            let weak = app.clone();
+            input_method.connect_preedit_finished(move |_| {
+                if let Some(view) = weak.upgrade().and_then(|app| app.view(id)) {
+                    view.composing.set(false);
+                }
+            });
+        }
 
         let weak = app.clone();
         self.web_view.connect_load_changed(move |web_view, event| {
@@ -464,6 +742,113 @@ mod tests {
         );
         assert_eq!(window_title(Some("   ")), "Eclipse — Roblox");
         assert_eq!(window_title(None), "Eclipse — Roblox");
+    }
+
+    #[test]
+    fn escape_closes_the_page_once_per_press_unless_a_composition_or_popup_takes_it() {
+        assert_eq!(
+            key_response(gdk::Key::Escape, EscapeTarget::Window, false),
+            KeyResponse::ClosePage
+        );
+        assert_eq!(
+            key_response(gdk::Key::Escape, EscapeTarget::Window, true),
+            KeyResponse::Swallow,
+            "a held Escape repeats; one press must close only one thing"
+        );
+        for target in [EscapeTarget::InputMethod, EscapeTarget::Popup] {
+            for held in [false, true] {
+                assert_eq!(
+                    key_response(gdk::Key::Escape, target, held),
+                    KeyResponse::Dismiss,
+                    "Escape cancels a composition or closes a select or context menu popup \
+                     before it closes the page: {target:?}, held {held}"
+                );
+            }
+        }
+        for key in [
+            gdk::Key::a,
+            gdk::Key::Return,
+            gdk::Key::BackSpace,
+            gdk::Key::F11,
+        ] {
+            for target in [
+                EscapeTarget::Window,
+                EscapeTarget::InputMethod,
+                EscapeTarget::Popup,
+            ] {
+                assert_eq!(key_response(key, target, false), KeyResponse::PassToPage);
+            }
+        }
+    }
+
+    fn game_window(width: u32, height: u32, unit: SizeUnit) -> ParentSize {
+        ParentSize {
+            width: NonZeroU32::new(width).expect("width"),
+            height: NonZeroU32::new(height).expect("height"),
+            unit,
+        }
+    }
+
+    #[test]
+    fn web_windows_take_most_of_the_game_window_and_never_shrink_below_the_minimum() {
+        assert_eq!(
+            window_size(game_window(1280, 720, SizeUnit::Logical), 2),
+            (1088, 612),
+            "logical sizes are GTK's own units on every scale"
+        );
+        assert_eq!(
+            window_size(game_window(3840, 2160, SizeUnit::DevicePixels), 2),
+            (1632, 918)
+        );
+        assert_eq!(
+            window_size(game_window(1920, 1080, SizeUnit::DevicePixels), 0),
+            (1632, 918)
+        );
+        assert_eq!(
+            window_size(game_window(320, 200, SizeUnit::Logical), 1),
+            MIN_SIZE
+        );
+        assert_eq!(
+            window_size(game_window(u32::MAX, u32::MAX, SizeUnit::Logical), 1),
+            (i32::MAX, i32::MAX)
+        );
+    }
+
+    #[test]
+    fn each_display_backend_parents_only_to_a_game_window_of_its_own_kind() {
+        let wayland = ParentWindow::Wayland {
+            handle: "game-window-export".to_string(),
+        };
+        let xid = NonZeroU32::new(0x0460_0003).expect("xid");
+        let x11 = ParentWindow::X11 { window: xid };
+        assert_eq!(
+            parenting(DisplayBackend::Wayland, Some(&wayland)),
+            Parenting::Exported("game-window-export")
+        );
+        assert_eq!(
+            parenting(DisplayBackend::X11, Some(&x11)),
+            Parenting::TransientFor(xid)
+        );
+        for (gtk, parent, game) in [
+            (DisplayBackend::Wayland, &x11, DisplayBackend::X11),
+            (DisplayBackend::X11, &wayland, DisplayBackend::Wayland),
+            (DisplayBackend::Other, &wayland, DisplayBackend::Wayland),
+        ] {
+            assert_eq!(
+                parenting(gtk, Some(parent)),
+                Parenting::Unparented(Unparented::BackendMismatch { gtk, game })
+            );
+        }
+        for backend in [
+            DisplayBackend::Wayland,
+            DisplayBackend::X11,
+            DisplayBackend::Other,
+        ] {
+            assert_eq!(
+                parenting(backend, None),
+                Parenting::Unparented(Unparented::NoGameWindow)
+            );
+        }
     }
 
     #[test]

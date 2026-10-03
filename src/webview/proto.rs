@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 use std::io::Read;
+use std::num::NonZeroU32;
 
-pub const PROTO_VERSION: u16 = 7;
+pub const PROTO_VERSION: u16 = 8;
 
 pub const MAGIC: [u8; 4] = *b"ECWV";
 
@@ -37,6 +38,8 @@ mod ct {
     pub(super) const COOKIES_CLEAR: u8 = 0x14;
     pub(super) const COOKIE_FLUSH: u8 = 0x15;
     pub(super) const SHUTDOWN: u8 = 0x16;
+    pub(super) const SET_PARENT: u8 = 0x17;
+    pub(super) const PARENT_RESIZED: u8 = 0x18;
 }
 
 mod ht {
@@ -59,6 +62,7 @@ mod ht {
     pub(super) const COOKIES_CLEARED: u8 = 0x91;
     pub(super) const COOKIE_FLUSHED: u8 = 0x92;
     pub(super) const COOKIE_SNAPSHOT: u8 = 0x93;
+    pub(super) const BACK_REQUESTED: u8 = 0x94;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,6 +330,51 @@ pub struct CookiePair {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParentWindow {
+    Wayland { handle: String },
+    X11 { window: NonZeroU32 },
+}
+
+impl ParentWindow {
+    fn byte(&self) -> u8 {
+        match self {
+            Self::Wayland { .. } => 0,
+            Self::X11 { .. } => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeUnit {
+    Logical,
+    DevicePixels,
+}
+
+impl SizeUnit {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Logical => 0,
+            Self::DevicePixels => 1,
+        }
+    }
+
+    fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Logical),
+            1 => Some(Self::DevicePixels),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentSize {
+    pub width: NonZeroU32,
+    pub height: NonZeroU32,
+    pub unit: SizeUnit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsumerMsg {
     Hello {
         version: u16,
@@ -433,6 +482,14 @@ pub enum ConsumerMsg {
     },
 
     Shutdown,
+
+    SetParent {
+        parent: ParentWindow,
+    },
+
+    ParentResized {
+        size: ParentSize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,6 +543,10 @@ pub enum HelperMsg {
     },
 
     CloseRequested {
+        view: i64,
+    },
+
+    BackRequested {
         view: i64,
     },
 
@@ -570,7 +631,9 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
             | ct::POLICY_REPLY
             | ct::COOKIES_CLEAR
             | ct::COOKIE_FLUSH
-            | ct::SHUTDOWN => Some(DEFAULT_CAP),
+            | ct::SHUTDOWN
+            | ct::SET_PARENT
+            | ct::PARENT_RESIZED => Some(DEFAULT_CAP),
             _ => None,
         },
         Dir::FromHelper => match type_byte {
@@ -587,6 +650,7 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
             | ht::FATAL
             | ht::PROGRESS
             | ht::CLOSE_REQUESTED
+            | ht::BACK_REQUESTED
             | ht::VIEW_CLOSED
             | ht::WEB_PROCESS_GONE
             | ht::COOKIE_SET_RESULT
@@ -817,6 +881,20 @@ impl ConsumerMsg {
                 ct::COOKIE_FLUSH
             }
             Self::Shutdown => ct::SHUTDOWN,
+            Self::SetParent { parent } => {
+                b.push(parent.byte());
+                match parent {
+                    ParentWindow::Wayland { handle } => put_str(&mut b, handle),
+                    ParentWindow::X11 { window } => put_u32(&mut b, window.get()),
+                }
+                ct::SET_PARENT
+            }
+            Self::ParentResized { size } => {
+                put_u32(&mut b, size.width.get());
+                put_u32(&mut b, size.height.get());
+                b.push(size.unit.byte());
+                ct::PARENT_RESIZED
+            }
         };
         compose_frame(Dir::FromConsumer, t, b)
     }
@@ -834,6 +912,7 @@ impl HelperMsg {
             Self::ResourceLoad { .. } => "ResourceLoad",
             Self::PolicyRequest { .. } => "PolicyRequest",
             Self::CloseRequested { .. } => "CloseRequested",
+            Self::BackRequested { .. } => "BackRequested",
             Self::ViewClosed { .. } => "ViewClosed",
             Self::WebProcessGone { .. } => "WebProcessGone",
             Self::BridgeCall { .. } => "BridgeCall",
@@ -918,6 +997,10 @@ impl HelperMsg {
             Self::CloseRequested { view } => {
                 put_i64(&mut b, *view);
                 ht::CLOSE_REQUESTED
+            }
+            Self::BackRequested { view } => {
+                put_i64(&mut b, *view);
+                ht::BACK_REQUESTED
             }
             Self::ViewClosed { view } => {
                 put_i64(&mut b, *view);
@@ -1120,6 +1203,35 @@ impl<'a> Body<'a> {
         Ok(cookies)
     }
 
+    fn nonzero_u32(&mut self, what: &'static str) -> Result<NonZeroU32, ProtoError> {
+        let value = self.u32()?;
+        NonZeroU32::new(value).ok_or_else(|| self.bad(what))
+    }
+
+    fn parent_window(&mut self) -> Result<ParentWindow, ProtoError> {
+        match self.u8()? {
+            0 => {
+                let handle = self.string()?;
+                if handle.is_empty() {
+                    return Err(self.bad("Wayland parent handle (must not be empty)"));
+                }
+                Ok(ParentWindow::Wayland { handle })
+            }
+            1 => Ok(ParentWindow::X11 {
+                window: self.nonzero_u32("X11 parent window (must not be 0)")?,
+            }),
+            _ => Err(self.bad("parent window kind")),
+        }
+    }
+
+    fn parent_size(&mut self) -> Result<ParentSize, ProtoError> {
+        Ok(ParentSize {
+            width: self.nonzero_u32("parent width (must be >= 1)")?,
+            height: self.nonzero_u32("parent height (must be >= 1)")?,
+            unit: self.enumerated(SizeUnit::from_byte, "parent size unit")?,
+        })
+    }
+
     fn bad(&self, what: &'static str) -> ProtoError {
         ProtoError::BadValue {
             type_byte: self.type_byte,
@@ -1302,6 +1414,12 @@ pub fn read_consumer_msg<R: Read>(r: &mut R) -> Result<ConsumerMsg, ProtoError> 
             request_id: b.u32()?,
         },
         ct::SHUTDOWN => ConsumerMsg::Shutdown,
+        ct::SET_PARENT => ConsumerMsg::SetParent {
+            parent: b.parent_window()?,
+        },
+        ct::PARENT_RESIZED => ConsumerMsg::ParentResized {
+            size: b.parent_size()?,
+        },
         _ => return Err(ProtoError::UnknownType { type_byte: t }),
     };
     b.finish()?;
@@ -1357,6 +1475,7 @@ pub fn read_helper_msg<R: Read>(r: &mut R) -> Result<HelperMsg, ProtoError> {
             method: b.string()?,
         },
         ht::CLOSE_REQUESTED => HelperMsg::CloseRequested { view: b.view()? },
+        ht::BACK_REQUESTED => HelperMsg::BackRequested { view: b.view()? },
         ht::VIEW_CLOSED => HelperMsg::ViewClosed { view: b.view()? },
         ht::WEB_PROCESS_GONE => HelperMsg::WebProcessGone { view: b.view()? },
         ht::BRIDGE_CALL => HelperMsg::BridgeCall {
@@ -1530,7 +1649,35 @@ mod tests {
             },
             ConsumerMsg::CookieFlush { request_id: 13 },
             ConsumerMsg::Shutdown,
+            ConsumerMsg::SetParent {
+                parent: ParentWindow::Wayland {
+                    handle: "b5d1c7e2-hyprland-export".to_string(),
+                },
+            },
+            ConsumerMsg::SetParent {
+                parent: ParentWindow::X11 {
+                    window: nonzero(0x0460_0003),
+                },
+            },
+            ConsumerMsg::ParentResized {
+                size: ParentSize {
+                    width: nonzero(1280),
+                    height: nonzero(720),
+                    unit: SizeUnit::Logical,
+                },
+            },
+            ConsumerMsg::ParentResized {
+                size: ParentSize {
+                    width: nonzero(3840),
+                    height: nonzero(2160),
+                    unit: SizeUnit::DevicePixels,
+                },
+            },
         ]
+    }
+
+    fn nonzero(value: u32) -> NonZeroU32 {
+        NonZeroU32::new(value).expect("a non-zero test value")
     }
 
     fn all_helper_msgs() -> Vec<HelperMsg> {
@@ -1576,6 +1723,7 @@ mod tests {
                 method: "GET".to_string(),
             },
             HelperMsg::CloseRequested { view: 42 },
+            HelperMsg::BackRequested { view: 42 },
             HelperMsg::ViewClosed { view: 42 },
             HelperMsg::WebProcessGone { view: 42 },
             HelperMsg::BridgeCall {
@@ -1817,6 +1965,46 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parent_messages_reject_empty_handles_zero_ids_and_sizes_and_unknown_tags() {
+        let empty_handle = ConsumerMsg::SetParent {
+            parent: ParentWindow::Wayland {
+                handle: String::new(),
+            },
+        }
+        .encode()
+        .expect("encode");
+        let frame = |type_byte, body: Vec<u8>| {
+            compose_frame(Dir::FromConsumer, type_byte, body).expect("compose")
+        };
+        let size = |width: u32, height: u32, unit: u8| {
+            let mut body = width.to_le_bytes().to_vec();
+            body.extend_from_slice(&height.to_le_bytes());
+            body.push(unit);
+            body
+        };
+        for bad in [
+            empty_handle,
+            frame(ct::SET_PARENT, vec![1, 0, 0, 0, 0]),
+            frame(ct::SET_PARENT, vec![2, 1, 0, 0, 0]),
+            frame(ct::PARENT_RESIZED, size(0, 720, 0)),
+            frame(ct::PARENT_RESIZED, size(1280, 0, 1)),
+            frame(ct::PARENT_RESIZED, size(1280, 720, 2)),
+        ] {
+            let decoded = read_consumer_msg(&mut bad.as_slice());
+            assert!(
+                matches!(
+                    decoded,
+                    Err(ProtoError::BadValue {
+                        type_byte: ct::SET_PARENT | ct::PARENT_RESIZED,
+                        ..
+                    })
+                ),
+                "{bad:?} decoded to {decoded:?}"
+            );
+        }
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod runtime;
 pub mod services;
 pub mod status;
 mod text_layout;
+mod web_view_parent;
 pub mod webview;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

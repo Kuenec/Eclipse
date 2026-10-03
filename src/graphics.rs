@@ -47,6 +47,8 @@ struct GameWindow<'vm> {
 
     engine_window: Option<crate::egl_engine::EngineNativeWindow>,
 
+    web_view_parent: Option<crate::web_view_parent::WebViewParent>,
+
     window: Option<Window>,
 
     create_error: Option<OsError>,
@@ -359,6 +361,7 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
         }
         crate::loader::ndk_registry::set_wsi_target(wsi_target);
         self.clipboard = host_clipboard(&window);
+        self.web_view_parent = web_view_parent(&window);
 
         self.window = Some(window);
         self.publish_engine_display_refresh_rates();
@@ -400,6 +403,11 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
                 });
                 publish_engine_window_geometry(wsi_ptr, geo.width, geo.height);
                 self.propagate_window_resize(geo.width, geo.height);
+                if let (Some(parent), Some(window)) =
+                    (self.web_view_parent.as_ref(), self.window.as_ref())
+                {
+                    parent.resized(size, window.scale_factor());
+                }
 
                 self.publish_engine_display_refresh_rates();
             }
@@ -667,6 +675,7 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.shutdown_runtime();
         self.clipboard = None;
+        self.web_view_parent = None;
     }
 }
 
@@ -698,6 +707,21 @@ fn pass_key_to_engine(
             false
         }
     }
+}
+
+fn web_view_parent(window: &Window) -> Option<crate::web_view_parent::WebViewParent> {
+    let (display, handle) = match (window.display_handle(), window.window_handle()) {
+        (Ok(display), Ok(handle)) => (display.as_raw(), handle.as_raw()),
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::info!(%error, "no game window handle; WebView windows open as normal windows");
+            return None;
+        }
+    };
+    let parent = unsafe {
+        crate::web_view_parent::WebViewParent::for_window_whose_display_outlives_it(display, handle)
+    };
+    parent.resized(window.inner_size(), window.scale_factor());
+    Some(parent)
 }
 
 fn host_clipboard(window: &Window) -> Option<crate::clipboard::HostClipboard> {
@@ -2028,6 +2052,7 @@ pub fn run_windowed(
         primary_press: None,
         synthetic_tap_done: false,
         engine_window: None,
+        web_view_parent: None,
         handed_off: false,
         published_window_size: None,
         engine_tap_downtime: None,

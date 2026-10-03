@@ -12,7 +12,8 @@ use std::time::{Duration, Instant, SystemTime};
 use super::cef_profile;
 use super::cookie_jar::{self, CookieJar, JarFileError};
 use super::proto::{
-    self, ClearScope, ConsumerMsg, CookiePair, HelperMsg, LoadEvent, StoredCookie, PROTO_VERSION,
+    self, ClearScope, ConsumerMsg, CookiePair, HelperMsg, LoadEvent, ParentSize, ParentWindow,
+    StoredCookie, PROTO_VERSION,
 };
 use super::redact::url_scheme_and_host_for_log;
 use crate::framework::view_registry;
@@ -410,6 +411,47 @@ impl Views {
     }
 }
 
+struct ParentState {
+    parent: Option<ParentWindow>,
+
+    size: Option<ParentSize>,
+}
+
+impl ParentState {
+    const fn new() -> Self {
+        Self {
+            parent: None,
+            size: None,
+        }
+    }
+
+    fn introduction(&self) -> Vec<ConsumerMsg> {
+        let parent = self
+            .parent
+            .clone()
+            .map(|parent| ConsumerMsg::SetParent { parent });
+        let size = self.size.map(|size| ConsumerMsg::ParentResized { size });
+        parent.into_iter().chain(size).collect()
+    }
+
+    fn set_parent(&mut self, parent: ParentWindow) -> Option<ConsumerMsg> {
+        if self.parent.as_ref() == Some(&parent) {
+            return None;
+        }
+        self.parent = Some(parent.clone());
+        Some(ConsumerMsg::SetParent { parent })
+    }
+
+    fn resize(&mut self, size: ParentSize) -> Option<ConsumerMsg> {
+        if self.size.replace(size) == Some(size) {
+            return None;
+        }
+        Some(ConsumerMsg::ParentResized { size })
+    }
+}
+
+static PARENT: Mutex<ParentState> = Mutex::new(ParentState::new());
+
 static VIEWS: Mutex<Views> = Mutex::new(Views::new());
 
 static VIEWS_CHANGED: Condvar = Condvar::new();
@@ -439,6 +481,12 @@ fn lock_views() -> Result<MutexGuard<'static, Views>, ClientError> {
     VIEWS
         .lock()
         .map_err(|_| ClientError::Internal("views lock poisoned"))
+}
+
+fn lock_parent() -> Result<MutexGuard<'static, ParentState>, ClientError> {
+    PARENT
+        .lock()
+        .map_err(|_| ClientError::Internal("parent lock poisoned"))
 }
 
 fn encode(msg: &ConsumerMsg) -> Result<Vec<u8>, ClientError> {
@@ -1270,15 +1318,7 @@ fn io_thread_main(
             return;
         }
     };
-    let started = perform_handshake(&stream, HANDSHAKE_TIMEOUT).and_then(|engine| {
-        tracing::info!(
-            %engine,
-            protocol = u64::from(PROTO_VERSION),
-            "eclipse-webview helper handshake complete"
-        );
-        hand_over_cookies(&stream, COOKIE_IMPORT_TIMEOUT)
-    });
-    if let Err(e) = started {
+    if let Err(e) = start_helper(&stream, HANDSHAKE_TIMEOUT, COOKIE_IMPORT_TIMEOUT) {
         let _ = child.kill();
         let status = child.wait().ok();
         let _ = tx.send(Err(with_exit_status(e, status)));
@@ -1320,6 +1360,57 @@ fn io_thread_main(
         return;
     }
     reader_loop(&stream, &up_tx, generation);
+}
+
+fn start_helper(
+    stream: &UnixStream,
+    handshake_timeout: Duration,
+    import_timeout: Duration,
+) -> Result<(), ClientError> {
+    let engine = perform_handshake(stream, handshake_timeout)?;
+    tracing::info!(
+        %engine,
+        protocol = u64::from(PROTO_VERSION),
+        "eclipse-webview helper handshake complete"
+    );
+    describe_game_window(stream)?;
+    hand_over_cookies(stream, import_timeout)
+}
+
+fn describe_game_window(stream: &UnixStream) -> Result<(), ClientError> {
+    let introduction = lock_parent()?.introduction();
+    for msg in &introduction {
+        (&mut &*stream).write_all(&encode(msg)?).map_err(|e| {
+            ClientError::Handshake(format!("describing the game window failed: {}", e.kind()))
+        })?;
+    }
+    Ok(())
+}
+
+pub fn set_parent(parent: ParentWindow) {
+    update_game_window(|state| state.set_parent(parent));
+}
+
+pub fn parent_resized(size: ParentSize) {
+    update_game_window(|state| state.resize(size));
+}
+
+fn update_game_window(change: impl FnOnce(&mut ParentState) -> Option<ConsumerMsg>) {
+    let sent = lock_client().and_then(|slot| {
+        let Some(msg) = change(&mut *lock_parent()?) else {
+            return Ok(());
+        };
+        match &*slot {
+            ClientSlot::Live(client) => client.send(&[encode(&msg)?]),
+            ClientSlot::Unspawned | ClientSlot::Restarting | ClientSlot::Failed(_) => Ok(()),
+        }
+    });
+    if let Err(e) = sent {
+        tracing::warn!(
+            error = %e,
+            "webview client: the web engine helper did not get the game window's handle or size"
+        );
+    }
 }
 
 fn ensure_live(slot: &mut ClientSlot, java_vm: jni::vm::JavaVM) -> Result<(), ClientError> {
@@ -1533,6 +1624,10 @@ fn route(msg: HelperMsg, views: &mut Views) -> Routed {
             entry.close_on_back();
             Upcall::Back
         }
+        HelperMsg::BackRequested { view } => match views.created(view) {
+            Some(entry) if entry.window_visible() => Upcall::Back,
+            _ => return Routed::Handled,
+        },
         HelperMsg::WebProcessGone { view } => {
             let Some(entry) = views.created(view) else {
                 return Routed::Handled;
@@ -3042,6 +3137,31 @@ mod tests {
     }
 
     #[test]
+    fn the_mouse_back_button_in_a_web_window_steps_back_through_web_history() {
+        let view = 58;
+        let mut views = views_with(view, created_entry(true));
+        assert!(matches!(
+            upcall(route(HelperMsg::BackRequested { view }, &mut views)),
+            Upcall::Back
+        ));
+        assert!(
+            views.entries[&view].back_navigates(),
+            "the mouse Back button is Android Back, as over the game window, so Roblox goes back \
+             one page while canGoBack is true instead of closing the view"
+        );
+
+        let hidden = 59;
+        let mut views = views_with(hidden, created_entry(false));
+        assert!(
+            matches!(
+                route(HelperMsg::BackRequested { view: hidden }, &mut views),
+                Routed::Handled
+            ),
+            "Back from a window the app already hid sends no Back to the game"
+        );
+    }
+
+    #[test]
     fn a_destroyed_view_gets_no_navigation_callback() {
         let mut views = Views::new();
         assert!(matches!(
@@ -3687,6 +3807,163 @@ mod tests {
             fatal,
             Err(ClientError::Unavailable(reason)) if reason == "the cookie store is gone"
         ));
+    }
+
+    fn game_window_size(width: u32, height: u32) -> ParentSize {
+        ParentSize {
+            width: std::num::NonZeroU32::new(width).expect("width"),
+            height: std::num::NonZeroU32::new(height).expect("height"),
+            unit: proto::SizeUnit::Logical,
+        }
+    }
+
+    fn exported_game_window() -> ParentWindow {
+        ParentWindow::Wayland {
+            handle: "game-window-export".into(),
+        }
+    }
+
+    #[test]
+    fn the_helper_hears_only_game_window_changes_and_a_restart_hears_the_latest() {
+        let mut state = ParentState::new();
+        assert_eq!(state.introduction(), Vec::new());
+        assert_eq!(
+            state.resize(game_window_size(1280, 720)),
+            Some(ConsumerMsg::ParentResized {
+                size: game_window_size(1280, 720)
+            })
+        );
+        assert_eq!(
+            state.introduction(),
+            [ConsumerMsg::ParentResized {
+                size: game_window_size(1280, 720)
+            }],
+            "a game window without an exportable handle still sizes the web windows"
+        );
+        assert_eq!(state.resize(game_window_size(1280, 720)), None);
+        assert_eq!(
+            state.set_parent(exported_game_window()),
+            Some(ConsumerMsg::SetParent {
+                parent: exported_game_window()
+            })
+        );
+        assert_eq!(state.set_parent(exported_game_window()), None);
+        assert!(state.resize(game_window_size(1920, 1080)).is_some());
+        assert_eq!(
+            state.introduction(),
+            [
+                ConsumerMsg::SetParent {
+                    parent: exported_game_window()
+                },
+                ConsumerMsg::ParentResized {
+                    size: game_window_size(1920, 1080)
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_helper_learns_the_game_window_before_it_takes_the_jar() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *CLIENT.lock().expect("client") = ClientSlot::Unspawned;
+        *PARENT.lock().expect("parent") = ParentState::new();
+        let dir = install_store("game-window-order", CookieOwner::Jar);
+        set_parent(exported_game_window());
+        parent_resized(game_window_size(1600, 900));
+        let (client_end, helper_end) = UnixStream::pair().expect("pair");
+        let helper = std::thread::spawn(move || {
+            let mut seen = vec![proto::read_consumer_msg(&mut &helper_end).expect("Hello")];
+            reply(
+                &helper_end,
+                HelperMsg::HelloAck {
+                    version: PROTO_VERSION,
+                    engine: "webkitgtk/test".into(),
+                },
+            );
+            loop {
+                let msg = proto::read_consumer_msg(&mut &helper_end).expect("a start message");
+                let import = match &msg {
+                    ConsumerMsg::CookieImport {
+                        request_id,
+                        cookies,
+                    } => Some(HelperMsg::CookieImportResult {
+                        request_id: *request_id,
+                        imported: u32::try_from(cookies.len()).expect("count"),
+                        failed: 0,
+                    }),
+                    _ => None,
+                };
+                seen.push(msg);
+                if let Some(result) = import {
+                    reply(&helper_end, result);
+                    return seen;
+                }
+            }
+        });
+        let started = start_helper(&client_end, Duration::from_secs(2), Duration::from_secs(2));
+        let seen = helper.join().expect("fake helper");
+        *PARENT.lock().expect("parent") = ParentState::new();
+        remove_store(&dir);
+
+        assert_eq!(started, Ok(()));
+        assert!(
+            matches!(
+                seen.as_slice(),
+                [
+                    ConsumerMsg::Hello { .. },
+                    ConsumerMsg::SetParent { parent },
+                    ConsumerMsg::ParentResized { size },
+                    ConsumerMsg::CookieImport { .. },
+                ] if *parent == exported_game_window() && *size == game_window_size(1600, 900)
+            ),
+            "the window handle and size must precede every view: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_running_helper_gets_game_window_changes_at_once() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *PARENT.lock().expect("parent") = ParentState::new();
+        let (host_end, helper_end) = UnixStream::pair().expect("socketpair");
+        helper_end
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        *CLIENT.lock().expect("client") =
+            ClientSlot::Live(stand_in_client(&host_end, HelperGeneration::next()));
+
+        set_parent(ParentWindow::X11 {
+            window: std::num::NonZeroU32::new(0x0460_0003).expect("xid"),
+        });
+        parent_resized(game_window_size(1280, 720));
+        parent_resized(game_window_size(1280, 720));
+        parent_resized(game_window_size(1280, 1024));
+        let seen: Vec<ConsumerMsg> = (0..3)
+            .map(|_| proto::read_consumer_msg(&mut &helper_end).expect("a game window message"))
+            .collect();
+        *CLIENT.lock().expect("client") = ClientSlot::Unspawned;
+        *PARENT.lock().expect("parent") = ParentState::new();
+
+        assert_eq!(
+            seen,
+            [
+                ConsumerMsg::SetParent {
+                    parent: ParentWindow::X11 {
+                        window: std::num::NonZeroU32::new(0x0460_0003).expect("xid"),
+                    }
+                },
+                ConsumerMsg::ParentResized {
+                    size: game_window_size(1280, 720)
+                },
+                ConsumerMsg::ParentResized {
+                    size: game_window_size(1280, 1024)
+                },
+            ],
+            "an unchanged size is not sent again"
+        );
     }
 
     fn jar_location(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
