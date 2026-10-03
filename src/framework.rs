@@ -12357,6 +12357,27 @@ pub struct RecipeStep {
     pub descriptor: &'static str,
 }
 
+#[derive(Clone, Copy)]
+pub enum ActivityStart<'a> {
+    Launcher(&'a str),
+    View { activity: &'a str, uri: &'a str },
+}
+
+impl<'a> ActivityStart<'a> {
+    pub fn activity(self) -> &'a str {
+        match self {
+            Self::Launcher(activity) | Self::View { activity, .. } => activity,
+        }
+    }
+
+    fn uri(self) -> Option<&'a str> {
+        match self {
+            Self::Launcher(_) => None,
+            Self::View { uri, .. } => Some(uri),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleProgress {
     BridgeProven,
@@ -12522,8 +12543,7 @@ pub fn drive_application_lifecycle(
     apk_path: &str,
     native_library_dir: &std::path::Path,
     signing_certificate_history: &SigningCertificateHistory,
-    launcher_activity: &str,
-    android_deep_link: Option<&str>,
+    start: ActivityStart<'_>,
 ) -> Result<LifecycleProgress, FrameworkError> {
     let native_library_dir = native_library_dir
         .to_str()
@@ -12541,8 +12561,7 @@ pub fn drive_application_lifecycle(
                 apk_path,
                 native_library_dir,
                 signing_certificate_history,
-                launcher_activity,
-                android_deep_link,
+                start,
             )
         })) {
             Ok(result) => result,
@@ -12668,7 +12687,11 @@ pub fn prepare_main_looper(vm: &Vm) -> Result<(), FrameworkError> {
     })
 }
 
-pub struct MainLooperWake;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostWake {
+    MainLooper,
+    Control,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MainLooperDue {
@@ -12687,13 +12710,12 @@ impl MainLooperDue {
     }
 }
 
-static MAIN_LOOPER_WAKER: OnceLock<winit::event_loop::EventLoopProxy<MainLooperWake>> =
-    OnceLock::new();
+static MAIN_LOOPER_WAKER: OnceLock<winit::event_loop::EventLoopProxy<HostWake>> = OnceLock::new();
 
 static MAIN_LOOPER_WAKE_SENT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-pub fn install_main_looper_waker(proxy: winit::event_loop::EventLoopProxy<MainLooperWake>) {
+pub fn install_main_looper_waker(proxy: winit::event_loop::EventLoopProxy<HostWake>) {
     if MAIN_LOOPER_WAKER.set(proxy).is_err() {
         tracing::warn!("main Looper waker already installed; keeping the first event loop's proxy");
     }
@@ -12706,7 +12728,7 @@ fn wake_main_looper() {
     if MAIN_LOOPER_WAKE_SENT.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    if proxy.send_event(MainLooperWake).is_err() {
+    if proxy.send_event(HostWake::MainLooper).is_err() {
         tracing::debug!("main Looper wake dropped: the host event loop has exited");
     }
 }
@@ -13976,8 +13998,7 @@ fn drive_lifecycle(
     apk_path: &str,
     native_library_dir: &str,
     signing_certificate_history: &SigningCertificateHistory,
-    launcher_activity: &str,
-    android_deep_link: Option<&str>,
+    start: ActivityStart<'_>,
 ) -> Result<LifecycleProgress, FrameworkError> {
     register_context_natives(env, apk_path)?;
 
@@ -14106,16 +14127,10 @@ fn drive_lifecycle(
     tracing::info!("Application.onCreate reached: recipe steps 1–3 driven");
 
     let activity_class = env.find_class(ACTIVITY_CLASS)?;
-    let (activity_name, activity_uri) =
-        activity_start_arguments(launcher_activity, android_deep_link);
-    let class_name_jstr = activity_name.map(|name| env.new_string(name)).transpose()?;
-    let activity_uri_jstr = activity_uri.map(|uri| env.new_string(uri)).transpose()?;
-    let null_class_name = JObject::null();
+    let activity_name = start.activity();
+    let class_name_jstr = env.new_string(activity_name)?;
+    let activity_uri_jstr = start.uri().map(|uri| env.new_string(uri)).transpose()?;
     let null_activity_uri = JObject::null();
-    let class_name_object: &JObject = class_name_jstr
-        .as_ref()
-        .map(AsRef::as_ref)
-        .unwrap_or(&null_class_name);
     let activity_uri_object: &JObject = activity_uri_jstr
         .as_ref()
         .map(AsRef::as_ref)
@@ -14126,7 +14141,7 @@ fn drive_lifecycle(
             jni_str!("createMainActivity"),
             jni_sig!("(Ljava/lang/String;JLjava/lang/String;)Landroid/app/Activity;"),
             &[
-                JValue::Object(class_name_object),
+                JValue::Object(&class_name_jstr),
                 JValue::Long(window_handle),
                 JValue::Object(activity_uri_object),
             ],
@@ -14138,7 +14153,7 @@ fn drive_lifecycle(
 
     call_activity_on_create(env, &activity, "step 5 Activity.onCreate")?;
     tracing::info!(
-        activity = activity_name.unwrap_or("<resolved ACTION_VIEW activity>"),
+        activity = activity_name,
         "Activity.onCreate reached: recipe steps 1–5 driven (launcher Activity onCreate)"
     );
 
@@ -14148,7 +14163,7 @@ fn drive_lifecycle(
 
     call_activity_on_resume(env, &activity, "step 7 Activity.onResume")?;
     tracing::info!(
-        activity = activity_name.unwrap_or("<resolved ACTION_VIEW activity>"),
+        activity = activity_name,
         "Activity resumed: recipe steps 1–7 driven (launcher Activity onStart + onResume)"
     );
     Ok(LifecycleProgress::ActivityResumed)
@@ -14203,16 +14218,6 @@ fn publish_native_library_dir(
             JValue::Object(&dir),
         )
     })
-}
-
-fn activity_start_arguments<'a>(
-    launcher_activity: &'a str,
-    android_deep_link: Option<&'a str>,
-) -> (Option<&'a str>, Option<&'a str>) {
-    match android_deep_link {
-        Some(uri) => (None, Some(uri)),
-        None => (Some(launcher_activity), None),
-    }
 }
 
 fn checked<'local, T>(
@@ -14671,18 +14676,15 @@ mod tests {
     static TEXTBOX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn deep_link_launch_uses_manifest_resolution_instead_of_the_launcher_activity() {
+    fn a_link_launch_passes_the_resolved_activity_together_with_the_uri() {
         let launcher = "com.roblox.client.startup.ActivitySplash";
+        let activity = "com.roblox.client.ActivityProtocolLaunch";
         let uri = "roblox://placeId=90441122676618";
 
-        assert_eq!(
-            activity_start_arguments(launcher, None),
-            (Some(launcher), None)
-        );
-        assert_eq!(
-            activity_start_arguments(launcher, Some(uri)),
-            (None, Some(uri))
-        );
+        let plain = ActivityStart::Launcher(launcher);
+        assert_eq!((plain.activity(), plain.uri()), (launcher, None));
+        let link = ActivityStart::View { activity, uri };
+        assert_eq!((link.activity(), link.uri()), (activity, Some(uri)));
     }
 
     #[test]

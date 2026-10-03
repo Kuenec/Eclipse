@@ -1130,6 +1130,7 @@ mod tests {
             min_sdk: Some(26),
             target_sdk,
             large_heap: false,
+            view_handlers: Vec::new(),
         }
     }
 

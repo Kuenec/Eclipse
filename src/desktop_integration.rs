@@ -67,26 +67,37 @@ pub(super) enum UrlHandlerInstall {
 }
 
 pub(super) fn install_url_handler() -> Result<UrlHandlerInstall, Box<dyn std::error::Error>> {
-    match std::fs::read_to_string(FLATPAK_INFO) {
-        Ok(info) => flatpak_exported_handler(&info),
-        Err(error) if error.kind() == ErrorKind::NotFound => install_host_url_handler()
+    match sandbox_app_id()? {
+        Some(app_id) => flatpak_exported_handler(app_id),
+        None => install_host_url_handler()
             .map(|desktop_path| UrlHandlerInstall::Registered { desktop_path }),
-        Err(error) => Err(io::Error::new(
-            error.kind(),
-            format!("cannot read {FLATPAK_INFO} to detect the Flatpak sandbox: {error}"),
-        )
-        .into()),
     }
 }
 
-fn flatpak_exported_handler(info: &str) -> Result<UrlHandlerInstall, Box<dyn std::error::Error>> {
-    let app_id = flatpak_app_id(info).ok_or_else(|| {
+pub(super) fn sandbox_app_id() -> io::Result<Option<String>> {
+    let info = match std::fs::read_to_string(FLATPAK_INFO) {
+        Ok(info) => info,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("cannot read {FLATPAK_INFO} to detect the Flatpak sandbox: {error}"),
+            ))
+        }
+    };
+    let app_id = flatpak_app_id(&info).ok_or_else(|| {
         io::Error::new(
             ErrorKind::InvalidData,
             format!("{FLATPAK_INFO} names no [Application] id"),
         )
     })?;
-    let desktop_path = flatpak_url_handler_path(app_id);
+    Ok(Some(app_id.to_owned()))
+}
+
+fn flatpak_exported_handler(
+    app_id: String,
+) -> Result<UrlHandlerInstall, Box<dyn std::error::Error>> {
+    let desktop_path = flatpak_url_handler_path(&app_id);
     if !desktop_path.is_file() {
         return Err(io::Error::new(
             ErrorKind::NotFound,
@@ -98,7 +109,7 @@ fn flatpak_exported_handler(info: &str) -> Result<UrlHandlerInstall, Box<dyn std
         .into());
     }
     Ok(UrlHandlerInstall::FlatpakExport {
-        app_id: app_id.to_owned(),
+        app_id,
         desktop_path,
     })
 }
@@ -447,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_entries_claim_exactly_the_schemes_the_browser_launch_parser_accepts() {
+    fn desktop_entries_claim_exactly_the_schemes_the_link_parser_accepts() {
         let mime_line = "\nMimeType=x-scheme-handler/roblox-player;x-scheme-handler/roblox;\n";
         let entry = desktop_entry(Path::new("/usr/bin/eclipse")).unwrap();
         assert!(entry.contains(mime_line), "{entry}");
@@ -465,8 +476,8 @@ mod tests {
                 other => panic!("no launch sample for the {other} scheme"),
             };
             assert_eq!(
-                crate::browser_launch::place_id(launch),
-                Ok(90_441_122_676_618),
+                eclipse::links::parse(launch),
+                eclipse::links::parse("90441122676618"),
                 "{mime}"
             );
         }

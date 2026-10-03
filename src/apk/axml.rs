@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use super::intent_filter::{PathMatcher, ViewHandler};
+
 const RES_STRING_POOL_TYPE: u16 = 0x0001;
 const RES_XML_TYPE: u16 = 0x0003;
 const RES_XML_RESOURCE_MAP_TYPE: u16 = 0x0180;
@@ -29,6 +31,8 @@ const MAX_DEPTH: usize = 256;
 
 const ANDROID_NS_URI: &str = "http://schemas.android.com/apk/res/android";
 
+const MAX_INTENT_FILTER_DATA_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxmlError {
     Truncated,
@@ -54,6 +58,8 @@ pub enum AxmlError {
     NoPackage,
 
     NoLauncher,
+
+    IntentFilterDataTooLarge,
 }
 
 impl fmt::Display for AxmlError {
@@ -71,6 +77,9 @@ impl fmt::Display for AxmlError {
             Self::NoManifestRoot => "binary XML has no root <manifest> element",
             Self::NoPackage => "binary XML <manifest> declares no package",
             Self::NoLauncher => "binary XML has no MAIN/LAUNCHER activity",
+            Self::IntentFilterDataTooLarge => {
+                "binary XML intent filters declare more data than Eclipse reads"
+            }
         };
         f.write_str(msg)
     }
@@ -88,6 +97,7 @@ pub(super) struct AxmlManifest {
     pub version_code: Option<u32>,
     pub version_name: Option<String>,
     pub split: Option<String>,
+    pub view_handlers: Vec<ViewHandler>,
 }
 
 pub(super) fn read_manifest(bytes: &[u8]) -> Result<AxmlManifest, AxmlError> {
@@ -580,13 +590,68 @@ impl Attribute {
 }
 
 struct OpenElement {
-    tag: Option<String>,
+    activity: Option<String>,
 
-    activity_name: Option<String>,
+    filter: Option<OpenFilter>,
+}
 
-    saw_main: bool,
+#[derive(Default)]
+struct OpenFilter {
+    main: bool,
+    launcher: bool,
+    view: bool,
+    default: bool,
+    schemes: Vec<String>,
+    hosts: Vec<String>,
+    paths: Vec<PathMatcher>,
+}
 
-    saw_launcher: bool,
+impl OpenFilter {
+    fn add(
+        &mut self,
+        tag: &str,
+        attrs: &[Attribute],
+        data_bytes: &mut usize,
+    ) -> Result<(), AxmlError> {
+        match tag {
+            "action" => match attr_string(attrs, Ns::Android, "name").as_deref() {
+                Some("android.intent.action.MAIN") => self.main = true,
+                Some("android.intent.action.VIEW") => self.view = true,
+                _ => {}
+            },
+            "category" => match attr_string(attrs, Ns::Android, "name").as_deref() {
+                Some("android.intent.category.LAUNCHER") => self.launcher = true,
+                Some("android.intent.category.DEFAULT") => self.default = true,
+                _ => {}
+            },
+            "data" => {
+                let mut read = |name| -> Result<Option<String>, AxmlError> {
+                    let value = attr_string(attrs, Ns::Android, name);
+                    if let Some(value) = &value {
+                        count_filter_data(data_bytes, value)?;
+                    }
+                    Ok(value)
+                };
+                self.schemes.extend(read("scheme")?);
+                self.hosts.extend(read("host")?);
+                self.paths.extend(read("path")?.map(PathMatcher::Literal));
+                self.paths
+                    .extend(read("pathPrefix")?.map(PathMatcher::Prefix));
+                self.paths
+                    .extend(read("pathPattern")?.map(PathMatcher::SimpleGlob));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn count_filter_data(data_bytes: &mut usize, text: &str) -> Result<(), AxmlError> {
+    *data_bytes = data_bytes
+        .checked_add(text.len() + 1)
+        .filter(|&total| total <= MAX_INTENT_FILTER_DATA_BYTES)
+        .ok_or(AxmlError::IntentFilterDataTooLarge)?;
+    Ok(())
 }
 
 fn walk(root: &Chunk, pool: &StringPool) -> Result<AxmlManifest, AxmlError> {
@@ -600,6 +665,8 @@ fn walk(root: &Chunk, pool: &StringPool) -> Result<AxmlManifest, AxmlError> {
     let mut version_code: Option<u32> = None;
     let mut version_name: Option<String> = None;
     let mut split: Option<String> = None;
+    let mut view_handlers: Vec<ViewHandler> = Vec::new();
+    let mut filter_data_bytes = 0;
     let mut saw_manifest = false;
 
     for child in root.children() {
@@ -638,48 +705,41 @@ fn walk(root: &Chunk, pool: &StringPool) -> Result<AxmlManifest, AxmlError> {
                     _ => {}
                 }
 
-                let activity_name = if matches!(tag_str, Some("activity") | Some("activity-alias"))
-                {
+                if let (Some(tag), Some(filter)) = (
+                    tag_str,
+                    stack.last_mut().and_then(|parent| parent.filter.as_mut()),
+                ) {
+                    filter.add(tag, &attrs, &mut filter_data_bytes)?;
+                }
+
+                let activity = if matches!(tag_str, Some("activity") | Some("activity-alias")) {
                     attr_string(&attrs, Ns::Android, "targetActivity")
                         .or_else(|| attr_string(&attrs, Ns::Android, "name"))
                 } else {
                     None
                 };
 
-                if matches!(tag_str, Some("action") | Some("category")) {
-                    if let Some(filter) = stack.last_mut() {
-                        if let Some(name) = attr_string(&attrs, Ns::Android, "name") {
-                            match (tag_str, name.as_str()) {
-                                (Some("action"), "android.intent.action.MAIN") => {
-                                    filter.saw_main = true;
-                                }
-                                (Some("category"), "android.intent.category.LAUNCHER") => {
-                                    filter.saw_launcher = true;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-
                 stack.push(OpenElement {
-                    tag,
-                    activity_name,
-                    saw_main: false,
-                    saw_launcher: false,
+                    activity,
+                    filter: (tag_str == Some("intent-filter")).then(OpenFilter::default),
                 });
             }
             RES_XML_END_ELEMENT_TYPE => {
                 let closing = stack.pop().ok_or(AxmlError::UnbalancedElement)?;
 
-                if closing.tag.as_deref() == Some("intent-filter")
-                    && closing.saw_main
-                    && closing.saw_launcher
-                {
-                    if let Some(activity) = stack.last() {
-                        if launcher.is_none() {
-                            launcher = activity.activity_name.clone();
-                        }
+                let activity = stack.last().and_then(|parent| parent.activity.as_ref());
+                if let (Some(filter), Some(activity)) = (closing.filter, activity) {
+                    if filter.main && filter.launcher && launcher.is_none() {
+                        launcher = Some(activity.clone());
+                    }
+                    if filter.view && filter.default {
+                        count_filter_data(&mut filter_data_bytes, activity)?;
+                        view_handlers.push(ViewHandler {
+                            activity: activity.clone(),
+                            schemes: filter.schemes,
+                            hosts: filter.hosts,
+                            paths: filter.paths,
+                        });
                     }
                 }
             }
@@ -701,6 +761,7 @@ fn walk(root: &Chunk, pool: &StringPool) -> Result<AxmlManifest, AxmlError> {
         version_code,
         version_name,
         split,
+        view_handlers,
     })
 }
 
@@ -1396,6 +1457,44 @@ mod tests {
         let axml = build_axml(&[&stub, &stub, &stub]);
 
         let _ = read_manifest(&axml);
+    }
+
+    #[test]
+    fn intent_filter_data_is_read_up_to_its_limit_and_refused_beyond_it() {
+        let scheme = "s".repeat(100);
+        let document = |entries: usize| {
+            let mut document = fixture::Document::default();
+            document.start(
+                "manifest",
+                &[fixture::Attribute {
+                    android: false,
+                    name: "package",
+                    value: fixture::Value::Str("com.example"),
+                }],
+            );
+            document.start("intent-filter", &[]);
+            for _ in 0..entries {
+                document.start(
+                    "data",
+                    &[fixture::Attribute {
+                        android: true,
+                        name: "scheme",
+                        value: fixture::Value::Str(&scheme),
+                    }],
+                );
+                document.end("data");
+            }
+            document.end("intent-filter");
+            document.end("manifest");
+            document.finish()
+        };
+        let fitting = MAX_INTENT_FILTER_DATA_BYTES / (scheme.len() + 1);
+
+        assert!(read_manifest(&document(fitting)).is_ok());
+        assert_eq!(
+            read_manifest(&document(fitting + 1)),
+            Err(AxmlError::IntentFilterDataTooLarge)
+        );
     }
 
     #[test]

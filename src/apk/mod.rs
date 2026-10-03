@@ -5,7 +5,7 @@ pub mod arsc;
 pub mod axml;
 pub mod cache;
 mod file_reader;
-pub mod https;
+mod intent_filter;
 mod locale_data;
 pub mod play;
 pub mod res_config;
@@ -29,6 +29,7 @@ use zip::{CompressionMethod, ZipArchive};
 
 use axml::AxmlError;
 use file_reader::ApkFileReader;
+use intent_filter::{ViewHandler, ViewUri};
 use signature::{SignatureError, SigningCertificateHistory};
 
 const MANIFEST_ENTRY: &str = "AndroidManifest.xml";
@@ -315,6 +316,18 @@ pub struct Manifest {
     pub target_sdk: Option<u32>,
 
     pub large_heap: bool,
+
+    pub(crate) view_handlers: Vec<ViewHandler>,
+}
+
+impl Manifest {
+    pub fn resolve_view_activity(&self, uri: &str) -> Option<&str> {
+        let uri = ViewUri::parse(uri)?;
+        self.view_handlers
+            .iter()
+            .find(|handler| handler.accepts(&uri))
+            .map(|handler| handler.activity.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -371,6 +384,7 @@ impl Apk {
             min_sdk: parsed.min_sdk,
             target_sdk: parsed.target_sdk,
             large_heap: parsed.large_heap,
+            view_handlers: parsed.view_handlers,
         })
     }
 
@@ -1330,6 +1344,161 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(manifest.package, "com.example.app");
         assert_eq!(manifest.launcher_activity, ".SplashActivity");
+    }
+
+    fn android<'a>(name: &'a str, value: &'a str) -> axml::fixture::Attribute<'a> {
+        axml::fixture::Attribute {
+            android: true,
+            name,
+            value: axml::fixture::Value::Str(value),
+        }
+    }
+
+    fn component_with_filter(
+        document: &mut axml::fixture::Document,
+        (tag, name): (&str, &str),
+        action: &str,
+        categories: &[&str],
+        data: &[&[axml::fixture::Attribute<'_>]],
+    ) {
+        document.start(tag, &[android("name", name)]);
+        document.start("intent-filter", &[]);
+        document.start("action", &[android("name", action)]);
+        document.end("action");
+        for category in categories {
+            document.start("category", &[android("name", category)]);
+            document.end("category");
+        }
+        for attributes in data {
+            document.start("data", attributes);
+            document.end("data");
+        }
+        document.end("intent-filter");
+        document.end(tag);
+    }
+
+    #[test]
+    fn view_links_resolve_to_the_first_activity_whose_default_view_filter_matches() {
+        const VIEW: &str = "android.intent.action.VIEW";
+        const DEFAULT: &str = "android.intent.category.DEFAULT";
+        const BROWSABLE: &str = "android.intent.category.BROWSABLE";
+        let mut document = axml::fixture::Document::default();
+        document.start(
+            "manifest",
+            &[axml::fixture::Attribute {
+                android: false,
+                name: "package",
+                value: axml::fixture::Value::Str(ROBLOX_PACKAGE),
+            }],
+        );
+        document.start("application", &[]);
+        component_with_filter(
+            &mut document,
+            ("activity", "com.example.Splash"),
+            "android.intent.action.MAIN",
+            &["android.intent.category.LAUNCHER", DEFAULT],
+            &[],
+        );
+        component_with_filter(
+            &mut document,
+            ("service", "com.example.Service"),
+            VIEW,
+            &[DEFAULT],
+            &[&[android("scheme", "roblox")]],
+        );
+        component_with_filter(
+            &mut document,
+            ("activity", "com.example.NoDefault"),
+            VIEW,
+            &[BROWSABLE],
+            &[&[android("scheme", "roblox")]],
+        );
+        component_with_filter(
+            &mut document,
+            ("activity", "com.example.Games"),
+            VIEW,
+            &[DEFAULT, BROWSABLE],
+            &[&[
+                android("scheme", "https"),
+                android("host", "www.roblox.com"),
+                android("pathPattern", "/games/..*"),
+            ]],
+        );
+        component_with_filter(
+            &mut document,
+            ("activity", "com.example.Share"),
+            VIEW,
+            &[DEFAULT],
+            &[&[
+                android("scheme", "https"),
+                android("host", "www.roblox.com"),
+                android("pathPrefix", "/share"),
+            ]],
+        );
+        component_with_filter(
+            &mut document,
+            ("activity", "com.example.Home"),
+            VIEW,
+            &[DEFAULT],
+            &[&[
+                android("scheme", "https"),
+                android("host", "roblox.com"),
+                android("path", "/home"),
+            ]],
+        );
+        component_with_filter(
+            &mut document,
+            ("activity", "com.example.Scheme"),
+            VIEW,
+            &[DEFAULT],
+            &[
+                &[android("scheme", "roblox")],
+                &[android("scheme", "robloxmobile")],
+            ],
+        );
+        component_with_filter(
+            &mut document,
+            ("activity", "com.example.Global"),
+            VIEW,
+            &[DEFAULT],
+            &[&[
+                android("scheme", "robloxglobal"),
+                android("pathPrefix", "/only"),
+            ]],
+        );
+        document.end("application");
+        document.end("manifest");
+
+        let bytes = build_apk(&[(MANIFEST_ENTRY, &document.finish())]);
+        let (mut apk, path) = open_apk(&bytes, "view-filters");
+        let manifest = apk.manifest().expect("parse manifest");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(manifest.launcher_activity, "com.example.Splash");
+        let cases = [
+            ("roblox://placeId=1818", Some("com.example.Scheme")),
+            ("robloxmobile://placeId=1818", Some("com.example.Scheme")),
+            ("https://www.roblox.com/games/1", Some("com.example.Games")),
+            (
+                "https://WWW.Roblox.com/games/1818/Slug?x=/share",
+                Some("com.example.Games"),
+            ),
+            ("https://www.roblox.com/games/", None),
+            (
+                "https://www.roblox.com/share?code=1&type=Server",
+                Some("com.example.Share"),
+            ),
+            ("https://roblox.com/share", None),
+            ("https://roblox.com/home", Some("com.example.Home")),
+            ("https://roblox.com/home/1", None),
+            ("http://www.roblox.com/games/1", None),
+            ("robloxglobal://any/path", Some("com.example.Global")),
+            ("roblox-player:1+launchmode:play", None),
+            ("placeId=1818", None),
+        ];
+        for (uri, activity) in cases {
+            assert_eq!(manifest.resolve_view_activity(uri), activity, "{uri}");
+        }
     }
 
     #[test]

@@ -436,7 +436,10 @@ fn the_installed_tap_receives_events_and_explains_crashes_in_the_run_log() {
     }
     let dir = std::env::temp_dir().join(format!("eclipse-client-log-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
-    let path = crate::diagnostics::start_run_log(&dir).expect("start the run log");
+    std::fs::create_dir_all(&dir).expect("create the record directory");
+    let path = dir.join("records");
+    let records = std::fs::File::create(&path).expect("create the record file");
+    crate::diagnostics::init(crate::diagnostics::LogSink::Supervisor(records));
     offer("Roblox", GRAPHICS_OOM);
 
     let (tap, events) = Tap::new(GameRpc::Ignored);

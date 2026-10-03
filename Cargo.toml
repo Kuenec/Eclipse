@@ -49,7 +49,7 @@ wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 x11-clipboard = "0.9.3"
 
-rustix = { version = "1", default-features = false, features = ["mm", "param"] }
+rustix = { version = "1", default-features = false, features = ["event", "mm", "net", "param", "pipe", "process"] }
 
 libc = "0.2"
 

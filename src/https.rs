@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -48,7 +50,7 @@ impl fmt::Display for Host {
     }
 }
 
-pub(super) fn request_agent() -> ureq::Agent {
+pub(crate) fn request_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .https_only(true)
         .http_status_as_error(false)
@@ -59,7 +61,7 @@ pub(super) fn request_agent() -> ureq::Agent {
         .into()
 }
 
-pub(super) fn download_agent() -> ureq::Agent {
+pub(crate) fn download_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .https_only(true)
         .http_status_as_error(false)
@@ -71,14 +73,14 @@ pub(super) fn download_agent() -> ureq::Agent {
         .into()
 }
 
-pub(super) fn redacted(error: ureq::Error) -> String {
+pub(crate) fn redacted(error: ureq::Error) -> String {
     match error {
         ureq::Error::BadUri(_) => "the URL is invalid".to_owned(),
         other => other.to_string(),
     }
 }
 
-pub(super) fn trusted_uri(url: &str, allowed: &'static [Host]) -> Result<Uri, DownloadError> {
+pub(crate) fn trusted_uri(url: &str, allowed: &'static [Host]) -> Result<Uri, DownloadError> {
     let untrusted = || DownloadError::Untrusted { allowed };
     let uri = Uri::try_from(url).map_err(|_| untrusted())?;
     let authority = uri.authority().ok_or_else(untrusted)?;
@@ -94,31 +96,31 @@ pub(super) fn trusted_uri(url: &str, allowed: &'static [Host]) -> Result<Uri, Do
     }
 }
 
-pub(super) struct Download<R> {
-    pub(super) body: R,
-    pub(super) extent: Extent,
-    pub(super) validator: Option<String>,
+pub(crate) struct Download<R> {
+    pub(crate) body: R,
+    pub(crate) extent: Extent,
+    pub(crate) validator: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Extent {
+pub(crate) enum Extent {
     Whole { length: Option<u64> },
     Partial(ContentRange),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ContentRange {
-    pub(super) start: u64,
-    pub(super) total: Option<u64>,
+pub(crate) struct ContentRange {
+    pub(crate) start: u64,
+    pub(crate) total: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Resume {
-    pub(super) offset: u64,
-    pub(super) validator: Option<String>,
+pub(crate) struct Resume {
+    pub(crate) offset: u64,
+    pub(crate) validator: Option<String>,
 }
 
-pub(super) fn open_download(
+pub(crate) fn open_download(
     agent: &ureq::Agent,
     url: &str,
     allowed: &'static [Host],
@@ -247,7 +249,7 @@ fn content_length(headers: &HeaderMap) -> Result<Option<u64>, DownloadError> {
         .transpose()
 }
 
-pub(super) fn save_download<R: Read, E: From<DownloadError>>(
+pub(crate) fn save_download<R: Read, E: From<DownloadError>>(
     mut open: impl FnMut(Option<&Resume>) -> Result<Download<R>, E>,
     limit: u64,
     dest: &Path,
