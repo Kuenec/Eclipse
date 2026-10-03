@@ -59,6 +59,8 @@ const AAUDIO_CALLBACK_RESULT_CONTINUE: i32 = 0;
 
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+pub(crate) const APP_SAMPLE_RATE: u32 = 48_000;
+
 pub const AAUDIO_NATIVE_COUNT: usize = 26;
 
 type DataCallback = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i32) -> i32;
@@ -259,6 +261,15 @@ enum DataPath {
     ReadWrite,
 }
 
+impl DataPath {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Callback(_) => "callback",
+            Self::ReadWrite => "read_write",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct StreamParameters {
     direction: Direction,
@@ -358,6 +369,14 @@ fn burst_frames(
     }
 }
 
+pub(crate) fn low_latency_burst_frames() -> u32 {
+    burst_frames(
+        APP_SAMPLE_RATE,
+        PerformanceMode::LowLatency,
+        &cpal::SupportedBufferSize::Unknown,
+    )
+}
+
 struct StreamShared {
     state: AtomicStreamState,
     frames_per_burst: AtomicI32,
@@ -386,6 +405,7 @@ struct StreamEntry {
     data_path: DataPath,
     format: StreamFormat,
     host: Option<cpal::Stream>,
+    read_logged: bool,
 }
 
 impl StreamEntry {
@@ -805,6 +825,7 @@ fn open_stream(settings: &BuilderSettings) -> Result<NdkHandle, i32> {
             data_path: params.data_path,
             format: plan.format,
             host: None,
+            read_logged: false,
         })
         .map_err(|_| AAUDIO_ERROR_NO_MEMORY)?;
     if let DataPath::Callback(data_callback) = params.data_path {
@@ -813,6 +834,7 @@ fn open_stream(settings: &BuilderSettings) -> Result<NdkHandle, i32> {
     tracing::info!(
         target: "eclipse::audio",
         direction = ?params.direction,
+        data_path = %params.data_path.label(),
         channels = plan.format.channels,
         sample_rate = plan.format.sample_rate,
         format = ?plan.format.app,
@@ -1035,11 +1057,24 @@ unsafe extern "C" fn stream_read(
     if frames == 0 {
         return 0;
     }
-    stream_value(stream, |entry| match (entry.direction, entry.data_path) {
-        (Direction::Input, DataPath::Callback(_)) => AAUDIO_ERROR_INVALID_STATE,
-        (Direction::Output, _) | (Direction::Input, DataPath::ReadWrite) => {
-            AAUDIO_ERROR_UNIMPLEMENTED
+    stream_value(stream, |entry| {
+        let code = match (entry.direction, entry.data_path) {
+            (Direction::Input, DataPath::Callback(_)) => AAUDIO_ERROR_INVALID_STATE,
+            (Direction::Output, _) | (Direction::Input, DataPath::ReadWrite) => {
+                AAUDIO_ERROR_UNIMPLEMENTED
+            }
+        };
+        if !entry.read_logged {
+            entry.read_logged = true;
+            tracing::warn!(
+                target: "eclipse::audio",
+                direction = ?entry.direction,
+                data_path = %entry.data_path.label(),
+                code,
+                "AAudio: read is not supported on this stream"
+            );
         }
+        code
     })
 }
 

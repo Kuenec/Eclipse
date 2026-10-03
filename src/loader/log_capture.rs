@@ -1,5 +1,8 @@
 use std::io;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+
+use tracing::subscriber::NoSubscriber;
+use tracing::Dispatch;
 
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -18,7 +21,13 @@ impl io::Write for SharedBuffer {
     }
 }
 
+fn share_callsite_interest_across_threads() {
+    static IDLE_DISPATCH: LazyLock<Dispatch> = LazyLock::new(|| Dispatch::new(NoSubscriber::new()));
+    LazyLock::force(&IDLE_DISPATCH);
+}
+
 pub(crate) fn formatted_log(directives: &str, body: impl FnOnce()) -> String {
+    share_callsite_interest_across_threads();
     let buffer = SharedBuffer::default();
     let writer = buffer.clone();
     let subscriber = tracing_subscriber::fmt()

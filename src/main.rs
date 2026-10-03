@@ -8,8 +8,9 @@ use eclipse::apk::store::{
 };
 use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode};
 use eclipse::graphics::launch_window::{LaunchWindow, WindowClosed};
-use eclipse::runtime::NativeLibRoot;
+use eclipse::runtime::{ClientCacheDir, NativeLibRoot};
 use eclipse::status::{StatusSink, StatusUpdate};
+use eclipse::storage::Trim;
 
 mod browser_launch;
 mod desktop_integration;
@@ -79,7 +80,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    if matches!(command, Some("__webview-test")) {
+    if matches!(command, Some("__webview-test") | Some("__platform-test")) {
         if let Err(error) = eclipse::runtime::prepare_art_boot_environment() {
             report_setup_failure(&args, "eclipse ART startup", &error.to_string());
             return ExitCode::FAILURE;
@@ -203,6 +204,19 @@ fn main() -> ExitCode {
             }
             Err(e) => {
                 eprintln!("__webview-test: {e}");
+                ExitCode::FAILURE
+            }
+        },
+
+        Some("__platform-test") => match run_platform_test() {
+            Ok(report) => {
+                for line in report.to_string().lines() {
+                    println!("__platform-test: {line}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("__platform-test: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -1178,12 +1192,14 @@ impl Host<'_> {
 struct PreparedClient {
     apks: ApkSet,
     app_lib_dir: PathBuf,
+    client_cache: ClientCacheDir,
 }
 
 fn prepare_client(
     mut apks: ApkSet,
     status: &StatusSink,
 ) -> Result<PreparedClient, Box<dyn std::error::Error>> {
+    let client_cache = prepare_client_cache(status)?;
     let app_lib_dir = native_lib_dir(eclipse::runtime::native_lib_root()?, apks.version_code())?;
     status.step(format!(
         "Extracting native libs (lib/x86_64/) to {}…",
@@ -1210,7 +1226,30 @@ fn prepare_client(
     ));
     let asset_count = apks.base_mut().extract_assets(&assets_dir)?;
     println!("extracted {asset_count} asset file(s) ✓");
-    Ok(PreparedClient { apks, app_lib_dir })
+    Ok(PreparedClient {
+        apks,
+        app_lib_dir,
+        client_cache,
+    })
+}
+
+fn prepare_client_cache(status: &StatusSink) -> Result<ClientCacheDir, Box<dyn std::error::Error>> {
+    let client_cache = eclipse::runtime::client_cache_dir()?;
+    eclipse::storage::create_client_cache(client_cache.path())?;
+    match eclipse::storage::trim_client_cache(
+        client_cache.path(),
+        eclipse::storage::CLIENT_CACHE_CAP,
+        std::time::SystemTime::now(),
+    ) {
+        Ok(Trim::Done { freed_bytes }) if freed_bytes > 0 => tracing::info!(
+            freed_bytes,
+            cache = %client_cache.path().display(),
+            "trimmed Roblox's cache to three quarters of its cap"
+        ),
+        Ok(_) => {}
+        Err(error) => status.warning(format!("could not trim Roblox's cache: {error}")),
+    }
+    Ok(client_cache)
 }
 
 fn boot_and_play(
@@ -1219,7 +1258,11 @@ fn boot_and_play(
     host: &mut Host<'_>,
     config: &eclipse_config::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let PreparedClient { apks, app_lib_dir } = prepared;
+    let PreparedClient {
+        apks,
+        app_lib_dir,
+        client_cache,
+    } = prepared;
     let base_path = apks.base_path().to_path_buf();
     let apk_path = base_path
         .to_str()
@@ -1230,7 +1273,7 @@ fn boot_and_play(
     let manifest = apks.manifest().clone();
     eclipse::webview::client::use_helper_path(config.webview_helper_path.clone())?;
     eclipse::performance::configure_engine_cpu_affinity(config.graphics_optimization_mode);
-    let plan = eclipse::runtime::BootPlan::new(&manifest, config);
+    let plan = eclipse::runtime::BootPlan::new(&manifest, config, client_cache);
 
     println!("# ART boot plan for {apk_path}");
     println!("package:            {}", manifest.package);
@@ -1463,6 +1506,30 @@ fn pump_tick(vm: &eclipse::runtime::Vm, ms: u64) {
     std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
+fn run_platform_test(
+) -> Result<eclipse::framework::platform_probe::PlatformProbeReport, Box<dyn std::error::Error>> {
+    let paths = eclipse::apk::ApkSetPaths::from_env()?.ok_or_else(|| {
+        format!(
+            "no Roblox APK (set {} to an APK file or to a directory holding {} and {}) — \
+             __platform-test boots ART with the installed framework on the classpath",
+            eclipse::apk::DEV_APK_ENV,
+            eclipse::apk::BASE_APK,
+            eclipse::apk::NATIVE_SPLIT_APK
+        )
+    })?;
+    let apks = eclipse::apk::ApkSet::open(paths)?;
+    let loaded = eclipse_config::load();
+    report_config(&loaded, &StatusSink::terminal());
+    let plan = eclipse::runtime::BootPlan::new(
+        apks.manifest(),
+        &loaded.config,
+        eclipse::runtime::client_cache_dir()?,
+    );
+    let vm = eclipse::runtime::boot(&plan, Some(apks.base_path()), None)?;
+    eclipse::framework::register_engine_preload_natives(&vm)?;
+    Ok(eclipse::framework::platform_probe::run(&vm)?)
+}
+
 fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     use eclipse::framework;
     use eclipse::webview::client;
@@ -1510,7 +1577,11 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     let loaded = eclipse_config::load();
     report_config(&loaded, &StatusSink::terminal());
     client::use_helper_path(loaded.config.webview_helper_path.clone())?;
-    let plan = eclipse::runtime::BootPlan::new(apks.manifest(), &loaded.config);
+    let plan = eclipse::runtime::BootPlan::new(
+        apks.manifest(),
+        &loaded.config,
+        eclipse::runtime::client_cache_dir()?,
+    );
     let vm = eclipse::runtime::boot(&plan, Some(apks.base_path()), None)?;
 
     eclipse::framework::register_engine_preload_natives(&vm)?;

@@ -26,6 +26,7 @@ mod asset_configuration;
 pub mod asset_registry;
 pub mod bitmap_registry;
 pub mod canvas_registry;
+mod captures;
 pub mod dialogs;
 mod external_uri;
 #[cfg(test)]
@@ -35,6 +36,7 @@ pub(crate) mod memory;
 mod message_queue;
 pub mod paint_registry;
 pub mod path_registry;
+pub mod platform_probe;
 mod preloaded_library;
 pub(crate) mod roblox_fonts;
 mod signing_certificates;
@@ -13994,6 +13996,8 @@ fn drive_lifecycle(
     register_xml_block_natives(env)?;
 
     register_environment_natives(env)?;
+
+    captures::register_natives(env)?;
 
     register_system_clock_natives(env)?;
 

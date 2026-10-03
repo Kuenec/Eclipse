@@ -12,6 +12,7 @@ use eclipse_config::{Config, TouchMode};
 use crate::apk::Manifest;
 use crate::host_locale::HostLocale;
 use crate::host_time_zone::HostTimeZone;
+use crate::loader::aaudio::{low_latency_burst_frames, APP_SAMPLE_RATE};
 
 const DEFAULT_SDK_INT: u32 = 33;
 
@@ -48,6 +49,8 @@ const ART_BOOT_JARS: [&str; 10] = [
 ];
 
 const APP_DEX_COMPILER_FILTER: &str = "verify";
+
+const CLIENT_CACHE_SUBDIR: &str = "client-cache";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HostCpu {
@@ -148,11 +151,13 @@ pub struct BootPlan {
     pub(crate) host_locale: Option<HostLocale>,
 
     pub(crate) host_time_zone: Option<HostTimeZone>,
+
+    pub client_cache_dir: ClientCacheDir,
 }
 
 impl BootPlan {
     #[must_use]
-    pub fn new(manifest: &Manifest, config: &Config) -> Self {
+    pub fn new(manifest: &Manifest, config: &Config, client_cache_dir: ClientCacheDir) -> Self {
         Self {
             launcher_activity: manifest.launcher_activity.clone(),
             sdk_int: manifest.target_sdk.unwrap_or(DEFAULT_SDK_INT),
@@ -162,6 +167,7 @@ impl BootPlan {
             touch_mode: config.touch_mode,
             host_locale: HostLocale::from_env(|name| std::env::var_os(name)),
             host_time_zone: HostTimeZone::detect(),
+            client_cache_dir,
         }
     }
 
@@ -178,7 +184,7 @@ impl BootPlan {
 
     #[must_use]
     pub fn vm_options(&self) -> Vec<String> {
-        let mut opts = Vec::with_capacity(10);
+        let mut opts = Vec::with_capacity(15);
         opts.push(format!("-Xmx{}m", self.heap_mib));
         opts.push(format!("-XX:HeapGrowthLimit={}m", self.heap_mib));
         if self.disable_hspace_compact {
@@ -195,6 +201,18 @@ impl BootPlan {
         opts.push(format!("-DBuild.VERSION.SDK_INT={}", self.java_sdk_int()));
 
         opts.push(format!("-Declipse.touch_mode={}", self.touch_mode.as_str()));
+        opts.push(format!(
+            "-Declipse.audio.output_sample_rate={APP_SAMPLE_RATE}"
+        ));
+        opts.push(format!(
+            "-Declipse.audio.output_frames_per_buffer={}",
+            low_latency_burst_frames()
+        ));
+        opts.push(format!(
+            "-Declipse.client_cache_dir={}",
+            self.client_cache_dir.0
+        ));
+        opts.push(format!("-Djava.io.tmpdir={}", self.client_cache_dir.0));
         if let Some(locale) = &self.host_locale {
             opts.push(format!("-Duser.locale={}", locale.language_tag()));
         }
@@ -551,6 +569,30 @@ pub fn native_lib_root() -> Result<NativeLibRoot, RuntimeError> {
     }
     let dirs = ProjectDirs::from("", "", "eclipse").ok_or(RuntimeError::NoCacheDir)?;
     Ok(NativeLibRoot::Cache(dirs.cache_dir().join("native-libs")))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCacheDir(String);
+
+impl ClientCacheDir {
+    fn in_cache_root(cache_root: &Path) -> Result<Self, RuntimeError> {
+        cache_root
+            .join(CLIENT_CACHE_SUBDIR)
+            .into_os_string()
+            .into_string()
+            .map(Self)
+            .map_err(|dir| RuntimeError::ClientCacheDirNotUtf8(PathBuf::from(dir)))
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+pub fn client_cache_dir() -> Result<ClientCacheDir, RuntimeError> {
+    let dirs = ProjectDirs::from("", "", "eclipse").ok_or(RuntimeError::NoCacheDir)?;
+    ClientCacheDir::in_cache_root(dirs.cache_dir())
 }
 
 fn search_path(entries: &[&Path]) -> Result<OsString, RuntimeError> {
@@ -920,6 +962,8 @@ pub enum RuntimeError {
 
     NoCacheDir,
 
+    ClientCacheDirNotUtf8(PathBuf),
+
     LoadLibart(libloading::Error),
 
     ResolveSymbol(libloading::Error),
@@ -1014,8 +1058,14 @@ impl fmt::Display for RuntimeError {
                 )
             }
             Self::NoCacheDir => f.write_str(
-                "could not determine a cache directory for extracted native libs \
-                 (set ECLIPSE_NATIVE_LIB_DIR to override)",
+                "could not determine Eclipse's cache directory for extracted native libs and \
+                 Roblox's cache because no home directory is known (set HOME)",
+            ),
+            Self::ClientCacheDirNotUtf8(dir) => write!(
+                f,
+                "the Roblox cache directory {} is not valid UTF-8, so Android's Java file APIs \
+                 cannot open it (set XDG_CACHE_HOME to a UTF-8 path)",
+                dir.display()
             ),
             Self::LoadLibart(e) => write!(f, "failed to dlopen libart.so: {e}"),
             Self::ResolveSymbol(e) => write!(f, "failed to resolve JNI_CreateJavaVM: {e}"),
@@ -1081,6 +1131,10 @@ mod tests {
             target_sdk,
             large_heap: false,
         }
+    }
+
+    fn test_client_cache() -> ClientCacheDir {
+        ClientCacheDir::in_cache_root(Path::new("/home/u/.cache/eclipse")).unwrap()
     }
 
     const ALL_FEATURES: HostCpu = HostCpu {
@@ -1391,7 +1445,11 @@ mod tests {
 
     #[test]
     fn boot_plan_derives_fields_from_manifest_and_config() {
-        let plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        let plan = BootPlan::new(
+            &manifest_with(Some(35)),
+            &Config::default(),
+            test_client_cache(),
+        );
         assert_eq!(
             plan.launcher_activity,
             "com.roblox.client.startup.ActivitySplash"
@@ -1404,7 +1462,11 @@ mod tests {
 
     #[test]
     fn boot_plan_sdk_int_falls_back_when_manifest_omits_target() {
-        let plan = BootPlan::new(&manifest_with(None), &Config::default());
+        let plan = BootPlan::new(
+            &manifest_with(None),
+            &Config::default(),
+            test_client_cache(),
+        );
         assert_eq!(plan.sdk_int, DEFAULT_SDK_INT);
     }
 
@@ -1417,7 +1479,11 @@ mod tests {
 
     #[test]
     fn vm_options_set_the_heap_limits() {
-        let plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        let plan = BootPlan::new(
+            &manifest_with(Some(35)),
+            &Config::default(),
+            test_client_cache(),
+        );
         let vm = plan.vm_options();
         assert!(vm.contains(&"-Xmx768m".to_owned()), "{vm:?}");
         assert!(
@@ -1432,7 +1498,11 @@ mod tests {
 
     #[test]
     fn vm_options_forward_host_isa_features_to_the_compilers() {
-        let plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        let plan = BootPlan::new(
+            &manifest_with(Some(35)),
+            &Config::default(),
+            test_client_cache(),
+        );
         let vm = plan.vm_options();
         let features = format!(
             "--instruction-set-features={}",
@@ -1448,7 +1518,11 @@ mod tests {
 
     #[test]
     fn vm_options_select_the_verify_filter_for_app_dex_compiles() {
-        let plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        let plan = BootPlan::new(
+            &manifest_with(Some(35)),
+            &Config::default(),
+            test_client_cache(),
+        );
         assert!(
             compiler_options(&plan.vm_options()).contains(&"--compiler-filter=verify"),
             "{:?}",
@@ -1458,7 +1532,11 @@ mod tests {
 
     #[test]
     fn vm_options_propagate_clamped_sdk_int() {
-        let plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        let plan = BootPlan::new(
+            &manifest_with(Some(35)),
+            &Config::default(),
+            test_client_cache(),
+        );
         let vm = plan.vm_options();
         assert!(
             vm.contains(&"-DBuild.VERSION.SDK_INT=28".to_owned()),
@@ -1470,7 +1548,11 @@ mod tests {
             "must neither fall back to 23 nor exceed the androidx API-29 switch: {vm:?}"
         );
 
-        let low = BootPlan::new(&manifest_with(Some(21)), &Config::default());
+        let low = BootPlan::new(
+            &manifest_with(Some(21)),
+            &Config::default(),
+            test_client_cache(),
+        );
         assert!(
             low.vm_options()
                 .contains(&"-DBuild.VERSION.SDK_INT=21".to_owned()),
@@ -1482,7 +1564,11 @@ mod tests {
 
     #[test]
     fn vm_options_publish_the_host_locale_as_the_java_default_locale() {
-        let mut plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        let mut plan = BootPlan::new(
+            &manifest_with(Some(35)),
+            &Config::default(),
+            test_client_cache(),
+        );
         plan.host_locale = HostLocale::from_env(|name| {
             (name == "LANG").then(|| std::ffi::OsString::from("fr_FR.UTF-8"))
         });
@@ -1506,7 +1592,11 @@ mod tests {
 
     #[test]
     fn vm_options_publish_the_host_time_zone_as_the_java_default_time_zone() {
-        let mut plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        let mut plan = BootPlan::new(
+            &manifest_with(Some(35)),
+            &Config::default(),
+            test_client_cache(),
+        );
         let zoneinfo = crate::host_time_zone::tests::zoneinfo_with("vm-options", &["Europe/Paris"]);
         plan.host_time_zone = HostTimeZone::from_sources(
             &zoneinfo,
@@ -1554,14 +1644,69 @@ mod tests {
                 touch_mode,
                 ..Config::default()
             };
-            let options = BootPlan::new(&manifest_with(Some(35)), &config).vm_options();
+            let options =
+                BootPlan::new(&manifest_with(Some(35)), &config, test_client_cache()).vm_options();
             assert!(options.contains(&expected.to_owned()), "{options:?}");
         }
     }
 
     #[test]
+    fn vm_options_publish_the_aaudio_output_profile_to_the_framework() {
+        let options = BootPlan::new(
+            &manifest_with(Some(35)),
+            &Config::default(),
+            test_client_cache(),
+        )
+        .vm_options();
+        for expected in [
+            "-Declipse.audio.output_sample_rate=48000",
+            "-Declipse.audio.output_frames_per_buffer=512",
+        ] {
+            assert!(
+                options.contains(&expected.to_owned()),
+                "FMOD sizes its mixer from AudioManager, which must report the 48 kHz rate and \
+                 512-frame low-latency burst AAudio opens with: {options:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_plan_points_the_client_cache_at_the_eclipse_cache_dir() {
+        let expected = ProjectDirs::from("", "", "eclipse")
+            .unwrap()
+            .cache_dir()
+            .join("client-cache");
+        let client_cache = client_cache_dir().unwrap();
+        assert_eq!(client_cache.path(), expected);
+        assert!(expected.is_absolute(), "{}", expected.display());
+
+        let options =
+            BootPlan::new(&manifest_with(Some(35)), &Config::default(), client_cache).vm_options();
+        for option in [
+            format!("-Declipse.client_cache_dir={}", expected.display()),
+            format!("-Djava.io.tmpdir={}", expected.display()),
+        ] {
+            assert!(options.contains(&option), "{option} in {options:?}");
+        }
+    }
+
+    #[test]
+    fn a_client_cache_dir_java_cannot_name_is_refused() {
+        let root = PathBuf::from(OsString::from_vec(b"/home/u/.cache/\xffeclipse".to_vec()));
+        let refused = ClientCacheDir::in_cache_root(&root);
+        assert!(
+            matches!(&refused, Err(RuntimeError::ClientCacheDirNotUtf8(dir)) if *dir == root.join("client-cache")),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
     fn vm_options_omit_hspace_flag_when_disabled() {
-        let mut plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        let mut plan = BootPlan::new(
+            &manifest_with(Some(35)),
+            &Config::default(),
+            test_client_cache(),
+        );
         plan.disable_hspace_compact = false;
         let vm = plan.vm_options();
         assert!(

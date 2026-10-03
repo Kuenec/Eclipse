@@ -647,6 +647,234 @@ fn framework_overlay_answers_activity_permission_requests() {
 }
 
 #[test]
+fn framework_overlay_preserves_microphone_permission_contract() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "! grep -qF ':eclipse_grant_audio_permission' \"$pmsm\"",
+        "replace_upstream_method \"$pmsm\" \"$UPSTREAM_CHECK_PERMISSION_HEAD\" \"$AUDIO_PERMISSION_GRANT_HEAD\"",
+        "cp \"$pmsm\" \"$work/smali-view/android/content/pm/PackageManager.smali\"",
+        "-u ATL_UGLY_ENABLE_MICROPHONE",
+        "VoiceChatProbe)\"",
+        "[ \"$voice_chat_output\" = 'voice-chat-ok' ]",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost microphone permission fragment {needle:?}; voice chat would \
+             again be denied the microphone"
+        );
+    }
+    let upstream = generator
+        .lines()
+        .find(|line| line.starts_with("UPSTREAM_CHECK_PERMISSION_HEAD="))
+        .expect("the upstream checkPermission head");
+    assert!(
+        upstream.contains(
+            "checkPermission(Ljava/lang/String;Ljava/lang/String;)I\\n    .registers 7\\n"
+        ),
+        "the anchor must pin checkPermission's register count so the inserted v0 stays a local"
+    );
+    let patched = generator
+        .lines()
+        .find(|line| line.starts_with("AUDIO_PERMISSION_GRANT_HEAD="))
+        .expect("the patched checkPermission head");
+    let mut rest = patched;
+    for needle in [
+        ".method public checkPermission(Ljava/lang/String;Ljava/lang/String;)I",
+        "const-string v0, \"android.permission.RECORD_AUDIO\"",
+        "invoke-virtual {v0, p1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z",
+        "if-nez v0, :eclipse_grant_audio_permission",
+        "const-string v0, \"android.permission.MODIFY_AUDIO_SETTINGS\"",
+        "invoke-virtual {v0, p1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z",
+        "if-eqz v0, :eclipse_not_audio_permission",
+        ":eclipse_grant_audio_permission",
+        "const/4 v0, 0x0",
+        "return v0",
+        ":eclipse_not_audio_permission",
+        "const/4 v1, -0x1",
+    ] {
+        let (_, after) = rest.split_once(needle).unwrap_or_else(|| {
+            panic!(
+                "the patched checkPermission head lost {needle:?} or reordered it; only the two \
+                 audio permissions may be granted before ATL's own policy runs"
+            )
+        });
+        rest = after;
+    }
+
+    let probe = include_str!("../tools/framework-overlay/tests/VoiceChatProbe.java");
+    for needle in [
+        "\"android.permission.RECORD_AUDIO\"",
+        "\"android.permission.MODIFY_AUDIO_SETTINGS\"",
+        "\"android.permission.ACCESS_FINE_LOCATION\", PERMISSION_DENIED",
+        "System.out.println(\"voice-chat-ok\");",
+    ] {
+        assert!(
+            probe.contains(needle),
+            "VoiceChatProbe lost {needle:?}; the build would no longer prove the granted \
+             microphone or the kept ATL policy"
+        );
+    }
+}
+
+#[test]
+fn framework_overlay_lets_voice_chat_start() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "replace_upstream_method \"$audio_manager_sm\" \"$UPSTREAM_ABANDON_AUDIO_FOCUS\" \"$AUDIO_MANAGER_VOICE_METHODS\"",
+        "replace_upstream_method \"$audio_attributes_builder_sm\" \"$UPSTREAM_AUDIO_ATTRIBUTES_BUILDER_INIT\" \"$AUDIO_ATTRIBUTES_BUILDER_INITS\"",
+        "cp \"$audio_manager_sm\" \"$work/smali-view/android/media/AudioManager.smali\"",
+        "cp \"$audio_attributes_builder_sm\" \"$work/smali-view/android/media/\"",
+        "cp \"$audio_focus_request_sm\" \"$audio_focus_builder_sm\" \"$work/smali-view/android/media/\"",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost voice-call fragment {needle:?}; Roblox's voice audio manager \
+             would throw when voice chat starts"
+        );
+    }
+    for (variable, methods) in [
+        (
+            "AUDIO_MANAGER_VOICE_METHODS=",
+            &[
+                ".method public requestAudioFocus(Landroid/media/AudioFocusRequest;)I",
+                "const/4 v0, 0x1",
+                ".method public abandonAudioFocusRequest(Landroid/media/AudioFocusRequest;)I",
+                "const/4 v0, 0x1",
+                ".method public isBluetoothScoAvailableOffCall()Z",
+                "const/4 v0, 0x0",
+                ".method public isVolumeFixed()Z",
+                "const/4 v0, 0x0",
+            ][..],
+        ),
+        (
+            "AUDIO_ATTRIBUTES_BUILDER_INITS=",
+            &[
+                ".method public constructor <init>()V",
+                "invoke-direct {p0, v0}, Landroid/media/AudioAttributes$Builder;-><init>(Landroid/media/AudioAttributes;)V",
+                ".method public constructor <init>(Landroid/media/AudioAttributes;)V",
+            ][..],
+        ),
+    ] {
+        let mut rest = generator
+            .lines()
+            .find(|line| line.starts_with(variable))
+            .unwrap_or_else(|| panic!("patch-framework.sh lost {variable}"));
+        for needle in methods {
+            let (_, after) = rest.split_once(needle).unwrap_or_else(|| {
+                panic!("{variable} lost {needle:?} or reordered it")
+            });
+            rest = after;
+        }
+    }
+
+    let builder = include_str!(
+        "../tools/framework-overlay/smali/android/media/AudioFocusRequest$Builder.smali"
+    );
+    for needle in [
+        ".method public constructor <init>(I)V",
+        ".method public setAudioAttributes(Landroid/media/AudioAttributes;)Landroid/media/AudioFocusRequest$Builder;",
+        ".method public setAcceptsDelayedFocusGain(Z)Landroid/media/AudioFocusRequest$Builder;",
+        ".method public setWillPauseWhenDucked(Z)Landroid/media/AudioFocusRequest$Builder;",
+        ".method public setOnAudioFocusChangeListener(Landroid/media/AudioManager$OnAudioFocusChangeListener;)Landroid/media/AudioFocusRequest$Builder;",
+        ".method public build()Landroid/media/AudioFocusRequest;",
+    ] {
+        assert!(
+            builder.contains(needle),
+            "AudioFocusRequest.Builder lost {needle:?}, which Roblox's voice audio manager calls"
+        );
+    }
+    let probe = include_str!("../tools/framework-overlay/tests/VoiceChatProbe.java");
+    for needle in [
+        "\"android.media.AudioAttributes$Builder\"",
+        "\"android.media.AudioFocusRequest$Builder\"",
+        "\"requestAudioFocus\"",
+        "\"abandonAudioFocusRequest\"",
+        "\"isBluetoothScoAvailableOffCall\"",
+        "\"isVolumeFixed\"",
+    ] {
+        assert!(
+            probe.contains(needle),
+            "VoiceChatProbe lost {needle:?}; the build would no longer prove that voice chat can \
+             start"
+        );
+    }
+}
+
+#[test]
+fn framework_overlay_reads_audio_properties_from_the_runtime() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "replace_upstream_method \"$audio_manager_sm\" \"$UPSTREAM_AUDIO_OUTPUT_PROPERTIES\" \"$AUDIO_OUTPUT_PROPERTIES\"",
+        "-Declipse.audio.output_sample_rate=48000",
+        "-Declipse.audio.output_frames_per_buffer=512",
+        "AudioPropertiesProbe)\"",
+        "[ \"$audio_properties_output\" = 'audio-properties-ok' ]",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost audio-property fragment {needle:?}; FMOD would again size its \
+             mixer from ATL's arbitrary 44100 Hz and 256 frames"
+        );
+    }
+    for (variable, ordered) in [
+        (
+            "UPSTREAM_AUDIO_OUTPUT_PROPERTIES=",
+            &["const-string v0, \"256\"", "const-string v0, \"44100\""][..],
+        ),
+        (
+            "AUDIO_OUTPUT_PROPERTIES=",
+            &[
+                "const-string v0, \"eclipse.audio.output_frames_per_buffer\"",
+                "invoke-static {v0}, Ljava/lang/System;->getProperty(Ljava/lang/String;)Ljava/lang/String;",
+                "const-string v0, \"eclipse.audio.output_sample_rate\"",
+                "invoke-static {v0}, Ljava/lang/System;->getProperty(Ljava/lang/String;)Ljava/lang/String;",
+            ][..],
+        ),
+    ] {
+        let mut rest = generator
+            .lines()
+            .find(|line| line.starts_with(variable))
+            .unwrap_or_else(|| panic!("patch-framework.sh lost {variable}"));
+        for needle in ordered {
+            let (_, after) = rest.split_once(needle).unwrap_or_else(|| {
+                panic!(
+                    "{variable} lost {needle:?} or reordered it; the frames case must read the \
+                     frames property and the rate case the rate property"
+                )
+            });
+            rest = after;
+        }
+    }
+    let patched = generator
+        .lines()
+        .find(|line| line.starts_with("AUDIO_OUTPUT_PROPERTIES="))
+        .expect("the patched getProperty cases");
+    for literal in ["\"256\"", "\"44100\""] {
+        assert!(
+            !patched.contains(literal),
+            "the patched getProperty cases must not fall back to ATL's literal {literal}"
+        );
+    }
+
+    let mut probe = include_str!("../tools/framework-overlay/tests/AudioPropertiesProbe.java");
+    for needle in [
+        "\"android.media.property.OUTPUT_SAMPLE_RATE\"",
+        "\"48000\"",
+        "\"android.media.property.OUTPUT_FRAMES_PER_BUFFER\"",
+        "\"512\"",
+        "System.out.println(\"audio-properties-ok\");",
+    ] {
+        let (_, after) = probe.split_once(needle).unwrap_or_else(|| {
+            panic!(
+                "AudioPropertiesProbe lost {needle:?} or reordered it; the build would no longer \
+                 prove what FMOD reads"
+            )
+        });
+        probe = after;
+    }
+}
+
+#[test]
 fn framework_overlay_ships_tzdata_and_the_host_default_time_zone() {
     let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
     for needle in [
@@ -670,6 +898,190 @@ fn framework_overlay_ships_tzdata_and_the_host_default_time_zone() {
     assert!(
         getter.contains("const-string v0, \"user.timezone\""),
         "the libcore TimezoneGetter must answer with the user.timezone Eclipse publishes"
+    );
+}
+
+#[test]
+fn framework_overlay_saves_captures_through_the_pictures_native() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "! grep -qF 'native_get_pictures_dir' \"$envsm\"",
+        "replace_upstream_method \"$envsm\" \"$UPSTREAM_ENVIRONMENT_NATIVE\" \"$ENVIRONMENT_NATIVES\"",
+        ".method private static native native_get_pictures_dir()Ljava/lang/String;",
+        "replace_upstream_method \"$envsm\" \"$UPSTREAM_PUBLIC_DIRECTORY\" \"$ENVIRONMENT_PUBLIC_DIRECTORY\"",
+        "cp \"$envsm\" \"$work/smali-view/android/os/Environment.smali\"",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost Environment capture fragment {needle:?}; Roblox captures \
+             would again fail in a missing app-data Pictures folder"
+        );
+    }
+    let patched = generator
+        .lines()
+        .find(|line| line.starts_with("ENVIRONMENT_PUBLIC_DIRECTORY="))
+        .expect("the patched getExternalStoragePublicDirectory body");
+    let mut rest = patched;
+    for needle in [
+        "Landroid/os/Environment;->DIRECTORY_PICTURES:Ljava/lang/String;",
+        "Ljava/lang/String;->equals(Ljava/lang/Object;)Z",
+        "if-eqz v0, :eclipse_not_pictures",
+        "Landroid/os/Environment;->native_get_pictures_dir()Ljava/lang/String;",
+        "return-object v0",
+        ":eclipse_not_pictures",
+        "Landroid/os/Environment;->throwIfUserRequired()V",
+        "buildExternalStoragePublicDirs(Ljava/lang/String;)[Ljava/io/File;",
+    ] {
+        let (_, after) = rest.split_once(needle).unwrap_or_else(|| {
+            panic!(
+                "the patched body lost {needle:?} or reordered it; only Pictures may go to the \
+                 native, and every other type keeps the stock app-data path"
+            )
+        });
+        rest = after;
+    }
+}
+
+#[test]
+fn framework_overlay_reads_the_client_cache_dir_from_the_runtime() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "replace_upstream_method \"$ctxsm\" \"$UPSTREAM_CACHE_DIR\" \"$CLIENT_CACHE_DIR\"",
+        "! grep -qF '/tmp/atl_cache' \"$ctxsm\"",
+        "cp \"$ctxsm\" \"$work/smali-view/android/content/Context.smali\"",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost Context cache fragment {needle:?}; Roblox's cache would \
+             return to /tmp/atl_cache"
+        );
+    }
+    let line = |variable: &str| {
+        generator
+            .lines()
+            .find(|line| line.starts_with(variable))
+            .unwrap_or_else(|| panic!("patch-framework.sh lost {variable}"))
+    };
+    assert!(
+        line("UPSTREAM_CACHE_DIR=").contains("const-string v2, \"/tmp/atl_cache/\""),
+        "the anchor must be ATL's /tmp/atl_cache location"
+    );
+    let patched = line("CLIENT_CACHE_DIR=");
+    assert!(!patched.contains("/tmp"), "{patched}");
+    let mut rest = patched;
+    for needle in [
+        "const-string v0, \"eclipse.client_cache_dir\"",
+        "Ljava/lang/System;->getProperty(Ljava/lang/String;)Ljava/lang/String;",
+        "if-nez v1, :eclipse_client_cache_dir_set",
+        "new-instance v0, Ljava/lang/IllegalStateException;",
+        "throw v0",
+        ":eclipse_client_cache_dir_set",
+        "invoke-direct {v0, v1}, Ljava/io/File;-><init>(Ljava/lang/String;)V",
+        "iput-object v0, p0, Landroid/content/Context;->cache_dir:Ljava/io/File;",
+    ] {
+        let (_, after) = rest.split_once(needle).unwrap_or_else(|| {
+            panic!(
+                "the patched getCacheDir lost {needle:?} or reordered it; the cache must come \
+                 from the property Eclipse sets, and a missing property must fail loudly"
+            )
+        });
+        rest = after;
+    }
+}
+
+struct PlatformTestRoot(PathBuf);
+
+impl PlatformTestRoot {
+    fn create() -> Self {
+        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("platform-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&path).ok();
+        std::fs::create_dir_all(path.join("config")).expect("create the config dir");
+        std::fs::create_dir_all(path.join("Pictures")).expect("create the Pictures dir");
+        Self(path)
+    }
+}
+
+impl Drop for PlatformTestRoot {
+    fn drop(&mut self) {
+        let removed = std::fs::remove_dir_all(&self.0);
+        if !std::thread::panicking() {
+            removed.expect("remove the platform test dir");
+        }
+    }
+}
+
+#[test]
+fn platform_test_saves_captures_in_the_user_pictures_folder() {
+    use eclipse::framework::platform_probe::{CAPTURE_PROBE_BYTES, CAPTURE_PROBE_FILE};
+
+    if !roblox_apk_present() {
+        eprintln!(
+            "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK to an APK file or to a directory \
+             holding base.apk and split_config.x86_64.apk)"
+        );
+        return;
+    }
+    if !android_runtime_present() {
+        eprintln!(
+            "SKIP: Android runtime absent (ART, its boot image or the patched framework; set \
+             ECLIPSE_LIBART and ECLIPSE_ANDROID_FRAMEWORK_DIR)"
+        );
+        return;
+    }
+
+    let root = PlatformTestRoot::create();
+    let pictures = root.0.join("Pictures");
+    let app_data = root.0.join("app-data");
+    std::fs::write(
+        root.0.join("config/user-dirs.dirs"),
+        format!("XDG_PICTURES_DIR=\"{}\"\n", pictures.display()),
+    )
+    .expect("write user-dirs.dirs");
+    let out = bounded_child::output(
+        Command::new(env!("CARGO_BIN_EXE_eclipse"))
+            .arg("__platform-test")
+            .env("XDG_CONFIG_HOME", root.0.join("config"))
+            .env("ECLIPSE_APP_DATA_DIR", &app_data),
+        ENGINE_LIMIT,
+    );
+    let text = combined(&out);
+
+    assert!(
+        out.status.success(),
+        "__platform-test exited non-zero ({:?}); platform-service regression.\n{text}",
+        out.status.code()
+    );
+    let roblox = pictures.join("Roblox");
+    for line in [
+        format!("__platform-test: Pictures directory: {}", roblox.display()),
+        format!(
+            "__platform-test: Movies directory: {}",
+            app_data.join("Movies").display()
+        ),
+        format!(
+            "__platform-test: Temporary directory: {}",
+            eclipse::runtime::client_cache_dir()
+                .expect("resolve the client cache dir")
+                .path()
+                .display()
+        ),
+    ] {
+        assert!(
+            text.lines().any(|output| output == line),
+            "missing {line:?}.\n{text}"
+        );
+    }
+    let capture = std::fs::read(roblox.join(CAPTURE_PROBE_FILE)).unwrap_or_else(|error| {
+        panic!(
+            "the probe capture is not in {}: {error}\n{text}",
+            roblox.display()
+        )
+    });
+    assert_eq!(capture, CAPTURE_PROBE_BYTES, "{text}");
+    assert!(
+        !app_data.join("Pictures").exists(),
+        "captures must not fall back to app data when the Pictures folder exists.\n{text}"
     );
 }
 
