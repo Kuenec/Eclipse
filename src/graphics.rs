@@ -13,7 +13,7 @@ use winit::platform::startup_notify::WindowAttributesExtStartupNotify as _;
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{ActivationToken, CursorGrabMode, Fullscreen, Window, WindowId};
 
-use crate::web_view_parent::{WebViewParent, WebViewPlacement};
+use crate::web_view_parent::WebViewParent;
 
 mod dialog_window;
 pub mod launch_window;
@@ -742,7 +742,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
         self.sync_web_view_window();
         let web_view_hidden = self.web_view_window == WebViewWindow::Hidden;
         if crate::webview::client::take_activation_request()
-            && self.web_view_placement() == WebViewPlacement::OwnWindow
+            && !crate::webview::client::pages_embedded()
         {
             self.request_web_view_activation();
         }
@@ -899,11 +899,12 @@ enum HostInputRoute {
 }
 
 impl WebViewWindow {
-    fn current(placement: WebViewPlacement) -> Self {
-        match (crate::webview::client::view_window_visible(), placement) {
+    fn current() -> Self {
+        use crate::webview::client;
+        match (client::view_window_visible(), client::pages_embedded()) {
             (false, _) => Self::Hidden,
-            (true, WebViewPlacement::OwnWindow) => Self::Shown,
-            (true, WebViewPlacement::GameWindow) => Self::Embedded,
+            (true, false) => Self::Shown,
+            (true, true) => Self::Embedded,
         }
     }
 
@@ -1299,14 +1300,8 @@ impl GameWindow<'_> {
         }
     }
 
-    fn web_view_placement(&self) -> WebViewPlacement {
-        self.web_view_parent
-            .as_ref()
-            .map_or(WebViewPlacement::OwnWindow, WebViewParent::placement)
-    }
-
     fn sync_web_view_window(&mut self) {
-        let current = WebViewWindow::current(self.web_view_placement());
+        let current = WebViewWindow::current();
         match (self.web_view_window, current) {
             (WebViewWindow::Hidden, WebViewWindow::Shown) => {
                 tracing::info!("WebView window shown; game input is withheld until it closes");

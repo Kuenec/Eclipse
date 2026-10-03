@@ -16,18 +16,15 @@ use crate::webview::client;
 use crate::webview::embed::Embedder;
 use crate::webview::proto::{ParentSize, ParentWindow, SizeUnit};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WebViewPlacement {
-    OwnWindow,
-    GameWindow,
-}
-
 pub(crate) struct WebViewParent {
     placement: Placement,
 }
 
 enum Placement {
-    Embedded(Embedder),
+    Embedded {
+        embedder: Embedder,
+        _export: Option<ExportedToplevel>,
+    },
     Dialog {
         _export: Option<ExportedToplevel>,
         unit: SizeUnit,
@@ -40,20 +37,9 @@ impl WebViewParent {
         window: RawWindowHandle,
     ) -> Self {
         let placement = match game_surface(display, window) {
-            GameSurface::Wayland { display, surface } => {
-                let embedded =
-                    unsafe { Embedder::for_surface_whose_display_outlives_it(display, surface) };
-                match embedded {
-                    Ok((embedder, connector)) => {
-                        tracing::info!(
-                            "WebView pages open inside the game window as a Wayland subsurface"
-                        );
-                        client::embed_in(connector);
-                        Placement::Embedded(embedder)
-                    }
-                    Err(embed_error) => unsafe { dialog_placement(display, surface, &embed_error) },
-                }
-            }
+            GameSurface::Wayland { display, surface } => unsafe {
+                wayland_placement(display, surface)
+            },
             GameSurface::X11 { window } => {
                 tracing::info!(
                     "WebView pages open as dialog windows of the game window: embedding them \
@@ -79,38 +65,57 @@ impl WebViewParent {
         Self { placement }
     }
 
-    pub(crate) fn placement(&self) -> WebViewPlacement {
-        match self.placement {
-            Placement::Embedded(_) => WebViewPlacement::GameWindow,
-            Placement::Dialog { .. } => WebViewPlacement::OwnWindow,
-        }
-    }
-
     pub(crate) fn resized(&self, window: &Window) {
-        match &self.placement {
-            Placement::Embedded(embedder) => {
+        let unit = match &self.placement {
+            Placement::Embedded { embedder, .. } => {
                 if let Some((width, height)) =
                     embedded_size(window.inner_size(), window.scale_factor())
                 {
                     embedder.resize(width, height);
                 }
+                SizeUnit::Logical
             }
-            Placement::Dialog { unit, .. } => {
-                if let Some(size) = parent_size(*unit, window.outer_size(), window.scale_factor()) {
-                    client::parent_resized(size);
-                }
-            }
+            Placement::Dialog { unit, .. } => *unit,
+        };
+        if let Some(size) = parent_size(unit, window.outer_size(), window.scale_factor()) {
+            client::parent_resized(size);
         }
     }
 }
 
-unsafe fn dialog_placement(
-    display: NonNull<c_void>,
-    surface: NonNull<c_void>,
-    embed_error: &crate::webview::embed::StartError,
-) -> Placement {
+unsafe fn wayland_placement(display: NonNull<c_void>, surface: NonNull<c_void>) -> Placement {
     let exported =
         unsafe { ExportedToplevel::for_surface_whose_display_outlives_it(display, surface) };
+    let embedded = unsafe { Embedder::for_surface_whose_display_outlives_it(display, surface) };
+    let (embedder, connector) = match embedded {
+        Ok(embedding) => embedding,
+        Err(embed_error) => return dialog_placement(exported, &embed_error),
+    };
+    tracing::info!("WebView pages open inside the game window as a Wayland subsurface");
+    let export = exported
+        .inspect_err(|error| {
+            tracing::info!(
+                %error,
+                "a WebView helper that cannot use the game window opens normal windows"
+            )
+        })
+        .ok();
+    client::embed_in(
+        connector,
+        export.as_ref().map(|export| ParentWindow::Wayland {
+            handle: export.handle.clone(),
+        }),
+    );
+    Placement::Embedded {
+        embedder,
+        _export: export,
+    }
+}
+
+fn dialog_placement(
+    exported: Result<ExportedToplevel, ExportError>,
+    embed_error: &crate::webview::embed::StartError,
+) -> Placement {
     let export = match exported {
         Ok(export) => {
             tracing::info!(

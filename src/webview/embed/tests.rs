@@ -10,18 +10,27 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use wayland_client::backend::protocol::{Argument, Interface, Message};
-use wayland_client::backend::{Backend, ObjectData, ObjectId};
+use wayland_client::backend::{Backend, ObjectData, ObjectId, ReadEventsGuard};
 use wayland_client::protocol::{
-    wl_callback, wl_compositor, wl_compositor::WlCompositor,
-    wl_data_device_manager::WlDataDeviceManager, wl_display, wl_display::WlDisplay, wl_keyboard,
-    wl_output, wl_output::WlOutput, wl_pointer, wl_region, wl_registry, wl_seat, wl_seat::WlSeat,
-    wl_shm, wl_shm::WlShm, wl_shm_pool, wl_subcompositor, wl_subcompositor::WlSubcompositor,
-    wl_subsurface, wl_surface,
+    wl_callback, wl_compositor, wl_compositor::WlCompositor, wl_data_device,
+    wl_data_device_manager, wl_data_device_manager::WlDataDeviceManager, wl_data_offer, wl_display,
+    wl_display::WlDisplay, wl_keyboard, wl_output, wl_output::WlOutput, wl_pointer, wl_region,
+    wl_registry, wl_seat, wl_seat::WlSeat, wl_shm, wl_shm::WlShm, wl_shm_pool, wl_subcompositor,
+    wl_subcompositor::WlSubcompositor, wl_subsurface, wl_surface,
 };
 use wayland_client::Proxy as _;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+    zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
     zwp_linux_dmabuf_v1, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+};
+use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
+    wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
+    wp_linux_drm_syncobj_surface_v1, wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
+    wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1,
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport, wp_viewport::WpViewport, wp_viewporter, wp_viewporter::WpViewporter,
 };
 use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base, xdg_wm_base::XdgWmBase,
@@ -106,6 +115,8 @@ fn named(name: &str) -> Option<&'static Interface> {
         WlSeat::interface(),
         WlOutput::interface(),
         ZwpLinuxDmabufV1::interface(),
+        WpLinuxDrmSyncobjManagerV1::interface(),
+        WpViewporter::interface(),
     ]
     .into_iter()
     .find(|interface| interface.name == name)
@@ -117,7 +128,7 @@ fn wait_readable(fd: std::os::fd::BorrowedFd<'_>, timeout: Duration) {
     let _ = poll(&mut fds, Some(&timeout));
 }
 
-const GLOBALS: [(u32, &str, u32); 10] = [
+const GLOBALS: [(u32, &str, u32); 12] = [
     (1, "wl_compositor", 6),
     (2, "wl_subcompositor", 1),
     (3, "wl_shm", 2),
@@ -128,11 +139,17 @@ const GLOBALS: [(u32, &str, u32); 10] = [
     (8, "zxdg_exporter_v2", 1),
     (9, "wl_output", 4),
     (10, "zwp_linux_dmabuf_v1", 4),
+    (11, "wp_linux_drm_syncobj_manager_v1", 1),
+    (12, "wp_viewporter", 1),
 ];
 
 const IMPORTABLE_DMABUF: u32 = u32::from_le_bytes(*b"AR24");
 
 const UNIMPORTABLE_DMABUF: u32 = u32::from_le_bytes(*b"XR24");
+
+const OFFERED_DMABUFS: [(u32, u64); 2] = [(IMPORTABLE_DMABUF, 0), (UNIMPORTABLE_DMABUF, 0)];
+
+const DMABUF_FILE_SIZE: u64 = 64 * 64 * 4;
 
 const FIRST_SERVER_ID: u32 = 0xff00_0000;
 
@@ -245,7 +262,17 @@ fn serve_compositor(
     loop {
         loop {
             match inbox.try_recv() {
-                Ok((object, opcode, args)) => wire.push(object, opcode, args).expect("event"),
+                Ok((object, opcode, args)) => {
+                    if let (Some(id), Some((interface, version))) =
+                        (new_id(&args), objects.get(&object).copied())
+                    {
+                        let created = interface.events[usize::from(opcode)].child_interface;
+                        if let Some(child) = created {
+                            objects.insert(id, (child, version));
+                        }
+                    }
+                    wire.push(object, opcode, args).expect("event");
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return,
             }
@@ -301,6 +328,11 @@ fn serve_compositor(
                             zwp_linux_buffer_params_v1::EVT_FAILED_OPCODE,
                             Vec::new(),
                         );
+                    }
+                }
+                ("zwp_linux_dmabuf_v1", "get_default_feedback", [Argument::NewId(feedback)]) => {
+                    for (opcode, args) in offered_formats() {
+                        let _ = wire.push(*feedback, opcode, args);
                     }
                 }
                 ("wl_display", "sync", [Argument::NewId(callback)]) => {
@@ -371,6 +403,8 @@ fn serve_compositor(
                 .is_some_and(|request| request.is_destructor);
             if destructor {
                 objects.remove(&seen.object);
+            }
+            if destructor && seen.object < FIRST_SERVER_ID {
                 let _ = wire.push(
                     1,
                     wl_display::EVT_DELETE_ID_OPCODE,
@@ -382,6 +416,42 @@ fn serve_compositor(
             }
         }
     }
+}
+
+fn offered_formats() -> [(u16, Args); 4] {
+    let table: Vec<u8> = OFFERED_DMABUFS
+        .iter()
+        .flat_map(|(format, modifier)| {
+            format
+                .to_ne_bytes()
+                .into_iter()
+                .chain([0; 4])
+                .chain(modifier.to_ne_bytes())
+        })
+        .collect();
+    let file = shm_file(table.len() as u64);
+    rustix::io::pwrite(&file, &table, 0).expect("fill the format table");
+    let indices: Vec<u8> = (0..OFFERED_DMABUFS.len() as u16)
+        .flat_map(u16::to_ne_bytes)
+        .collect();
+    [
+        (
+            zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE_OPCODE,
+            vec![
+                Argument::Fd(file),
+                Argument::Uint(u32::try_from(table.len()).expect("table size")),
+            ],
+        ),
+        (
+            zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS_OPCODE,
+            vec![Argument::Array(Box::new(indices))],
+        ),
+        (
+            zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_DONE_OPCODE,
+            Vec::new(),
+        ),
+        (zwp_linux_dmabuf_feedback_v1::EVT_DONE_OPCODE, Vec::new()),
+    ]
 }
 
 struct Ignore;
@@ -402,10 +472,10 @@ impl ObjectData for Ignore {
     fn destroyed(&self, _: ObjectId) {}
 }
 
-struct Game {
+pub(crate) struct Game {
     compositor: Compositor,
-    embedder: Option<Embedder>,
-    connector: Connector,
+    pub(crate) embedder: Option<Embedder>,
+    pub(crate) connector: Connector,
     surface: ObjectId,
     registry: ObjectId,
     backend: Backend,
@@ -449,7 +519,7 @@ fn game_bind(
 }
 
 impl Game {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let (client, server) = UnixStream::pair().expect("socketpair");
         let mut compositor = Compositor::start(server);
         let backend = Backend::connect(client).expect("libwayland-client");
@@ -553,6 +623,18 @@ impl Helper {
         self.wire.flush().expect("send a request");
     }
 
+    fn request_unless_cut_off(&mut self, object: u32, opcode: u16, args: Args) {
+        if self.wire.push(object, opcode, args).is_ok() {
+            let _ = self.wire.flush();
+        }
+    }
+
+    fn cut_off_with_an_error(&mut self) -> bool {
+        self.disconnected()
+            .iter()
+            .any(|event| event.message == "error")
+    }
+
     fn pump(&mut self, timeout: Duration) -> Result<(), WireError> {
         wait_readable(self.wire.fd(), timeout);
         let received = self.wire.receive();
@@ -592,6 +674,11 @@ impl Helper {
             match self.pump(QUIET) {
                 Ok(()) => {}
                 Err(WireError::Closed) => return self.backlog.drain(..).collect(),
+                Err(WireError::Io(error))
+                    if error.kind() == std::io::ErrorKind::ConnectionReset =>
+                {
+                    return self.backlog.drain(..).collect()
+                }
                 Err(error) => panic!("the helper socket failed: {error}"),
             }
         }
@@ -764,7 +851,9 @@ fn the_helper_sees_only_allowed_globals_and_a_hidden_bind_cuts_it_off_alone() {
             "xdg_wm_base",
             "wl_seat",
             "wl_output",
-            "zwp_linux_dmabuf_v1"
+            "zwp_linux_dmabuf_v1",
+            "wp_linux_drm_syncobj_manager_v1",
+            "wp_viewporter"
         ],
         "xdg-activation and xdg-foreign stay hidden"
     );
@@ -1376,27 +1465,13 @@ fn a_buffer_stride_is_checked_with_its_formats_own_pixel_size() {
     );
 }
 
-#[test]
-fn a_compositor_that_stops_reading_stops_the_proxy_reading_the_helper() {
+const FLOOD_LIMIT: usize = 8 * 1024 * 1024;
+
+fn damage_until_unread(helper: &mut Helper, surface: u32) -> usize {
     const DAMAGE_SIZE: usize = 24;
     const BATCH: usize = 1024;
-    const OFFERED: usize = 8 * 1024 * 1024;
-    let mut game = Game::start();
-    let mut helper = game.helper();
-    let (registry, _) = helper.registry();
-    let compositor = helper.bind(registry, 1, WlCompositor::interface(), 6);
-    let surface = helper.create(wl_surface::WlSurface::interface(), 6);
-    helper.request(
-        compositor,
-        wl_compositor::REQ_CREATE_SURFACE_OPCODE,
-        vec![Argument::NewId(surface)],
-    );
-    game.compositor
-        .created("wl_compositor", "create_surface", 1);
-
-    game.compositor.stall(true);
     let mut sent = 0;
-    while sent < OFFERED {
+    while sent < FLOOD_LIMIT {
         for _ in 0..BATCH {
             helper
                 .wire
@@ -1425,33 +1500,90 @@ fn a_compositor_that_stops_reading_stops_the_proxy_reading_the_helper() {
         }
         sent += BATCH * DAMAGE_SIZE;
     }
+    sent
+}
+
+#[test]
+fn a_compositor_that_stops_reading_stops_the_proxy_reading_the_helper() {
+    let mut game = Game::start();
+    let mut helper = game.helper();
+    let (registry, _) = helper.registry();
+    let compositor = helper.bind(registry, 1, WlCompositor::interface(), 6);
+    let surface = new_surface(&mut helper, compositor);
+    game.compositor
+        .created("wl_compositor", "create_surface", 1);
+
+    game.compositor.stall(true);
+    let sent = damage_until_unread(&mut helper, surface);
     game.compositor.stall(false);
     assert!(
-        sent < OFFERED / 4,
+        sent < FLOOD_LIMIT / 4,
         "the helper pushed {sent} bytes into the game's unbounded libwayland buffer while the \
          compositor read nothing"
     );
 }
 
-fn import_immediately(helper: &mut Helper, dmabuf: u32, surface: u32, format: u32) -> (u32, u32) {
+fn dmabuf_with_formats(helper: &mut Helper, registry: u32) -> u32 {
+    let dmabuf = helper.bind(registry, 10, ZwpLinuxDmabufV1::interface(), 4);
+    let feedback = helper.create(ZwpLinuxDmabufFeedbackV1::interface(), 4);
+    helper.request(
+        dmabuf,
+        zwp_linux_dmabuf_v1::REQ_GET_DEFAULT_FEEDBACK_OPCODE,
+        vec![Argument::NewId(feedback)],
+    );
+    helper.wait_for("the offered formats", |event| {
+        event.object == feedback && event.message == "done"
+    });
+    dmabuf
+}
+
+fn new_params(helper: &mut Helper, dmabuf: u32) -> u32 {
     let params = helper.create(ZwpLinuxBufferParamsV1::interface(), 4);
     helper.request(
         dmabuf,
         zwp_linux_dmabuf_v1::REQ_CREATE_PARAMS_OPCODE,
         vec![Argument::NewId(params)],
     );
+    params
+}
+
+fn add_plane(
+    helper: &mut Helper,
+    params: u32,
+    plane: u32,
+    (offset, stride): (u32, u32),
+    modifier: u64,
+) {
     helper.request(
         params,
         zwp_linux_buffer_params_v1::REQ_ADD_OPCODE,
         vec![
-            Argument::Fd(shm_file(64 * 64 * 4)),
-            Argument::Uint(0),
-            Argument::Uint(0),
-            Argument::Uint(64 * 4),
-            Argument::Uint(0),
-            Argument::Uint(0),
+            Argument::Fd(shm_file(DMABUF_FILE_SIZE)),
+            Argument::Uint(plane),
+            Argument::Uint(offset),
+            Argument::Uint(stride),
+            Argument::Uint((modifier >> 32) as u32),
+            Argument::Uint(modifier as u32),
         ],
     );
+}
+
+fn create_dmabuf(helper: &mut Helper, params: u32, (width, height): (i32, i32), flags: u32) {
+    helper.request(
+        params,
+        zwp_linux_buffer_params_v1::REQ_CREATE_OPCODE,
+        vec![
+            Argument::Int(width),
+            Argument::Int(height),
+            Argument::Uint(IMPORTABLE_DMABUF),
+            Argument::Uint(flags),
+        ],
+    );
+}
+
+fn immediate_dmabuf(helper: &mut Helper, dmabuf: u32, (format, modifier): (u32, u64)) -> u32 {
+    let params = new_params(helper, dmabuf);
+    add_plane(helper, params, 0, (0, 64 * 4), modifier);
     let buffer = helper.create(
         wayland_client::protocol::wl_buffer::WlBuffer::interface(),
         4,
@@ -1467,35 +1599,40 @@ fn import_immediately(helper: &mut Helper, dmabuf: u32, surface: u32, format: u3
             Argument::Uint(0),
         ],
     );
-    helper.request(
+    helper.request_unless_cut_off(
         params,
         zwp_linux_buffer_params_v1::REQ_DESTROY_OPCODE,
         Vec::new(),
     );
-    helper.request(
+    buffer
+}
+
+fn show(helper: &mut Helper, surface: u32, buffer: u32) {
+    helper.request_unless_cut_off(
         surface,
         wl_surface::REQ_ATTACH_OPCODE,
         vec![Argument::Object(buffer), Argument::Int(0), Argument::Int(0)],
     );
-    helper.request(surface, wl_surface::REQ_COMMIT_OPCODE, Vec::new());
-    (params, buffer)
+    helper.request_unless_cut_off(surface, wl_surface::REQ_COMMIT_OPCODE, Vec::new());
+}
+
+fn count(log: &[Seen], interface: &str, message: &str) -> usize {
+    log.iter()
+        .filter(|seen| seen.interface == interface && seen.message == message)
+        .count()
 }
 
 #[test]
-fn an_immediate_dmabuf_import_waits_for_the_compositor_and_a_failed_one_stays_with_the_proxy() {
+fn an_immediate_dmabuf_import_waits_for_the_compositor_and_a_failed_one_cuts_off_only_the_helper() {
     let mut game = Game::start();
     let mut helper = game.helper();
     let (registry, _) = helper.registry();
     let compositor = helper.bind(registry, 1, WlCompositor::interface(), 6);
-    let dmabuf = helper.bind(registry, 10, ZwpLinuxDmabufV1::interface(), 4);
-    let surface = helper.create(wl_surface::WlSurface::interface(), 6);
-    helper.request(
-        compositor,
-        wl_compositor::REQ_CREATE_SURFACE_OPCODE,
-        vec![Argument::NewId(surface)],
-    );
+    let dmabuf = dmabuf_with_formats(&mut helper, registry);
+    let surface = new_surface(&mut helper, compositor);
 
-    import_immediately(&mut helper, dmabuf, surface, IMPORTABLE_DMABUF);
+    let imported = immediate_dmabuf(&mut helper, dmabuf, (IMPORTABLE_DMABUF, 0));
+    show(&mut helper, surface, imported);
     let attached = game
         .compositor
         .wait_until("the imported buffer attached", |log| {
@@ -1509,11 +1646,9 @@ fn an_immediate_dmabuf_import_waits_for_the_compositor_and_a_failed_one_stays_wi
         "the helper's buffer is the one the compositor created"
     );
 
-    let (params, _) = import_immediately(&mut helper, dmabuf, surface, UNIMPORTABLE_DMABUF);
-    helper.wait_for("the failed import", |event| {
-        event.object == params && event.message == "failed"
-    });
-    helper.roundtrip();
+    let refused = immediate_dmabuf(&mut helper, dmabuf, (UNIMPORTABLE_DMABUF, 0));
+    show(&mut helper, surface, refused);
+    helper.disconnected();
     game.compositor.settle();
     let log = &game.compositor.log;
     let requests: Vec<&str> = log.iter().map(|seen| seen.message).collect();
@@ -1521,18 +1656,14 @@ fn an_immediate_dmabuf_import_waits_for_the_compositor_and_a_failed_one_stays_wi
         !requests.contains(&"create_immed"),
         "a failed immediate import may end the game's whole connection: {requests:?}"
     );
+    assert_eq!(count(log, "zwp_linux_buffer_params_v1", "create"), 2);
     assert_eq!(
-        log.iter().filter(|seen| seen.message == "create").count(),
-        2
-    );
-    assert_eq!(
-        log.iter().filter(|seen| seen.message == "attach").count(),
-        1,
-        "the buffer that failed to import never reaches the compositor"
-    );
-    assert_eq!(
-        log.iter().filter(|seen| seen.message == "commit").count(),
-        2
+        (
+            count(log, "wl_surface", "attach"),
+            count(log, "wl_surface", "commit")
+        ),
+        (1, 1),
+        "nothing the helper sends after a failed import reaches the compositor: {requests:?}"
     );
 }
 
@@ -1621,5 +1752,611 @@ fn a_subsurface_whose_parent_died_cannot_become_a_parent() {
             .len(),
         1,
         "Hyprland walks a new subsurface's parents without checking that they are alive"
+    );
+}
+
+#[test]
+fn a_failed_import_never_leaves_sync_points_without_a_buffer() {
+    let mut game = Game::start();
+    let mut helper = game.helper();
+    let (registry, _) = helper.registry();
+    let compositor = helper.bind(registry, 1, WlCompositor::interface(), 6);
+    let dmabuf = dmabuf_with_formats(&mut helper, registry);
+    let syncobj = helper.bind(registry, 11, WpLinuxDrmSyncobjManagerV1::interface(), 1);
+    let surface = new_surface(&mut helper, compositor);
+    let explicit = helper.create(WpLinuxDrmSyncobjSurfaceV1::interface(), 1);
+    helper.request(
+        syncobj,
+        wp_linux_drm_syncobj_manager_v1::REQ_GET_SURFACE_OPCODE,
+        vec![Argument::NewId(explicit), Argument::Object(surface)],
+    );
+    let timeline = helper.create(WpLinuxDrmSyncobjTimelineV1::interface(), 1);
+    helper.request(
+        syncobj,
+        wp_linux_drm_syncobj_manager_v1::REQ_IMPORT_TIMELINE_OPCODE,
+        vec![Argument::NewId(timeline), Argument::Fd(shm_file(4096))],
+    );
+
+    let refused = immediate_dmabuf(&mut helper, dmabuf, (UNIMPORTABLE_DMABUF, 0));
+    for (opcode, point) in [
+        (
+            wp_linux_drm_syncobj_surface_v1::REQ_SET_ACQUIRE_POINT_OPCODE,
+            1,
+        ),
+        (
+            wp_linux_drm_syncobj_surface_v1::REQ_SET_RELEASE_POINT_OPCODE,
+            2,
+        ),
+    ] {
+        helper.request_unless_cut_off(
+            explicit,
+            opcode,
+            vec![
+                Argument::Object(timeline),
+                Argument::Uint(0),
+                Argument::Uint(point),
+            ],
+        );
+    }
+    show(&mut helper, surface, refused);
+    helper.disconnected();
+    game.compositor.settle();
+    let log = &game.compositor.log;
+    assert_eq!(
+        (
+            count(log, "wp_linux_drm_syncobj_surface_v1", "set_acquire_point"),
+            count(log, "wl_surface", "commit")
+        ),
+        (0, 0),
+        "wlroots and Hyprland end the game's connection with no_buffer for a commit with sync \
+         points whose attach the proxy dropped"
+    );
+}
+
+#[test]
+fn an_attach_naming_a_buffer_the_game_never_held_cuts_off_only_the_helper() {
+    let mut game = Game::start();
+    let mut helper = game.helper();
+    let (registry, _) = helper.registry();
+    let compositor = helper.bind(registry, 1, WlCompositor::interface(), 6);
+    let surface = new_surface(&mut helper, compositor);
+    let proxy_registry = game.compositor.created("wl_display", "get_registry", 1);
+    game.compositor.send(
+        proxy_registry,
+        wl_registry::EVT_GLOBAL_REMOVE_OPCODE,
+        vec![Argument::Uint(10)],
+    );
+    helper.wait_for("the dmabuf global's removal", |event| {
+        event.object == registry && event.message == "global_remove"
+    });
+    let removed = helper.bind(registry, 10, ZwpLinuxDmabufV1::interface(), 4);
+    let buffer = immediate_dmabuf(&mut helper, removed, (IMPORTABLE_DMABUF, 0));
+    show(&mut helper, surface, buffer);
+
+    assert!(helper.cut_off_with_an_error());
+    assert!(
+        game.compositor.saw("wl_surface", "commit").is_empty(),
+        "a commit whose attach the proxy dropped may carry sync points without a buffer"
+    );
+}
+
+#[test]
+fn a_dmabuf_format_the_compositor_never_offered_cuts_off_only_the_helper() {
+    let mut game = Game::start();
+    let mut helper = game.helper();
+    let (registry, _) = helper.registry();
+    let dmabuf = dmabuf_with_formats(&mut helper, registry);
+    const UNOFFERED_MODIFIER: u64 = 7;
+    immediate_dmabuf(&mut helper, dmabuf, (IMPORTABLE_DMABUF, UNOFFERED_MODIFIER));
+
+    assert!(helper.cut_off_with_an_error());
+    assert!(
+        game.compositor
+            .saw("zwp_linux_buffer_params_v1", "create")
+            .is_empty(),
+        "Hyprland ends the game's connection for a create with a format and modifier it did \
+         not offer"
+    );
+}
+
+type ParamsSteps = fn(&mut Helper, u32);
+
+#[test]
+fn malformed_dmabuf_planes_cut_off_only_the_helper() {
+    const ROW: u32 = 64 * 4;
+    let cases: [(&str, ParamsSteps, usize, usize); 10] = [
+        (
+            "a plane index above 3",
+            |helper, params| add_plane(helper, params, 4, (0, ROW), 0),
+            0,
+            0,
+        ),
+        (
+            "a plane added twice",
+            |helper, params| {
+                add_plane(helper, params, 0, (0, ROW), 0);
+                add_plane(helper, params, 0, (0, ROW), 0);
+            },
+            1,
+            0,
+        ),
+        (
+            "planes with different modifiers",
+            |helper, params| {
+                add_plane(helper, params, 0, (0, ROW), 0);
+                add_plane(helper, params, 1, (0, ROW), 1);
+            },
+            1,
+            0,
+        ),
+        (
+            "a gap between planes",
+            |helper, params| {
+                add_plane(helper, params, 0, (0, ROW), 0);
+                add_plane(helper, params, 2, (0, ROW), 0);
+                create_dmabuf(helper, params, (64, 64), 0);
+            },
+            2,
+            0,
+        ),
+        (
+            "no plane 0",
+            |helper, params| {
+                add_plane(helper, params, 1, (0, ROW), 0);
+                create_dmabuf(helper, params, (64, 64), 0);
+            },
+            1,
+            0,
+        ),
+        (
+            "an empty buffer",
+            |helper, params| {
+                add_plane(helper, params, 0, (0, ROW), 0);
+                create_dmabuf(helper, params, (0, 64), 0);
+            },
+            1,
+            0,
+        ),
+        (
+            "unknown flags",
+            |helper, params| {
+                add_plane(helper, params, 0, (0, ROW), 0);
+                create_dmabuf(helper, params, (64, 64), 8);
+            },
+            1,
+            0,
+        ),
+        (
+            "an offset that overflows",
+            |helper, params| {
+                add_plane(helper, params, 0, (u32::MAX - 16, ROW), 0);
+                create_dmabuf(helper, params, (64, 64), 0);
+            },
+            1,
+            0,
+        ),
+        (
+            "plane 0 larger than its file",
+            |helper, params| {
+                add_plane(helper, params, 0, (0, ROW), 0);
+                create_dmabuf(helper, params, (64, 128), 0);
+            },
+            1,
+            0,
+        ),
+        (
+            "a plane added after the buffer was made",
+            |helper, params| {
+                add_plane(helper, params, 0, (0, ROW), 0);
+                create_dmabuf(helper, params, (64, 64), 0);
+                add_plane(helper, params, 1, (0, ROW), 0);
+            },
+            1,
+            1,
+        ),
+    ];
+    let mut game = Game::start();
+    for (case, steps, adds, creates) in cases {
+        game.compositor.settle();
+        let before = (
+            count(&game.compositor.log, "zwp_linux_buffer_params_v1", "add"),
+            count(&game.compositor.log, "zwp_linux_buffer_params_v1", "create"),
+        );
+        let mut helper = game.helper();
+        let (registry, _) = helper.registry();
+        let dmabuf = dmabuf_with_formats(&mut helper, registry);
+        let params = new_params(&mut helper, dmabuf);
+        steps(&mut helper, params);
+        assert!(helper.cut_off_with_an_error(), "{case}");
+        game.compositor.settle();
+        let after = (
+            count(&game.compositor.log, "zwp_linux_buffer_params_v1", "add"),
+            count(&game.compositor.log, "zwp_linux_buffer_params_v1", "create"),
+        );
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (adds, creates),
+            "wlroots ends the game's connection for {case}"
+        );
+    }
+}
+
+#[test]
+fn a_subsurface_below_a_destroyed_ancestor_never_reaches_the_compositor() {
+    let mut game = Game::start();
+    for commit in [false, true] {
+        let mut helper = game.helper();
+        let (registry, _) = helper.registry();
+        let compositor = helper.bind(registry, 1, WlCompositor::interface(), 6);
+        let subcompositor = helper.bind(registry, 2, WlSubcompositor::interface(), 1);
+        let root = new_surface(&mut helper, compositor);
+        let middle = new_surface(&mut helper, compositor);
+        let leaf = new_surface(&mut helper, compositor);
+        subsurface_of(&mut helper, subcompositor, middle, root);
+        subsurface_of(&mut helper, subcompositor, leaf, middle);
+        helper.request(root, wl_surface::REQ_DESTROY_OPCODE, Vec::new());
+        if commit {
+            helper.request(leaf, wl_surface::REQ_COMMIT_OPCODE, Vec::new());
+        } else {
+            let below = new_surface(&mut helper, compositor);
+            subsurface_of(&mut helper, subcompositor, below, leaf);
+        }
+        assert!(helper.cut_off_with_an_error(), "commit: {commit}");
+    }
+    game.compositor.settle();
+    let log = &game.compositor.log;
+    assert_eq!(
+        count(log, "wl_subcompositor", "get_subsurface"),
+        4,
+        "Hyprland follows a new subsurface's parents into the destroyed root"
+    );
+    assert_eq!(
+        count(log, "wl_surface", "commit"),
+        0,
+        "Hyprland follows a synchronized subsurface's parents into the destroyed root"
+    );
+}
+
+#[test]
+fn a_surface_destroyed_before_its_subsurface_cuts_off_only_the_helper() {
+    let mut game = Game::start();
+    let mut helper = game.helper();
+    let (registry, _) = helper.registry();
+    let compositor = helper.bind(registry, 1, WlCompositor::interface(), 6);
+    let subcompositor = helper.bind(registry, 2, WlSubcompositor::interface(), 1);
+    let parent = new_surface(&mut helper, compositor);
+    let child = new_surface(&mut helper, compositor);
+    subsurface_of(&mut helper, subcompositor, child, parent);
+    let upstream_child = game
+        .compositor
+        .created("wl_compositor", "create_surface", 2);
+    let upstream_subsurface = game
+        .compositor
+        .created("wl_subcompositor", "get_subsurface", 0);
+    helper.request(child, wl_surface::REQ_DESTROY_OPCODE, Vec::new());
+
+    assert!(helper.cut_off_with_an_error());
+    for object in [upstream_child, upstream_subsurface] {
+        game.compositor
+            .wait_for("the page's objects destroyed", |seen| {
+                seen.object == object && seen.message == "destroy"
+            });
+    }
+    let destroyed: Vec<u32> = game
+        .compositor
+        .log
+        .iter()
+        .filter(|seen| seen.message == "destroy")
+        .map(|seen| seen.object)
+        .collect();
+    let order = |object: u32| destroyed.iter().position(|seen| *seen == object);
+    assert!(
+        order(upstream_subsurface) < order(upstream_child),
+        "wlroots ends the game's connection for a surface destroyed before its role object: \
+         {destroyed:?}"
+    );
+}
+
+fn shm_buffer(helper: &mut Helper, shm: u32, (width, height): (i32, i32)) -> u32 {
+    let size = width * height * 4;
+    let pool = helper.create(wl_shm_pool::WlShmPool::interface(), 1);
+    helper.request(
+        shm,
+        wl_shm::REQ_CREATE_POOL_OPCODE,
+        vec![
+            Argument::NewId(pool),
+            Argument::Fd(shm_file(u64::from(size.unsigned_abs()))),
+            Argument::Int(size),
+        ],
+    );
+    let buffer = helper.create(
+        wayland_client::protocol::wl_buffer::WlBuffer::interface(),
+        1,
+    );
+    helper.request(
+        pool,
+        wl_shm_pool::REQ_CREATE_BUFFER_OPCODE,
+        vec![
+            Argument::NewId(buffer),
+            Argument::Int(0),
+            Argument::Int(width),
+            Argument::Int(height),
+            Argument::Int(width * 4),
+            Argument::Uint(wl_shm::Format::Argb8888 as u32),
+        ],
+    );
+    buffer
+}
+
+struct Page {
+    surface: u32,
+    viewport: u32,
+    shm: u32,
+}
+
+fn viewed_subsurface(helper: &mut Helper) -> Page {
+    let (registry, _) = helper.registry();
+    let compositor = helper.bind(registry, 1, WlCompositor::interface(), 6);
+    let subcompositor = helper.bind(registry, 2, WlSubcompositor::interface(), 1);
+    let shm = helper.bind(registry, 3, WlShm::interface(), 1);
+    let viewporter = helper.bind(registry, 12, WpViewporter::interface(), 1);
+    let parent = new_surface(helper, compositor);
+    let surface = new_surface(helper, compositor);
+    subsurface_of(helper, subcompositor, surface, parent);
+    let viewport = helper.create(WpViewport::interface(), 1);
+    helper.request(
+        viewporter,
+        wp_viewporter::REQ_GET_VIEWPORT_OPCODE,
+        vec![Argument::NewId(viewport), Argument::Object(surface)],
+    );
+    Page {
+        surface,
+        viewport,
+        shm,
+    }
+}
+
+fn set_source(helper: &mut Helper, viewport: u32, source: [i32; 4]) {
+    helper.request(
+        viewport,
+        wp_viewport::REQ_SET_SOURCE_OPCODE,
+        source.into_iter().map(Argument::Fixed).collect(),
+    );
+}
+
+type PageSteps = fn(&mut Helper, &Page);
+
+#[test]
+fn surface_sizes_compositors_refuse_cut_off_only_the_helper() {
+    const FIXED_ONE: i32 = 256;
+    let mut game = Game::start();
+    let mut helper = game.helper();
+    let page = viewed_subsurface(&mut helper);
+    let buffer = shm_buffer(&mut helper, page.shm, (64, 64));
+    helper.request(
+        page.surface,
+        wl_surface::REQ_SET_BUFFER_SCALE_OPCODE,
+        vec![Argument::Int(2)],
+    );
+    set_source(
+        &mut helper,
+        page.viewport,
+        [0, 0, 32, 32].map(|v| v * FIXED_ONE),
+    );
+    show(&mut helper, page.surface, buffer);
+    game.compositor.wait_for("a commit that fits", |seen| {
+        seen.interface == "wl_surface" && seen.message == "commit"
+    });
+    drop(helper);
+
+    let cases: [(&str, PageSteps); 3] = [
+        (
+            "a buffer that is not a multiple of its scale",
+            |helper, page| {
+                let buffer = shm_buffer(helper, page.shm, (63, 64));
+                helper.request(
+                    page.surface,
+                    wl_surface::REQ_SET_BUFFER_SCALE_OPCODE,
+                    vec![Argument::Int(2)],
+                );
+                show(helper, page.surface, buffer);
+            },
+        ),
+        ("a viewport source outside the buffer", |helper, page| {
+            let buffer = shm_buffer(helper, page.shm, (64, 64));
+            set_source(helper, page.viewport, [0, 0, 65, 64].map(|v| v * FIXED_ONE));
+            helper.request(
+                page.viewport,
+                wp_viewport::REQ_SET_DESTINATION_OPCODE,
+                vec![Argument::Int(64), Argument::Int(64)],
+            );
+            show(helper, page.surface, buffer);
+        }),
+        (
+            "a fractional viewport source without a destination",
+            |helper, page| {
+                let buffer = shm_buffer(helper, page.shm, (64, 64));
+                set_source(
+                    helper,
+                    page.viewport,
+                    [0, 0, 32 * FIXED_ONE + FIXED_ONE / 2, 32 * FIXED_ONE],
+                );
+                show(helper, page.surface, buffer);
+            },
+        ),
+    ];
+    for (case, steps) in cases {
+        game.compositor.settle();
+        let before = count(&game.compositor.log, "wl_surface", "commit");
+        let mut helper = game.helper();
+        let page = viewed_subsurface(&mut helper);
+        steps(&mut helper, &page);
+        assert!(helper.cut_off_with_an_error(), "{case}");
+        game.compositor.settle();
+        assert_eq!(
+            count(&game.compositor.log, "wl_surface", "commit"),
+            before,
+            "compositors end the game's connection for {case}"
+        );
+    }
+}
+
+fn prepared_read(backend: &Backend) -> ReadEventsGuard {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        backend
+            .dispatch_inner_queue()
+            .expect("dispatch the game's queue");
+        if let Some(guard) = backend.prepare_read() {
+            return guard;
+        }
+        assert!(Instant::now() < deadline, "the game's queue never emptied");
+    }
+}
+
+fn hold_a_prepared_read(backend: &Backend) -> (mpsc::Sender<()>, JoinHandle<()>) {
+    let (holding, held) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let backend = backend.clone();
+    let reader = std::thread::spawn(move || {
+        let guard = prepared_read(&backend);
+        let _ = holding.send(());
+        let _ = released.recv_timeout(WAIT);
+        drop(guard);
+    });
+    held.recv_timeout(WAIT)
+        .expect("another reader of the game's display");
+    (release, reader)
+}
+
+#[test]
+fn a_game_socket_that_only_became_writable_never_parks_the_proxy_in_a_read() {
+    let mut game = Game::start();
+    let mut helper = game.helper();
+    let (registry, _) = helper.registry();
+    let compositor = helper.bind(registry, 1, WlCompositor::interface(), 6);
+    let surface = new_surface(&mut helper, compositor);
+    game.compositor
+        .created("wl_compositor", "create_surface", 1);
+    game.compositor.stall(true);
+    damage_until_unread(&mut helper, surface);
+
+    let (release, reader) = hold_a_prepared_read(&game.backend);
+    game.compositor.stall(false);
+    std::thread::sleep(QUIET);
+    let embedder = game.embedder.take();
+    let (stopped, stop) = mpsc::channel();
+    let stopper = std::thread::spawn(move || {
+        drop(embedder);
+        let _ = stopped.send(());
+    });
+    let in_time = stop.recv_timeout(2 * QUIET).is_ok();
+    let _ = release.send(());
+    reader.join().expect("the other reader");
+    stopper.join().expect("the embedder's owner");
+    assert!(
+        in_time,
+        "the proxy waited in libwayland's read for another thread's prepared read although \
+         nothing was readable, so the game could not stop its WebView embedding"
+    );
+}
+
+struct Done(AtomicBool);
+
+impl ObjectData for Done {
+    fn event(
+        self: Arc<Self>,
+        _: &Backend,
+        _: Message<ObjectId, OwnedFd>,
+    ) -> Option<Arc<dyn ObjectData>> {
+        self.0.store(true, Ordering::Release);
+        None
+    }
+
+    fn destroyed(&self, _: ObjectId) {}
+}
+
+fn game_roundtrip(game: &Game) {
+    let done = Arc::new(Done(AtomicBool::new(false)));
+    game.backend
+        .send_request(
+            super::outgoing(
+                game.backend.display_id(),
+                wl_display::REQ_SYNC_OPCODE,
+                vec![Argument::NewId(ObjectId::null())],
+            ),
+            Some(Arc::clone(&done) as Arc<dyn ObjectData>),
+            Some((wl_callback::WlCallback::interface(), 1)),
+        )
+        .expect("a game sync");
+    game.backend.flush().expect("flush the game's sync");
+    let deadline = Instant::now() + WAIT;
+    while !done.0.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "the game's sync was never answered"
+        );
+        let guard = prepared_read(&game.backend);
+        wait_readable(guard.connection_fd(), QUIET);
+        let _ = guard.read();
+        game.backend
+            .dispatch_inner_queue()
+            .expect("dispatch the game's queue");
+    }
+}
+
+#[test]
+fn an_object_the_compositor_makes_for_the_helper_as_the_proxy_stops_is_destroyed_with_its_page() {
+    const OFFER: u32 = FIRST_SERVER_ID;
+    let mut game = Game::start();
+    let mut helper = game.helper();
+    let (registry, _) = helper.registry();
+    let seat = helper.bind(registry, 6, WlSeat::interface(), 9);
+    let manager = helper.bind(registry, 4, WlDataDeviceManager::interface(), 3);
+    let device = helper.create(wl_data_device::WlDataDevice::interface(), 3);
+    helper.request(
+        manager,
+        wl_data_device_manager::REQ_GET_DATA_DEVICE_OPCODE,
+        vec![Argument::NewId(device), Argument::Object(seat)],
+    );
+    let upstream_device = game
+        .compositor
+        .created("wl_data_device_manager", "get_data_device", 0);
+
+    let (release, reader) = hold_a_prepared_read(&game.backend);
+    game.compositor.send(
+        upstream_device,
+        wl_data_device::EVT_SELECTION_OPCODE,
+        vec![Argument::Object(0)],
+    );
+    std::thread::sleep(QUIET);
+    let embedder = game.embedder.take();
+    let stopper = std::thread::spawn(move || drop(embedder));
+    game.compositor.send(
+        upstream_device,
+        wl_data_device::EVT_DATA_OFFER_OPCODE,
+        vec![Argument::NewId(OFFER)],
+    );
+    std::thread::sleep(QUIET);
+    let _ = release.send(());
+    reader.join().expect("the other reader");
+    stopper.join().expect("the embedder's owner");
+
+    game.compositor.send(
+        OFFER,
+        wl_data_offer::EVT_OFFER_OPCODE,
+        vec![Argument::Str(Some(Box::new(
+            CString::new("text/plain").expect("mime type"),
+        )))],
+    );
+    game_roundtrip(&game);
+    assert!(
+        game.compositor
+            .saw("wl_data_offer", "destroy")
+            .iter()
+            .any(|seen| seen.object == OFFER),
+        "the proxy stopped without routing the compositor's last events, so an object made \
+         for the helper outlived it; read by another thread, such an event leaves the object \
+         on the proxy's destroyed queue and libwayland aborts the game at its next event"
     );
 }

@@ -6458,7 +6458,7 @@ fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let bound = register_class_natives_best_effort(env, WEB_VIEW_CLASS, &bindings)?;
     tracing::info!(
         bound,
-        "registered Eclipse's backing for the android.webkit.WebView native surface (constructor = shared view-registry peer; loads, history, reload, stopLoading, getUrl, destroy, evaluateJavascript and the JavaScript bridge forward to the WebKitGTK helper, which shows each WebView in its own window) (per-method best-effort)"
+        "registered Eclipse's backing for the android.webkit.WebView native surface (constructor = shared view-registry peer; loads, history, reload, stopLoading, getUrl, destroy, evaluateJavascript and the JavaScript bridge forward to the WebKitGTK helper, which shows each WebView inside the game window on Wayland and as a dialog of it elsewhere) (per-method best-effort)"
     );
     Ok(())
 }
