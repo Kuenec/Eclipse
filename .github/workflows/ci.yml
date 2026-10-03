@@ -132,6 +132,8 @@ jobs:
 
       - name: Lint and test the WebView helper in the SDK
         run: |
+          mkdir -p "$RUNNER_TEMP/cargo" "$GITHUB_WORKSPACE/crates/eclipse-webview/target"
+          chmod -R a+rwX "$RUNNER_TEMP/cargo" "$GITHUB_WORKSPACE"
           in_sdk() {
             flatpak build --share=network --filesystem="$GITHUB_WORKSPACE" --filesystem="$RUNNER_TEMP" \
               --build-dir="$GITHUB_WORKSPACE/crates/eclipse-webview" \
