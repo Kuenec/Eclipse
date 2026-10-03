@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::sync::OnceLock;
 
-use super::native_provider::EclipseNativeProvider;
+use super::native_provider::{last_dl_error, EclipseNativeProvider};
 use super::resolve::SymbolProvider;
 use super::vulkan_wsi;
 
@@ -63,12 +63,26 @@ pub(crate) unsafe extern "C" fn eclipse_dlopen(
     filename: *const c_char,
     flags: c_int,
 ) -> *mut c_void {
-    if !filename.is_null() {
-        if let Some(library) = PlatformLibrary::from_path(unsafe { CStr::from_ptr(filename) }) {
-            return library.handle();
-        }
+    let name = (!filename.is_null()).then(|| unsafe { CStr::from_ptr(filename) });
+    if let Some(library) = name.and_then(PlatformLibrary::from_path) {
+        return library.handle();
     }
-    unsafe { libc::dlopen(filename, flags) }
+    let handle = unsafe { libc::dlopen(filename, flags) };
+    if handle.is_null() && tracing::enabled!(target: "dlfcn", tracing::Level::DEBUG) {
+        return unsafe { log_failure_and_rearm_dlerror(name, flags) };
+    }
+    handle
+}
+
+unsafe fn log_failure_and_rearm_dlerror(name: Option<&CStr>, flags: c_int) -> *mut c_void {
+    tracing::debug!(
+        target: "dlfcn",
+        ?name,
+        flags,
+        reason = %last_dl_error(),
+        "host dlopen failed"
+    );
+    unsafe { libc::dlopen(name.map_or(std::ptr::null(), CStr::as_ptr), flags) }
 }
 
 pub(crate) unsafe extern "C" fn eclipse_dlclose(handle: *mut c_void) -> c_int {
@@ -265,5 +279,32 @@ mod tests {
             "Vulkan entry points stay routed through Eclipse's WSI"
         );
         assert_eq!(unsafe { (dl.close)(libc_handle) }, 0);
+    }
+
+    #[test]
+    fn failed_host_dlopen_logs_its_cause_and_leaves_it_for_dlerror() {
+        let dl = dl_through_provider();
+        let absent = c"libeclipse_absent_media_3b9e.so";
+        let mut caller_reason = String::new();
+        let log = crate::loader::log_capture::formatted_log("dlfcn=debug", || {
+            assert!(unsafe { (dl.open)(absent.as_ptr(), libc::RTLD_NOW) }.is_null());
+            caller_reason = last_dl_error();
+        });
+
+        let line = log
+            .lines()
+            .find(|line| line.contains("host dlopen failed"))
+            .unwrap_or_else(|| panic!("no dlopen failure line in {log:?}"));
+        assert!(line.contains("DEBUG dlfcn:"), "{line}");
+        assert!(line.contains(&format!("name=Some({absent:?})")), "{line}");
+        assert!(
+            line.contains("reason=libeclipse_absent_media_3b9e.so: cannot open shared object"),
+            "{line}"
+        );
+        assert!(
+            caller_reason.contains("libeclipse_absent_media_3b9e.so")
+                && caller_reason.contains("cannot open shared object"),
+            "the caller's dlerror() must still report the failure after logging: {caller_reason}"
+        );
     }
 }

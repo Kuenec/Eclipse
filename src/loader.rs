@@ -10,8 +10,11 @@ pub mod init_run;
 pub mod jni_mangle;
 pub mod jni_register;
 pub mod link;
+#[cfg(test)]
+mod log_capture;
 pub mod looper;
 pub mod map;
+pub mod mediacodec;
 pub mod module_registry;
 pub mod native_provider;
 pub mod ndk_registry;

@@ -114,6 +114,17 @@ pub fn instruction_set_features() -> String {
     HostCpu::detect().art_feature_string()
 }
 
+pub fn android_cpu_baseline() -> Result<(), RuntimeError> {
+    android_cpu_baseline_on(HostCpu::detect())
+}
+
+fn android_cpu_baseline_on(cpu: HostCpu) -> Result<(), RuntimeError> {
+    match cpu.missing_android_x86_64_feature() {
+        Some(feature) => Err(RuntimeError::CpuLacksFeature(feature)),
+        None => Ok(()),
+    }
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!(
     "Eclipse's runtime targets the Android x86-64 Roblox engine; \
@@ -430,7 +441,15 @@ fn find_art_boot_paths(layout: &InstallLayout) -> Result<ArtBootPaths, RuntimeEr
 }
 
 pub fn prepare_art_boot_environment() -> Result<(), RuntimeError> {
-    let paths = find_art_boot_paths(InstallLayout::current()?)?;
+    prepare_art_boot_environment_on(HostCpu::detect(), InstallLayout::current)
+}
+
+fn prepare_art_boot_environment_on(
+    cpu: HostCpu,
+    layout: impl FnOnce() -> Result<&'static InstallLayout, RuntimeError>,
+) -> Result<(), RuntimeError> {
+    android_cpu_baseline_on(cpu)?;
+    let paths = find_art_boot_paths(layout()?)?;
     if let Some(boot_class_path) = paths.boot_class_path {
         if std::env::var_os("BOOTCLASSPATH").as_ref() != Some(&boot_class_path) {
             unsafe { std::env::set_var("BOOTCLASSPATH", boot_class_path) };
@@ -771,9 +790,6 @@ pub fn boot(
     apk_path: Option<&Path>,
     app_lib_dir: Option<&Path>,
 ) -> Result<Vm, RuntimeError> {
-    if let Some(feature) = HostCpu::detect().missing_android_x86_64_feature() {
-        return Err(RuntimeError::CpuLacksFeature(feature));
-    }
     let layout = InstallLayout::current()?;
     let libart = libart_path(libart_location(layout))?;
     let art_boot = find_art_boot_paths(layout)?;
@@ -1166,6 +1182,47 @@ mod tests {
         assert!(RuntimeError::CpuLacksFeature("SSE4.1")
             .to_string()
             .contains("lacks SSE4.1"));
+    }
+
+    #[test]
+    fn art_preparation_refuses_a_cpu_below_the_baseline_before_the_install_layout() {
+        let core2 = HostCpu {
+            sse4_1: false,
+            sse4_2: false,
+            avx: false,
+            avx2: false,
+            bmi1: false,
+            popcnt: false,
+            ..ALL_FEATURES
+        };
+        let prepared = prepare_art_boot_environment_on(core2, || {
+            panic!("the install layout was looked up for a CPU below the baseline")
+        });
+        assert!(matches!(
+            prepared,
+            Err(RuntimeError::CpuLacksFeature("SSE4.1"))
+        ));
+    }
+
+    #[test]
+    fn the_android_cpu_baseline_names_the_first_missing_feature() {
+        let without_sse4_2 = HostCpu {
+            sse4_2: false,
+            popcnt: false,
+            ..ALL_FEATURES
+        };
+        assert!(matches!(
+            android_cpu_baseline_on(without_sse4_2),
+            Err(RuntimeError::CpuLacksFeature("SSE4.2"))
+        ));
+        assert!(android_cpu_baseline_on(ALL_FEATURES).is_ok());
+    }
+
+    #[test]
+    fn art_preparation_on_a_baseline_cpu_continues_to_the_install_layout() {
+        let prepared =
+            prepare_art_boot_environment_on(ALL_FEATURES, || Err(RuntimeError::NoCacheDir));
+        assert!(matches!(prepared, Err(RuntimeError::NoCacheDir)));
     }
 
     #[test]

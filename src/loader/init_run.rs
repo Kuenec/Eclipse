@@ -240,7 +240,7 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
 }
 
 fn extract_engine(apk: &mut crate::apk::Apk, lib_dir: &Path) -> Result<PathBuf, InitRunError> {
-    apk.extract_native_libs("x86_64", lib_dir)
+    apk.extract_native_libs(crate::apk::TARGET_ABI, lib_dir)
         .map_err(|e| InitRunError::Extract(lib_dir.to_path_buf(), e.to_string()))?;
     Ok(lib_dir.join("libroblox.so"))
 }
@@ -371,7 +371,10 @@ mod tests {
         let root = temp_dir("init-extract-failure");
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         writer
-            .start_file("lib/x86_64/libroblox.so", SimpleFileOptions::default())
+            .start_file(
+                format!("lib/{}/libroblox.so", crate::apk::TARGET_ABI),
+                SimpleFileOptions::default(),
+            )
             .expect("start the engine entry");
         writer
             .write_all(b"\x7fELF")

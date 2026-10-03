@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use crate::loader::native_provider::{HOST_EGL_SONAME, HOST_GLESV2_SONAME};
@@ -391,7 +391,7 @@ type PfnGlClearColor = unsafe extern "C" fn(f32, f32, f32, f32);
 type PfnGlClear = unsafe extern "C" fn(u32);
 type PfnGlViewport = unsafe extern "C" fn(i32, i32, i32, i32);
 type PfnGlCreateShader = unsafe extern "C" fn(u32) -> u32;
-type PfnGlShaderSource = unsafe extern "C" fn(u32, i32, *const *const i8, *const i32);
+type PfnGlShaderSource = unsafe extern "C" fn(u32, i32, *const *const c_char, *const i32);
 type PfnGlCompileShader = unsafe extern "C" fn(u32);
 type PfnGlGetShaderiv = unsafe extern "C" fn(u32, u32, *mut i32);
 type PfnGlCreateProgram = unsafe extern "C" fn() -> u32;
@@ -399,7 +399,7 @@ type PfnGlAttachShader = unsafe extern "C" fn(u32, u32);
 type PfnGlLinkProgram = unsafe extern "C" fn(u32);
 type PfnGlGetProgramiv = unsafe extern "C" fn(u32, u32, *mut i32);
 type PfnGlUseProgram = unsafe extern "C" fn(u32);
-type PfnGlGetAttribLocation = unsafe extern "C" fn(u32, *const i8) -> i32;
+type PfnGlGetAttribLocation = unsafe extern "C" fn(u32, *const c_char) -> i32;
 type PfnGlEnableVertexAttribArray = unsafe extern "C" fn(u32);
 type PfnGlVertexAttribPointer = unsafe extern "C" fn(u32, i32, u32, u8, i32, *const c_void);
 type PfnGlDrawArrays = unsafe extern "C" fn(u32, i32, i32);
@@ -595,7 +595,7 @@ unsafe fn compile_shader(gl: &Gles2, kind: u32, src: &[u8]) -> Result<u32, EglEr
         if shader == 0 {
             return Err(EglError::Gl("glCreateShader returned 0".into()));
         }
-        let ptr = src.as_ptr() as *const i8;
+        let ptr = src.as_ptr().cast::<c_char>();
         let ptrs = [ptr];
         (gl.gl_shader_source)(shader, 1, ptrs.as_ptr(), std::ptr::null());
         (gl.gl_compile_shader)(shader);

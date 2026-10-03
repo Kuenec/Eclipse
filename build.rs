@@ -94,18 +94,54 @@ fn build_libm_shim() {
         so.display()
     );
 
-    if let Ok(out) = Command::new("readelf").arg("-rW").arg(&so).output() {
-        if out.status.success() {
-            let relocs = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                !relocs.contains("R_X86_64_TPOFF64"),
-                "libm shim regressed: it now has R_X86_64_TPOFF64 (the apkenv linker cannot apply \
-                 it). The shim must stay no_std/no-TLS."
-            );
-        }
-    } else {
-        println!("cargo:warning=readelf not found; skipped the libm-shim modern-reloc guard");
-    }
+    reject_tls_in_libm_shim(&so);
 
     println!("cargo:rustc-env=ECLIPSE_LIBM_SHIM_SO={}", so.display());
+}
+
+fn reject_tls_in_libm_shim(so: &std::path::Path) {
+    let Some(program_headers) = readelf("-lW", so) else {
+        println!("cargo:warning=readelf not found; skipped the libm-shim TLS guard");
+        return;
+    };
+    assert!(
+        !program_headers
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("TLS")),
+        "libm shim regressed: it now has a TLS segment, which the apkenv linker cannot set up. \
+         The shim must stay no_std and free of thread-locals."
+    );
+
+    let relocations = readelf("-rW", so).expect("readelf ran for the program headers");
+    let tls_relocation = relocations
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(2))
+        .find(|kind| {
+            ["TPOFF", "DTPMOD", "TLS"]
+                .iter()
+                .any(|tls| kind.contains(tls))
+        });
+    if let Some(kind) = tls_relocation {
+        panic!(
+            "libm shim regressed: it now has {kind} relocations, which the apkenv linker cannot \
+             apply. The shim must stay no_std and free of thread-locals."
+        );
+    }
+}
+
+fn readelf(flag: &str, file: &std::path::Path) -> Option<String> {
+    use std::process::Command;
+
+    let output = match Command::new("readelf").arg(flag).arg(file).output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("failed to run readelf {flag} {}: {error}", file.display()),
+    };
+    assert!(
+        output.status.success(),
+        "readelf {flag} {} failed: {}",
+        file.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(String::from_utf8(output.stdout).expect("readelf prints UTF-8"))
 }

@@ -3,6 +3,7 @@ pub mod audio;
 pub mod bionic;
 #[cfg(test)]
 mod bounded_child;
+pub mod client_log;
 mod clipboard;
 pub mod config;
 pub mod diagnostics;

@@ -1,0 +1,34 @@
+[FLog::Output] All use of Roblox services must comply with Roblox's Terms of Use, Privacy Policy, Community Standards, and applicable laws. Processing of User personal information is limited to the purposes expressly permitted therein.
+2026-10-02T23:49:51.433Z,0.433572,2ea78c,6,Info [FLog::CrashReportLog] Roblox files folder: /app-data/files
+2026-10-02T23:49:51.440Z,0.440117,2ea7cf,6 [FLog::AndroidGLView] nativeInitClientSettings
+2026-10-02T23:49:51.458Z,0.458623,2ea73c,6,Critical [DFLog::Mimalloc] mi_option_show_errors=1
+2026-10-02T23:49:51.458Z,0.458627,2ea73c,6,Info [DFLog::Mimalloc] mi_option_show_stats=0
+2026-10-02T23:49:51.458Z,0.458763,2ea73c,6,Critical [FLog::Output] Build system id: 1
+2026-10-02T23:49:51.459Z,0.459926,2ea73c,6,Warning [FLog::IxpStorageManager] Failed to open cache file for reading
+2026-10-02T23:49:51.460Z,0.460778,2ea7e0,6,Error [DFLog::SQLite] sqlite3_error_log: 283 - recovered 12 frames from WAL file /app-data/files/appData/rbx-storage.db-wal
+2026-10-02T23:49:51.532Z,0.532994,2ea7ce,6 [FLog::SingleSurfaceApp] initializeWithAppStarter
+2026-10-02T23:49:51.533Z,0.533004,2ea7ce,6 [FLog::SingleSurfaceApp] initializeSingleton
+2026-10-02T23:49:51.533Z,0.533113,2ea7ce,6 [FLog::Output] setAssetFolder /app-data/files/assets/content
+2026-10-02T23:49:51.533Z,0.533293,2ea7ce,6 [FLog::Output] Evaluating deferred inferred crashes
+2026-10-02T23:49:51.538Z,0.538241,2ea7ce,6 [FLog::SingleSurfaceApp] setStage: (stage:Native)
+2026-10-02T23:49:51.538Z,0.538253,2ea7ce,6,Warning [FLog::SingleSurfaceApp] instantiate controllers
+2026-10-02T23:49:51.541Z,0.541077,2ea7ce,6 [FLog::SingleSurfaceApp] initializeLuaAppWithLoggedInUser: (stage:Native).
+2026-10-02T23:49:51.542Z,0.542352,2ea76d,6,Warning [FLog::Output] Hello world, CLI-208683!
+2026-10-02T23:49:51.542Z,0.542363,2ea76d,6,Warning [FLog::Output] Hello world, CLI-207485!
+2026-10-02T23:49:51.542Z,0.542368,2ea76d,6,Warning [FLog::Output] Hello again, world 206748!
+2026-10-02T23:49:51.634Z,0.634379,2ea7ce,6,Warning [FLog::SingleSurfaceApp] Register rendering frequency during startup.
+2026-10-02T23:49:51.634Z,0.634458,2ea7ce,6 [FLog::SingleSurfaceApp] setStage: (stage:InitializedLuaApp)
+2026-10-02T23:49:51.634Z,0.634586,2ea76d,6,Info [FLog::CreatorOutput] Info: DataModel Loading rbxasset://places/Mobile.rbxl
+2026-10-02T23:49:51.668Z,0.668740,2ea7ce,6 [FLog::SingleSurfaceApp] startLuaApp: (stage:InitializedLuaApp).
+2026-10-02T23:49:51.668Z,0.668752,2ea7ce,6 [FLog::SingleSurfaceApp] returnToLuaApp: (stage:InitializedLuaApp).
+2026-10-02T23:49:51.668Z,0.668760,2ea7ce,6 [FLog::SingleSurfaceApp] returnToLuaAppInternal: ... App has been initialized, returning from game.
+2026-10-02T23:49:51.699Z,0.699812,2ea7ce,6 [FLog::Graphics] Vulkan: Using extension: VK_KHR_surface
+2026-10-02T23:49:51.783Z,0.783198,2ea7ce,6 [channel] Caps: Border Color 1
+2026-10-02T23:49:51.787Z,0.787235,2ea7ce,6 [FLog::Graphics] Video memory size: 67108864
+2026-10-02T23:49:51.805Z,0.805710,2ea78f,6 [FLog::SessionTransitionFSM] Initialized.
+2026-10-02T23:49:51.810Z,0.810309,2ea7ce,6 [FLog::SingleSurfaceApp] setStage: (stage:LuaApp)
+2026-10-02T23:49:51.810Z,0.810557,2ea7ce,6 [FLog::SingleSurfaceApp] userDidLogin
+2026-10-02T23:49:51.810Z,0.810768,2ea7ce,6 [FLog::SingleSurfaceApp] updateSurfaceLuaApp: (stage:LuaApp)
+2026-10-02T23:49:51.855Z,0.855985,2ea80f,12 [DFLog::HttpTraceError] HttpResponse(#16 0x7f46a6e1d9b0) time:47.7ms (net:47.7ms timeInRetryQueue:0.0ms)status:401 Unauthorized bodySize:82 url:{ "https://apis.roblox.com/platform-chat-api/v1/get-conversation-metadata" } ip:128.116.0.1 external:0 numberOfTimesRetried:0
+2026-10-02T23:49:51.951Z,0.951032,2ea80f,6,Warning [DFLog::TurnApiClient] TurnApiClient: HTTP failure (err=0, status=401) — backing off
+2026-10-02T23:49:51.957Z,0.957931,2ea76d,6,Debug [DFLog::FlagCache] [FlagCache] writeFlagCache: Wrote signatureSize: 0

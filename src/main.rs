@@ -448,6 +448,7 @@ fn parse_run_path(arguments: &[OsString]) -> Result<Option<&std::path::Path>, St
 }
 
 fn install_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    eclipse::runtime::android_cpu_baseline()?;
     if arguments.is_empty() {
         return Err("usage: eclipse install <APK | DIRECTORY | BUNDLE>...".into());
     }
@@ -520,6 +521,7 @@ fn parse_update_source(arguments: &[OsString]) -> Result<UpdateSource, String> {
 }
 
 fn update_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    eclipse::runtime::android_cpu_baseline()?;
     let source = parse_update_source(arguments)?;
     let _client = lock_out_clients()?;
     let store = Store::open()?;

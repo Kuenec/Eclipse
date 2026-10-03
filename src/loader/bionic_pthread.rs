@@ -37,9 +37,6 @@ const ONCE_NOT_STARTED: i32 = 0;
 const ONCE_IN_PROGRESS: i32 = 1;
 const ONCE_DONE: i32 = 2;
 
-const SYS_GETTID: c_long = 186;
-
-const SYS_FUTEX: c_long = 202;
 const FUTEX_WAIT: c_int = 0;
 const FUTEX_WAKE: c_int = 1;
 
@@ -49,10 +46,6 @@ const FUTEX_PRIVATE_FLAG: c_int = 128;
 const FUTEX_CLOCK_REALTIME: c_int = 256;
 
 const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
-
-const SYS_TGKILL: c_long = 234;
-
-const SYS_GETPID: c_long = 39;
 
 thread_local! {
     static CACHED_TID: Cell<i32> = const { Cell::new(0) };
@@ -75,7 +68,7 @@ fn cache_current_tid() -> i32 {
             "pthread_atfork failed; a cached thread id would survive fork"
         );
     });
-    let tid = unsafe { libc::syscall(SYS_GETTID) as i32 };
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
     CACHED_TID.set(tid);
     tid
 }
@@ -87,7 +80,7 @@ unsafe extern "C" fn forget_cached_tid() {
 fn futex_wait(addr: &AtomicI32, expected: i32) {
     unsafe {
         libc::syscall(
-            SYS_FUTEX,
+            libc::SYS_futex,
             addr.as_ptr(),
             FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
             expected,
@@ -110,7 +103,7 @@ fn futex_wait_until(
 
     let result = unsafe {
         libc::syscall(
-            SYS_FUTEX,
+            libc::SYS_futex,
             addr.as_ptr(),
             FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG | clock_flag,
             expected,
@@ -131,7 +124,7 @@ fn futex_wait_until(
 fn futex_wake(addr: &AtomicI32, count: c_int) {
     unsafe {
         libc::syscall(
-            SYS_FUTEX,
+            libc::SYS_futex,
             addr.as_ptr(),
             FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
             count,
@@ -1061,7 +1054,7 @@ unsafe extern "C-unwind" fn eclipse_pthread_exit(_retval: *mut c_void) -> ! {
             let host: unsafe extern "C-unwind" fn(*mut c_void) -> ! = std::mem::transmute(sym);
             host(_retval);
         }
-        libc::syscall(60, 0);
+        libc::syscall(libc::SYS_exit, 0);
         std::process::abort();
     }
 }
@@ -1151,7 +1144,7 @@ extern "C-unwind" fn thread_trampoline(raw: *mut c_void) -> *mut c_void {
 fn futex_wake_u32(addr: &AtomicU32, count: c_int) {
     unsafe {
         libc::syscall(
-            SYS_FUTEX,
+            libc::SYS_futex,
             addr.as_ptr(),
             FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
             count,
@@ -1162,7 +1155,7 @@ fn futex_wake_u32(addr: &AtomicU32, count: c_int) {
 fn futex_wait_u32(addr: &AtomicU32, expected: u32) {
     unsafe {
         libc::syscall(
-            SYS_FUTEX,
+            libc::SYS_futex,
             addr.as_ptr(),
             FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
             expected,
@@ -1308,9 +1301,9 @@ unsafe extern "C" fn eclipse_pthread_setname_np(thread: usize, name: *const c_ch
 unsafe extern "C" fn eclipse_pthread_kill(thread: usize, sig: c_int) -> c_int {
     let tid = thread as i64;
 
-    let tgid = unsafe { libc::syscall(SYS_GETPID) };
+    let tgid = unsafe { libc::syscall(libc::SYS_getpid) };
 
-    let rc = unsafe { libc::syscall(SYS_TGKILL, tgid, tid, sig as i64) };
+    let rc = unsafe { libc::syscall(libc::SYS_tgkill, tgid, tid, sig as i64) };
     if rc == 0 {
         0
     } else {
@@ -2461,7 +2454,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             match std::fs::read_to_string(&path) {
-                Ok(syscall) if syscall.starts_with(&format!("{SYS_FUTEX} ")) => return,
+                Ok(syscall) if syscall.starts_with(&format!("{} ", libc::SYS_futex)) => return,
                 Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
                 Err(_) => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2604,7 +2597,7 @@ mod tests {
 
     fn wait_until_exited_or_parked(tid: usize) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let parked = format!("{SYS_FUTEX} ");
+        let parked = format!("{} ", libc::SYS_futex);
         while std::time::Instant::now() < deadline {
             match std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")) {
                 Err(_) => return,
@@ -2796,7 +2789,7 @@ mod tests {
 
     #[test]
     fn cached_thread_ids_match_the_kernel_in_every_thread() {
-        let kernel_tid = || unsafe { libc::syscall(SYS_GETTID) as i32 };
+        let kernel_tid = || unsafe { libc::syscall(libc::SYS_gettid) as i32 };
         unsafe {
             assert_eq!(eclipse_gettid(), kernel_tid());
             assert_eq!(eclipse_pthread_self(), kernel_tid() as usize);
@@ -2821,7 +2814,8 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
-            let fresh = unsafe { eclipse_gettid() } == unsafe { libc::syscall(SYS_GETTID) as i32 };
+            let fresh =
+                unsafe { eclipse_gettid() } == unsafe { libc::syscall(libc::SYS_gettid) as i32 };
             unsafe { libc::_exit(if fresh { 0 } else { 1 }) };
         }
         let mut status = 0;
