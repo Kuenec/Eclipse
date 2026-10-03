@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::io::AsRawFd as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
@@ -271,15 +272,44 @@ fn peer_allowed(peer: Uid, own: Uid) -> bool {
     peer == own
 }
 
+fn peer_uid(stream: &UnixStream) -> io::Result<Uid> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let expected = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let mut length = expected;
+    let status = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::addr_of_mut!(cred).cast(),
+            &mut length,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length != expected {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("SO_PEERCRED gave {length} bytes, not {expected}"),
+        ));
+    }
+    Ok(Uid::from_raw(cred.uid))
+}
+
 fn serve_connection(
     mut stream: UnixStream,
     slot: &LaunchSlot,
     window: &impl Fn(WindowCommand) -> Result<(), WindowGone>,
 ) -> io::Result<()> {
-    let peer = rustix::net::sockopt::socket_peercred(&stream)?;
-    if !peer_allowed(peer.uid, rustix::process::geteuid()) {
+    let peer = peer_uid(&stream)?;
+    if !peer_allowed(peer, rustix::process::geteuid()) {
         tracing::warn!(
-            uid = peer.uid.as_raw(),
+            uid = peer.as_raw(),
             "refused a control connection from another user"
         );
         return Ok(());
@@ -675,6 +705,13 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(dir.unwrap(), app);
         assert_eq!(modes, [0o700, 0o700]);
+    }
+
+    #[test]
+    fn the_peer_uid_is_read_from_the_connected_socket() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        assert_eq!(peer_uid(&ours).unwrap(), rustix::process::geteuid());
+        drop(theirs);
     }
 
     #[test]
