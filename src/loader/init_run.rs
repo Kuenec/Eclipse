@@ -240,7 +240,8 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
 }
 
 fn extract_engine(apk: &mut crate::apk::Apk, lib_dir: &Path) -> Result<PathBuf, InitRunError> {
-    apk.extract_native_libs(crate::apk::TARGET_ABI, lib_dir)
+    let status = crate::status::StatusSink::terminal();
+    apk.extract_native_libs(crate::apk::TARGET_ABI, lib_dir, &status)
         .map_err(|e| InitRunError::Extract(lib_dir.to_path_buf(), e.to_string()))?;
     Ok(lib_dir.join("libroblox.so"))
 }

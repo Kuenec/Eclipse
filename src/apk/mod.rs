@@ -20,7 +20,9 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crc32fast::Hasher as Crc32;
 use serde::{Deserialize, Serialize};
@@ -31,6 +33,8 @@ use axml::AxmlError;
 use file_reader::ApkFileReader;
 use intent_filter::{ViewHandler, ViewUri};
 use signature::{SignatureError, SigningCertificateHistory};
+
+use crate::status::{StatusSink, WINDOW_PROGRESS_INTERVAL};
 
 const MANIFEST_ENTRY: &str = "AndroidManifest.xml";
 
@@ -65,6 +69,8 @@ const EXTRACTION_LOCK: &str = ".eclipse-extract.lock";
 const EXTRACTION_STAMP: &str = ".eclipse-extract.stamp";
 
 const EXTRACTION_TEMP_SUFFIX: &str = ".partial";
+
+const SYNC_WORKERS: usize = 16;
 
 fn decode_modified_utf8(data: &[u8]) -> Option<String> {
     if let Ok(text) = std::str::from_utf8(data) {
@@ -140,6 +146,73 @@ struct PlannedEntry {
     dest: PathBuf,
     size: u64,
     crc32: u32,
+}
+
+struct ExtractionProgress<'a> {
+    status: &'a StatusSink,
+    done: u64,
+    total: u64,
+    last_update: Instant,
+}
+
+impl<'a> ExtractionProgress<'a> {
+    fn start(status: &'a StatusSink, planned: &[PlannedEntry]) -> Self {
+        let total = planned
+            .iter()
+            .fold(0_u64, |total, entry| total.saturating_add(entry.size));
+        status.extraction(0, total);
+        Self {
+            status,
+            done: 0,
+            total,
+            last_update: Instant::now(),
+        }
+    }
+
+    fn advance(&mut self, bytes: u64) {
+        self.done = self.done.saturating_add(bytes);
+        let now = Instant::now();
+        if now.duration_since(self.last_update) >= WINDOW_PROGRESS_INTERVAL
+            || self.done == self.total
+        {
+            self.last_update = now;
+            self.status.extraction(self.done, self.total);
+        }
+    }
+}
+
+fn sync_extracted(files: &[&Path]) -> io::Result<()> {
+    let next = AtomicUsize::new(0);
+    let sync_remaining = || -> io::Result<()> {
+        while let Some(path) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+            File::open(path)
+                .and_then(|opened| opened.sync_all())
+                .map_err(|error| io_context(error, "sync", path))?;
+        }
+        Ok(())
+    };
+    std::thread::scope(|scope| {
+        let helpers = (1..SYNC_WORKERS.min(files.len()))
+            .map(|_| {
+                std::thread::Builder::new()
+                    .name("eclipse-sync".to_owned())
+                    .spawn_scoped(scope, sync_remaining)
+                    .map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!("start a thread to sync extracted files: {error}"),
+                        )
+                    })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let synced = sync_remaining();
+        for helper in helpers {
+            helper
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+        }
+        synced
+    })
 }
 
 fn lock_extraction_dir(dir: &Path) -> io::Result<File> {
@@ -254,14 +327,8 @@ enum UnplannedEntries {
     Remove,
 }
 
-fn remove_unplanned_entries(dir: &Path, planned: &[PlannedEntry]) -> io::Result<()> {
-    let bookkeeping = [dir.join(EXTRACTION_LOCK), dir.join(EXTRACTION_STAMP)];
-    let files: HashSet<&Path> = planned
-        .iter()
-        .map(|entry| entry.dest.as_path())
-        .chain(bookkeeping.iter().map(PathBuf::as_path))
-        .collect();
-    let directories: HashSet<&Path> = planned
+fn planned_subdirectories<'a>(dir: &Path, planned: &'a [PlannedEntry]) -> HashSet<&'a Path> {
+    planned
         .iter()
         .flat_map(|entry| {
             entry
@@ -270,8 +337,24 @@ fn remove_unplanned_entries(dir: &Path, planned: &[PlannedEntry]) -> io::Result<
                 .skip(1)
                 .take_while(|ancestor| *ancestor != dir)
         })
+        .collect()
+}
+
+fn extraction_directories<'a>(dest_dir: &'a Path, planned: &'a [PlannedEntry]) -> Vec<&'a Path> {
+    planned_subdirectories(dest_dir, planned)
+        .into_iter()
+        .chain([dest_dir])
+        .collect()
+}
+
+fn remove_unplanned_entries(dir: &Path, planned: &[PlannedEntry]) -> io::Result<()> {
+    let bookkeeping = [dir.join(EXTRACTION_LOCK), dir.join(EXTRACTION_STAMP)];
+    let files: HashSet<&Path> = planned
+        .iter()
+        .map(|entry| entry.dest.as_path())
+        .chain(bookkeeping.iter().map(PathBuf::as_path))
         .collect();
-    remove_unplanned_in(dir, &files, &directories)
+    remove_unplanned_in(dir, &files, &planned_subdirectories(dir, planned))
 }
 
 fn remove_unplanned_in(
@@ -436,7 +519,12 @@ impl Apk {
         &self.file
     }
 
-    pub fn extract_native_libs(&mut self, abi: &str, dest_dir: &Path) -> Result<usize, ApkError> {
+    pub fn extract_native_libs(
+        &mut self,
+        abi: &str,
+        dest_dir: &Path,
+        status: &StatusSink,
+    ) -> Result<usize, ApkError> {
         let prefix = format!("lib/{abi}/");
 
         let names: Vec<String> = self
@@ -458,10 +546,14 @@ impl Apk {
                 crc32,
             });
         }
-        self.extract_planned(dest_dir, &planned, UnplannedEntries::Keep)
+        self.extract_planned(dest_dir, &planned, UnplannedEntries::Keep, status)
     }
 
-    pub fn extract_assets(&mut self, dest_dir: &Path) -> Result<usize, ApkError> {
+    pub fn extract_assets(
+        &mut self,
+        dest_dir: &Path,
+        status: &StatusSink,
+    ) -> Result<usize, ApkError> {
         const PREFIX: &str = "assets/";
 
         let names: Vec<String> = self
@@ -506,7 +598,7 @@ impl Apk {
                 crc32,
             });
         }
-        self.extract_planned(dest_dir, &planned, UnplannedEntries::Remove)
+        self.extract_planned(dest_dir, &planned, UnplannedEntries::Remove, status)
     }
 
     fn extract_planned(
@@ -514,6 +606,7 @@ impl Apk {
         dest_dir: &Path,
         planned: &[PlannedEntry],
         unplanned: UnplannedEntries,
+        status: &StatusSink,
     ) -> Result<usize, ApkError> {
         std::fs::create_dir_all(dest_dir).map_err(|error| io_context(error, "create", dest_dir))?;
         let _lock = lock_extraction_dir(dest_dir)?;
@@ -535,41 +628,22 @@ impl Apk {
             "{EXTRACTION_PREFIX}{}{EXTRACTION_TEMP_SUFFIX}",
             std::process::id()
         ));
-        let mut written = 0usize;
+        let mut progress = ExtractionProgress::start(status, planned);
+        let mut written = 0;
         for planned_entry in planned {
-            if extracted_entry_matches(
+            if !extracted_entry_matches(
                 &planned_entry.dest,
                 planned_entry.size,
                 planned_entry.crc32,
             )? {
-                continue;
+                self.write_entry(planned_entry, &temporary)?;
+                written += 1;
             }
-            if let Some(parent) = planned_entry.dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| io_context(error, "create", parent))?;
-            }
-            let mut entry = self.archive.by_name(&planned_entry.name)?;
-            let mut out = File::create(&temporary)
-                .map_err(|error| io_context(error, "create", &temporary))?;
-            io::copy(&mut entry, &mut out).map_err(|error| {
-                io_context(
-                    error,
-                    &format!("extract {} to", planned_entry.name),
-                    &temporary,
-                )
-            })?;
-            out.sync_all()
-                .map_err(|error| io_context(error, "sync", &temporary))?;
-            drop(out);
-            std::fs::rename(&temporary, &planned_entry.dest).map_err(|error| {
-                io_context(
-                    error,
-                    &format!("rename {} to", temporary.display()),
-                    &planned_entry.dest,
-                )
-            })?;
-            written += 1;
+            progress.advance(planned_entry.size);
         }
+        let files: Vec<&Path> = planned.iter().map(|entry| entry.dest.as_path()).collect();
+        sync_extracted(&files)?;
+        sync_extracted(&extraction_directories(dest_dir, planned))?;
 
         if let Some(stamp) = extraction_digest(&self.path, &source, planned)? {
             std::fs::write(&temporary, stamp)
@@ -583,6 +657,27 @@ impl Apk {
             })?;
         }
         Ok(written)
+    }
+
+    fn write_entry(&mut self, planned: &PlannedEntry, temporary: &Path) -> Result<(), ApkError> {
+        if let Some(parent) = planned.dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| io_context(error, "create", parent))?;
+        }
+        let mut entry = self.archive.by_name(&planned.name)?;
+        let mut out =
+            File::create(temporary).map_err(|error| io_context(error, "create", temporary))?;
+        io::copy(&mut entry, &mut out).map_err(|error| {
+            io_context(error, &format!("extract {} to", planned.name), temporary)
+        })?;
+        drop(out);
+        std::fs::rename(temporary, &planned.dest).map_err(|error| {
+            io_context(
+                error,
+                &format!("rename {} to", temporary.display()),
+                &planned.dest,
+            )
+        })?;
+        Ok(())
     }
 
     fn manifest_bytes(&mut self) -> Result<Vec<u8>, ApkError> {
@@ -1742,7 +1837,9 @@ mod tests {
         ));
         std::fs::remove_dir_all(&dir).ok();
 
-        let extracted = apk.extract_native_libs("x86_64", &dir).expect("extract");
+        let extracted = apk
+            .extract_native_libs("x86_64", &dir, &StatusSink::terminal())
+            .expect("extract");
         assert_eq!(extracted, 2, "two x86_64 libraries written");
         assert_eq!(
             std::fs::read(dir.join("libroblox.so")).unwrap(),
@@ -1758,7 +1855,9 @@ mod tests {
             "non-.so must not extract"
         );
 
-        let again = apk.extract_native_libs("x86_64", &dir).expect("re-extract");
+        let again = apk
+            .extract_native_libs("x86_64", &dir, &StatusSink::terminal())
+            .expect("re-extract");
         assert_eq!(again, 0, "an unchanged extraction writes nothing");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1779,10 +1878,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         old_apk
-            .extract_native_libs("x86_64", &dir)
+            .extract_native_libs("x86_64", &dir, &StatusSink::terminal())
             .expect("extract old APK");
         new_apk
-            .extract_native_libs("x86_64", &dir)
+            .extract_native_libs("x86_64", &dir, &StatusSink::terminal())
             .expect("extract upgraded APK");
         assert_eq!(
             std::fs::read(dir.join("libsame.so")).unwrap(),
@@ -1793,6 +1892,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&old_path).ok();
         std::fs::remove_file(&new_path).ok();
+    }
+
+    #[test]
+    fn extraction_syncs_the_destination_and_every_directory_below_it_once() {
+        let dest = Path::new("/extracted/assets");
+        let planned: Vec<PlannedEntry> = ["top.bin", "a/one.bin", "a/b/two.bin", "a/b/three.bin"]
+            .into_iter()
+            .map(|name| PlannedEntry {
+                name: format!("assets/{name}"),
+                dest: dest.join(name),
+                size: 1,
+                crc32: 0,
+            })
+            .collect();
+
+        let mut directories = extraction_directories(dest, &planned);
+        directories.sort_unstable();
+
+        assert_eq!(
+            directories,
+            [
+                Path::new("/extracted/assets"),
+                Path::new("/extracted/assets/a"),
+                Path::new("/extracted/assets/a/b"),
+            ]
+        );
     }
 
     #[test]
@@ -1810,7 +1935,9 @@ mod tests {
         ));
         std::fs::remove_dir_all(&dir).ok();
 
-        let count = apk.extract_assets(&dir).expect("extract assets");
+        let count = apk
+            .extract_assets(&dir, &StatusSink::terminal())
+            .expect("extract assets");
         assert_eq!(count, 2, "two asset files written");
         assert_eq!(
             std::fs::read(dir.join("shaders/shaders_glsles3.pack")).unwrap(),
@@ -1827,8 +1954,68 @@ mod tests {
             "non-asset entry must not be extracted"
         );
 
-        let again = apk.extract_assets(&dir).expect("re-extract assets");
+        let again = apk
+            .extract_assets(&dir, &StatusSink::terminal())
+            .expect("re-extract assets");
         assert_eq!(again, 0, "idempotent re-extract writes 0 files");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&apk_path).ok();
+    }
+
+    #[test]
+    fn extraction_reports_monotonic_progress_ending_at_the_total() {
+        use crate::status::{Progress, StatusUpdate};
+
+        let bytes = build_apk(&[
+            ("assets/a.bin", &[1; 300]),
+            ("assets/dir/b.bin", &[2; 500]),
+            ("assets/c.bin", &[3; 700]),
+        ]);
+        let (mut apk, apk_path) = open_apk(&bytes, "extract-progress");
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-extract-progress-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        let extract = |apk: &mut Apk| {
+            let (updates, shown) = std::sync::mpsc::channel();
+            let written = apk
+                .extract_assets(&dir, &StatusSink::with_window(updates))
+                .expect("extract assets");
+            let reported: Vec<(u64, u64)> = shown
+                .try_iter()
+                .map(|update| match update {
+                    StatusUpdate::Progress(Progress::Extraction { done, total }) => (done, total),
+                    other => panic!("extraction reports only its progress: {other:?}"),
+                })
+                .collect();
+            (written, reported)
+        };
+
+        let (written, reported) = extract(&mut apk);
+        assert_eq!(written, 3);
+        assert_eq!(reported.first(), Some(&(0, 1500)));
+        assert_eq!(reported.last(), Some(&(1500, 1500)));
+        assert!(
+            reported.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "{reported:?}"
+        );
+        assert!(
+            reported.iter().all(|&(_, total)| total == 1500),
+            "{reported:?}"
+        );
+
+        std::fs::remove_file(dir.join(EXTRACTION_STAMP)).unwrap();
+        let (written, reported) = extract(&mut apk);
+        assert_eq!(written, 0, "unchanged files are checked, not rewritten");
+        assert_eq!(
+            reported.last(),
+            Some(&(1500, 1500)),
+            "files that are already extracted count as prepared"
+        );
+
+        assert_eq!(extract(&mut apk), (0, Vec::new()));
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&apk_path).ok();
@@ -1853,9 +2040,16 @@ mod tests {
         ));
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(old_apk.extract_assets(&dir).expect("extract old APK"), 1);
         assert_eq!(
-            new_apk.extract_assets(&dir).expect("extract upgraded APK"),
+            old_apk
+                .extract_assets(&dir, &StatusSink::terminal())
+                .expect("extract old APK"),
+            1
+        );
+        assert_eq!(
+            new_apk
+                .extract_assets(&dir, &StatusSink::terminal())
+                .expect("extract upgraded APK"),
             1,
             "same-size changed asset must be rewritten"
         );
@@ -1909,9 +2103,16 @@ mod tests {
         std::fs::write(dir.join(".eclipse-extract.4242.partial"), b"stale").unwrap();
         let bookkeeping = [".eclipse-extract.lock", ".eclipse-extract.stamp"];
 
-        assert_eq!(old_apk.extract_assets(&dir).expect("extract old APK"), 3);
         assert_eq!(
-            new_apk.extract_assets(&dir).expect("extract upgraded APK"),
+            old_apk
+                .extract_assets(&dir, &StatusSink::terminal())
+                .expect("extract old APK"),
+            3
+        );
+        assert_eq!(
+            new_apk
+                .extract_assets(&dir, &StatusSink::terminal())
+                .expect("extract upgraded APK"),
             2
         );
         let mut upgraded = vec!["a", "b/", "b/y"];
@@ -1922,7 +2123,7 @@ mod tests {
 
         assert_eq!(
             old_apk
-                .extract_assets(&dir)
+                .extract_assets(&dir, &StatusSink::terminal())
                 .expect("extract downgraded APK"),
             3
         );
@@ -1973,8 +2174,9 @@ mod tests {
                         let (libs, assets, barrier) = (&libs, &assets, &barrier);
                         scope.spawn(move || {
                             barrier.wait();
-                            apk.extract_native_libs("x86_64", libs)?;
-                            apk.extract_assets(assets).map(drop)
+                            apk.extract_native_libs("x86_64", libs, &StatusSink::terminal())?;
+                            apk.extract_assets(assets, &StatusSink::terminal())
+                                .map(drop)
                         })
                     })
                     .collect();
@@ -2012,21 +2214,29 @@ mod tests {
         ));
         std::fs::remove_dir_all(&root).ok();
         let (libs, assets) = (root.join("libs"), root.join("assets"));
-        apk.extract_native_libs("x86_64", &libs)
+        apk.extract_native_libs("x86_64", &libs, &StatusSink::terminal())
             .expect("extract libs");
-        assert_eq!(apk.extract_assets(&assets).expect("extract assets"), 1);
         assert_eq!(
-            apk.extract_native_libs("x86_64", &libs)
+            apk.extract_assets(&assets, &StatusSink::terminal())
+                .expect("extract assets"),
+            1
+        );
+        assert_eq!(
+            apk.extract_native_libs("x86_64", &libs, &StatusSink::terminal())
                 .expect("stamped libs"),
             0
         );
-        assert_eq!(apk.extract_assets(&assets).expect("stamped assets"), 0);
+        assert_eq!(
+            apk.extract_assets(&assets, &StatusSink::terminal())
+                .expect("stamped assets"),
+            0
+        );
 
         let unreadable = std::fs::Permissions::from_mode(0o000);
         std::fs::set_permissions(libs.join("libroblox.so"), unreadable.clone()).unwrap();
         std::fs::set_permissions(assets.join("content/fonts/a.ttf"), unreadable).unwrap();
-        let again = apk.extract_native_libs("x86_64", &libs);
-        let assets_again = apk.extract_assets(&assets);
+        let again = apk.extract_native_libs("x86_64", &libs, &StatusSink::terminal());
+        let assets_again = apk.extract_assets(&assets, &StatusSink::terminal());
         let readable = std::fs::Permissions::from_mode(0o644);
         std::fs::set_permissions(libs.join("libroblox.so"), readable.clone()).unwrap();
         std::fs::set_permissions(assets.join("content/fonts/a.ttf"), readable).unwrap();
@@ -2054,9 +2264,10 @@ mod tests {
         ));
         std::fs::remove_dir_all(&root).ok();
         let (libs, assets) = (root.join("libs"), root.join("assets"));
-        apk.extract_native_libs("x86_64", &libs)
+        apk.extract_native_libs("x86_64", &libs, &StatusSink::terminal())
             .expect("extract libs");
-        apk.extract_assets(&assets).expect("extract assets");
+        apk.extract_assets(&assets, &StatusSink::terminal())
+            .expect("extract assets");
 
         for (path, bytes) in [
             (libs.join("libroblox.so"), b"OTHER-ENGINE".as_slice()),
@@ -2069,11 +2280,15 @@ mod tests {
         std::fs::write(libs.join(".eclipse-extract.4242.partial"), b"stale").unwrap();
 
         assert_eq!(
-            apk.extract_native_libs("x86_64", &libs)
+            apk.extract_native_libs("x86_64", &libs, &StatusSink::terminal())
                 .expect("re-extract libs"),
             1
         );
-        assert_eq!(apk.extract_assets(&assets).expect("re-extract assets"), 1);
+        assert_eq!(
+            apk.extract_assets(&assets, &StatusSink::terminal())
+                .expect("re-extract assets"),
+            1
+        );
         assert_eq!(
             std::fs::read(libs.join("libroblox.so")).unwrap(),
             b"ENGINE-BYTES"
@@ -2089,6 +2304,38 @@ mod tests {
     }
 
     #[test]
+    fn every_extracted_file_is_synced_and_a_failure_names_its_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-extract-sync-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files: Vec<PathBuf> = (0..40)
+            .map(|index| {
+                let path = dir.join(format!("file-{index}"));
+                std::fs::write(&path, index.to_string()).unwrap();
+                path
+            })
+            .collect();
+        let borrowed: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+        sync_extracted(&borrowed).expect("existing files sync");
+
+        let missing = dir.join("missing");
+        files.insert(37, missing.clone());
+        let borrowed: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+        let error = sync_extracted(&borrowed).expect_err("a missing file cannot be synced");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("sync {}: ", missing.display())),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn assets_that_collide_with_extraction_bookkeeping_are_refused() {
         let bytes = build_apk(&[("assets/.eclipse-extract.stamp", b"not a stamp")]);
         let (mut apk, apk_path) = open_apk(&bytes, "extract-collision");
@@ -2097,7 +2344,9 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::remove_dir_all(&dir).ok();
-        let error = apk.extract_assets(&dir).expect_err("bookkeeping name");
+        let error = apk
+            .extract_assets(&dir, &StatusSink::terminal())
+            .expect_err("bookkeeping name");
         assert!(
             error.to_string().contains(".eclipse-extract.stamp"),
             "{error}"
@@ -2123,7 +2372,7 @@ mod tests {
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let error = apk
-            .extract_assets(&dir)
+            .extract_assets(&dir, &StatusSink::terminal())
             .expect_err("the extracted asset cannot be read");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&apk_path).ok();

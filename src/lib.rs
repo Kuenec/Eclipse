@@ -7,6 +7,7 @@ pub mod client_log;
 mod clipboard;
 pub mod diagnostics;
 pub mod egl_engine;
+pub mod first_frame;
 mod font;
 pub mod framework;
 pub mod graphics;

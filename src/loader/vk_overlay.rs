@@ -2403,6 +2403,7 @@ unsafe fn present_engine_frame(
     let timing = frame_log.map(|log| (log, MonotonicNs::now()));
     let n = PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
+        crate::first_frame::presented();
         if let Ok(st) = STATE.lock() {
             tracing::info!(
                 device_set = st.device != 0,

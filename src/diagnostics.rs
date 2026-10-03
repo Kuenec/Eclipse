@@ -279,6 +279,19 @@ fn run_logs(dir: &Path) -> io::Result<Vec<RunFiles>> {
     Ok(runs.into_values().rev().collect())
 }
 
+pub fn log_dir(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join(LOG_DIR)
+}
+
+pub fn older_run_logs(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let runs = match run_logs(dir) {
+        Ok(runs) => runs,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(runs.into_iter().skip(1).flat_map(|run| run.paths).collect())
+}
+
 fn open_run(
     dir: &Path,
     started: std::time::SystemTime,
@@ -366,7 +379,7 @@ pub struct RunLog {
 
 impl RunLog {
     pub fn start(app_data_dir: &Path) -> io::Result<Self> {
-        let dir = app_data_dir.join(LOG_DIR);
+        let dir = log_dir(app_data_dir);
         fs::create_dir_all(&dir).map_err(failed("create", &dir))?;
         open_run(&dir, std::time::SystemTime::now(), RUN_LOG_LIMITS)
     }
@@ -610,6 +623,34 @@ mod tests {
         assert_eq!(names(&dir), expected);
         let total: u64 = run_logs(&dir).unwrap().iter().map(|run| run.bytes).sum();
         assert!(total <= TEST_LIMITS.total, "{total} bytes");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn older_run_logs_are_every_run_but_the_newest() {
+        let dir = temp_dir("older-runs");
+        assert_eq!(
+            older_run_logs(&dir.join("missing")).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        fs::write(dir.join("notes.txt"), b"kept").unwrap();
+        let mut stamps = Vec::new();
+        for second in 0..3 {
+            let mut log = open_run(&dir, at(1_800_000_000 + second, 0), TEST_LIMITS).unwrap();
+            fill(&mut log, 4);
+            fs::write(log.path(".report.txt"), b"report").unwrap();
+            stamps.push(log.stamp.clone());
+        }
+
+        let older: Vec<String> = older_run_logs(&dir)
+            .unwrap()
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap().to_owned())
+            .collect();
+        let expected = stamps[..2]
+            .iter()
+            .flat_map(|stamp| [HEAD_SUFFIX, ".report.txt"].map(|suffix| stamp.file_name(suffix)));
+        assert_eq!(sorted(older), sorted(expected.collect()));
         fs::remove_dir_all(&dir).ok();
     }
 

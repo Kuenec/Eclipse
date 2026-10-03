@@ -22,7 +22,7 @@ use winit::window::{ActivationToken, UserAttentionType, Window, WindowId};
 use super::{GlyphAtlas, GraphicsError, HostEventLoop, TextMeasure, VulkanRenderer};
 use crate::framework::view_registry::{LayoutParams, RenderNode, MATCH_PARENT, WRAP_CONTENT};
 use crate::framework::HostWake;
-use crate::status::{transfer_text, StatusUpdate};
+use crate::status::{Progress, StatusUpdate};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ACTIVATION_WAIT: Duration = Duration::from_millis(500);
@@ -492,7 +492,7 @@ struct Failure {
 #[derive(Default)]
 struct Content {
     step: Option<String>,
-    transfer: Option<(u64, Option<u64>)>,
+    progress: Option<Progress>,
     warnings: VecDeque<String>,
     error: Option<Failure>,
 }
@@ -502,9 +502,9 @@ impl Content {
         match update {
             StatusUpdate::Step(text) => {
                 self.step = Some(text);
-                self.transfer = None;
+                self.progress = None;
             }
-            StatusUpdate::Transfer { done, total } => self.transfer = Some((done, total)),
+            StatusUpdate::Progress(progress) => self.progress = Some(progress),
             StatusUpdate::Warning(text) => {
                 if self.warnings.len() == MAX_WARNINGS {
                     self.warnings.pop_front();
@@ -523,8 +523,8 @@ impl Content {
             Some(Failure { message, log: None }) => format!("{ERROR_HEADING} {message}"),
             None => {
                 let step = self.step.as_deref().unwrap_or(STARTING);
-                match self.transfer {
-                    Some((done, total)) => format!("{step} {}", transfer_text(done, total)),
+                match self.progress {
+                    Some(progress) => format!("{step} {}", progress.text()),
                     None => step.to_owned(),
                 }
             }
@@ -549,11 +549,11 @@ impl Content {
             None => {
                 let step = self.step.as_deref().unwrap_or(STARTING);
                 screen.paragraph(step, measure, width, BACKGROUND, 0);
-                if let Some((done, total)) = self.transfer {
-                    if let Some(total) = total.filter(|&total| total > 0) {
+                if let Some(progress) = self.progress {
+                    if let Some((done, total)) = progress.bar() {
                         screen.bar(done, total, width);
                     }
-                    screen.paragraph(&transfer_text(done, total), measure, width, BACKGROUND, 0);
+                    screen.paragraph(&progress.text(), measure, width, BACKGROUND, 0);
                 }
             }
         }
@@ -799,10 +799,10 @@ mod tests {
         );
 
         content.apply(StatusUpdate::Step("Downloading Roblox".to_owned()));
-        content.apply(StatusUpdate::Transfer {
+        content.apply(StatusUpdate::Progress(Progress::Transfer {
             done: 50 * 1024 * 1024,
             total: Some(100 * 1024 * 1024),
-        });
+        }));
         let nodes = content.nodes(&atlas, extent, 1.0);
         assert_eq!(
             texts(&nodes),
@@ -813,6 +813,27 @@ mod tests {
             .find(|node| node.background_color == Some(BAR_FILL))
             .expect("a progress bar");
         assert_eq!(fill.layout.width, (800 - 2 * PADDING) / 2);
+
+        content.apply(StatusUpdate::Step(
+            "Extracting Roblox bundled assets".to_owned(),
+        ));
+        content.apply(StatusUpdate::Progress(Progress::Extraction {
+            done: 60 * 1024 * 1024,
+            total: 80 * 1024 * 1024,
+        }));
+        let nodes = content.nodes(&atlas, extent, 1.0);
+        assert_eq!(
+            texts(&nodes),
+            [
+                "Extracting Roblox bundled assets",
+                "Prepared 60.0 of 80.0 MiB (75%)"
+            ]
+        );
+        let fill = nodes
+            .iter()
+            .find(|node| node.background_color == Some(BAR_FILL))
+            .expect("a progress bar");
+        assert_eq!(fill.layout.width, (800 - 2 * PADDING) * 3 / 4);
 
         for index in 0..=MAX_WARNINGS {
             content.apply(StatusUpdate::Warning(format!("warning {index}")));
@@ -854,10 +875,10 @@ mod tests {
             height: 900,
         };
         let mut content = Content::default();
-        content.apply(StatusUpdate::Transfer {
+        content.apply(StatusUpdate::Progress(Progress::Transfer {
             done: 1,
             total: Some(2),
-        });
+        }));
         for (scale, padding) in [(1.0, PADDING), (2.0, 2 * PADDING), (1.5, 48)] {
             let nodes = content.nodes(&atlas, extent, scale);
             assert_eq!(nodes[0].layout.padding, [padding; 4], "{scale}");
@@ -929,10 +950,10 @@ mod tests {
         let mut content = Content::default();
         assert_eq!(content.summary(), STARTING);
         content.apply(StatusUpdate::Step("Downloading Roblox…".to_owned()));
-        content.apply(StatusUpdate::Transfer {
+        content.apply(StatusUpdate::Progress(Progress::Transfer {
             done: 50 * 1024 * 1024,
             total: Some(100 * 1024 * 1024),
-        });
+        }));
         assert_eq!(
             content.summary(),
             "Downloading Roblox… Downloaded 50.0 of 100.0 MiB (50%)"
