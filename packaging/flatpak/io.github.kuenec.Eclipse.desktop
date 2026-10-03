@@ -9,5 +9,6 @@ Icon=io.github.kuenec.Eclipse
 Terminal=false
 StartupNotify=true
 SingleMainWindow=true
+X-GNOME-UsesNotifications=true
 Categories=Game;
 Keywords=roblox;android;game;

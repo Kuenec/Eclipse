@@ -28,12 +28,14 @@ pub mod bitmap_registry;
 pub mod canvas_registry;
 mod captures;
 pub mod dialogs;
-mod external_uri;
+mod external_intents;
 #[cfg(test)]
 mod fake_jvm;
+pub(crate) mod keep_screen_on;
 pub mod matrix_registry;
 pub(crate) mod memory;
 mod message_queue;
+pub(crate) mod notifications;
 pub mod paint_registry;
 pub mod path_registry;
 pub mod platform_probe;
@@ -12273,19 +12275,12 @@ fn register_activity_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 activity_is_task_root as *mut std::ffi::c_void,
             )
         },
-        unsafe {
-            NativeMethod::from_raw_parts(
-                external_uri::NATIVE_OPEN_URI_NAME,
-                external_uri::NATIVE_OPEN_URI_SIG,
-                external_uri::activity_native_open_uri as *mut std::ffi::c_void,
-            )
-        },
     ];
 
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/app/Activity",
-        "registered Eclipse's backing for nativeStartActivity + nativeFinish + nativeResumeActivity + isInMultiWindowMode + isTaskRoot + nativeOpenURI"
+        "registered Eclipse's backing for nativeStartActivity + nativeFinish + nativeResumeActivity + isInMultiWindowMode + isTaskRoot"
     );
     Ok(())
 }
@@ -12755,8 +12750,15 @@ static PENDING_HOST_CLIPBOARD_TEXT: std::sync::Mutex<Option<String>> = std::sync
 pub(crate) fn take_pending_host_clipboard_text() -> Option<String> {
     PENDING_HOST_CLIPBOARD_TEXT
         .lock()
-        .ok()
-        .and_then(|mut pending| pending.take())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+fn queue_host_clipboard_text(text: String) {
+    *PENDING_HOST_CLIPBOARD_TEXT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text);
+    wake_main_looper();
 }
 
 const CLIPBOARD_MANAGER_CLASS: &JNIStr = jni_str!("android/content/ClipboardManager");
@@ -12776,11 +12778,7 @@ extern "system" fn clipboard_manager_native_set_clipboard<'local>(
             );
             return Ok(());
         }
-        let value = text.try_to_string(env)?;
-        if let Ok(mut pending) = PENDING_HOST_CLIPBOARD_TEXT.lock() {
-            *pending = Some(value);
-        }
-        wake_main_looper();
+        queue_host_clipboard_text(text.try_to_string(env)?);
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
@@ -13993,13 +13991,11 @@ fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas
     Ok(drawn)
 }
 
-fn drive_lifecycle(
+fn register_framework_natives(
     env: &mut Env,
     apk_path: &str,
-    native_library_dir: &str,
     signing_certificate_history: &SigningCertificateHistory,
-    start: ActivityStart<'_>,
-) -> Result<LifecycleProgress, FrameworkError> {
+) -> Result<(), FrameworkError> {
     register_context_natives(env, apk_path)?;
 
     signing_certificates::register_natives(env, signing_certificate_history)?;
@@ -14036,6 +14032,8 @@ fn drive_lifecycle(
 
     register_activity_natives(env)?;
 
+    external_intents::register_natives(env)?;
+
     register_view_natives(env)?;
 
     register_view_tree_observer_natives(env)?;
@@ -14047,6 +14045,10 @@ fn drive_lifecycle(
     dialogs::register_natives(env)?;
 
     register_window_natives(env)?;
+
+    keep_screen_on::register_natives(env)?;
+
+    notifications::register_natives(env)?;
 
     register_text_view_natives(env)?;
 
@@ -14081,6 +14083,17 @@ fn drive_lifecycle(
     register_canvas_natives(env)?;
 
     register_runtime_native_load_natives(env)?;
+    Ok(())
+}
+
+fn drive_lifecycle(
+    env: &mut Env,
+    apk_path: &str,
+    native_library_dir: &str,
+    signing_certificate_history: &SigningCertificateHistory,
+    start: ActivityStart<'_>,
+) -> Result<LifecycleProgress, FrameworkError> {
+    register_framework_natives(env, apk_path, signing_certificate_history)?;
 
     env.find_class(CONTEXT_CLASS)?;
     env.find_class(APPLICATION_CLASS)?;
@@ -17324,14 +17337,25 @@ mod tests {
     }
 
     #[test]
-    fn activity_open_uri_is_bound_with_the_api_impl_signature() {
-        fake_jvm::with_env(register_activity_natives).expect("register Activity");
-        assert!(fake_jvm::registered_native(
-            "android/app/Activity",
-            "nativeOpenURI",
-            "(Ljava/lang/String;)V"
-        )
-        .is_some());
+    fn external_intent_natives_are_bound_with_the_api_impl_signatures() {
+        fake_jvm::with_env(external_intents::register_natives).expect("register the natives");
+        for (class, name, sig) in [
+            (
+                "android/app/Activity",
+                "nativeOpenURI",
+                "(Ljava/lang/String;)V",
+            ),
+            (
+                "android/content/Context",
+                "nativeShareFile",
+                "(Ljava/lang/String;I)V",
+            ),
+        ] {
+            assert!(
+                fake_jvm::registered_native(class, name, sig).is_some(),
+                "{class}.{name}{sig} is not bound"
+            );
+        }
     }
 
     #[test]
@@ -18735,7 +18759,7 @@ mod tests {
             .iter()
             .map(|&(name, _)| name)
             .collect();
-        let strictly_registered: [(&JNIStr, &[&JNIStr]); 8] = [
+        let strictly_registered: [(&JNIStr, &[&JNIStr]); 9] = [
             (
                 CONNECTIVITY_MANAGER_CLASS,
                 &[
@@ -18773,7 +18797,8 @@ mod tests {
                     CURRENT_THREAD_TIME_MILLIS_NAME,
                 ],
             ),
-            (ACTIVITY_CLASS, &[external_uri::NATIVE_OPEN_URI_NAME]),
+            (ACTIVITY_CLASS, &[external_intents::NATIVE_OPEN_URI_NAME]),
+            (CONTEXT_CLASS, &[external_intents::NATIVE_SHARE_FILE_NAME]),
             (ASSET_MANAGER_CLASS, &[ASSET_MANAGER_DELETE_THEME_NAME]),
             (dialogs::DIALOG_CLASS, &dialog_names),
             (dialogs::ALERT_DIALOG_CLASS, &alert_dialog_names),

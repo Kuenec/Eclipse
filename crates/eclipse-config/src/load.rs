@@ -822,6 +822,7 @@ mod tests {
             Config {
                 graphics_optimization_mode: GraphicsOptimizationMode::Quality,
                 touch_mode: TouchMode::FakeOff,
+                enable_gamemode: false,
                 fflags: BTreeMap::from([("DFIntExample".to_owned(), 42.into())]),
                 webview_helper_path: Some(PathBuf::from("/opt/eclipse-webview")),
             },
@@ -834,6 +835,34 @@ mod tests {
             assert_eq!(loaded.unused_keys_message(), None, "{json}");
             assert_eq!(loaded.config, config, "{json}");
         }
+    }
+
+    #[test]
+    fn a_sober_enable_gamemode_switch_is_read() {
+        let (_, loaded) = load_bytes("gamemode-off", br#"{"enable_gamemode": false}"#);
+        assert_eq!(loaded.problems, []);
+        assert!(loaded.unused_keys.is_empty(), "{:?}", loaded.unused_keys);
+        assert!(!loaded.config.enable_gamemode);
+        let (_, loaded) = load_bytes("gamemode-absent", b"{}");
+        assert!(loaded.config.enable_gamemode);
+    }
+
+    #[test]
+    fn an_enable_gamemode_that_is_not_a_boolean_keeps_gamemode_on() {
+        let (path, loaded) = load_bytes("gamemode-string", br#"{"enable_gamemode": "no"}"#);
+        assert!(loaded.config.enable_gamemode);
+        assert_eq!(
+            loaded
+                .problems
+                .iter()
+                .map(Problem::to_string)
+                .collect::<Vec<_>>(),
+            [format!(
+                "{}:1:21: enable_gamemode: expected one of `true`, `false`; Eclipse uses the \
+                 default (true)",
+                path.display()
+            )]
+        );
     }
 
     #[test]

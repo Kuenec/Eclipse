@@ -118,6 +118,7 @@ fn heap() -> MutexGuard<'static, Heap> {
 
 thread_local! {
     static PENDING_EXCEPTION: RefCell<Option<String>> = const { RefCell::new(None) };
+    static THROWN_MESSAGE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 unsafe extern "system" fn unimplemented_function() {
@@ -177,9 +178,15 @@ unsafe extern "system" fn is_assignable_from(
     true
 }
 
-unsafe extern "system" fn throw_new(_env: *mut JNIEnv, class: jclass, _msg: *const c_char) -> jint {
+unsafe extern "system" fn throw_new(_env: *mut JNIEnv, class: jclass, msg: *const c_char) -> jint {
     let name = heap().text(class).unwrap_or_default();
+    let message = (!msg.is_null()).then(|| {
+        unsafe { CStr::from_ptr(msg) }
+            .to_string_lossy()
+            .into_owned()
+    });
     PENDING_EXCEPTION.with(|pending| *pending.borrow_mut() = Some(name));
+    THROWN_MESSAGE.with(|thrown| *thrown.borrow_mut() = message);
     JNI_OK
 }
 
@@ -574,6 +581,10 @@ pub(super) fn throw(class: &str) {
 
 pub(super) fn take_exception() -> Option<String> {
     PENDING_EXCEPTION.with(|pending| pending.borrow_mut().take())
+}
+
+pub(super) fn take_thrown_message() -> Option<String> {
+    THROWN_MESSAGE.with(|thrown| thrown.borrow_mut().take())
 }
 
 pub(super) fn registered_native(class: &str, name: &str, sig: &str) -> Option<usize> {

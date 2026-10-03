@@ -114,6 +114,10 @@ struct GameWindow<'vm> {
 
     focused: bool,
 
+    idle_inhibit: crate::portal::IdleInhibit,
+
+    on_screen_keyboard: crate::on_screen_keyboard::OnScreenKeyboard,
+
     fullscreen: bool,
 
     host_cursor: HostCursor,
@@ -559,6 +563,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                     (false, false) | (true, true) => {}
                 }
                 self.focused = focused;
+                crate::framework::notifications::set_host_window_focused(focused);
                 if !focused {
                     self.release_engine_input_for_focus_loss();
                 }
@@ -746,7 +751,9 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
         } else {
             None
         };
-        self.sync_ime(ime_request(text_box.filter(|_| web_view_hidden)));
+        let game_text_box = text_box.filter(|_| web_view_hidden);
+        self.sync_ime(ime_request(game_text_box));
+        self.on_screen_keyboard.follow(game_text_box);
         if let Some(text) = crate::framework::take_pending_host_clipboard_text() {
             self.store_clipboard_text(text);
         }
@@ -758,6 +765,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
             self.handed_off && web_view_hidden && self.engine_center_queryable(),
         );
         self.sync_host_cursor();
+        crate::framework::keep_screen_on::sync_idle_inhibit(&mut self.idle_inhibit, self.focused);
         let now = std::time::Instant::now();
         self.sync_engine_surface_size(now);
         if now >= self.next_display_refresh_poll {
@@ -2307,6 +2315,8 @@ pub fn run_windowed(
         published_display_refresh_profile: None,
         next_display_refresh_poll: std::time::Instant::now(),
         focused: false,
+        idle_inhibit: crate::portal::IdleInhibit::Release,
+        on_screen_keyboard: crate::on_screen_keyboard::OnScreenKeyboard::from_environment(),
         fullscreen: false,
         host_cursor: HostCursor::Shown,
         pointer_lock_reasons: PointerLockReasons::default(),

@@ -4,7 +4,7 @@ Bug reports and focused pull requests are welcome. For a bug, include your distr
 
 ## Build
 
-Requirements: Rust 1.95+, a C/C++ toolchain, `pkg-config`, and the ALSA, Fontconfig and FreeType headers. The WebView helper also needs the GTK 4.10+ and WebKitGTK 6.0 (2.42+) headers.
+Requirements: Rust 1.95+, a C/C++ toolchain, `pkg-config`, and the ALSA, D-Bus, Fontconfig and FreeType headers. The tests also need `dbus-daemon`. The WebView helper also needs the GTK 4.10+ and WebKitGTK 6.0 (2.42+) headers.
 
 ```bash
 cargo build --release --locked
