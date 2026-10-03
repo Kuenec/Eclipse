@@ -79,15 +79,29 @@ impl Serialize for TouchMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Config {
     pub graphics_optimization_mode: GraphicsOptimizationMode,
 
     pub touch_mode: TouchMode,
 
+    pub enable_gamemode: bool,
+
     pub fflags: BTreeMap<String, serde_json::Value>,
 
     pub webview_helper_path: Option<PathBuf>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            graphics_optimization_mode: GraphicsOptimizationMode::default(),
+            touch_mode: TouchMode::default(),
+            enable_gamemode: true,
+            fflags: BTreeMap::new(),
+            webview_helper_path: None,
+        }
+    }
 }
 
 impl Config {
@@ -97,6 +111,7 @@ impl Config {
             Key::Setting(key) => match key.setting(&value)? {
                 Setting::TouchMode(mode) => self.touch_mode = mode,
                 Setting::GraphicsOptimizationMode(mode) => self.graphics_optimization_mode = mode,
+                Setting::EnableGamemode(enabled) => self.enable_gamemode = enabled,
             },
             Key::FileOnly(FileOnlyKey::Fflags) => {
                 self.fflags = serde_json::from_value(value).map_err(reason)?;
@@ -116,6 +131,7 @@ impl Config {
 pub enum Setting {
     TouchMode(TouchMode),
     GraphicsOptimizationMode(GraphicsOptimizationMode),
+    EnableGamemode(bool),
 }
 
 impl Setting {
@@ -124,6 +140,7 @@ impl Setting {
         match self {
             Self::TouchMode(_) => SettingKey::TouchMode,
             Self::GraphicsOptimizationMode(_) => SettingKey::GraphicsOptimizationMode,
+            Self::EnableGamemode(_) => SettingKey::EnableGamemode,
         }
     }
 }
@@ -132,16 +149,22 @@ impl Setting {
 pub enum SettingKey {
     TouchMode,
     GraphicsOptimizationMode,
+    EnableGamemode,
 }
 
 impl SettingKey {
-    const ALL: [Self; 2] = [Self::TouchMode, Self::GraphicsOptimizationMode];
+    const ALL: [Self; 3] = [
+        Self::TouchMode,
+        Self::GraphicsOptimizationMode,
+        Self::EnableGamemode,
+    ];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::TouchMode => "touch_mode",
             Self::GraphicsOptimizationMode => "graphics_optimization_mode",
+            Self::EnableGamemode => "enable_gamemode",
         }
     }
 
@@ -165,6 +188,7 @@ impl SettingKey {
             Self::GraphicsOptimizationMode => name
                 .and_then(GraphicsOptimizationMode::from_name)
                 .map(Setting::GraphicsOptimizationMode),
+            Self::EnableGamemode => value.as_bool().map(Setting::EnableGamemode),
         };
         setting.ok_or_else(|| format!("expected one of {}", self.accepted_values()))
     }
@@ -175,6 +199,7 @@ impl SettingKey {
             Self::GraphicsOptimizationMode => {
                 &GraphicsOptimizationMode::ALL.map(GraphicsOptimizationMode::as_str)
             }
+            Self::EnableGamemode => &["true", "false"],
         };
         let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
         quoted.join(", ")
@@ -289,7 +314,7 @@ mod tests {
         assert_eq!(
             SettingError::UnknownKey("use_opengl".to_owned()).to_string(),
             "`use_opengl` is not a setting; the settings are `touch_mode`, \
-             `graphics_optimization_mode`"
+             `graphics_optimization_mode`, `enable_gamemode`"
         );
     }
 
@@ -358,6 +383,35 @@ mod tests {
     }
 
     #[test]
+    fn enable_gamemode_takes_only_a_json_boolean() {
+        for enabled in [true, false] {
+            let setting = SettingKey::EnableGamemode
+                .parse(enabled.into())
+                .expect("a boolean");
+            assert_eq!(setting, Setting::EnableGamemode(enabled));
+            assert_eq!(setting.key(), SettingKey::EnableGamemode);
+            assert_eq!(
+                serde_json::to_string(&setting).expect("serialize"),
+                enabled.to_string()
+            );
+        }
+        for value in [
+            serde_json::json!("false"),
+            serde_json::json!(0),
+            serde_json::json!(null),
+        ] {
+            assert_eq!(
+                SettingKey::EnableGamemode.parse(value.clone()),
+                Err(SettingError::Invalid {
+                    key: SettingKey::EnableGamemode,
+                    message: "expected one of `true`, `false`".to_owned(),
+                }),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn every_schema_key_is_a_setting_or_file_only() {
         let written = serde_json::to_value(Config::default()).expect("serialize");
         let mut schema: Vec<&str> = written
@@ -389,6 +443,7 @@ mod tests {
         };
         assert_eq!(default_json("touch_mode"), r#""off""#);
         assert_eq!(default_json("graphics_optimization_mode"), r#""balanced""#);
+        assert_eq!(default_json("enable_gamemode"), "true");
         assert_eq!(default_json("fflags"), "{}");
         assert_eq!(default_json("webview_helper_path"), "null");
     }

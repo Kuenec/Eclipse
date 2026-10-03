@@ -75,6 +75,8 @@ libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }
 
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 
+dbus = { version = "0.9", features = ["stdfd"] }
+
 [dev-dependencies]
 
 rustix = { version = "1", default-features = false, features = ["fs", "time"] }

@@ -29,7 +29,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libasound2-dev libfontconfig1-dev libfreetype6-dev pkg-config shellcheck
+          sudo apt-get install --yes libasound2-dev libdbus-1-dev libfontconfig1-dev libfreetype6-dev pkg-config shellcheck
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
@@ -79,7 +79,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libasound2-dev libfontconfig1-dev libfreetype6-dev pkg-config
+          sudo apt-get install --yes libasound2-dev libdbus-1-dev libfontconfig1-dev libfreetype6-dev pkg-config dbus-daemon
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
@@ -109,7 +109,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libasound2-dev libfontconfig1-dev libfreetype6-dev pkg-config
+          sudo apt-get install --yes libasound2-dev libdbus-1-dev libfontconfig1-dev libfreetype6-dev pkg-config
 
       - name: Install minimum supported Rust
         uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a
@@ -162,7 +162,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libasound2-dev libfontconfig1-dev libfreetype6-dev pkg-config
+          sudo apt-get install --yes libasound2-dev libdbus-1-dev libfontconfig1-dev libfreetype6-dev pkg-config
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d

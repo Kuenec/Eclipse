@@ -1596,6 +1596,17 @@ fn prepare_client_cache(status: &StatusSink) -> Result<ClientCacheDir, Box<dyn s
     Ok(client_cache)
 }
 
+fn request_game_mode(config: &eclipse_config::Config) {
+    if !config.enable_gamemode
+        || eclipse::portal::gamemode_preloaded(std::env::var_os("LD_PRELOAD").as_deref())
+    {
+        return;
+    }
+    if let Err(error) = eclipse::portal::submit(eclipse::portal::PortalRequest::RegisterGame) {
+        tracing::warn!(%error, "cannot ask the desktop portal to turn on GameMode");
+    }
+}
+
 fn boot_and_play(
     prepared: PreparedClient,
     target: Option<&LaunchTarget>,
@@ -1617,6 +1628,7 @@ fn boot_and_play(
     let manifest = apks.manifest().clone();
     eclipse::webview::client::use_helper_path(config.webview_helper_path.clone())?;
     eclipse::performance::configure_engine_cpu_affinity(config.graphics_optimization_mode);
+    request_game_mode(config);
     let plan = eclipse::runtime::BootPlan::new(&manifest, config, client_cache);
     let link = target.map(|target| (target, target.android_uri()));
     let start = match &link {
@@ -1871,6 +1883,8 @@ fn pump_tick(vm: &eclipse::runtime::Vm, ms: u64) {
 
 fn run_platform_test(
 ) -> Result<eclipse::framework::platform_probe::PlatformProbeReport, Box<dyn std::error::Error>> {
+    const PORTAL_FLUSH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
     let paths = eclipse::apk::ApkSetPaths::from_env()?.ok_or_else(|| {
         format!(
             "no Roblox APK (set {} to an APK file or to a directory holding {} and {}) — \
@@ -1888,9 +1902,25 @@ fn run_platform_test(
         &loaded.config,
         eclipse::runtime::client_cache_dir()?,
     );
+    let apk_path = apks
+        .base_path()
+        .to_str()
+        .ok_or("the Roblox APK path is not valid UTF-8")?;
     let vm = eclipse::runtime::boot(&plan, Some(apks.base_path()), None)?;
-    eclipse::framework::register_engine_preload_natives(&vm)?;
-    Ok(eclipse::framework::platform_probe::run(&vm)?)
+    let report =
+        eclipse::framework::platform_probe::run(&vm, apk_path, apks.signing_certificate_history())?;
+    let (done, flushed) = std::sync::mpsc::sync_channel(1);
+    eclipse::portal::submit(eclipse::portal::PortalRequest::Flush(done))?;
+    flushed
+        .recv_timeout(PORTAL_FLUSH_DEADLINE)
+        .map_err(|error| {
+            format!(
+                "the desktop portal worker did not finish the probe's requests within {} s: \
+                 {error}",
+                PORTAL_FLUSH_DEADLINE.as_secs()
+            )
+        })?;
+    Ok(report)
 }
 
 fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {

@@ -747,6 +747,22 @@ UPSTREAM_PUBLIC_DIRECTORY=$'.method public static getExternalStoragePublicDirect
 ENVIRONMENT_PUBLIC_DIRECTORY=$'.method public static getExternalStoragePublicDirectory(Ljava/lang/String;)Ljava/io/File;\n    .registers 3\n\n    sget-object v0, Landroid/os/Environment;->DIRECTORY_PICTURES:Ljava/lang/String;\n\n    invoke-virtual {v0, p0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z\n\n    move-result v0\n\n    if-eqz v0, :eclipse_not_pictures\n\n    new-instance v0, Ljava/io/File;\n\n    invoke-static {}, Landroid/os/Environment;->native_get_pictures_dir()Ljava/lang/String;\n\n    move-result-object v1\n\n    invoke-direct {v0, v1}, Ljava/io/File;-><init>(Ljava/lang/String;)V\n\n    return-object v0\n\n    :eclipse_not_pictures\n    invoke-static {}, Landroid/os/Environment;->throwIfUserRequired()V\n\n    sget-object v0, Landroid/os/Environment;->sCurrentUser:Landroid/os/Environment$UserEnvironment;\n\n    invoke-virtual {v0, p0}, Landroid/os/Environment$UserEnvironment;->buildExternalStoragePublicDirs(Ljava/lang/String;)[Ljava/io/File;\n\n    move-result-object v0\n\n    const/4 v1, 0x0\n\n    aget-object v0, v0, v1\n\n    return-object v0\n.end method\n'
 replace_upstream_method "$envsm" "$UPSTREAM_PUBLIC_DIRECTORY" "$ENVIRONMENT_PUBLIC_DIRECTORY" 'getExternalStoragePublicDirectory'
 
+winsm="$work/smali/android/view/Window.smali"
+[ -f "$winsm" ] || fail "Window.smali not found after baksmali"
+! grep -qF 'nativeSetKeepScreenOn' "$winsm" || fail "Window.smali already declares nativeSetKeepScreenOn — installed Window drifted; update patch-framework.sh"
+UPSTREAM_WINDOW_NATIVE=$'.method private native set_title(JLjava/lang/String;)V\n.end method\n'
+WINDOW_NATIVES=$'.method private native set_title(JLjava/lang/String;)V\n.end method\n\n.method private static native nativeSetKeepScreenOn(Z)V\n.end method\n'
+replace_upstream_method "$winsm" "$UPSTREAM_WINDOW_NATIVE" "$WINDOW_NATIVES" 'set_title declaration'
+UPSTREAM_WINDOW_ADD_FLAGS=$'.method public addFlags(I)V\n    .registers 2\n\n    return-void\n.end method\n'
+WINDOW_ADD_FLAGS=$'.method public addFlags(I)V\n    .registers 3\n\n    and-int/lit16 v0, p1, 0x80\n\n    if-eqz v0, :eclipse_keep_screen_on_unchanged\n\n    const/4 v0, 0x1\n\n    invoke-static {v0}, Landroid/view/Window;->nativeSetKeepScreenOn(Z)V\n\n    :eclipse_keep_screen_on_unchanged\n    return-void\n.end method\n'
+replace_upstream_method "$winsm" "$UPSTREAM_WINDOW_ADD_FLAGS" "$WINDOW_ADD_FLAGS" 'addFlags'
+UPSTREAM_WINDOW_CLEAR_FLAGS=$'.method public clearFlags(I)V\n    .registers 2\n\n    return-void\n.end method\n'
+WINDOW_CLEAR_FLAGS=$'.method public clearFlags(I)V\n    .registers 3\n\n    and-int/lit16 v0, p1, 0x80\n\n    if-eqz v0, :eclipse_keep_screen_on_unchanged\n\n    const/4 v0, 0x0\n\n    invoke-static {v0}, Landroid/view/Window;->nativeSetKeepScreenOn(Z)V\n\n    :eclipse_keep_screen_on_unchanged\n    return-void\n.end method\n'
+replace_upstream_method "$winsm" "$UPSTREAM_WINDOW_CLEAR_FLAGS" "$WINDOW_CLEAR_FLAGS" 'clearFlags'
+UPSTREAM_WINDOW_SET_FLAGS=$'.method public setFlags(II)V\n    .registers 3\n\n    return-void\n.end method\n'
+WINDOW_SET_FLAGS=$'.method public setFlags(II)V\n    .registers 4\n\n    and-int/lit16 v0, p2, 0x80\n\n    if-eqz v0, :eclipse_keep_screen_on_unchanged\n\n    and-int/lit16 v0, p1, 0x80\n\n    if-nez v0, :eclipse_keep_screen_on_set\n\n    const/4 v0, 0x0\n\n    goto :eclipse_keep_screen_on_apply\n\n    :eclipse_keep_screen_on_set\n    const/4 v0, 0x1\n\n    :eclipse_keep_screen_on_apply\n    invoke-static {v0}, Landroid/view/Window;->nativeSetKeepScreenOn(Z)V\n\n    :eclipse_keep_screen_on_unchanged\n    return-void\n.end method\n'
+replace_upstream_method "$winsm" "$UPSTREAM_WINDOW_SET_FLAGS" "$WINDOW_SET_FLAGS" 'setFlags'
+
 ctxsm="$work/smali/android/content/Context.smali"
 [ -f "$ctxsm" ] || fail "Context.smali not found after baksmali"
 UPSTREAM_CACHE_DIR=$'    new-instance v0, Ljava/io/File;\n\n    new-instance v1, Ljava/lang/StringBuilder;\n\n    invoke-direct {v1}, Ljava/lang/StringBuilder;-><init>()V\n\n    const-string v2, "/tmp/atl_cache/"\n\n    invoke-virtual {v1, v2}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;\n\n    move-result-object v1\n\n    invoke-virtual {p0}, Landroid/content/Context;->getPackageName()Ljava/lang/String;\n\n    move-result-object v2\n\n    invoke-virtual {v1, v2}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;\n\n    move-result-object v1\n\n    invoke-virtual {v1}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;\n\n    move-result-object v1\n\n    invoke-direct {v0, v1}, Ljava/io/File;-><init>(Ljava/lang/String;)V\n\n    iput-object v0, p0, Landroid/content/Context;->cache_dir:Ljava/io/File;\n'
@@ -1319,6 +1335,7 @@ cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
 cp "$lmsm" "$work/smali-view/android/location/LocationManager.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
 cp "$envsm" "$work/smali-view/android/os/Environment.smali"
+cp "$winsm" "$work/smali-view/android/view/Window.smali"
 cp "$ctxsm" "$work/smali-view/android/content/Context.smali"
 cp "$spsm" "$work/smali-view/android/os/SystemProperties.smali"
 cp "$pmsm" "$work/smali-view/android/content/pm/PackageManager.smali"

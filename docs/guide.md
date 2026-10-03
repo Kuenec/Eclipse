@@ -36,6 +36,7 @@ Voice chat uses your system's default microphone. Choose it in your desktop's so
 | `fflags` | `{}` | Fast Flags passed to Roblox |
 | `touch_mode` | `"off"` | `"on"` sends clicks as touch input |
 | `graphics_optimization_mode` | `"balanced"` | `"performance"` pins Eclipse to physical cores |
+| `enable_gamemode` | `true` | Turns on GameMode while Roblox runs, if GameMode is installed |
 
 ## Files
 

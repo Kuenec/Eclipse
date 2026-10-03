@@ -943,6 +943,94 @@ fn framework_overlay_saves_captures_through_the_pictures_native() {
 }
 
 #[test]
+fn framework_overlay_preserves_keep_screen_on_contract() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "! grep -qF 'nativeSetKeepScreenOn' \"$winsm\"",
+        ".method private static native nativeSetKeepScreenOn(Z)V",
+        "replace_upstream_method \"$winsm\" \"$UPSTREAM_WINDOW_NATIVE\" \"$WINDOW_NATIVES\"",
+        "replace_upstream_method \"$winsm\" \"$UPSTREAM_WINDOW_ADD_FLAGS\" \"$WINDOW_ADD_FLAGS\"",
+        "replace_upstream_method \"$winsm\" \"$UPSTREAM_WINDOW_CLEAR_FLAGS\" \"$WINDOW_CLEAR_FLAGS\"",
+        "replace_upstream_method \"$winsm\" \"$UPSTREAM_WINDOW_SET_FLAGS\" \"$WINDOW_SET_FLAGS\"",
+        "cp \"$winsm\" \"$work/smali-view/android/view/Window.smali\"",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost Window keep-screen-on fragment {needle:?}; the client's \
+             FLAG_KEEP_SCREEN_ON would again be dropped by ATL's empty flag methods"
+        );
+    }
+    let line = |variable: &str| {
+        generator
+            .lines()
+            .find(|line| line.starts_with(variable))
+            .unwrap_or_else(|| panic!("patch-framework.sh lost {variable}"))
+    };
+    for (variable, signature, registers) in [
+        ("UPSTREAM_WINDOW_ADD_FLAGS=", "addFlags(I)V", 2),
+        ("UPSTREAM_WINDOW_CLEAR_FLAGS=", "clearFlags(I)V", 2),
+        ("UPSTREAM_WINDOW_SET_FLAGS=", "setFlags(II)V", 3),
+    ] {
+        assert_eq!(
+            line(variable),
+            format!(
+                "{variable}$'.method public {signature}\\n    .registers {registers}\\n\\n    \
+                 return-void\\n.end method\\n'"
+            ),
+            "the anchor must be ATL's empty {signature}, so a changed upstream body stops the build"
+        );
+    }
+    for (variable, ordered) in [
+        (
+            "WINDOW_ADD_FLAGS=",
+            &[
+                "and-int/lit16 v0, p1, 0x80",
+                "if-eqz v0, :eclipse_keep_screen_on_unchanged",
+                "const/4 v0, 0x1",
+                "invoke-static {v0}, Landroid/view/Window;->nativeSetKeepScreenOn(Z)V",
+                ":eclipse_keep_screen_on_unchanged",
+            ][..],
+        ),
+        (
+            "WINDOW_CLEAR_FLAGS=",
+            &[
+                "and-int/lit16 v0, p1, 0x80",
+                "if-eqz v0, :eclipse_keep_screen_on_unchanged",
+                "const/4 v0, 0x0",
+                "invoke-static {v0}, Landroid/view/Window;->nativeSetKeepScreenOn(Z)V",
+                ":eclipse_keep_screen_on_unchanged",
+            ][..],
+        ),
+        (
+            "WINDOW_SET_FLAGS=",
+            &[
+                "and-int/lit16 v0, p2, 0x80",
+                "if-eqz v0, :eclipse_keep_screen_on_unchanged",
+                "and-int/lit16 v0, p1, 0x80",
+                "if-nez v0, :eclipse_keep_screen_on_set",
+                "const/4 v0, 0x0",
+                ":eclipse_keep_screen_on_set",
+                "const/4 v0, 0x1",
+                ":eclipse_keep_screen_on_apply",
+                "invoke-static {v0}, Landroid/view/Window;->nativeSetKeepScreenOn(Z)V",
+                ":eclipse_keep_screen_on_unchanged",
+            ][..],
+        ),
+    ] {
+        let mut rest = line(variable);
+        for needle in ordered {
+            let (_, after) = rest.split_once(needle).unwrap_or_else(|| {
+                panic!(
+                    "{variable} lost {needle:?} or reordered it; only the FLAG_KEEP_SCREEN_ON bit \
+                     (0x80) may reach the native, with the value the call gives it"
+                )
+            });
+            rest = after;
+        }
+    }
+}
+
+#[test]
 fn framework_overlay_reads_the_client_cache_dir_from_the_runtime() {
     let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
     for needle in [
@@ -992,13 +1080,38 @@ fn framework_overlay_reads_the_client_cache_dir_from_the_runtime() {
 struct PlatformTestRoot(PathBuf);
 
 impl PlatformTestRoot {
-    fn create() -> Self {
+    fn create(tag: &str) -> Self {
         let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("platform-test-{}", std::process::id()));
+            .join(format!("platform-test-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&path).ok();
         std::fs::create_dir_all(path.join("config")).expect("create the config dir");
         std::fs::create_dir_all(path.join("Pictures")).expect("create the Pictures dir");
         Self(path)
+    }
+
+    fn app_data(&self) -> PathBuf {
+        self.0.join("app-data")
+    }
+
+    fn run(&self) -> String {
+        let out = bounded_child::output(
+            Command::new(env!("CARGO_BIN_EXE_eclipse"))
+                .arg("__platform-test")
+                .env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    format!("unix:path={}", self.0.join("no-session-bus").display()),
+                )
+                .env("XDG_CONFIG_HOME", self.0.join("config"))
+                .env("ECLIPSE_APP_DATA_DIR", self.app_data()),
+            ENGINE_LIMIT,
+        );
+        let text = combined(&out);
+        assert!(
+            out.status.success(),
+            "__platform-test exited non-zero ({:?}); platform-service regression.\n{text}",
+            out.status.code()
+        );
+        text
     }
 }
 
@@ -1011,67 +1124,69 @@ impl Drop for PlatformTestRoot {
     }
 }
 
-#[test]
-fn platform_test_saves_captures_in_the_user_pictures_folder() {
-    use eclipse::framework::platform_probe::{CAPTURE_PROBE_BYTES, CAPTURE_PROBE_FILE};
-
+fn platform_test_can_boot() -> bool {
     if !roblox_apk_present() {
         eprintln!(
             "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK to an APK file or to a directory \
              holding base.apk and split_config.x86_64.apk)"
         );
-        return;
+        return false;
     }
     if !android_runtime_present() {
         eprintln!(
             "SKIP: Android runtime absent (ART, its boot image or the patched framework; set \
              ECLIPSE_LIBART and ECLIPSE_ANDROID_FRAMEWORK_DIR)"
         );
-        return;
+        return false;
     }
+    true
+}
 
-    let root = PlatformTestRoot::create();
-    let pictures = root.0.join("Pictures");
-    let app_data = root.0.join("app-data");
-    std::fs::write(
-        root.0.join("config/user-dirs.dirs"),
-        format!("XDG_PICTURES_DIR=\"{}\"\n", pictures.display()),
-    )
-    .expect("write user-dirs.dirs");
-    let out = bounded_child::output(
-        Command::new(env!("CARGO_BIN_EXE_eclipse"))
-            .arg("__platform-test")
-            .env("XDG_CONFIG_HOME", root.0.join("config"))
-            .env("ECLIPSE_APP_DATA_DIR", &app_data),
-        ENGINE_LIMIT,
-    );
-    let text = combined(&out);
-
-    assert!(
-        out.status.success(),
-        "__platform-test exited non-zero ({:?}); platform-service regression.\n{text}",
-        out.status.code()
-    );
-    let roblox = pictures.join("Roblox");
-    for line in [
-        format!("__platform-test: Pictures directory: {}", roblox.display()),
-        format!(
-            "__platform-test: Movies directory: {}",
-            app_data.join("Movies").display()
-        ),
-        format!(
-            "__platform-test: Temporary directory: {}",
-            eclipse::runtime::client_cache_dir()
-                .expect("resolve the client cache dir")
-                .path()
-                .display()
-        ),
-    ] {
+fn assert_lines(text: &str, lines: &[String]) {
+    for line in lines {
         assert!(
             text.lines().any(|output| output == line),
             "missing {line:?}.\n{text}"
         );
     }
+}
+
+#[test]
+fn platform_test_saves_captures_in_the_user_pictures_folder() {
+    use eclipse::framework::platform_probe::{CAPTURE_PROBE_BYTES, CAPTURE_PROBE_FILE};
+
+    if !platform_test_can_boot() {
+        return;
+    }
+
+    let root = PlatformTestRoot::create("captures");
+    let pictures = root.0.join("Pictures");
+    let app_data = root.app_data();
+    std::fs::write(
+        root.0.join("config/user-dirs.dirs"),
+        format!("XDG_PICTURES_DIR=\"{}\"\n", pictures.display()),
+    )
+    .expect("write user-dirs.dirs");
+    let text = root.run();
+
+    let roblox = pictures.join("Roblox");
+    assert_lines(
+        &text,
+        &[
+            format!("__platform-test: Pictures directory: {}", roblox.display()),
+            format!(
+                "__platform-test: Movies directory: {}",
+                app_data.join("Movies").display()
+            ),
+            format!(
+                "__platform-test: Temporary directory: {}",
+                eclipse::runtime::client_cache_dir()
+                    .expect("resolve the client cache dir")
+                    .path()
+                    .display()
+            ),
+        ],
+    );
     let capture = std::fs::read(roblox.join(CAPTURE_PROBE_FILE)).unwrap_or_else(|error| {
         panic!(
             "the probe capture is not in {}: {error}\n{text}",
@@ -1082,6 +1197,34 @@ fn platform_test_saves_captures_in_the_user_pictures_folder() {
     assert!(
         !app_data.join("Pictures").exists(),
         "captures must not fall back to app data when the Pictures folder exists.\n{text}"
+    );
+}
+
+#[test]
+fn platform_test_keeps_the_screen_on_only_for_the_keep_screen_on_flag() {
+    if !platform_test_can_boot() {
+        return;
+    }
+
+    let root = PlatformTestRoot::create("keep-screen-on");
+    let text = root.run();
+
+    let observed: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("__platform-test: Window."))
+        .collect();
+    assert_eq!(
+        observed,
+        [
+            "addFlags(0x80) keeps the screen on",
+            "addFlags(0x400) keeps the screen on",
+            "clearFlags(0x80) lets the screen sleep",
+            "setFlags(0x80, 0x80) keeps the screen on",
+            "setFlags(0x0, 0x80) lets the screen sleep",
+            "setFlags(0x0, 0x400) lets the screen sleep",
+        ],
+        "the client's FLAG_KEEP_SCREEN_ON (0x80) must reach Eclipse through the overlay's Window \
+         flag methods, and no other flag may change it.\n{text}"
     );
 }
 
