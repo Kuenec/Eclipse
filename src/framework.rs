@@ -167,26 +167,27 @@ extern "system" fn println_native<'local>(
             Some(tag.try_to_string(env)?)
         };
         let msg_str = msg.try_to_string(env)?;
+        let logged = redact_urls_for_log(&msg_str);
 
         let tag_ref = tag_str.as_deref().unwrap_or("");
         match priority {
             LOG_PRIORITY_VERBOSE => {
-                tracing::trace!(target: "android.util.Log", tag = tag_ref, "{msg_str}")
+                tracing::trace!(target: "android.util.Log", tag = tag_ref, "{logged}")
             }
             LOG_PRIORITY_DEBUG => {
-                tracing::debug!(target: "android.util.Log", tag = tag_ref, "{msg_str}")
+                tracing::debug!(target: "android.util.Log", tag = tag_ref, "{logged}")
             }
             LOG_PRIORITY_INFO => {
-                tracing::info!(target: "android.util.Log", tag = tag_ref, "{msg_str}")
+                tracing::info!(target: "android.util.Log", tag = tag_ref, "{logged}")
             }
             LOG_PRIORITY_WARN => {
-                tracing::warn!(target: "android.util.Log", tag = tag_ref, "{msg_str}")
+                tracing::warn!(target: "android.util.Log", tag = tag_ref, "{logged}")
             }
             LOG_PRIORITY_ERROR | LOG_PRIORITY_ASSERT => {
-                tracing::error!(target: "android.util.Log", tag = tag_ref, "{msg_str}")
+                tracing::error!(target: "android.util.Log", tag = tag_ref, "{logged}")
             }
 
-            _ => tracing::info!(target: "android.util.Log", tag = tag_ref, priority, "{msg_str}"),
+            _ => tracing::info!(target: "android.util.Log", tag = tag_ref, priority, "{logged}"),
         }
 
         Ok(jint::try_from(msg_str.len()).unwrap_or(jint::MAX))
@@ -3410,7 +3411,7 @@ extern "system" fn view_native_set_visibility<'local>(
     alpha: f32,
     sensitive: jboolean,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
+    env.with_env(|env| -> jni::errors::Result<()> {
         if let Err(e) = view_registry::set_visible(widget, visibility == VIEW_VISIBLE) {
             tracing::debug!(
                 target: "android.view.View",
@@ -3431,7 +3432,7 @@ extern "system" fn view_native_set_visibility<'local>(
                 "View.native_setVisibility: recorded the view's visibility"
             );
             text_field_visibility_changed(widget, visibility);
-            crate::webview::client::refresh_visibility();
+            crate::webview::client::refresh_visibility(env);
         }
         Ok(())
     })
@@ -4349,7 +4350,7 @@ extern "system" fn view_group_native_add_view<'local>(
     index: jint,
     _params: JObject<'local>,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
+    env.with_env(|env| -> jni::errors::Result<()> {
         match view_registry::attach_child(parent, child, usize::try_from(index).ok()) {
             Ok(()) => tracing::debug!(
                 target: "android.view.ViewGroup",
@@ -4366,7 +4367,7 @@ extern "system" fn view_group_native_add_view<'local>(
                 "ViewGroup.native_addView: invalid parent or child handle (ignored)"
             ),
         }
-        crate::webview::client::refresh_visibility();
+        crate::webview::client::refresh_visibility(env);
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
@@ -4378,7 +4379,7 @@ extern "system" fn view_group_native_remove_view<'local>(
     parent: jlong,
     child: jlong,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
+    env.with_env(|env| -> jni::errors::Result<()> {
         match view_registry::detach_child(parent, child) {
             Ok(()) => tracing::debug!(
                 target: "android.view.ViewGroup",
@@ -4394,7 +4395,7 @@ extern "system" fn view_group_native_remove_view<'local>(
                 "ViewGroup.native_removeView: invalid parent handle (ignored)"
             ),
         }
-        crate::webview::client::refresh_visibility();
+        crate::webview::client::refresh_visibility(env);
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
@@ -6114,7 +6115,7 @@ const WEB_VIEW_NATIVE_REMOVE_JAVASCRIPT_INTERFACE_SIG: &JNIStr = jni_str!("(JLja
 const WEB_VIEW_NATIVE_DESTROY_NAME: &JNIStr = jni_str!("native_destroy");
 const WEB_VIEW_NATIVE_DESTROY_SIG: &JNIStr = jni_str!("(J)V");
 
-use crate::webview::redact::{url_scheme_and_host_for_log, NON_URL};
+use crate::webview::redact::{redact_urls_for_log, url_scheme_and_host_for_log, NON_URL};
 
 fn warn_load_url_unavailable(widget: jlong, target: &str, reason: &str) {
     static LOAD_URL_WARNED: std::sync::atomic::AtomicBool =
@@ -6683,12 +6684,15 @@ type MainJob = Box<dyn for<'l> FnOnce(&mut Env<'l>) + Send + 'static>;
 struct MainDispatchSlot {
     job: Option<MainJob>,
 
+    posted: std::collections::VecDeque<MainJob>,
+
     open: bool,
 }
 
 static MAIN_DISPATCH: std::sync::Mutex<MainDispatchSlot> =
     std::sync::Mutex::new(MainDispatchSlot {
         job: None,
+        posted: std::collections::VecDeque::new(),
         open: true,
     });
 
@@ -6782,6 +6786,28 @@ fn dispatch_webview_callback_on_main<R: Send + 'static>(
     }
 }
 
+fn post_webview_callback_to_main(
+    env: &mut Env,
+    what: &'static str,
+    job: impl for<'l> FnOnce(&mut Env<'l>) + Send + 'static,
+) {
+    let gate = if MAIN_THREAD_ID.get().is_none() {
+        MainDispatchGate::InlineNoMainLooper
+    } else {
+        match MAIN_DISPATCH.lock() {
+            Ok(mut slot) if slot.open => {
+                slot.posted.push_back(Box::new(job));
+                drop(slot);
+                wake_main_looper();
+                return;
+            }
+            Ok(_) | Err(_) => MainDispatchGate::InlineDrainRetired,
+        }
+    };
+    warn_main_dispatch_degraded(what, gate);
+    job(env);
+}
+
 fn run_main_job_here(java_vm: &JavaVM, job: MainJob) {
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         match std::panic::catch_unwind(AssertUnwindSafe(|| job(env))) {
@@ -6805,32 +6831,44 @@ fn warn_main_dispatch_degraded(what: &'static str, gate: MainDispatchGate) {
     }
 }
 
+fn take_main_jobs(slot: &mut MainDispatchSlot) -> Vec<MainJob> {
+    slot.job
+        .take()
+        .into_iter()
+        .chain(std::mem::take(&mut slot.posted))
+        .collect()
+}
+
 fn run_pending_main_upcall(env: &mut Env) {
-    let job = match MAIN_DISPATCH.lock() {
-        Ok(mut slot) => slot.job.take(),
-        Err(_) => None,
+    let jobs: Vec<MainJob> = match MAIN_DISPATCH.lock() {
+        Ok(mut slot) => take_main_jobs(&mut slot),
+        Err(_) => Vec::new(),
     };
-    if let Some(job) = job {
+    for job in jobs {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| job(env)));
     }
 }
 
 pub fn retire_main_upcall_dispatch(vm: &Vm) {
-    let job = match MAIN_DISPATCH.lock() {
+    let jobs: Vec<MainJob> = match MAIN_DISPATCH.lock() {
         Ok(mut slot) => {
             slot.open = false;
-            slot.job.take()
+            take_main_jobs(&mut slot)
         }
         Err(_) => return,
     };
-    let Some(job) = job else { return };
+    if jobs.is_empty() {
+        return;
+    }
     let raw = vm.as_raw();
     if raw.is_null() {
         return;
     }
 
     let java_vm = unsafe { JavaVM::from_raw(raw) };
-    run_main_job_here(&java_vm, job);
+    for job in jobs {
+        run_main_job_here(&java_vm, job);
+    }
 }
 
 const WEB_VIEW_INTERNAL_PROGRESS_CHANGED_NAME: &JNIStr = jni_str!("internalProgressChanged");
@@ -7842,21 +7880,11 @@ extern "system" fn web_view_cookie_manager_get_cookie<'local>(
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         let url_s = read_jstring(env, &url).unwrap_or_default();
         let fixed = fixup_webview_cookie_url(&url_s);
-        let cookies = env
-            .get_java_vm()
-            .map_err(|e| crate::webview::client::ClientError::Unavailable(format!("JavaVM: {e}")))
-            .and_then(|java_vm| {
-                crate::webview::client::cookie_get_blocking(
-                    java_vm,
-                    fixed.url,
-                    std::time::Duration::from_secs(5),
-                )
-            });
-        let cookies = cookies.unwrap_or_else(|error| {
+        let cookies = crate::webview::client::cookie_get(fixed.url).unwrap_or_else(|error| {
             tracing::warn!(
                 target: "android.webkit.CookieManager",
                 %error,
-                "CookieManager.getCookie: the web engine helper answered nothing; reporting no cookies"
+                "CookieManager.getCookie failed; reporting no cookies"
             );
             Vec::new()
         });
@@ -7865,22 +7893,38 @@ extern "system" fn web_view_cookie_manager_get_cookie<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-fn send_set_cookie(env: &mut Env, request_id: u32, url: &str, header: String) -> bool {
+fn send_set_cookie(request_id: u32, url: &str, header: String) -> Option<bool> {
     let (url, header) = set_cookie_request(url, header);
-    let result = env
-        .get_java_vm()
-        .map_err(|e| crate::webview::client::ClientError::Unavailable(format!("JavaVM: {e}")))
-        .and_then(|java_vm| crate::webview::client::cookie_set(java_vm, request_id, url, header));
-    match result {
-        Ok(()) => true,
+    match crate::webview::client::cookie_set(request_id, url, header) {
+        Ok(crate::webview::client::CookieAnswer::Now(ok)) => Some(ok),
+        Ok(crate::webview::client::CookieAnswer::FromHelper) => None,
         Err(error) => {
             tracing::warn!(
                 target: "android.webkit.CookieManager",
                 %error,
-                "CookieManager.setCookie: not delivered to the web engine helper"
+                "CookieManager.setCookie failed"
             );
-            false
+            Some(false)
         }
+    }
+}
+
+fn post_cookie_answer(
+    env: &mut Env,
+    callbacks: &std::sync::Mutex<std::collections::HashMap<u32, Global<JObject<'static>>>>,
+    request_id: u32,
+    value: bool,
+) {
+    if let Some(g) = callbacks
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(&request_id))
+    {
+        post_webview_callback_to_main(
+            env,
+            "ValueCallback.onReceiveValue(Boolean)",
+            boolean_callback_job(g, value),
+        );
     }
 }
 
@@ -7896,7 +7940,7 @@ extern "system" fn web_view_cookie_manager_set_cookie<'local>(
             return Ok(());
         };
         let request_id = crate::webview::client::next_request_id();
-        send_set_cookie(env, request_id, &url_s, value_s);
+        send_set_cookie(request_id, &url_s, value_s);
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
@@ -7923,14 +7967,8 @@ extern "system" fn web_view_cookie_manager_set_cookie_cb<'local>(
                 }
             }
         }
-        if !send_set_cookie(env, request_id, &url_s, value_s) {
-            if let Some(g) = cookie_set_callbacks()
-                .lock()
-                .ok()
-                .and_then(|mut m| m.remove(&request_id))
-            {
-                fire_boolean_value_callback(env, &g, false);
-            }
+        if let Some(ok) = send_set_cookie(request_id, &url_s, value_s) {
+            post_cookie_answer(env, cookie_set_callbacks(), request_id, ok);
         }
         Ok(())
     })
@@ -7968,23 +8006,20 @@ fn web_view_cookie_manager_remove_impl<'local>(
                 }
             }
         }
-        let result = env
-            .get_java_vm()
-            .map_err(|e| crate::webview::client::ClientError::Unavailable(format!("JavaVM: {e}")))
-            .and_then(|java_vm| crate::webview::client::cookies_clear(java_vm, request_id, scope));
-        if let Err(error) = result {
-            tracing::warn!(
-                target: "android.webkit.CookieManager",
-                %error,
-                "CookieManager.remove*Cookies: not delivered to the web engine helper"
-            );
-            if let Some(g) = cookie_clear_callbacks()
-                .lock()
-                .ok()
-                .and_then(|mut m| m.remove(&request_id))
-            {
-                fire_boolean_value_callback(env, &g, false);
+        let removed = match crate::webview::client::cookies_clear(request_id, scope) {
+            Ok(crate::webview::client::CookieAnswer::Now(removed)) => Some(removed),
+            Ok(crate::webview::client::CookieAnswer::FromHelper) => None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "android.webkit.CookieManager",
+                    %error,
+                    "CookieManager.remove*Cookies failed"
+                );
+                Some(false)
             }
+        };
+        if let Some(removed) = removed {
+            post_cookie_answer(env, cookie_clear_callbacks(), request_id, removed);
         }
         Ok(())
     })
@@ -7995,21 +8030,12 @@ extern "system" fn web_view_cookie_manager_flush<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
 ) {
-    env.with_env(|env: &mut Env| -> jni::errors::Result<()> {
-        let result = env
-            .get_java_vm()
-            .map_err(|e| crate::webview::client::ClientError::Unavailable(format!("JavaVM: {e}")))
-            .and_then(|java_vm| {
-                crate::webview::client::cookie_flush_blocking(
-                    java_vm,
-                    std::time::Duration::from_secs(10),
-                )
-            });
-        match result {
+    env.with_env(|_env: &mut Env| -> jni::errors::Result<()> {
+        match crate::webview::client::cookie_flush() {
             Ok(true) => {}
             Ok(false) => tracing::warn!(
                 target: "android.webkit.CookieManager",
-                "CookieManager.flush(): the web engine could not save its session cookies"
+                "CookieManager.flush(): the cookies could not be saved"
             ),
             Err(error) => tracing::warn!(
                 target: "android.webkit.CookieManager",
@@ -8020,6 +8046,21 @@ extern "system" fn web_view_cookie_manager_flush<'local>(
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
+}
+
+pub fn register_cookie_manager(vm: &Vm) -> Result<(), FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| register_cookie_manager_natives(env))) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
 }
 
 fn register_cookie_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
@@ -8058,7 +8099,7 @@ fn register_cookie_manager_natives(env: &mut Env) -> Result<(), FrameworkError> 
     let bound = register_class_natives_best_effort(env, COOKIE_MANAGER_CLASS, &bindings)?;
     tracing::info!(
         bound,
-        "registered Eclipse's non-GTK backing for the android.webkit.CookieManager native surface (get/set/set-with-callback/removeAll/removeSession/flush → private persistent helper store) (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for the android.webkit.CookieManager native surface (get/set/set-with-callback/removeAll/removeSession/flush → Eclipse's cookie jar, or the web engine helper while it runs) (per-method best-effort)"
     );
     Ok(())
 }
@@ -8637,16 +8678,19 @@ fn eval_drain_victims<V>(
         .collect()
 }
 
-pub fn drain_all_webview_callbacks(java_vm: &JavaVM, reason: &str) {
-    fn take_all<V>(m: &'static std::sync::Mutex<std::collections::HashMap<u32, V>>) -> Vec<V> {
+pub fn fail_webview_callbacks(java_vm: &JavaVM, request_ids: &[u32], reason: &str) {
+    fn take<V>(
+        m: &'static std::sync::Mutex<std::collections::HashMap<u32, V>>,
+        request_ids: &[u32],
+    ) -> Vec<V> {
         m.lock()
             .ok()
-            .map(|mut m| m.drain().map(|(_, v)| v).collect())
+            .map(|mut m| request_ids.iter().filter_map(|id| m.remove(id)).collect())
             .unwrap_or_default()
     }
-    let evals: Vec<(jlong, u64, Global<JObject<'static>>)> = take_all(eval_callbacks());
-    let sets: Vec<Global<JObject<'static>>> = take_all(cookie_set_callbacks());
-    let clears: Vec<Global<JObject<'static>>> = take_all(cookie_clear_callbacks());
+    let evals: Vec<(jlong, u64, Global<JObject<'static>>)> = take(eval_callbacks(), request_ids);
+    let sets: Vec<Global<JObject<'static>>> = take(cookie_set_callbacks(), request_ids);
+    let clears: Vec<Global<JObject<'static>>> = take(cookie_clear_callbacks(), request_ids);
     if evals.is_empty() && sets.is_empty() && clears.is_empty() {
         return;
     }
@@ -8689,14 +8733,21 @@ fn fire_string_callback_global(java_vm: &JavaVM, global: Global<JObject<'static>
     );
 }
 
+fn boolean_callback_job(
+    global: Global<JObject<'static>>,
+    ok: bool,
+) -> impl for<'l> FnOnce(&mut Env<'l>) + Send + 'static {
+    move |env: &mut Env| match env.new_local_ref(global.as_obj()) {
+        Ok(local) => fire_boolean_value_callback(env, &local, ok),
+        Err(_) => clear_pending(env),
+    }
+}
+
 fn fire_boolean_callback_global(java_vm: &JavaVM, global: Global<JObject<'static>>, ok: bool) {
     let _ = dispatch_webview_callback_on_main(
         java_vm,
         "ValueCallback.onReceiveValue(Boolean)",
-        move |env: &mut Env| match env.new_local_ref(global.as_obj()) {
-            Ok(local) => fire_boolean_value_callback(env, &local, ok),
-            Err(_) => clear_pending(env),
-        },
+        boolean_callback_job(global, ok),
     );
 }
 
@@ -11708,11 +11759,11 @@ extern "system" fn window_set_widget_as_root<'local>(
     native_window: jlong,
     widget: jlong,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
+    env.with_env(|env| -> jni::errors::Result<()> {
         let root = view_registry::with_view(widget, |_v| ())
             .is_ok()
             .then_some(widget);
-        let recorded = match dialogs::set_dialog_root(native_window, root) {
+        let recorded = match dialogs::set_dialog_root(env, native_window, root) {
             Ok(()) => Ok(false),
             Err(window_registry::WindowRegistryError::NotADialog) => {
                 window_registry::with_window(native_window, |w| w.root_view = root).map(|()| true)
@@ -11724,7 +11775,7 @@ extern "system" fn window_set_widget_as_root<'local>(
                 if activity_window {
                     show_window_root(root, true);
                     view_registry::set_active_root(root.unwrap_or(0));
-                    crate::webview::client::refresh_visibility();
+                    crate::webview::client::refresh_visibility(env);
                 }
                 tracing::debug!(
                     target: "android.view.Window",
@@ -12069,7 +12120,7 @@ extern "system" fn activity_native_finish<'local>(
         match activity_content_root(env, &this) {
             Ok(Some(root)) => {
                 if view_registry::release_window_root(root).is_ok() {
-                    crate::webview::client::refresh_visibility();
+                    crate::webview::client::refresh_visibility(env);
                 }
             }
             Ok(None) => {}
@@ -16455,6 +16506,63 @@ mod tests {
         assert_eq!(LOG_PRIORITY_WARN, 5);
         assert_eq!(LOG_PRIORITY_ERROR, 6);
         assert_eq!(LOG_PRIORITY_ASSERT, 7);
+    }
+
+    fn forwarded_java_log(priority: jint, message: &str) -> String {
+        crate::diagnostics::captured_log_lines(|| {
+            fake_jvm::with_env(|env| {
+                let tag = env.new_string("RobloxWeb").expect("tag");
+                let msg = env.new_string(message).expect("message");
+                let written = println_native(
+                    fake_jvm::native_env(),
+                    JClass::null(),
+                    0,
+                    priority,
+                    tag,
+                    msg,
+                );
+                assert_eq!(usize::try_from(written), Ok(message.len()));
+            });
+        })
+    }
+
+    #[test]
+    fn forwarded_java_log_lines_keep_only_scheme_and_host_of_urls_at_every_priority() {
+        for priority in [
+            LOG_PRIORITY_VERBOSE,
+            LOG_PRIORITY_DEBUG,
+            LOG_PRIORITY_INFO,
+            LOG_PRIORITY_WARN,
+            LOG_PRIORITY_ERROR,
+            LOG_PRIORITY_ASSERT,
+        ] {
+            let log = forwarded_java_log(
+                priority,
+                "loading https://www.roblox.com/login?token=abc&x=1 now",
+            );
+            assert!(
+                log.contains(
+                    "android.util.Log: loading https://www.roblox.com now tag=\"RobloxWeb\"\n"
+                ),
+                "priority {priority}: {log}"
+            );
+            assert!(
+                !log.contains("token=") && !log.contains("abc"),
+                "priority {priority}: {log}"
+            );
+        }
+    }
+
+    #[test]
+    fn forwarded_java_log_lines_without_urls_are_unchanged() {
+        let message = "Roblox ready: 100% of 3 tasks, path=/data/user/0 key:value";
+        let log = forwarded_java_log(LOG_PRIORITY_INFO, message);
+        assert!(
+            log.contains(&format!(
+                " INFO android.util.Log: {message} tag=\"RobloxWeb\"\n"
+            )),
+            "{log}"
+        );
     }
 
     #[test]

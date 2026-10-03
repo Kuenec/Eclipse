@@ -1,9 +1,5 @@
-use eclipse_webview::proto::{self, CookieExpiry, SameSite, StoredCookie};
+use eclipse_webview::proto::{CookieExpiry, SameSite, StoredCookie};
 use gtk4::glib;
-use std::fmt;
-use std::io::{Read as _, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::{Path, PathBuf};
 use webkit6::soup;
 
 const SESSION_COOKIE_MAX_AGE: i32 = -1;
@@ -54,72 +50,11 @@ pub(crate) fn from_soup(cookie: &mut soup::Cookie) -> StoredCookie {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum JarError {
-    Io(std::io::Error),
-    Oversized,
-    Codec(proto::ProtoError),
-}
-
-impl fmt::Display for JarError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "{error}"),
-            Self::Oversized => write!(f, "larger than {} bytes", proto::GLOBAL_FRAME_CAP),
-            Self::Codec(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-pub(crate) struct SessionJar {
-    path: PathBuf,
-}
-
-impl SessionJar {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub(crate) fn load(&self) -> Result<Vec<StoredCookie>, JarError> {
-        let file = match std::fs::File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(JarError::Io(error)),
-        };
-        let mut bytes = Vec::new();
-        file.take(u64::from(proto::GLOBAL_FRAME_CAP) + 1)
-            .read_to_end(&mut bytes)
-            .map_err(JarError::Io)?;
-        if bytes.len() > proto::GLOBAL_FRAME_CAP as usize {
-            return Err(JarError::Oversized);
-        }
-        proto::decode_cookies(&bytes).map_err(JarError::Codec)
-    }
-
-    pub(crate) fn store(&self, cookies: &[StoredCookie]) -> Result<(), JarError> {
-        let bytes = proto::encode_cookies(cookies).map_err(JarError::Codec)?;
-        let staging = self.path.with_extension("tmp");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&staging)
-            .map_err(JarError::Io)?;
-        file.write_all(&bytes).map_err(JarError::Io)?;
-        file.sync_all().map_err(JarError::Io)?;
-        std::fs::rename(&staging, &self.path).map_err(JarError::Io)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
+    use eclipse_webview::cookie_jar;
+    use std::time::SystemTime;
 
     fn cookie(name: &str, expiry: CookieExpiry) -> StoredCookie {
         StoredCookie {
@@ -132,14 +67,6 @@ mod tests {
             same_site: SameSite::Lax,
             expiry,
         }
-    }
-
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("eclipse-webview-jar-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
     }
 
     #[test]
@@ -172,28 +99,53 @@ mod tests {
         assert!(to_soup(&domainless).is_err());
     }
 
-    #[test]
-    fn the_session_jar_round_trips_privately_and_starts_empty() {
-        let dir = scratch("roundtrip");
-        let jar = SessionJar::new(dir.join("session-cookies"));
-        assert!(jar.load().expect("missing jar").is_empty());
-        let cookies = vec![cookie("a", CookieExpiry::Session)];
-        jar.store(&cookies).expect("store");
-        assert_eq!(jar.load().expect("load"), cookies);
-        let mode = std::fs::metadata(jar.path())
-            .expect("metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+    fn within_a_second(ours: &StoredCookie, theirs: &StoredCookie) -> bool {
+        let expiry_close = match (ours.expiry, theirs.expiry) {
+            (CookieExpiry::At { epoch_s: a }, CookieExpiry::At { epoch_s: b }) => {
+                a.abs_diff(b) <= 1
+            }
+            (a, b) => a == b,
+        };
+        expiry_close
+            && StoredCookie {
+                expiry: theirs.expiry,
+                ..ours.clone()
+            } == *theirs
     }
 
     #[test]
-    fn a_corrupt_session_jar_is_reported_not_trusted() {
-        let dir = scratch("corrupt");
-        let jar = SessionJar::new(dir.join("session-cookies"));
-        std::fs::write(jar.path(), [5, 0, 1]).expect("write");
-        assert!(matches!(jar.load(), Err(JarError::Codec(_))));
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+    fn the_host_jar_reads_set_cookie_headers_as_libsoup_does() {
+        let url = "https://www.roblox.com/games/1818/details";
+        let origin = glib::Uri::parse(url, glib::UriFlags::NONE).expect("parse the URL");
+        for header in [
+            ".ROBLOSECURITY=_|WARNING:-DO-NOT-SHARE-THIS.|_token; domain=.roblox.com; HttpOnly; \
+             secure; expires=Fri, 02 Oct 2054 21:00:00 GMT; path=/",
+            "RBXEventTrackerV2=CreateDate=10/2/2026 9:53:04 PM&rbxid=&browserid=1790949822023019; \
+             expires=Tue, 17 Feb 2054 21:53:04 GMT; path=/; domain=.roblox.com",
+            "RBXSessionTracker=sessionid=1; domain=roblox.com; path=/",
+            "GuestData=UserID=-1; domain=.roblox.com; expires=Sat, 31 Jan 2054 21:53:04 GMT; path=/",
+            "host-only=1",
+            "own-host=1; Domain=www.roblox.com",
+            "brief=1; Max-Age=3600; Path=/games",
+            "relative-path=1; Path=relative",
+            "missing-same-site=1; Secure",
+            "same-site-none=1; SameSite=None; Secure",
+            "same-site-strict=1; SameSite=Strict",
+            "same-site-lax=1; samesite=lax",
+            ".ROBLOSECURITY=;domain=.roblox.com;path=/;expires=Wed, 10 May 2000 00:00:00 GMT",
+        ] {
+            let ours = cookie_jar::parse_set_cookie(url, header, SystemTime::now())
+                .unwrap_or_else(|error| panic!("the jar refused {header:?}: {error}"));
+            let mut parsed = soup::Cookie::parse(header, Some(&origin))
+                .unwrap_or_else(|| panic!("libsoup refused {header:?}"));
+            let theirs = from_soup(&mut parsed);
+            assert!(
+                within_a_second(&ours, &theirs),
+                "{header:?}\n jar: {ours:?}\n libsoup: {theirs:?}"
+            );
+        }
+        let mismatched = "elsewhere=1; Domain=example.com";
+        assert!(cookie_jar::parse_set_cookie(url, mismatched, SystemTime::now()).is_err());
+        assert!(soup::Cookie::parse(mismatched, Some(&origin)).is_none());
     }
 }

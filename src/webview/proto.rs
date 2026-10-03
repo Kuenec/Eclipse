@@ -2,13 +2,11 @@
 
 use std::io::Read;
 
-pub const PROTO_VERSION: u16 = 6;
+pub const PROTO_VERSION: u16 = 7;
 
 pub const MAGIC: [u8; 4] = *b"ECWV";
 
 pub const GLOBAL_FRAME_CAP: u32 = 8 * 1024 * 1024;
-
-pub const PERSISTENT_COOKIE_FILE: &str = "cookies.sqlite";
 
 const DEFAULT_CAP: u32 = 64 * 1024;
 
@@ -60,6 +58,7 @@ mod ht {
     pub(super) const COOKIE_LIST: u8 = 0x90;
     pub(super) const COOKIES_CLEARED: u8 = 0x91;
     pub(super) const COOKIE_FLUSHED: u8 = 0x92;
+    pub(super) const COOKIE_SNAPSHOT: u8 = 0x93;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -535,6 +534,10 @@ pub enum HelperMsg {
         request_id: u32,
         ok: bool,
     },
+
+    CookieSnapshot {
+        cookies: Vec<StoredCookie>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -578,7 +581,8 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
             | ht::POLICY_REQUEST
             | ht::BRIDGE_CALL
             | ht::EVALUATE_JS_RESULT
-            | ht::COOKIE_LIST => Some(PAYLOAD_CAP),
+            | ht::COOKIE_LIST
+            | ht::COOKIE_SNAPSHOT => Some(PAYLOAD_CAP),
             ht::HELLO_ACK
             | ht::FATAL
             | ht::PROGRESS
@@ -839,6 +843,7 @@ impl HelperMsg {
             Self::CookieList { .. } => "CookieList",
             Self::CookiesCleared { .. } => "CookiesCleared",
             Self::CookieFlushed { .. } => "CookieFlushed",
+            Self::CookieSnapshot { .. } => "CookieSnapshot",
         }
     }
 
@@ -981,6 +986,10 @@ impl HelperMsg {
                 put_u32(&mut b, *request_id);
                 put_bool(&mut b, *ok);
                 ht::COOKIE_FLUSHED
+            }
+            Self::CookieSnapshot { cookies } => {
+                put_cookies(&mut b, ht::COOKIE_SNAPSHOT, cookies)?;
+                ht::COOKIE_SNAPSHOT
             }
         };
         compose_frame(Dir::FromHelper, t, b)
@@ -1392,6 +1401,9 @@ pub fn read_helper_msg<R: Read>(r: &mut R) -> Result<HelperMsg, ProtoError> {
             request_id: b.u32()?,
             ok: b.bool()?,
         },
+        ht::COOKIE_SNAPSHOT => HelperMsg::CookieSnapshot {
+            cookies: b.cookies()?,
+        },
         _ => return Err(ProtoError::UnknownType { type_byte: t }),
     };
     b.finish()?;
@@ -1600,6 +1612,17 @@ mod tests {
             HelperMsg::CookieFlushed {
                 request_id: 13,
                 ok: true,
+            },
+            HelperMsg::CookieSnapshot {
+                cookies: vec![
+                    a_cookie("session", CookieExpiry::Session),
+                    a_cookie(
+                        "persistent",
+                        CookieExpiry::At {
+                            epoch_s: 1_900_000_000,
+                        },
+                    ),
+                ],
             },
         ]
     }

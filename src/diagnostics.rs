@@ -38,13 +38,39 @@ impl Visit for EventFieldVisitor<'_> {
 
 impl<S: Subscriber> Layer<S> for PanicSafeStderr {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        let meta = event.metadata();
-        let line = log_line(meta.level(), meta.target(), |line| {
-            event.record(&mut EventFieldVisitor(line));
-        });
+        let line = event_line(event);
         let _ = std::io::stderr().write_all(line.as_bytes());
         append_to_run_log(&line);
     }
+}
+
+fn event_line(event: &Event<'_>) -> String {
+    let meta = event.metadata();
+    log_line(meta.level(), meta.target(), |line| {
+        event.record(&mut EventFieldVisitor(line));
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn captured_log_lines(body: impl FnOnce()) -> String {
+    use std::sync::Arc;
+
+    struct Capture(Arc<Mutex<String>>);
+
+    impl<S: Subscriber> Layer<S> for Capture {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_str(&event_line(event));
+        }
+    }
+
+    let lines = Arc::new(Mutex::new(String::new()));
+    let subscriber = Registry::default().with(Capture(Arc::clone(&lines)));
+    tracing::subscriber::with_default(subscriber, body);
+    let captured = lines.lock().unwrap_or_else(PoisonError::into_inner);
+    captured.clone()
 }
 
 fn log_line(level: &Level, target: &str, message: impl FnOnce(&mut String)) -> String {

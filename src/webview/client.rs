@@ -4,26 +4,36 @@ use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use super::cef_profile;
+use super::cookie_jar::{self, CookieJar, JarFileError};
 use super::proto::{
     self, ClearScope, ConsumerMsg, CookiePair, HelperMsg, LoadEvent, StoredCookie, PROTO_VERSION,
 };
+use super::redact::url_scheme_and_host_for_log;
 use crate::framework::view_registry;
 
 pub const HELPER_NOT_FOUND_MARKER: &str = "helper binary not found";
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-const MIGRATION_TIMEOUT: Duration = Duration::from_secs(5);
+const COOKIE_IMPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SPAWN_RESULT_TIMEOUT: Duration = HANDSHAKE_TIMEOUT
-    .saturating_add(MIGRATION_TIMEOUT)
+    .saturating_add(COOKIE_IMPORT_TIMEOUT)
     .saturating_add(Duration::from_secs(5));
+
+const COOKIE_GET_TIMEOUT: Duration = Duration::from_secs(5);
+
+const COOKIE_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub const HELPER_IDLE_GRACE: Duration = Duration::from_secs(30);
+
+const IDLE_STOP_WAIT: Duration = Duration::from_secs(5);
 
 const HELPER_EXIT_LIMIT: u32 = 3;
 
@@ -41,7 +51,7 @@ const CLIENT_SETTINGS_SHIM_FILE_NAME: &str = "libeclipse_client_settings_path.so
 
 const BRIDGE_RESULT_OVER_CAP: &str = "\"eclipse: bridge result exceeds the frame cap\"";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientError {
     HelperNotFound { probed: Vec<PathBuf> },
 
@@ -55,7 +65,7 @@ pub enum ClientError {
 
     VersionMismatch { helper_version: u16 },
 
-    Migration(String),
+    CookieImport(String),
 
     Encode(proto::ProtoError),
 
@@ -94,7 +104,7 @@ impl std::fmt::Display for ClientError {
                 "helper protocol version mismatch: helper v{helper_version}, consumer \
                  v{PROTO_VERSION}"
             ),
-            Self::Migration(e) => write!(f, "the CEF cookie migration failed: {e}"),
+            Self::CookieImport(e) => write!(f, "the helper did not take the cookie jar: {e}"),
             Self::Encode(e) => write!(f, "message rejected before send: {e}"),
             Self::Unavailable(reason) => write!(f, "web engine helper unavailable: {reason}"),
             Self::TimedOut(what) => {
@@ -139,6 +149,21 @@ struct Client {
     io: JoinHandle<()>,
 
     upcall: JoinHandle<()>,
+
+    idle: JoinHandle<()>,
+
+    generation: HelperGeneration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HelperGeneration(u64);
+
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+impl HelperGeneration {
+    fn next() -> Self {
+        Self(NEXT_GENERATION.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 static CLIENT: Mutex<ClientSlot> = Mutex::new(ClientSlot::Unspawned);
@@ -180,6 +205,8 @@ struct ViewEntry {
     back_closes: bool,
 
     observed: LoadObserved,
+
+    last_load: Option<ConsumerMsg>,
 }
 
 impl ViewEntry {
@@ -226,8 +253,34 @@ impl ViewEntry {
         batch.extend(visibility_change(view, was_visible, self.window_visible()));
         self.observed = LoadObserved::default();
         self.back_closes = false;
+        self.last_load = Some(load.clone());
         batch.push(load);
         batch
+    }
+
+    fn restorable(&self) -> bool {
+        !self.created && !self.shown && self.last_load.is_some()
+    }
+
+    fn restore(&mut self, view: i64) -> Vec<ConsumerMsg> {
+        match self.last_load.clone() {
+            Some(load) => self.load_batch(view, true, load),
+            None => Vec::new(),
+        }
+    }
+
+    fn note_page(&mut self, view: i64, url: &str) {
+        let web = url.starts_with("https://") || url.starts_with("http://");
+        let data_page = matches!(
+            &self.last_load,
+            Some(ConsumerMsg::LoadData { base_url, .. }) if base_url == url
+        );
+        if web && !data_page {
+            self.last_load = Some(ConsumerMsg::LoadUrl {
+                view,
+                url: url.to_string(),
+            });
+        }
     }
 
     fn show(&mut self, view: i64, shown: bool) -> Option<ConsumerMsg> {
@@ -248,6 +301,10 @@ struct Views {
     entries: BTreeMap<i64, ViewEntry>,
 
     closing: BTreeSet<i64>,
+
+    helper: Option<HelperGeneration>,
+
+    activity: u64,
 }
 
 impl Views {
@@ -255,6 +312,8 @@ impl Views {
         Self {
             entries: BTreeMap::new(),
             closing: BTreeSet::new(),
+            helper: None,
+            activity: 0,
         }
     }
 
@@ -267,6 +326,52 @@ impl Views {
                 .count(),
             Ordering::Release,
         );
+        VIEWS_CHANGED.notify_all();
+    }
+
+    fn idle(&self) -> bool {
+        !self.entries.values().any(ViewEntry::window_visible)
+    }
+
+    fn still_idle(&self, generation: HelperGeneration, activity: u64) -> bool {
+        self.helper == Some(generation) && self.idle() && self.activity == activity
+    }
+
+    fn note_activity(&mut self) {
+        self.activity = self.activity.wrapping_add(1);
+    }
+
+    fn adopt(&mut self, generation: HelperGeneration) {
+        self.helper = Some(generation);
+        self.note_activity();
+        self.publish();
+    }
+
+    fn restores(&self, shown: &[(i64, bool)]) -> bool {
+        shown.iter().any(|&(view, shown)| {
+            shown && self.entries.get(&view).is_some_and(ViewEntry::restorable)
+        })
+    }
+
+    fn apply_shown(&mut self, shown: &[(i64, bool)], can_create: bool) -> Vec<ConsumerMsg> {
+        let mut batch = Vec::new();
+        for &(view, shown) in shown {
+            let Some(entry) = self.entries.get_mut(&view) else {
+                continue;
+            };
+            if shown && can_create && entry.restorable() {
+                batch.extend(entry.restore(view));
+            } else {
+                batch.extend(entry.show(view, shown));
+            }
+        }
+        if batch
+            .iter()
+            .any(|msg| matches!(msg, ConsumerMsg::SetVisible { visible: true, .. }))
+        {
+            self.note_activity();
+        }
+        batch
     }
 
     fn created(&mut self, view: i64) -> Option<&mut ViewEntry> {
@@ -300,11 +405,14 @@ impl Views {
             entry.can_go_back = false;
         }
         self.closing.clear();
+        self.helper = None;
         visible
     }
 }
 
 static VIEWS: Mutex<Views> = Mutex::new(Views::new());
+
+static VIEWS_CHANGED: Condvar = Condvar::new();
 
 static TRACKED_VIEWS: AtomicUsize = AtomicUsize::new(0);
 
@@ -318,6 +426,8 @@ static COOKIE_GETS: Mutex<BTreeMap<u32, mpsc::Sender<Vec<CookiePair>>>> =
     Mutex::new(BTreeMap::new());
 
 static COOKIE_FLUSHES: Mutex<BTreeMap<u32, mpsc::Sender<bool>>> = Mutex::new(BTreeMap::new());
+
+static OWED_REPLIES: Mutex<BTreeMap<u32, HelperGeneration>> = Mutex::new(BTreeMap::new());
 
 fn lock_client() -> Result<MutexGuard<'static, ClientSlot>, ClientError> {
     CLIENT
@@ -339,14 +449,51 @@ fn encode_all(batch: &[ConsumerMsg]) -> Result<Vec<Vec<u8>>, ClientError> {
     batch.iter().map(encode).collect()
 }
 
-fn write_frames(slot: &ClientSlot, frames: &[Vec<u8>]) -> Result<(), ClientError> {
-    let client = slot.live()?;
-    for frame in frames {
-        (&mut &client.writer).write_all(frame).map_err(|e| {
-            ClientError::Unavailable(format!("control-socket write failed: {}", e.kind()))
-        })?;
+impl Client {
+    fn send(&self, frames: &[Vec<u8>]) -> Result<(), ClientError> {
+        for frame in frames {
+            (&mut &self.writer).write_all(frame).map_err(|e| {
+                ClientError::Unavailable(format!("control-socket write failed: {}", e.kind()))
+            })?;
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+fn write_frames(slot: &ClientSlot, frames: &[Vec<u8>]) -> Result<(), ClientError> {
+    slot.live()?.send(frames)
+}
+
+fn send_owing_reply(slot: &ClientSlot, request_id: u32, frame: Vec<u8>) -> Result<(), ClientError> {
+    let client = slot.live()?;
+    OWED_REPLIES
+        .lock()
+        .map_err(|_| ClientError::Internal("owed replies lock poisoned"))?
+        .insert(request_id, client.generation);
+    client
+        .send(&[frame])
+        .inspect_err(|_| reply_received(request_id))
+}
+
+fn reply_received(request_id: u32) {
+    if let Ok(mut owed) = OWED_REPLIES.lock() {
+        owed.remove(&request_id);
+    }
+}
+
+fn replies_still_owed(generation: HelperGeneration) -> Vec<u32> {
+    let Ok(mut owed) = OWED_REPLIES.lock() else {
+        return Vec::new();
+    };
+    let mut unanswered = Vec::new();
+    owed.retain(|request_id, owner| {
+        let retired = *owner == generation;
+        if retired {
+            unanswered.push(*request_id);
+        }
+        !retired
+    });
+    unanswered
 }
 
 fn note_visibility(batch: &[ConsumerMsg]) {
@@ -578,217 +725,289 @@ fn with_exit_status(error: ClientError, status: Option<std::process::ExitStatus>
     }
 }
 
-fn cef_profile_to_import(storage: &Storage) -> Option<PathBuf> {
-    let profile = &storage.cef_profile;
-    match profile.try_exists() {
-        Ok(true) => {}
-        Ok(false) => return None,
-        Err(e) => {
-            tracing::warn!(
-                profile = %profile.display(),
-                "cannot look for the CEF WebView profile, so its cookies were not migrated: {e}"
-            );
-            return None;
-        }
-    }
-    let webkit_store = storage.data.join(proto::PERSISTENT_COOKIE_FILE);
-    if !matches!(webkit_store.try_exists(), Ok(false)) {
-        tracing::warn!(
-            profile = %profile.display(),
-            "keeping the CEF WebView profile without migrating it, because the WebKit cookie \
-             store already exists and the old cookies could replace newer ones"
-        );
-        return None;
-    }
-    Some(profile.clone())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CookieOwner {
+    Jar,
+
+    Helper(HelperGeneration),
 }
 
-enum Import {
-    Saved,
+struct CookieStore {
+    jar: CookieJar,
 
-    Unsaved(String),
+    file: PathBuf,
+
+    owner: CookieOwner,
+
+    dirty: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum MigrationStage {
-    Importing { request_id: u32 },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookieAnswer {
+    Now(bool),
 
-    Flushing { request_id: u32 },
+    FromHelper,
 }
 
-#[derive(Debug)]
-struct Migration {
-    profile: PathBuf,
+static COOKIES: Mutex<Option<CookieStore>> = Mutex::new(None);
 
-    total: usize,
+static JAR_WRITE: Mutex<()> = Mutex::new(());
 
-    stage: MigrationStage,
+fn lock_cookie_store() -> Result<MutexGuard<'static, Option<CookieStore>>, ClientError> {
+    COOKIES
+        .lock()
+        .map_err(|_| ClientError::Internal("cookie store lock poisoned"))
 }
 
-enum MigrationStep {
-    Send(Migration, ConsumerMsg),
-
-    Done(Migration, Import),
-
-    Unrelated(Migration, HelperMsg),
+fn with_cookie_store<T>(action: impl FnOnce(&mut CookieStore) -> T) -> Result<T, ClientError> {
+    let mut slot = lock_cookie_store()?;
+    let store = match &mut *slot {
+        Some(store) => store,
+        empty => empty.insert(CookieStore::open()?),
+    };
+    Ok(action(store))
 }
 
-impl Migration {
-    fn start(profile: &Path, cookies: Vec<StoredCookie>) -> (Self, ConsumerMsg) {
-        let request_id = next_request_id();
-        let migration = Self {
-            profile: profile.to_path_buf(),
-            total: cookies.len(),
-            stage: MigrationStage::Importing { request_id },
-        };
-        (
-            migration,
-            ConsumerMsg::CookieImport {
-                request_id,
-                cookies,
-            },
+impl CookieStore {
+    fn open() -> Result<Self, ClientError> {
+        let storage = webview_storage()?;
+        Self::load(
+            storage.data.join(cookie_jar::COOKIE_JAR_FILE),
+            &storage.cef_profile,
+            SystemTime::now(),
         )
     }
 
-    fn advance(self, msg: HelperMsg) -> MigrationStep {
-        match (self.stage, msg) {
-            (
-                MigrationStage::Importing { request_id },
-                HelperMsg::CookieImportResult {
-                    request_id: answered,
-                    imported,
-                    ..
-                },
-            ) if answered == request_id => {
-                if usize::try_from(imported) != Ok(self.total) {
-                    let reason = format!("the helper stored {imported} of {} cookies", self.total);
-                    return MigrationStep::Done(self, Import::Unsaved(reason));
-                }
-                let request_id = next_request_id();
-                MigrationStep::Send(
-                    Self {
-                        stage: MigrationStage::Flushing { request_id },
-                        ..self
-                    },
-                    ConsumerMsg::CookieFlush { request_id },
-                )
+    fn load(file: PathBuf, cef_profile: &Path, now: SystemTime) -> Result<Self, ClientError> {
+        let jar = match cookie_jar::read_file(&file, now) {
+            Ok(Some(jar)) => {
+                warn_about_an_unmigrated_cef_profile(cef_profile);
+                jar
             }
-            (
-                MigrationStage::Flushing { request_id },
-                HelperMsg::CookieFlushed {
-                    request_id: answered,
-                    ok,
-                },
-            ) if answered == request_id => {
-                let outcome = if ok {
-                    Import::Saved
-                } else {
-                    Import::Unsaved("the helper could not save the imported cookies".to_string())
-                };
-                MigrationStep::Done(self, outcome)
+            Ok(None) => migrate_cef_profile(&file, cef_profile, now),
+            Err(JarFileError::Io(error)) => {
+                return Err(ClientError::Storage(format!(
+                    "cannot read the cookie jar {}: {error}",
+                    file.display()
+                )))
             }
-            (_, msg) => MigrationStep::Unrelated(self, msg),
+            Err(error @ (JarFileError::Oversized | JarFileError::Codec(_))) => {
+                set_aside_a_corrupt_jar(&file, &error);
+                CookieJar::default()
+            }
+        };
+        Ok(Self {
+            jar,
+            file,
+            owner: CookieOwner::Jar,
+            dirty: false,
+        })
+    }
+
+    fn answers(&self) -> bool {
+        self.owner == CookieOwner::Jar
+    }
+
+    fn set(&mut self, url: &str, header: &str) -> bool {
+        match self.jar.set_from_header(url, header, SystemTime::now()) {
+            Ok(changed) => {
+                self.dirty |= changed;
+                true
+            }
+            Err(rejected) => {
+                tracing::warn!(
+                    target: "android.webkit.CookieManager",
+                    url = %url_scheme_and_host_for_log(url),
+                    %rejected,
+                    "CookieManager.setCookie: the cookie jar refused a cookie"
+                );
+                false
+            }
         }
     }
 
-    fn conclude(self, outcome: Import) {
-        let profile = self.profile.display();
-        match outcome {
-            Import::Unsaved(reason) => tracing::warn!(
-                %profile,
-                reason,
-                "keeping the CEF WebView profile because the WebKit cookie store did not save its \
-                 cookies"
-            ),
-            Import::Saved => match std::fs::remove_dir_all(&self.profile) {
-                Ok(()) => tracing::info!(
-                    cookies = self.total,
-                    "migrated the CEF WebView cookies into the WebKit cookie store and removed the \
-                     CEF profile"
-                ),
-                Err(e) => tracing::error!(
-                    %profile,
-                    cookies = self.total,
-                    "migrated the CEF WebView cookies but cannot remove the CEF profile: {e}"
-                ),
-            },
+    fn clear(&mut self, scope: ClearScope) -> bool {
+        let removed = self.jar.clear(scope);
+        self.dirty |= removed;
+        removed
+    }
+
+    fn take_unsaved(&mut self) -> Result<Option<(PathBuf, Vec<u8>)>, proto::ProtoError> {
+        if !self.dirty {
+            return Ok(None);
         }
+        let bytes = self.jar.encode()?;
+        self.dirty = false;
+        Ok(Some((self.file.clone(), bytes)))
     }
 }
 
-fn migrate_cef_profile(
-    stream: &UnixStream,
-    profile: &Path,
-    now: SystemTime,
-    timeout: Duration,
-) -> Result<Option<Migration>, ClientError> {
-    let cookies = match cef_profile::read_cookies(profile, now) {
-        Ok(cookies) => cookies,
-        Err(e) => {
+fn warn_about_an_unmigrated_cef_profile(profile: &Path) {
+    if matches!(profile.try_exists(), Ok(false)) {
+        return;
+    }
+    tracing::warn!(
+        profile = %profile.display(),
+        "keeping the CEF WebView profile without migrating it, because the cookie jar already \
+         exists and the old cookies could replace newer ones"
+    );
+}
+
+fn set_aside_a_corrupt_jar(file: &Path, error: &JarFileError) {
+    match cookie_jar::quarantine(file) {
+        Ok(moved_to) => tracing::error!(
+            jar = %file.display(),
+            moved_to = %moved_to.display(),
+            %error,
+            "the WebView cookie jar is corrupt; it was moved aside and the jar starts empty"
+        ),
+        Err(move_error) => tracing::error!(
+            jar = %file.display(),
+            %error,
+            %move_error,
+            "the WebView cookie jar is corrupt and cannot be moved aside; the jar starts \
+             empty and its next save replaces the file"
+        ),
+    }
+}
+
+fn migrate_cef_profile(file: &Path, profile: &Path, now: SystemTime) -> CookieJar {
+    match profile.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return CookieJar::default(),
+        Err(error) => {
             tracing::warn!(
                 profile = %profile.display(),
-                reason = %e,
+                "cannot look for the CEF WebView profile, so its cookies were not migrated: {error}"
+            );
+            return CookieJar::default();
+        }
+    }
+    let jar = match cef_profile::read_cookies(profile, now) {
+        Ok(cookies) => CookieJar::from_cookies(cookies, now),
+        Err(error) => {
+            tracing::warn!(
+                profile = %profile.display(),
+                reason = %error,
                 "keeping the CEF WebView profile because its cookies cannot be migrated"
             );
-            return Ok(None);
+            return CookieJar::default();
         }
     };
-    let (migration, import) = Migration::start(profile, cookies);
-    let frame = match encode(&import) {
-        Ok(frame) => frame,
-        Err(e) => {
-            migration.conclude(Import::Unsaved(e.to_string()));
-            return Ok(None);
-        }
-    };
-    send_migration_frame(stream, &frame)?;
-    let pending = await_migration(stream, migration, Instant::now() + timeout);
-    stream.set_read_timeout(None).map_err(|e| {
-        ClientError::Migration(format!("clearing the read timeout failed: {}", e.kind()))
-    })?;
-    pending
+    let cookies = jar.all_unexpired(now).len();
+    match save_and_read_back(file, &jar, now) {
+        Err(reason) => tracing::warn!(
+            profile = %profile.display(),
+            reason,
+            "keeping the CEF WebView profile because the cookie jar did not save its cookies"
+        ),
+        Ok(()) => match std::fs::remove_dir_all(profile) {
+            Ok(()) => tracing::info!(
+                cookies,
+                "migrated the CEF WebView cookies into the cookie jar and removed the CEF profile"
+            ),
+            Err(error) => tracing::error!(
+                profile = %profile.display(),
+                cookies,
+                "migrated the CEF WebView cookies but cannot remove the CEF profile: {error}"
+            ),
+        },
+    }
+    jar
 }
 
-fn await_migration(
-    stream: &UnixStream,
-    mut migration: Migration,
-    deadline: Instant,
-) -> Result<Option<Migration>, ClientError> {
-    loop {
-        let Some(msg) = read_migration_reply(stream, deadline)? else {
-            tracing::warn!(
-                profile = %migration.profile.display(),
-                "the helper has not finished importing the CEF WebView cookies; the migration \
-                 completes when it answers"
-            );
-            return Ok(Some(migration));
-        };
-        migration = match migration.advance(msg) {
-            MigrationStep::Send(next, request) => {
-                send_migration_frame(stream, &encode(&request)?)?;
-                next
-            }
-            MigrationStep::Done(done, outcome) => {
-                done.conclude(outcome);
-                return Ok(None);
-            }
-            MigrationStep::Unrelated(_, other) => {
-                return Err(ClientError::Migration(format!(
-                    "expected the cookie migration's reply, got {}",
+fn save_and_read_back(file: &Path, jar: &CookieJar, now: SystemTime) -> Result<(), String> {
+    let bytes = jar.encode().map_err(|error| error.to_string())?;
+    cookie_jar::write_file(file, &bytes).map_err(|error| error.to_string())?;
+    match cookie_jar::read_file(file, now) {
+        Ok(Some(saved)) if saved == *jar => Ok(()),
+        Ok(_) => Err("the saved jar reads back differently".to_string()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn with_helper_cookies(
+    generation: HelperGeneration,
+    action: impl FnOnce(&mut CookieStore),
+) -> bool {
+    let mut slot = match lock_cookie_store() {
+        Ok(slot) => slot,
+        Err(error) => {
+            tracing::warn!(%error, "the web engine helper's cookies were not kept");
+            return false;
+        }
+    };
+    match slot.as_mut() {
+        Some(store) if store.owner == CookieOwner::Helper(generation) => {
+            action(store);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn install_snapshot(generation: HelperGeneration, cookies: Vec<StoredCookie>) {
+    let installed = with_helper_cookies(generation, |store| {
+        store.dirty |= store.jar.replace_all(cookies, SystemTime::now());
+    });
+    if !installed {
+        tracing::debug!("ignoring a cookie snapshot from a retired web engine helper");
+    }
+}
+
+fn return_cookies_to_the_jar(generation: HelperGeneration) {
+    with_helper_cookies(generation, |store| store.owner = CookieOwner::Jar);
+}
+
+fn hand_over_cookies(stream: &UnixStream, timeout: Duration) -> Result<(), ClientError> {
+    let cookies = with_cookie_store(|store| store.jar.all_unexpired(SystemTime::now()))?;
+    let total = cookies.len();
+    let request_id = next_request_id();
+    send_spawn_frame(
+        stream,
+        &encode(&ConsumerMsg::CookieImport {
+            request_id,
+            cookies,
+        })?,
+    )?;
+    let deadline = Instant::now() + timeout;
+    let imported = loop {
+        match read_spawn_reply(stream, deadline)? {
+            None => return Err(ClientError::TimedOut("the cookie import")),
+            Some(HelperMsg::CookieImportResult {
+                request_id: answered,
+                imported,
+                ..
+            }) if answered == request_id => break imported,
+            Some(HelperMsg::CookieSnapshot { .. }) => {}
+            Some(other) => {
+                return Err(ClientError::CookieImport(format!(
+                    "expected the import's result, got {}",
                     other.name()
                 )))
             }
-        };
+        }
+    };
+    stream.set_read_timeout(None).map_err(|e| {
+        ClientError::CookieImport(format!("clearing the read timeout failed: {}", e.kind()))
+    })?;
+    if usize::try_from(imported) != Ok(total) {
+        tracing::warn!(
+            imported,
+            total,
+            "the web engine helper did not take every cookie of the jar"
+        );
     }
+    Ok(())
 }
 
-fn send_migration_frame(stream: &UnixStream, frame: &[u8]) -> Result<(), ClientError> {
+fn send_spawn_frame(stream: &UnixStream, frame: &[u8]) -> Result<(), ClientError> {
     (&mut &*stream)
         .write_all(frame)
-        .map_err(|e| ClientError::Migration(format!("write failed: {}", e.kind())))
+        .map_err(|e| ClientError::CookieImport(format!("write failed: {}", e.kind())))
 }
 
-fn read_migration_reply(
+fn read_spawn_reply(
     stream: &UnixStream,
     deadline: Instant,
 ) -> Result<Option<HelperMsg>, ClientError> {
@@ -800,14 +1019,14 @@ fn read_migration_reply(
     };
     stream
         .set_read_timeout(Some(remaining))
-        .map_err(|e| ClientError::Migration(format!("set_read_timeout failed: {}", e.kind())))?;
+        .map_err(|e| ClientError::CookieImport(format!("set_read_timeout failed: {}", e.kind())))?;
     match proto::read_helper_msg(&mut &*stream) {
         Ok(HelperMsg::Fatal { reason }) => Err(ClientError::Unavailable(reason)),
         Ok(msg) => Ok(Some(msg)),
         Err(proto::ProtoError::Io(
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut,
         )) => Ok(None),
-        Err(e) => Err(ClientError::Migration(format!("protocol error: {e}"))),
+        Err(e) => Err(ClientError::CookieImport(format!("protocol error: {e}"))),
     }
 }
 
@@ -818,18 +1037,31 @@ struct Spawned {
 }
 
 fn spawn_client(java_vm: jni::vm::JavaVM) -> Result<Client, ClientError> {
+    let generation = HelperGeneration::next();
     let (tx, rx) = mpsc::channel::<Result<Spawned, ClientError>>();
     let io = std::thread::Builder::new()
         .name("eclipse-webview-io".into())
-        .spawn(move || io_thread_main(&tx, java_vm))
+        .spawn(move || io_thread_main(&tx, java_vm, generation))
         .map_err(|e| ClientError::Spawn(format!("io-thread spawn failed: {e}")))?;
     match rx.recv_timeout(SPAWN_RESULT_TIMEOUT) {
-        Ok(Ok(spawned)) => Ok(Client {
-            child: spawned.child,
-            writer: spawned.writer,
-            io,
-            upcall: spawned.upcall,
-        }),
+        Ok(Ok(spawned)) => {
+            let mut child = spawned.child;
+            match adopt(generation) {
+                Ok(idle) => Ok(Client {
+                    child,
+                    writer: spawned.writer,
+                    io,
+                    upcall: spawned.upcall,
+                    idle,
+                    generation,
+                }),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    Err(e)
+                }
+            }
+        }
         Ok(Err(e)) => {
             let _ = io.join();
             Err(e)
@@ -840,12 +1072,198 @@ fn spawn_client(java_vm: jni::vm::JavaVM) -> Result<Client, ClientError> {
     }
 }
 
-fn io_thread_main(tx: &mpsc::Sender<Result<Spawned, ClientError>>, java_vm: jni::vm::JavaVM) {
-    let spawned = webview_storage().and_then(|storage| {
-        let cef_profile = cef_profile_to_import(&storage);
-        spawn_helper_process(&storage).map(|spawned| (cef_profile, spawned))
-    });
-    let (cef_profile, (stream, mut child)) = match spawned {
+fn adopt(generation: HelperGeneration) -> Result<JoinHandle<()>, ClientError> {
+    lock_views()?.adopt(generation);
+    let idle = std::thread::Builder::new()
+        .name("eclipse-webview-idle".into())
+        .spawn(move || watch_idle(generation, HELPER_IDLE_GRACE))
+        .map_err(|e| ClientError::Spawn(format!("idle-thread spawn failed: {e}")))?;
+    with_cookie_store(|store| store.owner = CookieOwner::Helper(generation))?;
+    Ok(idle)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleWait {
+    UntilChange,
+
+    For(Duration),
+
+    Elapsed { activity: u64 },
+}
+
+#[derive(Default)]
+struct IdleTimer {
+    since: Option<(u64, Instant)>,
+}
+
+impl IdleTimer {
+    fn next(&mut self, idle: bool, activity: u64, now: Instant, grace: Duration) -> IdleWait {
+        if !idle {
+            self.since = None;
+            return IdleWait::UntilChange;
+        }
+        let start = match self.since {
+            Some((seen, start)) if seen == activity => start,
+            _ => {
+                self.since = Some((activity, now));
+                now
+            }
+        };
+        let left = grace.saturating_sub(now.saturating_duration_since(start));
+        if left.is_zero() {
+            IdleWait::Elapsed { activity }
+        } else {
+            IdleWait::For(left)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleStop {
+    Stopped,
+
+    Busy,
+
+    Retired,
+}
+
+fn watch_idle(generation: HelperGeneration, grace: Duration) {
+    loop {
+        let outcome = match wait_for_idle(generation, grace) {
+            Ok(Some(activity)) => stop_idle_helper(generation, activity),
+            Ok(None) => Ok(IdleStop::Retired),
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(IdleStop::Busy) => {}
+            Ok(IdleStop::Stopped | IdleStop::Retired) => return,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "webview client: the idle web engine helper keeps running"
+                );
+                return;
+            }
+        }
+    }
+}
+
+fn wait_for_idle(
+    generation: HelperGeneration,
+    grace: Duration,
+) -> Result<Option<u64>, ClientError> {
+    let mut views = lock_views()?;
+    let mut timer = IdleTimer::default();
+    loop {
+        if views.helper != Some(generation) {
+            return Ok(None);
+        }
+        views = match timer.next(views.idle(), views.activity, Instant::now(), grace) {
+            IdleWait::UntilChange => VIEWS_CHANGED
+                .wait(views)
+                .map_err(|_| ClientError::Internal("views lock poisoned"))?,
+            IdleWait::For(left) => {
+                VIEWS_CHANGED
+                    .wait_timeout(views, left)
+                    .map_err(|_| ClientError::Internal("views lock poisoned"))?
+                    .0
+            }
+            IdleWait::Elapsed { activity } => return Ok(Some(activity)),
+        };
+    }
+}
+
+fn stop_idle_helper(generation: HelperGeneration, activity: u64) -> Result<IdleStop, ClientError> {
+    let mut slot = lock_client()?;
+    let still_idle = lock_views()?.still_idle(generation, activity);
+    let mut client = match std::mem::replace(&mut *slot, ClientSlot::Unspawned) {
+        ClientSlot::Live(client) if client.generation == generation && still_idle => client,
+        ClientSlot::Live(client) if client.generation == generation => {
+            *slot = ClientSlot::Live(client);
+            return Ok(IdleStop::Busy);
+        }
+        other => {
+            *slot = other;
+            return Ok(IdleStop::Retired);
+        }
+    };
+    let flushed = ask_helper(&client, &COOKIE_FLUSHES, |request_id| {
+        ConsumerMsg::CookieFlush { request_id }
+    })
+    .and_then(|reply| reply.wait("the cookie flush before its idle stop", IDLE_STOP_WAIT));
+    match flushed {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            "webview client: the idle web engine helper could not hand back its cookies; the jar \
+             keeps their last snapshot"
+        ),
+        Err(error) => tracing::warn!(
+            error = %error,
+            "webview client: the idle web engine helper did not hand back its cookies; the jar \
+             keeps their last snapshot"
+        ),
+    }
+    if let Ok(mut views) = VIEWS.lock() {
+        views.reset_after_helper_loss();
+        views.publish();
+    }
+    return_cookies_to_the_jar(generation);
+    wake_all_cookie_waiters();
+    drop(slot);
+    match stop_helper_process(&mut client, IDLE_STOP_WAIT) {
+        Some(status) if status.success() => tracing::info!(
+            %status,
+            "webview client: stopped the web engine helper because no WebView window was shown"
+        ),
+        status => tracing::warn!(
+            status = ?status,
+            "webview client: the idle web engine helper did not exit cleanly"
+        ),
+    }
+    let io_joined = client.io.join().is_ok();
+    let upcall_joined = client.upcall.join().is_ok();
+    if !(io_joined && upcall_joined) {
+        tracing::warn!(
+            io_joined,
+            upcall_joined,
+            "webview client: a thread of the idle web engine helper panicked"
+        );
+    }
+    if let Err(error) = save_cookie_jar() {
+        tracing::warn!(
+            error = %error,
+            "webview client: the cookies of the idle web engine helper were not saved"
+        );
+    }
+    Ok(IdleStop::Stopped)
+}
+
+fn stop_helper_process(
+    client: &mut Client,
+    deadline: Duration,
+) -> Option<std::process::ExitStatus> {
+    if let Ok(frame) = ConsumerMsg::Shutdown.encode() {
+        let _ = (&mut &client.writer).write_all(&frame);
+    }
+    let t0 = Instant::now();
+    while t0.elapsed() < deadline {
+        match client.child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    let _ = client.child.kill();
+    client.child.wait().ok()
+}
+
+fn io_thread_main(
+    tx: &mpsc::Sender<Result<Spawned, ClientError>>,
+    java_vm: jni::vm::JavaVM,
+    generation: HelperGeneration,
+) {
+    let spawned = webview_storage().and_then(|storage| spawn_helper_process(&storage));
+    let (stream, mut child) = match spawned {
         Ok(spawned) => spawned,
         Err(e) => {
             let _ = tx.send(Err(e));
@@ -858,19 +1276,14 @@ fn io_thread_main(tx: &mpsc::Sender<Result<Spawned, ClientError>>, java_vm: jni:
             protocol = u64::from(PROTO_VERSION),
             "eclipse-webview helper handshake complete"
         );
-        cef_profile.map_or(Ok(None), |profile| {
-            migrate_cef_profile(&stream, &profile, SystemTime::now(), MIGRATION_TIMEOUT)
-        })
+        hand_over_cookies(&stream, COOKIE_IMPORT_TIMEOUT)
     });
-    let migration = match started {
-        Ok(migration) => migration,
-        Err(e) => {
-            let _ = child.kill();
-            let status = child.wait().ok();
-            let _ = tx.send(Err(with_exit_status(e, status)));
-            return;
-        }
-    };
+    if let Err(e) = started {
+        let _ = child.kill();
+        let status = child.wait().ok();
+        let _ = tx.send(Err(with_exit_status(e, status)));
+        return;
+    }
     let writer = match stream.try_clone() {
         Ok(writer) => writer,
         Err(e) => {
@@ -885,7 +1298,7 @@ fn io_thread_main(tx: &mpsc::Sender<Result<Spawned, ClientError>>, java_vm: jni:
     let (up_tx, up_rx) = mpsc::channel::<Upcall>();
     let upcall = match std::thread::Builder::new()
         .name("eclipse-webview-upcall".into())
-        .spawn(move || upcall_thread_main(&up_rx, &java_vm))
+        .spawn(move || upcall_thread_main(&up_rx, &java_vm, generation))
     {
         Ok(handle) => handle,
         Err(e) => {
@@ -906,7 +1319,7 @@ fn io_thread_main(tx: &mpsc::Sender<Result<Spawned, ClientError>>, java_vm: jni:
         let _ = spawned.child.wait();
         return;
     }
-    reader_loop(&stream, &up_tx, migration);
+    reader_loop(&stream, &up_tx, generation);
 }
 
 fn ensure_live(slot: &mut ClientSlot, java_vm: jni::vm::JavaVM) -> Result<(), ClientError> {
@@ -997,8 +1410,29 @@ enum Upcall {
     },
 }
 
+impl Upcall {
+    fn answered_request(&self) -> Option<u32> {
+        match self {
+            Self::EvaluateJsResult { request_id, .. }
+            | Self::CookieSetResult { request_id, .. }
+            | Self::CookiesCleared { request_id, .. } => Some(*request_id),
+            Self::LoadChanged { .. }
+            | Self::Progress { .. }
+            | Self::LoadFailed { .. }
+            | Self::ResourceLoad { .. }
+            | Self::Policy { .. }
+            | Self::Back
+            | Self::BridgeCall { .. }
+            | Self::ViewClosed { .. }
+            | Self::HelperGone { .. } => None,
+        }
+    }
+}
+
 enum Routed {
     Upcall(Upcall),
+
+    Snapshot(Vec<StoredCookie>),
 
     Handled,
 
@@ -1036,6 +1470,7 @@ fn route(msg: HelperMsg, views: &mut Views) -> Routed {
             can_go_back,
         } => {
             if let Some(entry) = views.created(view) {
+                entry.note_page(view, &url);
                 entry.url = Some(url).filter(|url| !url.is_empty());
                 entry.can_go_back = can_go_back;
             }
@@ -1154,10 +1589,11 @@ fn route(msg: HelperMsg, views: &mut Views) -> Routed {
                 request_id,
                 imported,
                 failed,
-                "webview client: a cookie import result matches no CEF cookie migration"
+                "webview client: a cookie import result arrived after the helper started"
             );
             return Routed::Handled;
         }
+        HelperMsg::CookieSnapshot { cookies } => return Routed::Snapshot(cookies),
         HelperMsg::CookieList {
             request_id,
             cookies,
@@ -1198,11 +1634,7 @@ fn wake_all_cookie_waiters() {
     }
 }
 
-fn reader_loop(
-    stream: &UnixStream,
-    upcalls: &mpsc::Sender<Upcall>,
-    mut migration: Option<Migration>,
-) {
+fn reader_loop(stream: &UnixStream, upcalls: &mpsc::Sender<Upcall>, generation: HelperGeneration) {
     loop {
         let msg = match proto::read_helper_msg(&mut &*stream) {
             Ok(msg) => msg,
@@ -1210,6 +1642,7 @@ fn reader_loop(
                 helper_lost(
                     Loss::Exited("the helper closed its control socket".into()),
                     upcalls,
+                    generation,
                 );
                 return;
             }
@@ -1217,27 +1650,10 @@ fn reader_loop(
                 helper_lost(
                     Loss::Exited(format!("protocol error from the helper: {e}")),
                     upcalls,
+                    generation,
                 );
                 return;
             }
-        };
-        let msg = match migration.take() {
-            None => msg,
-            Some(pending) => match pending.advance(msg) {
-                MigrationStep::Send(next, request) => {
-                    send_reply(&request);
-                    migration = Some(next);
-                    continue;
-                }
-                MigrationStep::Done(done, outcome) => {
-                    done.conclude(outcome);
-                    continue;
-                }
-                MigrationStep::Unrelated(pending, msg) => {
-                    migration = Some(pending);
-                    msg
-                }
-            },
         };
         let routed = match VIEWS.lock() {
             Ok(mut views) => {
@@ -1249,11 +1665,15 @@ fn reader_loop(
         };
         match routed {
             Routed::Upcall(upcall) => {
+                if let Some(request_id) = upcall.answered_request() {
+                    reply_received(request_id);
+                }
                 let _ = upcalls.send(upcall);
             }
+            Routed::Snapshot(cookies) => install_snapshot(generation, cookies),
             Routed::Handled => {}
             Routed::Fatal(reason) => {
-                helper_lost(Loss::Fatal(reason), upcalls);
+                helper_lost(Loss::Fatal(reason), upcalls, generation);
                 return;
             }
         }
@@ -1282,12 +1702,12 @@ fn slot_after(loss: Loss) -> ClientSlot {
     }
 }
 
-fn helper_lost(loss: Loss, upcalls: &mpsc::Sender<Upcall>) {
+fn helper_lost(loss: Loss, upcalls: &mpsc::Sender<Upcall>, generation: HelperGeneration) {
     let Ok(mut slot) = CLIENT.lock() else {
         return;
     };
-    if !matches!(&*slot, ClientSlot::Live(_)) {
-        tracing::debug!("webview reader exiting after teardown");
+    if !matches!(&*slot, ClientSlot::Live(client) if client.generation == generation) {
+        tracing::debug!("webview reader exiting after its helper was retired");
         return;
     }
     let reason = match &loss {
@@ -1297,6 +1717,7 @@ fn helper_lost(loss: Loss, upcalls: &mpsc::Sender<Upcall>) {
         let _ = client.child.kill();
         let _ = client.child.wait();
     }
+    return_cookies_to_the_jar(generation);
     let visible_views = match VIEWS.lock() {
         Ok(mut views) => {
             let visible = views.reset_after_helper_loss();
@@ -1323,15 +1744,23 @@ fn finish_restart() {
     }
 }
 
-fn upcall_thread_main(rx: &mpsc::Receiver<Upcall>, java_vm: &jni::vm::JavaVM) {
+fn upcall_thread_main(
+    rx: &mpsc::Receiver<Upcall>,
+    java_vm: &jni::vm::JavaVM,
+    generation: HelperGeneration,
+) {
     let mut gone = None;
     while let Ok(upcall) = rx.recv() {
         match upcall {
             Upcall::HelperGone { visible_views } => gone = Some(visible_views),
-            other => run_upcall(java_vm, other),
+            other => run_upcall(java_vm, other, generation),
         }
     }
-    crate::framework::drain_all_webview_callbacks(java_vm, "web engine helper connection closed");
+    crate::framework::fail_webview_callbacks(
+        java_vm,
+        &replies_still_owed(generation),
+        "web engine helper connection closed",
+    );
     let Some(visible_views) = gone else {
         return;
     };
@@ -1341,7 +1770,7 @@ fn upcall_thread_main(rx: &mpsc::Receiver<Upcall>, java_vm: &jni::vm::JavaVM) {
     finish_restart();
 }
 
-fn run_upcall(java_vm: &jni::vm::JavaVM, upcall: Upcall) {
+fn run_upcall(java_vm: &jni::vm::JavaVM, upcall: Upcall, generation: HelperGeneration) {
     match upcall {
         Upcall::LoadChanged { view, state, url } => {
             if crate::framework::fire_web_view_internal_load_changed(java_vm, view, state, &url) {
@@ -1373,10 +1802,13 @@ fn run_upcall(java_vm: &jni::vm::JavaVM, upcall: Upcall) {
         } => {
             let override_load =
                 crate::framework::fire_web_view_should_override_url_loading(java_vm, view, request);
-            send_reply(&ConsumerMsg::PolicyReply {
-                policy_id,
-                override_load,
-            });
+            send_reply(
+                generation,
+                &ConsumerMsg::PolicyReply {
+                    policy_id,
+                    override_load,
+                },
+            );
         }
         Upcall::Back => crate::framework::dispatch_activity_back(java_vm),
         Upcall::BridgeCall {
@@ -1386,7 +1818,7 @@ fn run_upcall(java_vm: &jni::vm::JavaVM, upcall: Upcall) {
         } => {
             let (ok, result_json) =
                 crate::framework::fire_bridge_call(java_vm, view, call_id, &payload_json);
-            send_reply(&bridge_result(call_id, ok, result_json));
+            send_reply(generation, &bridge_result(call_id, ok, result_json));
         }
         Upcall::EvaluateJsResult {
             request_id,
@@ -1408,11 +1840,13 @@ fn run_upcall(java_vm: &jni::vm::JavaVM, upcall: Upcall) {
     }
 }
 
-fn send_reply(msg: &ConsumerMsg) {
+fn send_reply(generation: HelperGeneration, msg: &ConsumerMsg) {
     let result = encode(msg).and_then(|frame| {
         let slot = lock_client()?;
         match &*slot {
-            ClientSlot::Live(_) => write_frames(&slot, &[frame]),
+            ClientSlot::Live(client) if client.generation == generation => {
+                write_frames(&slot, &[frame])
+            }
             _ => Ok(()),
         }
     });
@@ -1485,6 +1919,7 @@ fn load(java_vm: jni::vm::JavaVM, view: i64, request: ConsumerMsg) -> Result<(),
             .entry(view)
             .or_default()
             .load_batch(view, shown, request);
+        views.note_activity();
         views.publish();
         batch
     };
@@ -1525,7 +1960,7 @@ pub fn evaluate_js(view: i64, request_id: u32, script: String) -> Result<(), Cli
             "the WebView has not loaded a page yet".to_string(),
         ));
     }
-    write_frames(&slot, &[frame])
+    send_owing_reply(&slot, request_id, frame)
 }
 
 pub fn set_user_agent(view: i64, user_agent: Option<String>) -> Result<(), ClientError> {
@@ -1632,42 +2067,47 @@ pub fn close_view(view: i64) -> Result<(), ClientError> {
     write_frames(&slot, &[encode(&ConsumerMsg::CloseView { view })?])
 }
 
-pub fn refresh_visibility() {
+pub fn refresh_visibility(env: &jni::Env<'_>) {
     if TRACKED_VIEWS.load(Ordering::Acquire) == 0 {
         return;
     }
-    let created: Vec<i64> = match VIEWS.lock() {
+    let loaded: Vec<i64> = match VIEWS.lock() {
         Ok(views) => views
             .entries
             .iter()
-            .filter(|(_, entry)| entry.created)
+            .filter(|(_, entry)| entry.last_load.is_some())
             .map(|(view, _)| *view)
             .collect(),
         Err(_) => return,
     };
-    if created.is_empty() {
+    if loaded.is_empty() {
         return;
     }
-    let shown: Vec<(i64, bool)> = created
+    let shown: Vec<(i64, bool)> = loaded
         .into_iter()
         .map(|view| (view, view_registry::is_shown(view)))
         .collect();
-    if let Err(e) = apply_shown(&shown) {
+    if let Err(e) = apply_shown(env, &shown) {
         tracing::warn!(error = %e, "webview client: a WebView window visibility change was not sent");
     }
 }
 
-fn apply_shown(shown: &[(i64, bool)]) -> Result<(), ClientError> {
-    let slot = lock_client()?;
-    let batch: Vec<ConsumerMsg> = {
+fn apply_shown(env: &jni::Env<'_>, shown: &[(i64, bool)]) -> Result<(), ClientError> {
+    let mut slot = lock_client()?;
+    let spawned = if lock_views()?.restores(shown) {
+        env.get_java_vm()
+            .map_err(|e| ClientError::Spawn(format!("JavaVM unavailable: {e}")))
+            .and_then(|java_vm| ensure_live(&mut slot, java_vm))
+    } else {
+        Ok(())
+    };
+    let batch = {
         let mut views = lock_views()?;
-        let batch = shown
-            .iter()
-            .filter_map(|&(view, shown)| views.created(view)?.show(view, shown))
-            .collect();
+        let batch = views.apply_shown(shown, spawned.is_ok());
         views.publish();
         batch
     };
+    spawned?;
     if batch.is_empty() {
         return Ok(());
     }
@@ -1711,96 +2151,150 @@ pub fn activate(token: String) {
     }
 }
 
-fn send_spawning(java_vm: jni::vm::JavaVM, msg: &ConsumerMsg) -> Result<(), ClientError> {
-    let frame = encode(msg)?;
-    let mut slot = lock_client()?;
-    ensure_live(&mut slot, java_vm)?;
-    write_frames(&slot, &[frame])
-}
-
-pub fn cookie_set(
-    java_vm: jni::vm::JavaVM,
+struct HelperReply<T: 'static> {
     request_id: u32,
-    url: String,
-    header: String,
-) -> Result<(), ClientError> {
-    send_spawning(
-        java_vm,
-        &ConsumerMsg::CookieSet {
-            request_id,
-            url,
-            header,
-        },
-    )
+
+    waiters: &'static Mutex<BTreeMap<u32, mpsc::Sender<T>>>,
+
+    answer: mpsc::Receiver<T>,
 }
 
-pub fn cookies_clear(
-    java_vm: jni::vm::JavaVM,
-    request_id: u32,
-    scope: ClearScope,
-) -> Result<(), ClientError> {
-    send_spawning(java_vm, &ConsumerMsg::CookiesClear { request_id, scope })
+impl<T> HelperReply<T> {
+    fn forget(&self) {
+        if let Ok(mut waiters) = self.waiters.lock() {
+            waiters.remove(&self.request_id);
+        }
+    }
+
+    fn wait(self, what: &'static str, timeout: Duration) -> Result<T, ClientError> {
+        match self.answer.recv_timeout(timeout) {
+            Ok(value) => Ok(value),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.forget();
+                Err(ClientError::TimedOut(what))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ClientError::Unavailable(
+                "the helper exited before answering".to_string(),
+            )),
+        }
+    }
 }
 
-fn request_blocking<T>(
-    java_vm: jni::vm::JavaVM,
+fn ask_helper<T>(
+    client: &Client,
     waiters: &'static Mutex<BTreeMap<u32, mpsc::Sender<T>>>,
     msg: impl FnOnce(u32) -> ConsumerMsg,
-    what: &'static str,
-    timeout: Duration,
-) -> Result<T, ClientError> {
+) -> Result<HelperReply<T>, ClientError> {
     let request_id = next_request_id();
-    let (tx, rx) = mpsc::channel::<T>();
+    let frame = encode(&msg(request_id))?;
+    let (tx, answer) = mpsc::channel::<T>();
     waiters
         .lock()
         .map_err(|_| ClientError::Internal("cookie waiters lock poisoned"))?
         .insert(request_id, tx);
-    let forget = || {
-        if let Ok(mut waiters) = waiters.lock() {
-            waiters.remove(&request_id);
-        }
+    let reply = HelperReply {
+        request_id,
+        waiters,
+        answer,
     };
-    if let Err(e) = send_spawning(java_vm, &msg(request_id)) {
-        forget();
+    if let Err(e) = client.send(&[frame]) {
+        reply.forget();
         return Err(e);
     }
-    match rx.recv_timeout(timeout) {
-        Ok(value) => Ok(value),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            forget();
-            Err(ClientError::TimedOut(what))
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ClientError::Unavailable(
-            "the helper exited before answering".to_string(),
-        )),
+    Ok(reply)
+}
+
+pub fn cookie_get(url: String) -> Result<Vec<CookiePair>, ClientError> {
+    let slot = lock_client()?;
+    let from_jar = with_cookie_store(|store| {
+        store
+            .answers()
+            .then(|| store.jar.matching(&url, SystemTime::now()))
+    })?;
+    if let Some(cookies) = from_jar {
+        return Ok(cookies);
     }
+    let reply = ask_helper(slot.live()?, &COOKIE_GETS, |request_id| {
+        ConsumerMsg::CookieGet { request_id, url }
+    })?;
+    drop(slot);
+    reply.wait("CookieManager.getCookie", COOKIE_GET_TIMEOUT)
 }
 
-pub fn cookie_get_blocking(
-    java_vm: jni::vm::JavaVM,
+pub fn cookie_set(
+    request_id: u32,
     url: String,
-    timeout: Duration,
-) -> Result<Vec<CookiePair>, ClientError> {
-    request_blocking(
-        java_vm,
-        &COOKIE_GETS,
-        |request_id| ConsumerMsg::CookieGet { request_id, url },
-        "CookieManager.getCookie",
-        timeout,
-    )
+    header: String,
+) -> Result<CookieAnswer, ClientError> {
+    let slot = lock_client()?;
+    if let Some(ok) = with_cookie_store(|store| store.answers().then(|| store.set(&url, &header)))?
+    {
+        return Ok(CookieAnswer::Now(ok));
+    }
+    send_owing_reply(
+        &slot,
+        request_id,
+        encode(&ConsumerMsg::CookieSet {
+            request_id,
+            url,
+            header,
+        })?,
+    )?;
+    Ok(CookieAnswer::FromHelper)
 }
 
-pub fn cookie_flush_blocking(
-    java_vm: jni::vm::JavaVM,
-    timeout: Duration,
-) -> Result<bool, ClientError> {
-    request_blocking(
-        java_vm,
-        &COOKIE_FLUSHES,
-        |request_id| ConsumerMsg::CookieFlush { request_id },
-        "CookieManager.flush",
-        timeout,
-    )
+pub fn cookies_clear(request_id: u32, scope: ClearScope) -> Result<CookieAnswer, ClientError> {
+    let slot = lock_client()?;
+    if let Some(removed) = with_cookie_store(|store| store.answers().then(|| store.clear(scope)))? {
+        return Ok(CookieAnswer::Now(removed));
+    }
+    send_owing_reply(
+        &slot,
+        request_id,
+        encode(&ConsumerMsg::CookiesClear { request_id, scope })?,
+    )?;
+    Ok(CookieAnswer::FromHelper)
+}
+
+pub fn cookie_flush() -> Result<bool, ClientError> {
+    let pending = {
+        let slot = lock_client()?;
+        if with_cookie_store(|store| store.answers())? {
+            None
+        } else {
+            Some(ask_helper(slot.live()?, &COOKIE_FLUSHES, |request_id| {
+                ConsumerMsg::CookieFlush { request_id }
+            })?)
+        }
+    };
+    let helper_saved = pending
+        .map(|reply| reply.wait("CookieManager.flush", COOKIE_FLUSH_TIMEOUT))
+        .transpose();
+    let jar_saved = save_cookie_jar()?;
+    Ok(helper_saved?.unwrap_or(true) && jar_saved)
+}
+
+fn save_cookie_jar() -> Result<bool, ClientError> {
+    let _writer = JAR_WRITE
+        .lock()
+        .map_err(|_| ClientError::Internal("cookie jar writer lock poisoned"))?;
+    let Some((file, bytes)) =
+        with_cookie_store(CookieStore::take_unsaved)?.map_err(ClientError::Encode)?
+    else {
+        return Ok(true);
+    };
+    match cookie_jar::write_file(&file, &bytes) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            tracing::error!(
+                jar = %file.display(),
+                %error,
+                "cannot save the WebView cookie jar; the next flush tries again"
+            );
+            with_cookie_store(|store| store.dirty = true)?;
+            Ok(false)
+        }
+    }
 }
 
 pub fn view_close_pending(view: i64) -> bool {
@@ -1823,10 +2317,18 @@ pub fn failed_reason() -> Option<String> {
     }
 }
 
-pub fn needs_cookie_flush_before_shutdown() -> bool {
+pub fn helper_running() -> bool {
     CLIENT
         .lock()
         .is_ok_and(|slot| matches!(&*slot, ClientSlot::Live(_)))
+}
+
+pub fn needs_cookie_flush_before_shutdown() -> bool {
+    COOKIES.lock().is_ok_and(|store| {
+        store
+            .as_ref()
+            .is_some_and(|store| store.dirty || store.owner != CookieOwner::Jar)
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1853,6 +2355,7 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
     if let Ok(mut views) = VIEWS.lock() {
         views.entries.clear();
         views.closing.clear();
+        views.helper = None;
         views.publish();
     }
     let Some(mut client) = taken else {
@@ -1861,28 +2364,10 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
             reader_joined: false,
         };
     };
-    if let Ok(frame) = ConsumerMsg::Shutdown.encode() {
-        let _ = (&mut &client.writer).write_all(&frame);
-    }
-    let t0 = Instant::now();
-    let mut exit: Option<i32> = None;
-    while t0.elapsed() < deadline {
-        match client.child.try_wait() {
-            Ok(Some(status)) => {
-                exit = status.code();
-                break;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => break,
-        }
-    }
-    if exit.is_none() {
-        let _ = client.child.kill();
-        if let Ok(status) = client.child.wait() {
-            exit = status.code();
-        }
-    }
+    return_cookies_to_the_jar(client.generation);
+    let exit = stop_helper_process(&mut client, deadline).and_then(|status| status.code());
     let reader_joined = client.io.join().is_ok();
+    let _ = client.idle.join();
     let t0 = Instant::now();
     while !client.upcall.is_finished() && t0.elapsed() < deadline {
         let _ = crate::framework::pump_main_looper(vm);
@@ -2400,6 +2885,7 @@ mod tests {
     fn upcall(routed: Routed) -> Upcall {
         match routed {
             Routed::Upcall(upcall) => upcall,
+            Routed::Snapshot(_) => panic!("expected an upcall, got a cookie snapshot"),
             Routed::Handled => panic!("expected an upcall, the message was handled in place"),
             Routed::Fatal(reason) => panic!("expected an upcall, got fatal {reason}"),
         }
@@ -2757,17 +3243,10 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+        let generation = HelperGeneration::next();
+        let dir = install_store("helper-exit", CookieOwner::Helper(generation));
         let (host_end, helper_end) = UnixStream::pair().expect("socketpair");
-        let child = std::process::Command::new("/bin/sh")
-            .args(["-c", "exit 0"])
-            .spawn()
-            .expect("spawn a stand-in helper");
-        *CLIENT.lock().expect("client") = ClientSlot::Live(Client {
-            child,
-            writer: host_end.try_clone().expect("writer"),
-            io: std::thread::spawn(|| {}),
-            upcall: std::thread::spawn(|| {}),
-        });
+        *CLIENT.lock().expect("client") = ClientSlot::Live(stand_in_client(&host_end, generation));
         let shown_view = registry_view(true);
         let hidden_view = registry_view(false);
         {
@@ -2779,7 +3258,7 @@ mod tests {
         assert!(view_window_visible());
 
         let (tx, rx) = mpsc::channel();
-        let reader = std::thread::spawn(move || reader_loop(&host_end, &tx, None));
+        let reader = std::thread::spawn(move || reader_loop(&host_end, &tx, generation));
         drop(helper_end);
         reader.join().expect("reader");
 
@@ -2802,15 +3281,19 @@ mod tests {
         }
         free_registry_views(&[shown_view, hidden_view]);
         UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+        let owner = cookie_owner();
+        remove_store(&dir);
 
         assert!(
             matches!(gone, Ok(Upcall::HelperGone { visible_views: 1 })),
             "exactly the one shown view gets an Android Back"
         );
         assert!(restarting && hidden && uncreated);
-        assert!(
-            respawnable,
-            "the next WebView or cookie call starts a new helper"
+        assert!(respawnable, "the next WebView load starts a new helper");
+        assert_eq!(
+            owner,
+            Some(CookieOwner::Jar),
+            "the jar answers cookie calls again once the helper is gone"
         );
     }
 
@@ -2841,25 +3324,42 @@ mod tests {
         UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
     }
 
-    fn cef_storage(tag: &str) -> Storage {
-        let root = temp_dir(tag);
-        let storage = Storage {
-            data: root.join("app-data/webview"),
-            cache: root.join("cache/webview"),
-            cef_profile: root.join("app-data").join(CEF_PROFILE_DIR),
-        };
-        std::fs::create_dir_all(&storage.data).expect("create the WebKit data dir");
-        cef_profile::install_fixture(&storage.cef_profile);
-        storage
+    fn stand_in_client(writer: &UnixStream, generation: HelperGeneration) -> Client {
+        Client {
+            child: std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .expect("spawn a stand-in helper"),
+            writer: writer.try_clone().expect("writer"),
+            io: std::thread::spawn(|| {}),
+            upcall: std::thread::spawn(|| {}),
+            idle: std::thread::spawn(|| {}),
+            generation,
+        }
     }
 
-    fn migrate(stream: &UnixStream, profile: &Path) -> Result<Option<Migration>, ClientError> {
-        migrate_cef_profile(
-            stream,
-            profile,
-            cef_profile::fixture_written_at(),
-            MIGRATION_TIMEOUT,
-        )
+    fn install_store(tag: &str, owner: CookieOwner) -> PathBuf {
+        let dir = temp_dir(tag);
+        *COOKIES.lock().expect("cookies") = Some(CookieStore {
+            jar: CookieJar::default(),
+            file: dir.join(cookie_jar::COOKIE_JAR_FILE),
+            owner,
+            dirty: false,
+        });
+        dir
+    }
+
+    fn remove_store(dir: &Path) {
+        *COOKIES.lock().expect("cookies") = None;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn cookie_owner() -> Option<CookieOwner> {
+        COOKIES
+            .lock()
+            .expect("cookies")
+            .as_ref()
+            .map(|store| store.owner)
     }
 
     fn reply(stream: &UnixStream, msg: HelperMsg) {
@@ -2867,218 +3367,892 @@ mod tests {
         (&mut &*stream).write_all(&frame).expect("write the reply");
     }
 
-    fn answer_import(stream: &UnixStream, failed: u32) -> Vec<StoredCookie> {
-        let ConsumerMsg::CookieImport {
-            request_id,
-            cookies,
-        } = proto::read_consumer_msg(&mut &*stream).expect("read the import")
-        else {
-            panic!("the migration must start with CookieImport");
+    fn names(cookies: &[CookiePair]) -> Vec<&str> {
+        cookies.iter().map(|cookie| cookie.name.as_str()).collect()
+    }
+
+    const PAGE: &str = "https://www.roblox.com/home";
+
+    #[test]
+    fn cookie_calls_answer_from_the_jar_and_never_start_the_helper() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *CLIENT.lock().expect("client") = ClientSlot::Unspawned;
+        let dir = install_store("jar-answers", CookieOwner::Jar);
+        let file = dir.join(cookie_jar::COOKIE_JAR_FILE);
+
+        let set = cookie_set(1, PAGE.into(), "a=1; Domain=roblox.com; Max-Age=600".into());
+        let refused = cookie_set(2, PAGE.into(), "b=1; Domain=example.com".into());
+        let session = cookie_set(3, PAGE.into(), "s=1".into());
+        let got = cookie_get(PAGE.into()).expect("getCookie");
+        let needs_flush = needs_cookie_flush_before_shutdown();
+        let flushed = cookie_flush();
+        let saved = cookie_jar::read_file(&file, SystemTime::now()).expect("read the jar");
+        let first = std::fs::metadata(&file).expect("the saved jar");
+        std::thread::sleep(Duration::from_millis(20));
+        let unchanged_flush = cookie_flush();
+        let second = std::fs::metadata(&file).expect("the saved jar");
+        let cleared = cookies_clear(4, ClearScope::Session);
+        let cleared_again = cookies_clear(5, ClearScope::Session);
+        let after_clear = cookie_get(PAGE.into()).expect("getCookie");
+        let unspawned = matches!(*CLIENT.lock().expect("client"), ClientSlot::Unspawned);
+        remove_store(&dir);
+
+        assert_eq!(set, Ok(CookieAnswer::Now(true)));
+        assert_eq!(refused, Ok(CookieAnswer::Now(false)));
+        assert_eq!(session, Ok(CookieAnswer::Now(true)));
+        assert_eq!(names(&got), ["a", "s"]);
+        assert!(needs_flush, "unsaved cookies must be flushed at exit");
+        assert_eq!(flushed, Ok(true));
+        let saved = saved.expect("the flush wrote the jar");
+        assert_eq!(names(&saved.matching(PAGE, SystemTime::now())), ["a", "s"]);
+        assert_eq!(unchanged_flush, Ok(true));
+        assert_eq!(
+            (second.ino(), second.mtime(), second.mtime_nsec()),
+            (first.ino(), first.mtime(), first.mtime_nsec()),
+            "a flush with nothing new must not rewrite the jar"
+        );
+        assert_eq!(cleared, Ok(CookieAnswer::Now(true)));
+        assert_eq!(cleared_again, Ok(CookieAnswer::Now(false)));
+        assert_eq!(names(&after_clear), ["a"]);
+        assert!(unspawned, "no cookie call may start the web engine helper");
+    }
+
+    #[test]
+    fn cookie_calls_go_to_the_running_helper() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = HelperGeneration::next();
+        let dir = install_store("helper-answers", CookieOwner::Helper(generation));
+        let (host_end, helper_end) = UnixStream::pair().expect("socketpair");
+        *CLIENT.lock().expect("client") = ClientSlot::Live(stand_in_client(&host_end, generation));
+        let snapshot = vec![StoredCookie {
+            name: "page".into(),
+            value: "1".into(),
+            domain: "www.roblox.com".into(),
+            path: "/".into(),
+            secure: false,
+            http_only: true,
+            same_site: proto::SameSite::Lax,
+            expiry: proto::CookieExpiry::Session,
+        }];
+        let helper_snapshot = snapshot.clone();
+        let helper = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                let msg = proto::read_consumer_msg(&mut &helper_end).expect("a cookie request");
+                match &msg {
+                    ConsumerMsg::CookieGet { request_id, .. } => reply(
+                        &helper_end,
+                        HelperMsg::CookieList {
+                            request_id: *request_id,
+                            cookies: vec![CookiePair {
+                                name: "page".into(),
+                                value: "1".into(),
+                            }],
+                        },
+                    ),
+                    ConsumerMsg::CookieFlush { request_id } => {
+                        reply(
+                            &helper_end,
+                            HelperMsg::CookieSnapshot {
+                                cookies: helper_snapshot.clone(),
+                            },
+                        );
+                        reply(
+                            &helper_end,
+                            HelperMsg::CookieFlushed {
+                                request_id: *request_id,
+                                ok: true,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+                seen.push(msg);
+            }
+            seen
+        });
+        let (tx, _rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || reader_loop(&host_end, &tx, generation));
+
+        let set = cookie_set(7, PAGE.into(), "x=1".into());
+        let got = cookie_get(PAGE.into());
+        let flushed = cookie_flush();
+        let seen = helper.join().expect("fake helper");
+        reader.join().expect("reader");
+        let saved = COOKIES
+            .lock()
+            .expect("cookies")
+            .as_ref()
+            .map(|store| (store.jar.all_unexpired(SystemTime::now()), store.dirty));
+        let file = dir.join(cookie_jar::COOKIE_JAR_FILE);
+        let on_disk = cookie_jar::read_file(&file, SystemTime::now()).expect("read the jar");
+        let owner = cookie_owner();
+        *CLIENT.lock().expect("client") = ClientSlot::Unspawned;
+        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+        remove_store(&dir);
+
+        assert_eq!(set, Ok(CookieAnswer::FromHelper));
+        assert_eq!(
+            got.map(|cookies| names(&cookies).join(",")),
+            Ok("page".into())
+        );
+        assert_eq!(flushed, Ok(true));
+        assert!(matches!(
+            seen.as_slice(),
+            [
+                ConsumerMsg::CookieSet { request_id: 7, .. },
+                ConsumerMsg::CookieGet { .. },
+                ConsumerMsg::CookieFlush { .. }
+            ]
+        ));
+        assert_eq!(
+            saved,
+            Some((snapshot.clone(), false)),
+            "the flush installs the helper's snapshot and saves it"
+        );
+        assert_eq!(
+            on_disk.map(|jar| jar.all_unexpired(SystemTime::now())),
+            Some(snapshot)
+        );
+        assert_eq!(
+            owner,
+            Some(CookieOwner::Jar),
+            "the helper's exit returns the cookies"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_from_a_retired_helper_is_ignored() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retired = HelperGeneration::next();
+        let current = HelperGeneration::next();
+        let dir = install_store("stale-snapshot", CookieOwner::Helper(current));
+        let cookie = |name: &str| StoredCookie {
+            name: name.into(),
+            value: "1".into(),
+            domain: "www.roblox.com".into(),
+            path: "/".into(),
+            secure: false,
+            http_only: false,
+            same_site: proto::SameSite::Lax,
+            expiry: proto::CookieExpiry::Session,
         };
-        let total = u32::try_from(cookies.len()).expect("cookie count");
-        reply(
-            stream,
-            HelperMsg::CookieImportResult {
+        let jar_state = || {
+            COOKIES.lock().expect("cookies").as_ref().map(|store| {
+                (
+                    names(&store.jar.matching(PAGE, SystemTime::now())).join(","),
+                    store.dirty,
+                )
+            })
+        };
+        install_snapshot(retired, vec![cookie("stale")]);
+        let after_retired = jar_state();
+        install_snapshot(current, vec![cookie("fresh")]);
+        let after_current = jar_state();
+        return_cookies_to_the_jar(retired);
+        let owner_after_retired = cookie_owner();
+        return_cookies_to_the_jar(current);
+        let owner_after_current = cookie_owner();
+        remove_store(&dir);
+
+        assert_eq!(after_retired, Some((String::new(), false)));
+        assert_eq!(after_current, Some(("fresh".to_string(), true)));
+        assert_eq!(owner_after_retired, Some(CookieOwner::Helper(current)));
+        assert_eq!(owner_after_current, Some(CookieOwner::Jar));
+    }
+
+    #[test]
+    fn a_new_helper_gets_the_jar_before_anything_else() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = install_store("hand-over", CookieOwner::Jar);
+        with_cookie_store(|store| {
+            store.set(PAGE, "kept=1; Max-Age=600");
+            store.set(PAGE, "gone=1; Max-Age=0");
+            store.set(PAGE, "session=1");
+        })
+        .expect("fill the jar");
+        let (client_end, helper_end) = UnixStream::pair().expect("pair");
+        let (answered_tx, answered_rx) = mpsc::channel::<Instant>();
+        let helper = std::thread::spawn(move || {
+            let hello = proto::read_consumer_msg(&mut &helper_end).expect("Hello");
+            reply(
+                &helper_end,
+                HelperMsg::HelloAck {
+                    version: PROTO_VERSION,
+                    engine: "webkitgtk/test".into(),
+                },
+            );
+            let import = proto::read_consumer_msg(&mut &helper_end).expect("CookieImport");
+            let ConsumerMsg::CookieImport {
                 request_id,
-                imported: total - failed,
-                failed,
+                cookies,
+            } = &import
+            else {
+                return (hello, import);
+            };
+            reply(
+                &helper_end,
+                HelperMsg::CookieSnapshot {
+                    cookies: Vec::new(),
+                },
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            answered_tx.send(Instant::now()).expect("note the answer");
+            reply(
+                &helper_end,
+                HelperMsg::CookieImportResult {
+                    request_id: *request_id,
+                    imported: u32::try_from(cookies.len()).expect("count"),
+                    failed: 0,
+                },
+            );
+            (hello, import)
+        });
+        let started = perform_handshake(&client_end, Duration::from_secs(2))
+            .and_then(|_| hand_over_cookies(&client_end, Duration::from_secs(2)));
+        let returned = Instant::now();
+        let (hello, import) = helper.join().expect("fake helper");
+        let answered = answered_rx.recv().expect("the helper answered");
+        let owner = cookie_owner();
+        remove_store(&dir);
+
+        assert_eq!(started, Ok(()));
+        assert_eq!(
+            hello,
+            ConsumerMsg::Hello {
+                version: PROTO_VERSION
+            }
+        );
+        match import {
+            ConsumerMsg::CookieImport { cookies, .. } => assert_eq!(
+                cookies
+                    .iter()
+                    .map(|cookie| cookie.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["kept", "session"],
+                "the import carries every unexpired cookie, session ones included"
+            ),
+            other => panic!("the jar must follow the handshake, got {other:?}"),
+        }
+        assert!(
+            returned >= answered,
+            "the start must wait for the import, so no view is created before it"
+        );
+        assert_eq!(
+            client_end.read_timeout().expect("read timeout"),
+            None,
+            "the reader thread blocks without a timeout"
+        );
+        assert_eq!(
+            owner,
+            Some(CookieOwner::Jar),
+            "the spawner hands the cookies to the helper only once it is live"
+        );
+    }
+
+    #[test]
+    fn a_helper_that_never_takes_the_jar_fails_its_start() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = install_store("import-silent", CookieOwner::Jar);
+        let (client_end, helper_end) = UnixStream::pair().expect("pair");
+        let silent = hand_over_cookies(&client_end, Duration::from_millis(50));
+        let (client_end, fatal_end) = UnixStream::pair().expect("pair");
+        reply(
+            &fatal_end,
+            HelperMsg::Fatal {
+                reason: "the cookie store is gone".into(),
             },
         );
-        cookies
+        let fatal = hand_over_cookies(&client_end, Duration::from_secs(2));
+        drop(helper_end);
+        remove_store(&dir);
+
+        assert!(matches!(
+            silent,
+            Err(ClientError::TimedOut("the cookie import"))
+        ));
+        assert!(matches!(
+            fatal,
+            Err(ClientError::Unavailable(reason)) if reason == "the cookie store is gone"
+        ));
     }
 
-    fn answer_flush(stream: &UnixStream, ok: bool) {
-        let ConsumerMsg::CookieFlush { request_id } =
-            proto::read_consumer_msg(&mut &*stream).expect("read the flush")
-        else {
-            panic!("an import must be followed by CookieFlush");
-        };
-        reply(stream, HelperMsg::CookieFlushed { request_id, ok });
+    fn jar_location(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = temp_dir(tag);
+        let data = root.join("app-data/webview");
+        std::fs::create_dir_all(&data).expect("create the jar dir");
+        let profile = root.join("app-data").join(CEF_PROFILE_DIR);
+        (root, data.join(cookie_jar::COOKIE_JAR_FILE), profile)
     }
 
-    fn assert_nothing_more(stream: &UnixStream) {
+    #[test]
+    fn a_corrupt_jar_is_moved_aside_and_never_overwritten() {
+        let (root, file, profile) = jar_location("corrupt-jar");
+        std::fs::write(&file, [9, 0, 1, 2]).expect("damage the jar");
+        let store = CookieStore::load(file.clone(), &profile, SystemTime::now()).expect("load");
+        assert!(store.jar.all_unexpired(SystemTime::now()).is_empty());
+        assert!(!store.dirty);
+        assert!(!file.exists());
         assert_eq!(
-            proto::read_consumer_msg(&mut &*stream),
-            Err(proto::ProtoError::Eof)
+            std::fs::read(file.with_extension("corrupt")).expect("the damaged jar is kept"),
+            [9, 0, 1, 2]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_jar_that_cannot_be_read_stays_in_place_and_loads_once_it_can() {
+        let (root, file, profile) = jar_location("unreadable-jar");
+        std::fs::create_dir(&file).expect("put a directory where the jar is");
+        let unreadable = CookieStore::load(file.clone(), &profile, SystemTime::now());
+        let kept = file.is_dir();
+        let moved_aside = file.with_extension("corrupt").exists();
+        std::fs::remove_dir(&file).expect("remove the directory");
+        let mut jar = CookieJar::default();
+        jar.set_from_header(PAGE, "a=1; Max-Age=600", SystemTime::now())
+            .expect("a cookie");
+        cookie_jar::write_file(&file, &jar.encode().expect("encode")).expect("write the jar");
+        let readable = CookieStore::load(file, &profile, SystemTime::now());
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(matches!(unreadable, Err(ClientError::Storage(_))));
+        assert!(kept, "a jar that cannot be read must stay where it is");
+        assert!(!moved_aside, "only a corrupt jar is moved aside");
+        let readable = readable.expect("the jar loads once it can be read");
+        assert_eq!(
+            names(&readable.jar.matching(PAGE, SystemTime::now())),
+            ["a"]
         );
     }
 
     #[test]
-    fn only_a_cef_profile_beside_a_new_webkit_store_is_imported() {
-        let storage = cef_storage("cef-plan");
-        assert_eq!(
-            cef_profile_to_import(&storage),
-            Some(storage.cef_profile.clone())
-        );
-        let webkit_store = storage.data.join(proto::PERSISTENT_COOKIE_FILE);
-        touch(&webkit_store);
-        assert_eq!(cef_profile_to_import(&storage), None);
-        std::fs::remove_file(&webkit_store).expect("remove the WebKit store");
-        std::fs::remove_dir_all(&storage.cef_profile).expect("remove the CEF profile");
-        assert_eq!(cef_profile_to_import(&storage), None);
-    }
+    fn a_cef_profile_moves_into_the_jar_and_is_then_removed() {
+        let (root, file, profile) = jar_location("cef-migrated");
+        cef_profile::install_fixture(&profile);
+        let now = cef_profile::fixture_written_at();
+        let store = CookieStore::load(file.clone(), &profile, now).expect("load");
+        let cookies = store.jar.all_unexpired(now);
+        let saved = cookie_jar::read_file(&file, now).expect("read the jar");
+        let _ = std::fs::remove_dir_all(&root);
 
-    #[test]
-    fn a_cef_profile_is_imported_flushed_and_then_removed() {
-        let profile = cef_storage("cef-migrated").cef_profile;
-        let (client_end, helper_end) = UnixStream::pair().expect("pair");
-        let helper = std::thread::spawn(move || {
-            let cookies = answer_import(&helper_end, 0);
-            answer_flush(&helper_end, true);
-            assert_nothing_more(&helper_end);
-            cookies
-        });
-        let pending = migrate(&client_end, &profile).expect("migrate");
-        drop(client_end);
-        let cookies = helper.join().expect("fake helper");
-        assert!(pending.is_none(), "an answered migration is finished");
         assert_eq!(cookies.len(), 12);
         let login = cookies
             .iter()
             .find(|cookie| cookie.name == ".ROBLOSECURITY")
-            .expect("the login cookie is imported");
+            .expect("the login cookie is migrated");
         assert_eq!(
             login.value,
             "synthetic-roblosecurity-for-the-eclipse-cef-migration-test"
         );
+        assert_eq!(saved, Some(store.jar));
         assert!(!profile.exists(), "a migrated CEF profile must be removed");
     }
 
     #[test]
-    fn the_cef_profile_stays_until_every_cookie_is_saved() {
-        for (tag, failed, flushed) in [("cef-rejected", 1, true), ("cef-unflushed", 0, false)] {
-            let profile = cef_storage(tag).cef_profile;
-            let (client_end, helper_end) = UnixStream::pair().expect("pair");
-            let helper = std::thread::spawn(move || {
-                answer_import(&helper_end, failed);
-                if failed == 0 {
-                    answer_flush(&helper_end, flushed);
-                }
-                assert_nothing_more(&helper_end);
-            });
-            let pending =
-                migrate(&client_end, &profile).expect("a refused import is not a protocol failure");
-            assert!(pending.is_none(), "{tag}: a refused import is finished");
-            drop(client_end);
-            helper.join().expect("fake helper");
-            assert!(profile.exists(), "{tag}: the CEF profile must stay");
+    fn a_cef_profile_stays_unless_its_cookies_reach_the_jar_file() {
+        let (root, file, profile) = jar_location("cef-unsaved");
+        cef_profile::install_fixture(&profile);
+        let now = cef_profile::fixture_written_at();
+        let unwritable = root.join("missing-dir").join(cookie_jar::COOKIE_JAR_FILE);
+        let store = CookieStore::load(unwritable, &profile, now).expect("load");
+        assert_eq!(store.jar.all_unexpired(now).len(), 12);
+        assert!(
+            profile.exists(),
+            "the profile stays when the jar cannot be saved"
+        );
+
+        std::fs::write(profile.join(cef_profile::COOKIE_DATABASE), [0x5Au8; 4096])
+            .expect("damage the cookie database");
+        let store = CookieStore::load(file.clone(), &profile, now).expect("load");
+        assert!(store.jar.all_unexpired(now).is_empty());
+        assert!(profile.exists(), "an unreadable profile stays");
+        assert!(!file.exists(), "nothing is saved for an unreadable profile");
+
+        cef_profile::install_fixture(&profile);
+        cookie_jar::write_file(&file, &CookieJar::default().encode().expect("encode"))
+            .expect("an existing jar");
+        let store = CookieStore::load(file, &profile, now).expect("load");
+        assert!(store.jar.all_unexpired(now).is_empty());
+        assert!(
+            profile.exists(),
+            "a CEF profile beside an existing jar is kept, so old cookies never replace newer ones"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_idle_grace_runs_from_the_last_load_or_shown_window() {
+        let grace = Duration::from_secs(30);
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut timer = IdleTimer::default();
+        assert_eq!(timer.next(false, 1, at(0), grace), IdleWait::UntilChange);
+        assert_eq!(timer.next(true, 1, at(1), grace), IdleWait::For(grace));
+        assert_eq!(
+            timer.next(true, 1, at(11), grace),
+            IdleWait::For(Duration::from_secs(20))
+        );
+        assert_eq!(
+            timer.next(true, 2, at(21), grace),
+            IdleWait::For(grace),
+            "a load inside the grace starts it again"
+        );
+        assert_eq!(
+            timer.next(true, 2, at(50), grace),
+            IdleWait::For(Duration::from_secs(1))
+        );
+        assert_eq!(
+            timer.next(true, 2, at(51), grace),
+            IdleWait::Elapsed { activity: 2 }
+        );
+        assert_eq!(timer.next(false, 2, at(52), grace), IdleWait::UntilChange);
+        assert_eq!(
+            timer.next(true, 2, at(53), grace),
+            IdleWait::For(grace),
+            "a window shown and hidden again starts the grace again"
+        );
+    }
+
+    fn page_cookie() -> StoredCookie {
+        StoredCookie {
+            name: "page".into(),
+            value: "1".into(),
+            domain: "www.roblox.com".into(),
+            path: "/".into(),
+            secure: false,
+            http_only: false,
+            same_site: proto::SameSite::Lax,
+            expiry: proto::CookieExpiry::Session,
         }
     }
 
-    #[test]
-    fn an_unreadable_cef_profile_stays_and_sends_nothing() {
-        let profile = cef_storage("cef-unreadable").cef_profile;
-        std::fs::write(profile.join(cef_profile::COOKIE_DATABASE), [0x5Au8; 4096])
-            .expect("damage the cookie database");
-        let (client_end, helper_end) = UnixStream::pair().expect("pair");
-        let pending = migrate(&client_end, &profile).expect("migrate");
-        drop(client_end);
-        assert_nothing_more(&helper_end);
-        assert!(pending.is_none());
-        assert!(profile.exists());
+    fn running_helper(generation: HelperGeneration) -> (Client, UnixStream) {
+        let (host_end, helper_end) = UnixStream::pair().expect("socketpair");
+        let reader_end = host_end.try_clone().expect("reader end");
+        let (up_tx, up_rx) = mpsc::channel();
+        let io = std::thread::spawn(move || reader_loop(&reader_end, &up_tx, generation));
+        let upcall = std::thread::spawn(move || while up_rx.recv().is_ok() {});
+        let client = Client {
+            io,
+            upcall,
+            ..stand_in_client(&host_end, generation)
+        };
+        (client, helper_end)
+    }
+
+    fn answer_until_shutdown(
+        helper_end: UnixStream,
+        snapshot: Vec<StoredCookie>,
+    ) -> Vec<ConsumerMsg> {
+        let mut seen = Vec::new();
+        loop {
+            let msg = proto::read_consumer_msg(&mut &helper_end).expect("a host message");
+            if let ConsumerMsg::CookieFlush { request_id } = &msg {
+                reply(
+                    &helper_end,
+                    HelperMsg::CookieSnapshot {
+                        cookies: snapshot.clone(),
+                    },
+                );
+                reply(
+                    &helper_end,
+                    HelperMsg::CookieFlushed {
+                        request_id: *request_id,
+                        ok: true,
+                    },
+                );
+            }
+            let shutdown = msg == ConsumerMsg::Shutdown;
+            seen.push(msg);
+            if shutdown {
+                return seen;
+            }
+        }
+    }
+
+    fn hidden_page(view: i64) -> ViewEntry {
+        let mut entry = ViewEntry::default();
+        entry.load_batch(view, false, load(view));
+        entry
     }
 
     #[test]
-    fn a_silent_helper_keeps_the_cef_profile_and_the_socket_blocking() {
-        let profile = cef_storage("cef-silent").cef_profile;
-        let (client_end, _helper_end) = UnixStream::pair().expect("pair");
-        let pending = migrate_cef_profile(
-            &client_end,
-            &profile,
-            cef_profile::fixture_written_at(),
-            Duration::from_millis(50),
-        )
-        .expect("an unanswered import is not a protocol failure");
-        assert!(pending.is_some(), "the migration waits for the late answer");
-        assert!(profile.exists());
-        assert_eq!(client_end.read_timeout().expect("read timeout"), None);
-    }
-
-    #[test]
-    fn a_cef_migration_the_helper_answers_late_finishes_while_the_helper_runs() {
+    fn an_idle_helper_hands_back_its_cookies_then_shuts_down() {
         let _serial = HELPER_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
-        let profile = cef_storage("cef-late").cef_profile;
-        let (client_end, helper_end) = UnixStream::pair().expect("pair");
-        let (gave_up, host_gave_up) = mpsc::channel::<()>();
-        let helper = std::thread::spawn(move || {
-            let ConsumerMsg::CookieImport {
-                request_id,
-                cookies,
-            } = proto::read_consumer_msg(&mut &helper_end).expect("read the import")
-            else {
-                panic!("the migration must start with CookieImport");
-            };
-            host_gave_up
-                .recv()
-                .expect("the host stops waiting before the answer");
-            reply(
-                &helper_end,
-                HelperMsg::CookieImportResult {
-                    request_id,
-                    imported: u32::try_from(cookies.len()).expect("cookie count"),
-                    failed: 0,
-                },
-            );
-            answer_flush(&helper_end, true);
-        });
-        let pending = migrate_cef_profile(
-            &client_end,
-            &profile,
-            cef_profile::fixture_written_at(),
-            Duration::from_millis(50),
-        )
-        .expect("migrate");
-        let kept_while_unanswered = profile.exists();
-        *CLIENT.lock().expect("client") = ClientSlot::Live(Client {
-            child: std::process::Command::new("/bin/sh")
-                .args(["-c", "exit 0"])
-                .spawn()
-                .expect("spawn a stand-in helper"),
-            writer: client_end.try_clone().expect("writer"),
-            io: std::thread::spawn(|| {}),
-            upcall: std::thread::spawn(|| {}),
-        });
-        gave_up.send(()).expect("release the helper");
-        let (tx, _rx) = mpsc::channel();
-        let reader = std::thread::spawn(move || reader_loop(&client_end, &tx, pending));
-        helper.join().expect("fake helper");
-        reader.join().expect("reader");
-        finish_restart();
-        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+        let generation = HelperGeneration::next();
+        let dir = install_store("idle-stop", CookieOwner::Helper(generation));
+        let (client, helper_end) = running_helper(generation);
+        *CLIENT.lock().expect("client") = ClientSlot::Live(client);
+        let view = registry_view(false);
+        {
+            let mut views = VIEWS.lock().expect("views");
+            views.entries.insert(view, hidden_page(view));
+            views.entries.get_mut(&view).expect("entry").created = true;
+            views.adopt(generation);
+        }
+        let helper =
+            std::thread::spawn(move || answer_until_shutdown(helper_end, vec![page_cookie()]));
+
+        watch_idle(generation, Duration::from_millis(50));
+        let seen = helper.join().expect("stand-in helper");
+        let unspawned = matches!(*CLIENT.lock().expect("client"), ClientSlot::Unspawned);
+        let owner = cookie_owner();
+        let from_jar = cookie_get(PAGE.into());
+        let still_unspawned = matches!(*CLIENT.lock().expect("client"), ClientSlot::Unspawned);
+        let saved =
+            cookie_jar::read_file(&dir.join(cookie_jar::COOKIE_JAR_FILE), SystemTime::now())
+                .expect("read the jar");
+        let (helper_left, entry_kept) = {
+            let mut views = VIEWS.lock().expect("views");
+            let helper_left = views.helper;
+            let entry = views.entries.remove(&view).expect("the view stays tracked");
+            views.publish();
+            (
+                helper_left,
+                !entry.created && entry.last_load == Some(load(view)),
+            )
+        };
+        free_registry_views(&[view]);
+        let exits = UNEXPECTED_EXITS.load(Ordering::SeqCst);
+        remove_store(&dir);
 
         assert!(
-            kept_while_unanswered,
-            "the profile stays while the import is unanswered"
+            matches!(
+                seen.as_slice(),
+                [ConsumerMsg::CookieFlush { .. }, ConsumerMsg::Shutdown]
+            ),
+            "the helper is asked for its cookies, then shut down: {seen:?}"
         );
+        assert!(unspawned && still_unspawned);
+        assert_eq!(exits, 0, "an idle stop is no unexpected exit");
+        assert_eq!(owner, Some(CookieOwner::Jar));
+        assert_eq!(
+            from_jar.map(|cookies| names(&cookies).join(",")),
+            Ok("page".to_string()),
+            "the jar answers with the helper's last cookies"
+        );
+        assert_eq!(
+            saved.map(|jar| jar.all_unexpired(SystemTime::now())),
+            Some(vec![page_cookie()]),
+            "the stop saves the cookies it took back"
+        );
+        assert_eq!(helper_left, None);
+        assert!(entry_kept, "the hidden view keeps the page it shows again");
+    }
+
+    #[test]
+    fn a_load_or_a_shown_window_inside_the_grace_keeps_the_helper() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = HelperGeneration::next();
+        let dir = install_store("idle-busy", CookieOwner::Helper(generation));
+        let (host_end, helper_end) = UnixStream::pair().expect("socketpair");
+        *CLIENT.lock().expect("client") = ClientSlot::Live(stand_in_client(&host_end, generation));
+        let view = registry_view(true);
+        let quiet = {
+            let mut views = VIEWS.lock().expect("views");
+            views.entries.insert(view, hidden_page(view));
+            views.adopt(generation);
+            views.activity
+        };
+        VIEWS.lock().expect("views").note_activity();
+        let loaded = stop_idle_helper(generation, quiet);
+        let shown = {
+            let mut views = VIEWS.lock().expect("views");
+            let entry = views.entries.get_mut(&view).expect("entry");
+            entry.created = true;
+            entry.shown = true;
+            let activity = views.activity;
+            drop(views);
+            stop_idle_helper(generation, activity)
+        };
+        let retired = stop_idle_helper(HelperGeneration::next(), quiet);
+        helper_end.set_nonblocking(true).expect("nonblocking");
+        let sent = proto::read_consumer_msg(&mut &helper_end);
+        let live = matches!(&*CLIENT.lock().expect("client"), ClientSlot::Live(client) if client.generation == generation);
+        {
+            let mut views = VIEWS.lock().expect("views");
+            views.entries.remove(&view);
+            views.helper = None;
+            views.publish();
+        }
+        free_registry_views(&[view]);
+        *CLIENT.lock().expect("client") = ClientSlot::Unspawned;
+        remove_store(&dir);
+
+        assert_eq!(loaded, Ok(IdleStop::Busy), "a load after the grace began");
+        assert_eq!(shown, Ok(IdleStop::Busy), "a shown window");
+        assert_eq!(retired, Ok(IdleStop::Retired), "another helper is live");
         assert!(
-            !profile.exists(),
-            "a late but complete import is flushed and the CEF profile removed"
+            matches!(
+                sent,
+                Err(proto::ProtoError::Io(std::io::ErrorKind::WouldBlock))
+            ),
+            "nothing reaches a helper that stays: {sent:?}"
+        );
+        assert!(live);
+    }
+
+    #[test]
+    fn eof_from_a_retired_helper_leaves_the_newer_helper_alone() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+        let retired = HelperGeneration::next();
+        let current = HelperGeneration::next();
+        let dir = install_store("retired-eof", CookieOwner::Helper(current));
+        let (host_end, _helper_end) = UnixStream::pair().expect("socketpair");
+        *CLIENT.lock().expect("client") = ClientSlot::Live(stand_in_client(&host_end, current));
+        let view = registry_view(true);
+        {
+            let mut views = VIEWS.lock().expect("views");
+            views.entries.insert(view, created_entry(true));
+            views.adopt(current);
+        }
+
+        let (old_host, old_helper) = UnixStream::pair().expect("socketpair");
+        drop(old_helper);
+        let (tx, rx) = mpsc::channel();
+        reader_loop(&old_host, &tx, retired);
+
+        let live = matches!(&*CLIENT.lock().expect("client"), ClientSlot::Live(client) if client.generation == current);
+        let owner = cookie_owner();
+        let (window_kept, helper_kept) = {
+            let mut views = VIEWS.lock().expect("views");
+            let kept = (views.entries[&view].window_visible(), views.helper);
+            views.entries.remove(&view);
+            views.helper = None;
+            views.publish();
+            kept
+        };
+        free_registry_views(&[view]);
+        let exits = UNEXPECTED_EXITS.load(Ordering::SeqCst);
+        *CLIENT.lock().expect("client") = ClientSlot::Unspawned;
+        remove_store(&dir);
+
+        assert!(live, "the newer helper keeps running");
+        assert_eq!(exits, 0);
+        assert_eq!(owner, Some(CookieOwner::Helper(current)));
+        assert!(window_kept);
+        assert_eq!(helper_kept, Some(current));
+        assert!(rx.try_recv().is_err(), "no Back reaches Android");
+    }
+
+    #[test]
+    fn a_retired_helpers_replies_never_reach_a_newer_one() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retired = HelperGeneration::next();
+        let current = HelperGeneration::next();
+        let (host_end, helper_end) = UnixStream::pair().expect("socketpair");
+        *CLIENT.lock().expect("client") = ClientSlot::Live(stand_in_client(&host_end, current));
+        let reply_to = |generation, policy_id| {
+            send_reply(
+                generation,
+                &ConsumerMsg::PolicyReply {
+                    policy_id,
+                    override_load: false,
+                },
+            );
+        };
+        reply_to(retired, 5);
+        reply_to(current, 6);
+        let delivered = proto::read_consumer_msg(&mut &helper_end);
+        *CLIENT.lock().expect("client") = ClientSlot::Unspawned;
+
+        assert_eq!(
+            delivered,
+            Ok(ConsumerMsg::PolicyReply {
+                policy_id: 6,
+                override_load: false
+            }),
+            "only the live helper's own reply arrives"
         );
     }
 
     #[test]
-    fn a_helper_failing_during_the_cef_migration_fails_its_start() {
-        let profile = cef_storage("cef-fatal").cef_profile;
-        let (client_end, helper_end) = UnixStream::pair().expect("pair");
-        let helper = std::thread::spawn(move || {
-            proto::read_consumer_msg(&mut &helper_end).expect("read the import");
-            reply(
-                &helper_end,
-                HelperMsg::Fatal {
-                    reason: "the cookie store is gone".into(),
+    fn a_retired_helper_fails_only_the_callbacks_it_still_owes() {
+        let _serial = HELPER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        UNEXPECTED_EXITS.store(0, Ordering::SeqCst);
+        let retired = HelperGeneration::next();
+        let current = HelperGeneration::next();
+        let dir = install_store("owed-replies", CookieOwner::Helper(retired));
+        let (old_host, old_helper) = UnixStream::pair().expect("socketpair");
+        *CLIENT.lock().expect("client") = ClientSlot::Live(stand_in_client(&old_host, retired));
+        let answered = next_request_id();
+        let owed = next_request_id();
+        let to_retired = [
+            cookie_set(answered, PAGE.into(), "a=1".into()),
+            cookie_set(owed, PAGE.into(), "b=1".into()),
+        ];
+
+        with_cookie_store(|store| store.owner = CookieOwner::Helper(current)).expect("store");
+        let (new_host, _new_helper) = UnixStream::pair().expect("socketpair");
+        *CLIENT.lock().expect("client") = ClientSlot::Live(stand_in_client(&new_host, current));
+        let newer = next_request_id();
+        let to_current = cookies_clear(newer, ClearScope::All);
+
+        reply(
+            &old_helper,
+            HelperMsg::CookieSetResult {
+                request_id: answered,
+                ok: true,
+            },
+        );
+        drop(old_helper);
+        let (tx, rx) = mpsc::channel();
+        reader_loop(&old_host, &tx, retired);
+        let failed = replies_still_owed(retired);
+        let still_owed = replies_still_owed(current);
+        let live = matches!(&*CLIENT.lock().expect("client"), ClientSlot::Live(client) if client.generation == current);
+        *CLIENT.lock().expect("client") = ClientSlot::Unspawned;
+        remove_store(&dir);
+
+        assert_eq!(
+            to_retired,
+            [Ok(CookieAnswer::FromHelper), Ok(CookieAnswer::FromHelper)]
+        );
+        assert_eq!(to_current, Ok(CookieAnswer::FromHelper));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Upcall::CookieSetResult { request_id, ok: true }) if request_id == answered
+        ));
+        assert_eq!(
+            failed,
+            [owed],
+            "the retired helper fails only what it never answered"
+        );
+        assert_eq!(
+            still_owed,
+            [newer],
+            "the newer helper's callback stays pending until that helper answers it"
+        );
+        assert!(live, "the newer helper keeps running");
+    }
+
+    #[test]
+    fn showing_a_view_the_helper_lost_recreates_it_with_its_last_page() {
+        let view = 70;
+        let mut views = Views::new();
+        let mut entry = ViewEntry {
+            user_agent: Some(ROBLOX_UA.to_string()),
+            ..ViewEntry::default()
+        };
+        entry.bridges.insert(
+            "__globalRobloxAndroidBridge__".into(),
+            vec!["executeRoblox".into()],
+        );
+        entry.load_batch(view, false, load(view));
+        views.entries.insert(view, entry);
+        let page = "https://www.roblox.com/games/1818";
+        route(
+            HelperMsg::NavigationState {
+                view,
+                url: page.into(),
+                title: "Servers".into(),
+                can_go_back: true,
+            },
+            &mut views,
+        );
+        views.reset_after_helper_loss();
+        let before = views.activity;
+        let shown = [(view, true)];
+
+        assert!(views.restores(&shown));
+        assert!(!views.restores(&[(view, false)]));
+        assert_eq!(
+            views.apply_shown(&shown, true),
+            vec![
+                ConsumerMsg::CreateView { view },
+                ConsumerMsg::SetUserAgent {
+                    view,
+                    user_agent: ROBLOX_UA.to_string(),
                 },
-            );
-        });
-        match migrate(&client_end, &profile) {
-            Err(ClientError::Unavailable(reason)) => {
-                assert_eq!(reason, "the cookie store is gone");
-            }
-            other => panic!("expected the helper's failure, got {other:?}"),
-        }
-        helper.join().expect("fake helper");
-        assert!(profile.exists());
+                ConsumerMsg::BridgeRegister {
+                    view,
+                    name: "__globalRobloxAndroidBridge__".into(),
+                    methods: vec!["executeRoblox".into()],
+                },
+                ConsumerMsg::SetVisible {
+                    view,
+                    visible: true,
+                },
+                ConsumerMsg::LoadUrl {
+                    view,
+                    url: page.into(),
+                },
+            ]
+        );
+        assert_ne!(views.activity, before, "a shown window restarts the grace");
+        assert!(views.entries[&view].window_visible());
+        assert!(views.apply_shown(&shown, true).is_empty(), "shown once");
+
+        views.reset_after_helper_loss();
+        views.apply_shown(&[(view, false)], true);
+        assert!(
+            views.apply_shown(&shown, false).is_empty(),
+            "no window without a helper"
+        );
+        assert!(
+            !views.restores(&shown),
+            "a failed start is not retried while the view stays shown"
+        );
+    }
+
+    #[test]
+    fn the_page_to_restore_follows_navigation_but_keeps_loaded_data() {
+        let view = 71;
+        let mut entry = ViewEntry::default();
+        entry.note_page(view, "https://www.roblox.com/home");
+        assert_eq!(
+            entry.last_load,
+            Some(ConsumerMsg::LoadUrl {
+                view,
+                url: "https://www.roblox.com/home".into()
+            })
+        );
+        entry.note_page(view, "about:blank");
+        assert_eq!(
+            entry.last_load,
+            Some(ConsumerMsg::LoadUrl {
+                view,
+                url: "https://www.roblox.com/home".into()
+            }),
+            "only web pages can be loaded again"
+        );
+        let data = ConsumerMsg::LoadData {
+            view,
+            base_url: "https://www.roblox.com/".into(),
+            data: "<p>hi</p>".into(),
+            mime: "text/html".into(),
+            encoding: String::new(),
+        };
+        entry.load_batch(view, false, data.clone());
+        entry.note_page(view, "https://www.roblox.com/");
+        assert_eq!(
+            entry.last_load,
+            Some(data),
+            "loaded data is not replaced by its base URL"
+        );
     }
 }

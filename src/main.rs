@@ -1367,8 +1367,8 @@ impl std::fmt::Display for WebViewTestReport {
             f,
             "WebView engine pipeline OK: internalLoadChanged upcalls {}/3 (state 0 @ {}ms, \
              state 3 @ {}ms), page URL OK, bridge round-trip OK, evaluateJavascript OK, honest \
-             UA OK, cookie set/get OK, cookie callback OK, cookie flush OK, ViewClosed, helper \
-             exit 0",
+             UA OK, page cookies OK, cookie set/get OK, cookie callback OK, cookie flush OK, \
+             ViewClosed, idle stop OK, helper restart OK, helper exit 0",
             self.load_upcalls, self.started_ms, self.finished_ms
         )
     }
@@ -1384,32 +1384,76 @@ function(e){window.__eclipseBridgeResult='ERR:'+e;});}\
 else{setTimeout(eclipseBridge,50);}}\
 eclipseBridge();</script></body>";
 
+const WEBVIEW_TEST_PAGE_COOKIE: &str = "ECLIPSE_PAGE=1; Max-Age=3600; Path=/";
+
+const REQUEST_HEAD_LIMIT: usize = 16 * 1024;
+
+fn read_request_head(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while !head.windows(4).any(|end| end == b"\r\n\r\n") && head.len() < REQUEST_HEAD_LIMIT {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => head.extend_from_slice(&chunk[..n]),
+        }
+    }
+    String::from_utf8_lossy(&head).into_owned()
+}
+
+fn request_cookie_names(head: &str) -> String {
+    head.lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, cookies)| cookies.split(';'))
+        .filter_map(|pair| pair.split_once('=').map(|(name, _)| name.trim()))
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn start_loopback_page() -> std::io::Result<u16> {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            let mut buf = [0u8; 2048];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let path = req.split_whitespace().nth(1).unwrap_or("/");
-            let (status, body): (&str, &str) = if path == "/" || path.starts_with("/?") {
-                ("200 OK", WEBVIEW_TEST_PAGE)
+            let head = read_request_head(&mut stream);
+            let path = head.split_whitespace().nth(1).unwrap_or("/");
+            let resp = if path == "/" || path.starts_with("/?") {
+                let body = WEBVIEW_TEST_PAGE.replacen(
+                    "<script>",
+                    &format!(
+                        "<script>window.__eclipseServerCookies=\"{}\";",
+                        request_cookie_names(&head)
+                    ),
+                    1,
+                );
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                     Set-Cookie: {WEBVIEW_TEST_PAGE_COOKIE}\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                )
             } else {
-                ("404 Not Found", "")
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
             };
-            let resp = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
             let _ = stream.write_all(resp.as_bytes());
         }
     });
     Ok(port)
+}
+
+fn has_cookie(cookies: &str, pair: &str) -> bool {
+    cookies.split("; ").any(|cookie| cookie == pair)
 }
 
 fn pump_tick(vm: &eclipse::runtime::Vm, ms: u64) {
@@ -1472,12 +1516,52 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     eclipse::framework::register_engine_preload_natives(&vm)?;
 
     eclipse::framework::prepare_main_looper(&vm)?;
+    framework::register_cookie_manager(&vm)?;
+    if std::env::var("ECLIPSE_WEBVIEW_EXPECT_PERSISTED_TEST_COOKIE").as_deref() == Ok("1") {
+        let restored = framework::cookie_manager_get_cookie(&vm, &target_url);
+        for pair in ["ECLIPSE_TEST=1", "ECLIPSE_HTTPONLY=1", "ECLIPSE_PAGE=1"] {
+            if !has_cookie(&restored, pair) {
+                return Err(format!(
+                    "getCookie before the first view did not restore {pair} from the jar"
+                )
+                .into());
+            }
+        }
+        if client::helper_running() {
+            return Err("getCookie before the first view started the web engine helper".into());
+        }
+        println!(
+            "# persisted cookies OK (served from the jar before any view, values not printed)"
+        );
+    }
+    framework::cookie_manager_set_cookie_cb(&vm, &target_url, "ECLIPSE_PRE=1; Path=/")
+        .map_err(|e| format!("CookieManager.setCookie(3-arg) before the first view failed: {e}"))?;
+    if framework::read_probe_last_value(&vm).is_some() {
+        return Err(
+            "the jar ran the setCookie ValueCallback inside the call instead of posting it \
+             to the main Looper"
+                .into(),
+        );
+    }
+    framework::cookie_manager_set_cookie(&vm, &target_url, "ECLIPSE_HTTPONLY=1; HttpOnly; Path=/")
+        .map_err(|e| format!("CookieManager.setCookie before the first view failed: {e}"))?;
+    pump_tick(&vm, 0);
+    if !framework::read_probe_last_value(&vm).is_some_and(|v| v.contains("true")) {
+        return Err(
+            "the jar's setCookie ValueCallback did not get Boolean.TRUE at the next Looper pump"
+                .into(),
+        );
+    }
+    if client::helper_running() {
+        return Err("setCookie before the first view started the web engine helper".into());
+    }
+    println!("# jar answer posted OK (the ValueCallback ran at the next Looper pump)");
     println!("# ART booted ✓ — driving the WebView smoke (register → alloc → setWebViewClient → addJavascriptInterface → loadUrl)…");
+    let start = Instant::now();
     let handle = eclipse::framework::drive_webview_smoke(&vm, &target_url)?;
 
     let fail_reason =
         || client::failed_reason().map(|r| format!("web engine helper unavailable: {r}"));
-    let start = Instant::now();
     let mut started_ms: Option<u128> = None;
     let finished_ms = loop {
         if let Some(reason) = fail_reason() {
@@ -1493,11 +1577,9 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
                 );
             }
             if obs.finished {
-                println!(
-                    "# load-state 3 observed @ {} ms",
-                    start.elapsed().as_millis()
-                );
-                break start.elapsed().as_millis();
+                let finished_ms = start.elapsed().as_millis();
+                println!("# load-state 3 observed, first view @ {finished_ms} ms");
+                break finished_ms;
             }
         }
         if started_ms.is_none() && start.elapsed() > START_DEADLINE {
@@ -1531,8 +1613,8 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     };
     println!("# page URL OK (WebView.getUrl follows the engine)");
 
-    let eval_and_wait = |script: &str| -> Option<String> {
-        if framework::webview_evaluate(&vm, handle, script).is_err() {
+    let eval_and_wait = |view: i64, script: &str| -> Option<String> {
+        if framework::webview_evaluate(&vm, view, script).is_err() {
             return None;
         }
         let end = Instant::now() + LEG_DEADLINE;
@@ -1547,7 +1629,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         }
     };
 
-    let ua = eval_and_wait("navigator.userAgent")
+    let ua = eval_and_wait(handle, "navigator.userAgent")
         .ok_or("evaluateJavascript(navigator.userAgent) produced no result within 15 s")?;
     if !(ua.contains("Eclipse-WebView") && ua.contains("Chrome/152"))
         || ua.contains("GDPR VIOLATION")
@@ -1561,7 +1643,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
 
     let bridge_deadline = Instant::now() + LEG_DEADLINE;
     loop {
-        if let Some(r) = eval_and_wait("window.__eclipseBridgeResult||''") {
+        if let Some(r) = eval_and_wait(handle, "window.__eclipseBridgeResult||''") {
             if r.contains("echo:PING") {
                 break;
             }
@@ -1584,13 +1666,44 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         }
     }
 
-    if std::env::var("ECLIPSE_WEBVIEW_EXPECT_PERSISTED_TEST_COOKIE").as_deref() == Ok("1") {
-        let restored = framework::cookie_manager_get_cookie(&vm, &target_url);
-        if !restored.contains("ECLIPSE_TEST=1") {
-            return Err("persistent-cookie probe did not restore ECLIPSE_TEST before this process's setCookie".into());
-        }
-        println!("# persisted cookie restored OK (value not printed)");
+    let server_saw = |view: i64| -> Result<Vec<String>, String> {
+        let names = eval_and_wait(view, "window.__eclipseServerCookies||''")
+            .ok_or("the page's server cookie list produced no result within 15 s")?;
+        Ok(names
+            .trim_matches('"')
+            .split(',')
+            .map(str::to_string)
+            .collect())
+    };
+    let server_cookies = server_saw(handle)?;
+    if !["ECLIPSE_PRE", "ECLIPSE_HTTPONLY"]
+        .iter()
+        .all(|name| server_cookies.iter().any(|seen| seen == name))
+    {
+        return Err("the page request did not carry the cookies set before the first view".into());
     }
+    let document_cookies = eval_and_wait(handle, "document.cookie")
+        .ok_or("document.cookie produced no result within 15 s")?;
+    let document_cookies = document_cookies.trim_matches('"');
+    if !has_cookie(document_cookies, "ECLIPSE_PRE=1")
+        || document_cookies.contains("ECLIPSE_HTTPONLY")
+    {
+        return Err("document.cookie must show ECLIPSE_PRE and hide the HttpOnly cookie".into());
+    }
+    let page_cookie_deadline = Instant::now() + LEG_DEADLINE;
+    while !has_cookie(
+        &framework::cookie_manager_get_cookie(&vm, &target_url),
+        "ECLIPSE_PAGE=1",
+    ) {
+        if Instant::now() > page_cookie_deadline {
+            return Err("getCookie did not return the page's ECLIPSE_PAGE within 15 s".into());
+        }
+        pump_tick(&vm, 100);
+    }
+    println!(
+        "# page cookies OK (the jar reached the request, HttpOnly stayed hidden, the page's cookie \
+         reached getCookie)"
+    );
     framework::cookie_manager_set_cookie(&vm, &target_url, "ECLIPSE_TEST=1; Path=/")
         .map_err(|e| format!("CookieManager.setCookie(2-arg) failed: {e}"))?;
     let cookie_deadline = Instant::now() + LEG_DEADLINE;
@@ -1629,18 +1742,76 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     framework::cookie_manager_flush(&vm).map_err(|e| format!("CookieManager.flush failed: {e}"))?;
     println!("# cookie flush OK (the engine saved its session cookies)");
 
-    client::close_view(handle).map_err(|e| format!("CloseView send failed: {e}"))?;
-    let close_deadline = Instant::now() + CLOSE_DEADLINE;
-    while client::view_close_pending(handle) {
+    let close = |view: i64| -> Result<(), String> {
+        client::close_view(view).map_err(|e| format!("CloseView send failed: {e}"))?;
+        let close_deadline = Instant::now() + CLOSE_DEADLINE;
+        while client::view_close_pending(view) {
+            if let Some(reason) = fail_reason() {
+                return Err(reason);
+            }
+            if Instant::now() > close_deadline {
+                return Err("ViewClosed not observed within 15 s".into());
+            }
+            pump_tick(&vm, 50);
+        }
+        Ok(())
+    };
+    close(handle)?;
+    println!("# view-closed ✓ — waiting for the idle helper to stop…");
+
+    let closed = Instant::now();
+    let idle_wait = client::HELPER_IDLE_GRACE + Duration::from_secs(5);
+    let mut stopped_after = None;
+    while closed.elapsed() < idle_wait {
+        if stopped_after.is_none() && !client::helper_running() {
+            stopped_after = Some(start.elapsed());
+        }
+        pump_tick(&vm, 100);
+    }
+    let stopped_after = stopped_after.ok_or_else(|| {
+        format!(
+            "the helper still ran {} s after its page closed",
+            idle_wait.as_secs()
+        )
+    })?;
+    if stopped_after < client::HELPER_IDLE_GRACE {
+        return Err(format!(
+            "the helper stopped {} ms after the page loaded, before its idle grace",
+            stopped_after.as_millis()
+        )
+        .into());
+    }
+    if !has_cookie(
+        &framework::cookie_manager_get_cookie(&vm, &target_url),
+        "ECLIPSE_PAGE=1",
+    ) || client::helper_running()
+    {
+        return Err(
+            "getCookie after the idle stop did not answer ECLIPSE_PAGE from the jar".into(),
+        );
+    }
+    println!("# idle stop OK (no page shown for the grace; the jar answers the page's cookie)");
+
+    let again = eclipse::framework::drive_webview_smoke(&vm, &target_url)?;
+    let again_deadline = Instant::now() + FINISH_DEADLINE;
+    while !client::load_observed(again).is_some_and(|obs| obs.finished) {
         if let Some(reason) = fail_reason() {
             return Err(reason.into());
         }
-        if Instant::now() > close_deadline {
-            return Err("ViewClosed not observed within 15 s".into());
+        if Instant::now() > again_deadline {
+            return Err("the page loaded after the idle stop did not finish within 90 s".into());
         }
         pump_tick(&vm, 50);
     }
-    println!("# view-closed ✓ — shutting the helper down…");
+    if !client::helper_running() {
+        return Err("a page loaded after the idle stop did not start the helper again".into());
+    }
+    if !server_saw(again)?.iter().any(|seen| seen == "ECLIPSE_PAGE") {
+        return Err("the restarted helper did not send the jar's ECLIPSE_PAGE".into());
+    }
+    close(again)?;
+    println!("# helper restart OK (the next page started the helper with the jar's cookies)");
+    println!("# shutting the helper down…");
     let report = client::shutdown(&vm, Duration::from_secs(15));
     if report.helper_exit != Some(0) {
         return Err(format!(

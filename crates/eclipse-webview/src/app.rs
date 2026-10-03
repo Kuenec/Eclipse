@@ -1,10 +1,9 @@
-use crate::cookies::{self, SessionJar};
+use crate::cookies;
 use crate::logging::{self, Redacted};
 use crate::view::{self, Route, View};
 use crate::wire::{Inbound, Wire};
 use eclipse_webview::proto::{
-    ClearScope, ConsumerMsg, CookieExpiry, CookiePair, HelperMsg, ProtoError, StoredCookie,
-    PERSISTENT_COOKIE_FILE,
+    ClearScope, ConsumerMsg, CookiePair, HelperMsg, ProtoError, StoredCookie,
 };
 use gtk4::prelude::*;
 use gtk4::{gio, glib};
@@ -32,7 +31,6 @@ pub(crate) struct Storage {
 
 pub(crate) struct Engine {
     session: webkit6::NetworkSession,
-    jar: SessionJar,
 }
 
 fn utf8(path: &std::path::Path) -> Result<&str, String> {
@@ -49,17 +47,11 @@ pub(crate) fn configure_web_context() -> Result<(), String> {
 
 impl Engine {
     pub(crate) fn open(storage: &Storage) -> Result<Engine, String> {
-        let cookie_file = storage.data.join(PERSISTENT_COOKIE_FILE);
-        let (data, cache, cookie_file) = (
-            utf8(&storage.data)?,
-            utf8(&storage.cache)?,
-            utf8(&cookie_file)?,
-        );
+        let (data, cache) = (utf8(&storage.data)?, utf8(&storage.cache)?);
         let session = webkit6::NetworkSession::new(Some(data), Some(cache));
         session
             .cookie_manager()
-            .ok_or("the WebKit network session has no cookie manager")?
-            .set_persistent_storage(cookie_file, webkit6::CookiePersistentStorage::Sqlite);
+            .ok_or("the WebKit network session has no cookie manager")?;
         session.connect_download_started(|_, download| {
             let url = download
                 .request()
@@ -71,10 +63,7 @@ impl Engine {
             ));
             download.cancel();
         });
-        Ok(Engine {
-            session,
-            jar: SessionJar::new(storage.data.join("session-cookies")),
-        })
+        Ok(Engine { session })
     }
 
     fn cookie_manager(&self) -> webkit6::CookieManager {
@@ -145,7 +134,6 @@ impl App {
             exit: Cell::new(None),
             main_loop,
         });
-        app.restore_session_cookies();
         let weak = Rc::downgrade(&app);
         app.engine.cookie_manager().connect_changed(move |_| {
             if let Some(app) = weak.upgrade() {
@@ -262,8 +250,7 @@ impl App {
         for view in views {
             view.window.destroy();
         }
-        let main_loop = self.main_loop.clone();
-        self.snapshot(move |_| main_loop.quit());
+        self.main_loop.quit();
     }
 
     fn handle(self: &Rc<Self>, msg: ConsumerMsg) {
@@ -704,39 +691,6 @@ impl App {
             });
     }
 
-    fn restore_session_cookies(self: &Rc<Self>) {
-        let stored = match self.engine.jar.load() {
-            Ok(stored) => stored,
-            Err(error) => {
-                logging::warn(format_args!(
-                    "ignoring the saved session cookies in {}: {error}",
-                    self.engine.jar.path().display()
-                ));
-                return;
-            }
-        };
-        let restored = stored.len();
-        for cookie in stored {
-            match cookies::to_soup(&cookie) {
-                Ok(cookie) => self.engine.cookie_manager().add_cookie(
-                    &cookie,
-                    None::<&gio::Cancellable>,
-                    |result| {
-                        if let Err(error) = result {
-                            logging::warn(format_args!("cannot restore a session cookie: {error}"));
-                        }
-                    },
-                ),
-                Err(error) => {
-                    logging::warn(format_args!("cannot restore a session cookie: {error}"))
-                }
-            }
-        }
-        if restored > 0 {
-            logging::info(format_args!("restoring {restored} session cookie(s)"));
-        }
-    }
-
     fn schedule_snapshot(self: &Rc<Self>) {
         if self.snapshot_scheduled.replace(true) {
             return;
@@ -750,28 +704,34 @@ impl App {
         });
     }
 
-    fn snapshot(&self, done: impl FnOnce(bool) + 'static) {
-        let path = self.engine.jar.path().to_path_buf();
+    fn snapshot(self: &Rc<Self>, done: impl FnOnce(bool) + 'static) {
+        let app = Rc::clone(self);
         self.engine
             .cookie_manager()
             .all_cookies(None::<&gio::Cancellable>, move |result| {
                 let cookies = match result {
                     Ok(cookies) => cookies,
                     Err(error) => {
-                        logging::error(format_args!("cannot list cookies to save: {error}"));
+                        logging::error(format_args!("cannot list cookies for the host: {error}"));
                         done(false);
                         return;
                     }
                 };
-                let session: Vec<StoredCookie> = cookies
-                    .into_iter()
-                    .map(|mut cookie| cookies::from_soup(&mut cookie))
-                    .filter(|cookie| cookie.expiry == CookieExpiry::Session)
-                    .collect();
-                match SessionJar::new(path).store(&session) {
-                    Ok(()) => done(true),
+                let snapshot = HelperMsg::CookieSnapshot {
+                    cookies: cookies
+                        .into_iter()
+                        .map(|mut cookie| cookies::from_soup(&mut cookie))
+                        .collect(),
+                };
+                match snapshot.encode() {
+                    Ok(frame) => {
+                        app.transmit(&frame, snapshot.name());
+                        done(true);
+                    }
                     Err(error) => {
-                        logging::error(format_args!("cannot save the session cookies: {error}"));
+                        logging::error(format_args!(
+                            "cannot send the cookies to the host: {error}"
+                        ));
                         done(false);
                     }
                 }
@@ -821,6 +781,7 @@ mod tests {
     use eclipse_webview::proto::{self, LoadEvent, GLOBAL_FRAME_CAP};
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
+    use std::time::Instant;
 
     fn storage(tag: &str) -> (PathBuf, Storage) {
         let root =
@@ -922,10 +883,73 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
+    fn pump_until(what: &str, done: impl Fn() -> bool) {
+        let context = glib::MainContext::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "WebKit did not {what} within 10 s"
+            );
+            if !context.iteration(false) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("list the storage") {
+            let path = entry.expect("a storage entry").path();
+            if path.is_dir() {
+                files.extend(files_under(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    fn webkit_keeps_cookies_in_memory_and_hands_them_to_the_host() {
+        let (root, app, host) = app_with_host("memory-cookies");
+        let cookie = soup::Cookie::new("ECLIPSE_MEMORY", "1", "www.roblox.com", "/", 3600);
+        let added = Rc::new(Cell::new(None));
+        let noted = Rc::clone(&added);
+        app.engine
+            .cookie_manager()
+            .add_cookie(&cookie, None::<&gio::Cancellable>, move |result| {
+                noted.set(Some(result.is_ok()))
+            });
+        pump_until("store a cookie", || added.get().is_some());
+        let sent = Rc::new(Cell::new(None));
+        let noted = Rc::clone(&sent);
+        app.snapshot(move |ok| noted.set(Some(ok)));
+        pump_until("list its cookies", || sent.get().is_some());
+        let snapshot = proto::read_helper_msg(&mut &host);
+        drop(app);
+        let files = files_under(&root);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+
+        assert_eq!(added.get(), Some(true));
+        assert_eq!(sent.get(), Some(true));
+        match snapshot {
+            Ok(HelperMsg::CookieSnapshot { cookies }) => assert!(
+                cookies.iter().any(|cookie| cookie.name == "ECLIPSE_MEMORY"),
+                "{cookies:?}"
+            ),
+            other => panic!("expected the cookie snapshot, got {other:?}"),
+        }
+        assert!(
+            files.iter().all(|file| !file.ends_with("cookies.sqlite")),
+            "WebKit must keep cookies in memory, the host's jar is their only file: {files:?}"
+        );
+    }
+
     #[test]
     fn webkit_backed_checks_run_on_the_one_thread_that_starts_webkit() {
         an_engine_tears_down_without_touching_a_finalized_session();
         a_page_message_too_large_to_send_is_dropped_without_ending_the_helper();
         a_reply_too_large_to_send_reaches_the_host_as_a_failure();
+        webkit_keeps_cookies_in_memory_and_hands_them_to_the_host();
     }
 }
