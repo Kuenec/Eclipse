@@ -24,7 +24,7 @@
   <screenshots>
     <screenshot type="default">
       <caption>The launch window downloading the official Roblox client</caption>
-      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/main/packaging/flatpak/screenshots/first-launch.png</image>
+      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.7/packaging/flatpak/screenshots/first-launch.png</image>
     </screenshot>
   </screenshots>
   <url type="homepage">https://github.com/Kuenec/Eclipse</url>
@@ -55,6 +55,24 @@
     <color type="primary" scheme_preference="dark">#9e391b</color>
   </branding>
   <releases>
+    <release version="0.1.7" date="2026-10-03">
+      <description>
+        <ul>
+          <li>
+            Buy Robux and other Roblox web pages now cover the game window exactly, and move with it
+            when it is resized.
+          </li>
+          <li>
+            More kinds of Roblox links open in Eclipse, and starting Eclipse while Roblox runs asks
+            the desktop to show the running game instead of reporting an error.
+          </li>
+          <li>
+            Roblox captures are saved in Pictures/Roblox, voice chat can use the microphone, and
+            each launch keeps its own log; the last five are kept.
+          </li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.6" date="2026-10-03">
       <description>
         <ul>
