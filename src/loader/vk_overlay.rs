@@ -1,8 +1,10 @@
+use super::frame_log::{self, FrameLog, HostCall, MonotonicNs};
 use crate::framework::{ActiveTextOverlay, TextSelection};
 use crate::graphics::FrameFence;
 use crate::text_layout::{FieldStyle, PixelRect, Scroll, Selection, Viewport};
 use ash::vk;
 use ash::vk::Handle;
+use std::cell::Cell;
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -896,11 +898,6 @@ unsafe fn locate_image_index(pi: &vk::PresentInfoKHR<'_>, our_sc: u64) -> Option
 fn probe_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| std::env::var_os("ECLIPSE_VK_PROBE").is_some())
-}
-
-fn fps_probe_enabled() -> bool {
-    static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("ECLIPSE_VK_FPS").is_some())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2368,10 +2365,42 @@ unsafe fn present_with_overlay(
     unsafe { present_through_gate(gate, host, queue, pi, target) }
 }
 
+thread_local! {
+    static HOST_CALL: Cell<Option<HostCall>> = const { Cell::new(None) };
+}
+
+fn host_queue_present() -> Option<vk::PFN_vkQueuePresentKHR> {
+    let addr = cached(&HOST_QUEUE_PRESENT)?;
+    Some(unsafe { std::mem::transmute::<usize, vk::PFN_vkQueuePresentKHR>(addr) })
+}
+
+unsafe extern "system" fn timed_host_present(
+    queue: vk::Queue,
+    p_present_info: *const vk::PresentInfoKHR<'_>,
+) -> vk::Result {
+    let Some(host) = host_queue_present() else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let started = MonotonicNs::now();
+    let result = unsafe { host(queue, p_present_info) };
+    let ended = MonotonicNs::now();
+    HOST_CALL.set(Some(HostCall { started, ended }));
+    result
+}
+
 unsafe extern "system" fn eclipse_vk_queue_present_khr(
     queue: vk::Queue,
     p_present_info: *const vk::PresentInfoKHR<'_>,
 ) -> vk::Result {
+    unsafe { present_engine_frame(frame_log::armed(), queue, p_present_info) }
+}
+
+unsafe fn present_engine_frame(
+    frame_log: Option<&FrameLog>,
+    queue: vk::Queue,
+    p_present_info: *const vk::PresentInfoKHR<'_>,
+) -> vk::Result {
+    let timing = frame_log.map(|log| (log, MonotonicNs::now()));
     let n = PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
         if let Ok(st) = STATE.lock() {
@@ -2387,32 +2416,22 @@ unsafe extern "system" fn eclipse_vk_queue_present_khr(
         }
     }
 
-    if fps_probe_enabled() && n.is_multiple_of(120) {
-        static LAST: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
-        if let Ok(mut g) = LAST.lock() {
-            let now = std::time::Instant::now();
-            if let Some((t0, n0)) = *g {
-                let dt = now.duration_since(t0).as_secs_f64();
-                if dt > 0.0 {
-                    tracing::info!(
-                        fps = ((n - n0) as f64 / dt) as u32,
-                        field_focused = crate::framework::active_text_field() != 0,
-                        "vk-overlay present rate"
-                    );
-                }
-            }
-            *g = Some((now, n));
-        }
-    }
-    let Some(addr) = cached(&HOST_QUEUE_PRESENT) else {
+    let Some(host) = host_queue_present() else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
-
-    let host: vk::PFN_vkQueuePresentKHR =
-        unsafe { std::mem::transmute::<usize, vk::PFN_vkQueuePresentKHR>(addr) };
+    let host: vk::PFN_vkQueuePresentKHR = if timing.is_some() {
+        timed_host_present
+    } else {
+        host
+    };
 
     crate::framework::engine_presented();
     let result = unsafe { present_with_overlay(host, queue, p_present_info) };
+    if let Some((log, entered)) = timing {
+        if let Some(host_call) = HOST_CALL.take() {
+            log.record(entered, host_call);
+        }
+    }
     let report = match result {
         vk::Result::SUCCESS => Some(HostReport::FramePresented),
         vk::Result::SUBOPTIMAL_KHR => Some(HostReport::Suboptimal),
@@ -2440,7 +2459,10 @@ unsafe fn presented_swapchains<'a>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::frame_log::tests::{nanos, read_ring};
+    use super::super::link::tests::temp_dir;
     use super::*;
+    use std::num::NonZeroU64;
     use std::sync::atomic::AtomicI32;
 
     #[test]
@@ -3341,6 +3363,7 @@ mod tests {
 
     static STUB_ENGINE_ACQUIRE: AtomicI32 = AtomicI32::new(0);
     static STUB_ENGINE_PRESENT: AtomicI32 = AtomicI32::new(0);
+    static STUB_ENGINE_PRESENTED_AT: AtomicU64 = AtomicU64::new(0);
 
     fn stub_host_acquire(swapchain: vk::SwapchainKHR, image_index: *mut u32) -> vk::Result {
         match swapchain.as_raw() {
@@ -3478,6 +3501,7 @@ mod tests {
         _queue: vk::Queue,
         _info: *const vk::PresentInfoKHR<'_>,
     ) -> vk::Result {
+        STUB_ENGINE_PRESENTED_AT.store(nanos(MonotonicNs::now()), Ordering::SeqCst);
         vk::Result::from_raw(STUB_ENGINE_PRESENT.load(Ordering::SeqCst))
     }
 
@@ -3503,6 +3527,15 @@ mod tests {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
         unsafe { eclipse_vk_queue_present_khr(vk::Queue::null(), &info) }
+    }
+
+    fn engine_presents_logged(log: &FrameLog, swapchain: vk::SwapchainKHR) -> vk::Result {
+        let swapchains = [swapchain];
+        let image_indices = [0];
+        let info = vk::PresentInfoKHR::default()
+            .swapchains(&swapchains)
+            .image_indices(&image_indices);
+        unsafe { present_engine_frame(Some(log), vk::Queue::null(), &info) }
     }
 
     fn engine_queries_surface(surface: u64) -> (vk::Result, vk::SurfaceCapabilitiesKHR) {
@@ -3758,6 +3791,45 @@ mod tests {
             queried,
             vk::Result::ERROR_SURFACE_LOST_KHR,
             "a driver that reports suboptimal only from present still gets a rebuilt swapchain"
+        );
+    }
+
+    #[test]
+    fn a_logged_present_records_one_entry_timed_around_the_host_call() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let host = ScriptedHost::install();
+        let swapchain = engine_swapchain_on(ENGINE_SURFACE);
+        host.reports(vk::Result::SUCCESS, vk::Result::SUCCESS);
+        let dir = temp_dir("frame-log-seam");
+        let path = dir.join("frames.bin");
+        let log = FrameLog::create(&path, NonZeroU64::new(4).unwrap()).unwrap();
+
+        let unlogged = engine_presents(swapchain);
+        let timed_without_log = HOST_CALL.take();
+        let before = nanos(MonotonicNs::now());
+        let logged = engine_presents_logged(&log, swapchain);
+        let host_called_at = STUB_ENGINE_PRESENTED_AT.load(Ordering::SeqCst);
+        let after = nanos(MonotonicNs::now());
+        let ring = read_ring(&path);
+        drop(log);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!([unlogged, logged], [vk::Result::SUCCESS; 2]);
+        assert!(
+            timed_without_log.is_none(),
+            "a present without a log never times the host call"
+        );
+        assert_eq!(ring.written, 1, "only the logged present is recorded");
+        let entry = ring.entries[0];
+        let host_started = entry.entered + u64::from(entry.seam);
+        let host_ended = host_started + u64::from(entry.driver);
+        assert!(
+            before <= entry.entered
+                && host_started <= host_called_at
+                && host_called_at <= host_ended
+                && host_ended <= after,
+            "the entry is timed from the seam's entry around the host's present: before \
+             {before}, {entry:?}, host called at {host_called_at}, after {after}"
         );
     }
 

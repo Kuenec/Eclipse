@@ -95,6 +95,9 @@ jobs:
       - name: Test detached libm shim crate
         run: cargo test --manifest-path crates/libm-shim/Cargo.toml --all-targets --locked
 
+      - name: Test the performance harness
+        run: python3 -m unittest discover --start-directory tools/perf --pattern 'test_*.py'
+
   msrv:
     name: MSRV / Rust 1.95
     runs-on: ubuntu-latest

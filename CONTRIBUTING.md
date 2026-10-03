@@ -32,6 +32,8 @@ Tests that need the real client run when `ECLIPSE_ROBLOX_APK` points at an offic
 
 Packaging changes must pass `desktop-file-validate` and Flathub's `flatpak-builder-lint`. Each exception in `packaging/flatpak/lint-exceptions.json` has its reason here: `appstream-external-screenshot-url`, because screenshots are served from GitHub, not Flathub's media mirror.
 
+To record frame times, run `flatpak run --filesystem=xdg-run/eclipse-perf:create --env=ECLIPSE_FRAMETIME_LOG=$XDG_RUNTIME_DIR/eclipse-perf/run.bin io.github.kuenec.Eclipse run`, then `tools/perf/frametimes.py $XDG_RUNTIME_DIR/eclipse-perf/run.bin --from 10`. Each run needs a new file.
+
 ## Layout
 
 | Path | Contents |
@@ -45,6 +47,7 @@ Packaging changes must pass `desktop-file-validate` and Flathub's `flatpak-build
 | `src/webview/`, `crates/eclipse-webview/` | WebView helper and its protocol |
 | `crates/eclipse-config/` | Settings schema and config.json loading |
 | `tools/framework-overlay/` | Android framework patches and probes |
+| `tools/perf/` | Performance measurement harness |
 | `packaging/flatpak/` | Flatpak manifest and metadata |
 
 ## Releases

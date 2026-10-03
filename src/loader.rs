@@ -6,6 +6,7 @@ pub mod bionic_sysconf;
 pub mod dlfcn;
 pub mod elf;
 pub mod engine;
+pub mod frame_log;
 pub mod init_run;
 pub mod jni_mangle;
 pub mod jni_register;

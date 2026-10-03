@@ -38,6 +38,7 @@ const OPEN_USAGE: &str = "usage: eclipse open <LINK | PLACE ID>";
 const OPEN_CONTEXT: &str = "eclipse open";
 const HAND_OFF_CONTEXT: &str = "eclipse launch";
 const SETTINGS_CONTEXT: &str = "eclipse Android settings setup";
+const FRAME_LOG_CONTEXT: &str = "eclipse frame-time log";
 const UNSUPERVISED: &str = "the Android client must be started by Eclipse's supervisor; start \
      Eclipse without ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE in its environment";
 const BROWSER_LAUNCH_CONTEXT: &str = "eclipse browser launch";
@@ -595,6 +596,10 @@ fn run_client(launch: LaunchCommand, supervision: Option<Supervision>) -> ExitCo
         report_setup_failure(&launch, launch.launch().context(), UNSUPERVISED);
         return ExitCode::FAILURE;
     };
+    if let Err(error) = eclipse::loader::frame_log::arm_from_env() {
+        report_setup_failure(&launch, FRAME_LOG_CONTEXT, &error.to_string());
+        finish_android_process(ClientEnd::FailureShown, exit);
+    }
     eclipse::diagnostics::init(eclipse::diagnostics::LogSink::Supervisor(records));
     tracing::debug!(version = eclipse::VERSION, "eclipse client starting");
     let loaded = eclipse_config::load();
