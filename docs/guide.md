@@ -25,6 +25,10 @@ If another app handles Roblox links, make Eclipse the default:
 xdg-mime default io.github.kuenec.Eclipse.UrlHandler.desktop x-scheme-handler/roblox-player x-scheme-handler/roblox
 ```
 
+## Voice chat
+
+Voice chat uses your system's default microphone. Choose it in your desktop's sound settings.
+
 ## Settings
 
 | Key | Default | Effect |
@@ -35,13 +39,15 @@ xdg-mime default io.github.kuenec.Eclipse.UrlHandler.desktop x-scheme-handler/ro
 
 ## Files
 
-Everything lives in `~/.var/app/io.github.kuenec.Eclipse/`:
+Eclipse keeps its files in `~/.var/app/io.github.kuenec.Eclipse/`:
 
 | What | Where |
 |---|---|
 | Settings | `config/eclipse/config.json` |
 | Roblox | `data/eclipse/roblox/` |
 | Game data and logs | `data/eclipse/app-data/` |
+| Roblox's cache, trimmed above 512 MiB | `cache/eclipse/client-cache/` |
+| Captures | `~/Pictures/Roblox/`, or `data/eclipse/app-data/Pictures/` until `xdg-user-dirs-update` sets your Pictures folder |
 
 ## Safety
 

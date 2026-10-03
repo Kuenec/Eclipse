@@ -14,6 +14,7 @@ finish-args:
   - --socket=pulseaudio
   - --device=dri
   - --filesystem=xdg-download:ro
+  - --filesystem=xdg-pictures/Roblox:create
 cleanup:
   - /include
   - /bin/android-translation-layer

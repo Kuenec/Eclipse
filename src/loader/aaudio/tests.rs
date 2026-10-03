@@ -3,6 +3,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use crate::loader::log_capture::formatted_log;
 use crate::loader::native_provider::EclipseNativeProvider;
 use crate::loader::resolve::SymbolProvider;
 
@@ -54,6 +55,7 @@ fn detached_stream_with(
                 device: DeviceFormat::Float,
             },
             host: None,
+            read_logged: false,
         })
         .expect("insert stream");
     (ptr_of(handle), shared)
@@ -543,6 +545,43 @@ fn read_is_rejected_for_callback_and_output_streams() {
 }
 
 #[test]
+fn the_first_read_on_each_stream_is_logged_once() {
+    let (read_write, _) = detached_stream_with(Direction::Input, DataPath::ReadWrite);
+    let (callback, _) = detached_stream(Direction::Input);
+    let mut buffer = [0i16; 8];
+    let buf = buffer.as_mut_ptr().cast::<c_void>();
+    let log = formatted_log("eclipse::audio=warn", || {
+        for _ in 0..3 {
+            unsafe {
+                assert_eq!(
+                    stream_read(read_write, buf, 4, 0),
+                    AAUDIO_ERROR_UNIMPLEMENTED
+                );
+                assert_eq!(stream_read(callback, buf, 4, 0), AAUDIO_ERROR_INVALID_STATE);
+            }
+        }
+    });
+    let reads: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("AAudio: read is not supported on this stream"))
+        .collect();
+    assert_eq!(reads.len(), 2, "{log}");
+    for (line, fields) in reads.iter().zip([
+        ["WARN eclipse::audio:", "data_path=read_write", "code=-890"],
+        ["WARN eclipse::audio:", "data_path=callback", "code=-895"],
+    ]) {
+        assert!(line.contains("direction=Input"), "{line}");
+        for field in fields {
+            assert!(line.contains(field), "{field} missing from {line}");
+        }
+    }
+    unsafe {
+        assert_eq!(stream_close(read_write), AAUDIO_OK);
+        assert_eq!(stream_close(callback), AAUDIO_OK);
+    }
+}
+
+#[test]
 fn null_and_stale_handles_are_errors_not_crashes() {
     let null = std::ptr::null_mut();
     unsafe {
@@ -980,6 +1019,36 @@ fn fmod_driver_probe_opens_callback_less_streams_in_both_directions() {
             "{direction:?} probe reports the device's own rate and channels"
         );
     }
+}
+
+#[test]
+fn the_stream_opened_line_names_the_data_path() {
+    if default_device_config(Direction::Output).is_none() {
+        eprintln!("the_stream_opened_line_names_the_data_path: no Output device");
+        return;
+    }
+    let api = fmod_view();
+    let probe = CallbackProbe::default();
+    let callbacks: [Option<DataCallback>; 2] = [None, Some(write_silence)];
+    let log = formatted_log("eclipse::audio=info", || unsafe {
+        let mut builder = std::ptr::null_mut();
+        assert_eq!((api.create)(&mut builder), AAUDIO_OK);
+        (api.set_i32[2])(builder, AAUDIO_DIRECTION_OUTPUT);
+        for callback in callbacks {
+            (api.set_data)(builder, callback, probe.user_data() as *mut c_void);
+            let mut stream = std::ptr::null_mut();
+            assert_eq!((api.open)(builder, &mut stream), AAUDIO_OK);
+            assert_eq!((api.close)(stream), AAUDIO_OK);
+        }
+        assert_eq!((api.delete)(builder), AAUDIO_OK);
+    });
+    let opened: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("AAudio: stream opened"))
+        .collect();
+    assert_eq!(opened.len(), 2, "{log}");
+    assert!(opened[0].contains("data_path=read_write"), "{}", opened[0]);
+    assert!(opened[1].contains("data_path=callback"), "{}", opened[1]);
 }
 
 #[test]

@@ -19,6 +19,7 @@ pub mod performance;
 pub mod runtime;
 pub mod services;
 pub mod status;
+pub mod storage;
 mod text_layout;
 mod web_view_parent;
 pub mod webview;

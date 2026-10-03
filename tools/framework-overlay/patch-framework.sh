@@ -737,6 +737,23 @@ n="$(grep -cF '.method public vibrate(J)V' "$vibsm")" || true
 n="$(grep -cF '.method public cancel()V' "$vibsm")" || true
 [ "$n" = "1" ] || fail "Vibrator.smali upstream cancel count = $n (expected 1) — installed Vibrator drifted; update patch-framework.sh"
 
+envsm="$work/smali/android/os/Environment.smali"
+[ -f "$envsm" ] || fail "Environment.smali not found after baksmali"
+! grep -qF 'native_get_pictures_dir' "$envsm" || fail "Environment.smali already declares native_get_pictures_dir — installed Environment drifted; update patch-framework.sh"
+UPSTREAM_ENVIRONMENT_NATIVE=$'.method private static native native_get_app_data_dir()Ljava/lang/String;\n.end method\n'
+ENVIRONMENT_NATIVES=$'.method private static native native_get_app_data_dir()Ljava/lang/String;\n.end method\n\n.method private static native native_get_pictures_dir()Ljava/lang/String;\n.end method\n'
+replace_upstream_method "$envsm" "$UPSTREAM_ENVIRONMENT_NATIVE" "$ENVIRONMENT_NATIVES" 'native_get_app_data_dir declaration'
+UPSTREAM_PUBLIC_DIRECTORY=$'.method public static getExternalStoragePublicDirectory(Ljava/lang/String;)Ljava/io/File;\n    .registers 3\n\n    invoke-static {}, Landroid/os/Environment;->throwIfUserRequired()V\n\n    sget-object v0, Landroid/os/Environment;->sCurrentUser:Landroid/os/Environment$UserEnvironment;\n\n    invoke-virtual {v0, p0}, Landroid/os/Environment$UserEnvironment;->buildExternalStoragePublicDirs(Ljava/lang/String;)[Ljava/io/File;\n\n    move-result-object v0\n\n    const/4 v1, 0x0\n\n    aget-object v0, v0, v1\n\n    return-object v0\n.end method\n'
+ENVIRONMENT_PUBLIC_DIRECTORY=$'.method public static getExternalStoragePublicDirectory(Ljava/lang/String;)Ljava/io/File;\n    .registers 3\n\n    sget-object v0, Landroid/os/Environment;->DIRECTORY_PICTURES:Ljava/lang/String;\n\n    invoke-virtual {v0, p0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z\n\n    move-result v0\n\n    if-eqz v0, :eclipse_not_pictures\n\n    new-instance v0, Ljava/io/File;\n\n    invoke-static {}, Landroid/os/Environment;->native_get_pictures_dir()Ljava/lang/String;\n\n    move-result-object v1\n\n    invoke-direct {v0, v1}, Ljava/io/File;-><init>(Ljava/lang/String;)V\n\n    return-object v0\n\n    :eclipse_not_pictures\n    invoke-static {}, Landroid/os/Environment;->throwIfUserRequired()V\n\n    sget-object v0, Landroid/os/Environment;->sCurrentUser:Landroid/os/Environment$UserEnvironment;\n\n    invoke-virtual {v0, p0}, Landroid/os/Environment$UserEnvironment;->buildExternalStoragePublicDirs(Ljava/lang/String;)[Ljava/io/File;\n\n    move-result-object v0\n\n    const/4 v1, 0x0\n\n    aget-object v0, v0, v1\n\n    return-object v0\n.end method\n'
+replace_upstream_method "$envsm" "$UPSTREAM_PUBLIC_DIRECTORY" "$ENVIRONMENT_PUBLIC_DIRECTORY" 'getExternalStoragePublicDirectory'
+
+ctxsm="$work/smali/android/content/Context.smali"
+[ -f "$ctxsm" ] || fail "Context.smali not found after baksmali"
+UPSTREAM_CACHE_DIR=$'    new-instance v0, Ljava/io/File;\n\n    new-instance v1, Ljava/lang/StringBuilder;\n\n    invoke-direct {v1}, Ljava/lang/StringBuilder;-><init>()V\n\n    const-string v2, "/tmp/atl_cache/"\n\n    invoke-virtual {v1, v2}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;\n\n    move-result-object v1\n\n    invoke-virtual {p0}, Landroid/content/Context;->getPackageName()Ljava/lang/String;\n\n    move-result-object v2\n\n    invoke-virtual {v1, v2}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;\n\n    move-result-object v1\n\n    invoke-virtual {v1}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;\n\n    move-result-object v1\n\n    invoke-direct {v0, v1}, Ljava/io/File;-><init>(Ljava/lang/String;)V\n\n    iput-object v0, p0, Landroid/content/Context;->cache_dir:Ljava/io/File;\n'
+CLIENT_CACHE_DIR=$'    const-string v0, "eclipse.client_cache_dir"\n\n    invoke-static {v0}, Ljava/lang/System;->getProperty(Ljava/lang/String;)Ljava/lang/String;\n\n    move-result-object v1\n\n    if-nez v1, :eclipse_client_cache_dir_set\n\n    new-instance v0, Ljava/lang/IllegalStateException;\n\n    const-string v1, "eclipse.client_cache_dir is unset; Eclipse sets it when it boots Roblox"\n\n    invoke-direct {v0, v1}, Ljava/lang/IllegalStateException;-><init>(Ljava/lang/String;)V\n\n    throw v0\n\n    :eclipse_client_cache_dir_set\n    new-instance v0, Ljava/io/File;\n\n    invoke-direct {v0, v1}, Ljava/io/File;-><init>(Ljava/lang/String;)V\n\n    iput-object v0, p0, Landroid/content/Context;->cache_dir:Ljava/io/File;\n'
+replace_upstream_method "$ctxsm" "$UPSTREAM_CACHE_DIR" "$CLIENT_CACHE_DIR" 'getCacheDir /tmp/atl_cache location'
+! grep -qF '/tmp/atl_cache' "$ctxsm" || fail "Context.smali still names /tmp/atl_cache; Roblox's cache would stay in /tmp"
+
 afm="$work/smali/android/view/autofill/AutofillManager.smali"
 [ -f "$afm" ] || fail "AutofillManager.smali not found after baksmali"
 n="$(grep -cF ".method public unregisterCallback(Landroid/view/autofill/AutofillManager\$AutofillCallback;)V" "$afm")" || true
@@ -1215,6 +1232,34 @@ grep -qF '"android.hardware.type.pc"' "$pmsm" || fail "PackageManager.smali lost
 grep -qF '"android.hardware.touchscreen"' "$pmsm" || fail "PackageManager.smali lost the exact touchscreen feature literal"
 grep -qF '"android.hardware.audio.low_latency"' "$pmsm" || fail "PackageManager.smali lost the exact low-latency feature literal"
 
+! grep -qF ':eclipse_grant_audio_permission' "$pmsm" || fail "PackageManager.smali already carries the Eclipse audio permission grant — installed framework drifted; update patch-framework.sh"
+UPSTREAM_CHECK_PERMISSION_HEAD=$'.method public checkPermission(Ljava/lang/String;Ljava/lang/String;)I\n    .registers 7\n\n    const/4 v1, -0x1\n'
+AUDIO_PERMISSION_GRANT_HEAD=$'.method public checkPermission(Ljava/lang/String;Ljava/lang/String;)I\n    .registers 7\n\n    const-string v0, "android.permission.RECORD_AUDIO"\n\n    invoke-virtual {v0, p1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z\n\n    move-result v0\n\n    if-nez v0, :eclipse_grant_audio_permission\n\n    const-string v0, "android.permission.MODIFY_AUDIO_SETTINGS"\n\n    invoke-virtual {v0, p1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z\n\n    move-result v0\n\n    if-eqz v0, :eclipse_not_audio_permission\n\n    :eclipse_grant_audio_permission\n    const/4 v0, 0x0\n\n    return v0\n\n    :eclipse_not_audio_permission\n    const/4 v1, -0x1\n'
+replace_upstream_method "$pmsm" "$UPSTREAM_CHECK_PERMISSION_HEAD" "$AUDIO_PERMISSION_GRANT_HEAD" 'checkPermission audio grant'
+
+audio_manager_sm="$work/smali/android/media/AudioManager.smali"
+[ -f "$audio_manager_sm" ] || fail "AudioManager.smali not found after baksmali"
+[ ! -e "$work/smali/android/media/AudioFocusRequest.smali" ] || fail "the installed framework already ships AudioFocusRequest — installed framework drifted; drop Eclipse's copy"
+for voice_method in 'requestAudioFocus(Landroid/media/AudioFocusRequest;)I' 'abandonAudioFocusRequest(Landroid/media/AudioFocusRequest;)I' 'isBluetoothScoAvailableOffCall()Z' 'isVolumeFixed()Z'; do
+    ! grep -qF "$voice_method" "$audio_manager_sm" || fail "AudioManager.smali already declares $voice_method — installed AudioManager drifted; update patch-framework.sh"
+done
+UPSTREAM_ABANDON_AUDIO_FOCUS=$'.method public abandonAudioFocus(Landroid/media/AudioManager$OnAudioFocusChangeListener;)I\n    .registers 3\n\n    const/4 v0, 0x1\n\n    return v0\n.end method\n'
+AUDIO_MANAGER_VOICE_METHODS=$'.method public abandonAudioFocus(Landroid/media/AudioManager$OnAudioFocusChangeListener;)I\n    .registers 3\n\n    const/4 v0, 0x1\n\n    return v0\n.end method\n\n.method public requestAudioFocus(Landroid/media/AudioFocusRequest;)I\n    .registers 3\n\n    const/4 v0, 0x1\n\n    return v0\n.end method\n\n.method public abandonAudioFocusRequest(Landroid/media/AudioFocusRequest;)I\n    .registers 3\n\n    const/4 v0, 0x1\n\n    return v0\n.end method\n\n.method public isBluetoothScoAvailableOffCall()Z\n    .registers 2\n\n    const/4 v0, 0x0\n\n    return v0\n.end method\n\n.method public isVolumeFixed()Z\n    .registers 2\n\n    const/4 v0, 0x0\n\n    return v0\n.end method\n'
+replace_upstream_method "$audio_manager_sm" "$UPSTREAM_ABANDON_AUDIO_FOCUS" "$AUDIO_MANAGER_VOICE_METHODS" 'abandonAudioFocus voice-call methods'
+UPSTREAM_AUDIO_OUTPUT_PROPERTIES=$'    :pswitch_40\n    const-string v0, "256"\n\n    goto :goto_2b\n\n    :pswitch_43\n    const-string v0, "44100"\n\n    goto :goto_2b\n'
+AUDIO_OUTPUT_PROPERTIES=$'    :pswitch_40\n    const-string v0, "eclipse.audio.output_frames_per_buffer"\n\n    invoke-static {v0}, Ljava/lang/System;->getProperty(Ljava/lang/String;)Ljava/lang/String;\n\n    move-result-object v0\n\n    goto :goto_2b\n\n    :pswitch_43\n    const-string v0, "eclipse.audio.output_sample_rate"\n\n    invoke-static {v0}, Ljava/lang/System;->getProperty(Ljava/lang/String;)Ljava/lang/String;\n\n    move-result-object v0\n\n    goto :goto_2b\n'
+replace_upstream_method "$audio_manager_sm" "$UPSTREAM_AUDIO_OUTPUT_PROPERTIES" "$AUDIO_OUTPUT_PROPERTIES" 'getProperty output sample rate and frames per buffer'
+audio_attributes_builder_sm="$work/smali/android/media/AudioAttributes\$Builder.smali"
+[ -f "$audio_attributes_builder_sm" ] || fail "AudioAttributes\$Builder.smali not found after baksmali"
+! grep -qF '.method public constructor <init>()V' "$audio_attributes_builder_sm" || fail "AudioAttributes\$Builder.smali already has a public no-argument constructor — installed framework drifted; update patch-framework.sh"
+UPSTREAM_AUDIO_ATTRIBUTES_BUILDER_INIT=$'.method public constructor <init>(Landroid/media/AudioAttributes;)V\n    .registers 2\n\n    iput-object p1, p0, Landroid/media/AudioAttributes$Builder;->this$0:Landroid/media/AudioAttributes;\n\n    invoke-direct {p0}, Ljava/lang/Object;-><init>()V\n\n    return-void\n.end method\n'
+AUDIO_ATTRIBUTES_BUILDER_INITS=$'.method public constructor <init>()V\n    .registers 2\n\n    new-instance v0, Landroid/media/AudioAttributes;\n\n    invoke-direct {v0}, Landroid/media/AudioAttributes;-><init>()V\n\n    invoke-direct {p0, v0}, Landroid/media/AudioAttributes$Builder;-><init>(Landroid/media/AudioAttributes;)V\n\n    return-void\n.end method\n\n.method public constructor <init>(Landroid/media/AudioAttributes;)V\n    .registers 2\n\n    iput-object p1, p0, Landroid/media/AudioAttributes$Builder;->this$0:Landroid/media/AudioAttributes;\n\n    invoke-direct {p0}, Ljava/lang/Object;-><init>()V\n\n    return-void\n.end method\n'
+replace_upstream_method "$audio_attributes_builder_sm" "$UPSTREAM_AUDIO_ATTRIBUTES_BUILDER_INIT" "$AUDIO_ATTRIBUTES_BUILDER_INITS" 'public no-argument constructor'
+audio_focus_request_sm="$here/smali/android/media/AudioFocusRequest.smali"
+audio_focus_builder_sm="$here/smali/android/media/AudioFocusRequest\$Builder.smali"
+[ -f "$audio_focus_request_sm" ] || fail "AudioFocusRequest.smali missing at $audio_focus_request_sm"
+[ -f "$audio_focus_builder_sm" ] || fail "AudioFocusRequest\$Builder.smali missing at $audio_focus_builder_sm"
+
 grep -qxF '.field public static final GET_SIGNATURES:I = 0x40' "$pmsm" || fail "PackageManager.smali GET_SIGNATURES is no longer 0x40 — the overlay stub constant would disagree with the framework"
 ! grep -qF 'GET_SIGNING_CERTIFICATES' "$pmsm" || fail "PackageManager.smali already declares GET_SIGNING_CERTIFICATES — installed framework drifted; update patch-framework.sh"
 perl -0pi -e 's{(\.field public static final GET_SIGNATURES:I = 0x40\n)}{$1\n.field public static final GET_SIGNING_CERTIFICATES:I = 0x8000000\n}' "$pmsm"
@@ -1259,7 +1304,7 @@ perl -0777 -ne 'exit(/\.method final releaseTheme\(J\)V(?:(?!\.end method).)*->d
 mkdir -p "$work/smali-view/android/content/res"
 cp "$amsm" "$work/smali-view/android/content/res/AssetManager.smali"
 
-mkdir -p "$work/smali-view/android/atl" "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/content" "$work/smali-view/android/content/pm" "$work/smali-view/android/net" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics"
+mkdir -p "$work/smali-view/android/atl" "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/content" "$work/smali-view/android/content/pm" "$work/smali-view/android/net" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics" "$work/smali-view/android/media"
 cp "$crsm" "$work/smali-view/android/content/ContentResolver.smali"
 cp "$connectivity_sm" "$work/smali-view/android/net/ConnectivityManager.smali"
 cp "$here/smali/android/net/LinkProperties.smali" "$work/smali-view/android/net/"
@@ -1273,8 +1318,13 @@ cp "$prd_sm" "$work/smali-view/android/app/"
 cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
 cp "$lmsm" "$work/smali-view/android/location/LocationManager.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
+cp "$envsm" "$work/smali-view/android/os/Environment.smali"
+cp "$ctxsm" "$work/smali-view/android/content/Context.smali"
 cp "$spsm" "$work/smali-view/android/os/SystemProperties.smali"
 cp "$pmsm" "$work/smali-view/android/content/pm/PackageManager.smali"
+cp "$audio_manager_sm" "$work/smali-view/android/media/AudioManager.smali"
+cp "$audio_attributes_builder_sm" "$work/smali-view/android/media/"
+cp "$audio_focus_request_sm" "$audio_focus_builder_sm" "$work/smali-view/android/media/"
 cp "$ppsm" "$work/smali-view/android/content/pm/PackageParser.smali"
 cp "$ppkg_sm" "$work/smali-view/android/content/pm/PackageParser\$Package.smali"
 cp "$atlsm" "$work/smali-view/android/atl/ATLLoadedApp.smali"
@@ -1524,6 +1574,52 @@ display_output="$(env \
 [ "$display_output" = 'display-refresh-rates-ok' ] \
     || fail "display refresh-rate regression probe returned '$display_output'"
 
+voice_chat_probe="$here/tests/VoiceChatProbe.java"
+[ -f "$voice_chat_probe" ] || fail "voice chat regression probe missing at $voice_chat_probe"
+mkdir -p "$work/voice-chat-probe/classes" "$work/voice-chat-probe/cache" "$work/voice-chat-probe/data"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/voice-chat-probe/classes" "$voice_chat_probe"
+"$DX" --dex --output="$work/voice-chat-probe/probe.jar" "$work/voice-chat-probe/classes"
+voice_chat_boot_class_path="$boot_class_path:$work/jar/api-impl.jar:$work/voice-chat-probe/probe.jar"
+voice_chat_boot_class_path_locations="$boot_class_path_locations:/system/framework/api-impl.jar:/system/framework/probe.jar"
+voice_chat_output="$(env \
+    -u ATL_UGLY_ENABLE_MICROPHONE \
+    -u ATL_UGLY_ENABLE_LOCATION \
+    ANDROID_DATA="$work/voice-chat-probe/data" \
+    XDG_CACHE_HOME="$work/voice-chat-probe/cache" \
+    BOOTCLASSPATH="$voice_chat_boot_class_path" \
+    "$DALVIKVM" \
+    -Ximage:"$work/art/oat/boot.art" \
+    -Xbootclasspath:"$voice_chat_boot_class_path" \
+    -Xbootclasspath-locations:"$voice_chat_boot_class_path_locations" \
+    -Ximage-compiler-option --no-generate-debug-info \
+    -Ximage-compiler-option --no-generate-mini-debug-info \
+    VoiceChatProbe)"
+[ "$voice_chat_output" = 'voice-chat-ok' ] \
+    || fail "voice chat regression probe returned '$voice_chat_output'"
+
+audio_properties_probe="$here/tests/AudioPropertiesProbe.java"
+[ -f "$audio_properties_probe" ] || fail "audio properties regression probe missing at $audio_properties_probe"
+mkdir -p "$work/audio-properties-probe/classes" "$work/audio-properties-probe/cache" "$work/audio-properties-probe/data"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/audio-properties-probe/classes" "$audio_properties_probe"
+"$DX" --dex --output="$work/audio-properties-probe/probe.jar" "$work/audio-properties-probe/classes"
+audio_properties_boot_class_path="$boot_class_path:$work/jar/api-impl.jar:$work/audio-properties-probe/probe.jar"
+audio_properties_boot_class_path_locations="$boot_class_path_locations:/system/framework/api-impl.jar:/system/framework/probe.jar"
+audio_properties_output="$(env \
+    ANDROID_DATA="$work/audio-properties-probe/data" \
+    XDG_CACHE_HOME="$work/audio-properties-probe/cache" \
+    BOOTCLASSPATH="$audio_properties_boot_class_path" \
+    "$DALVIKVM" \
+    -Ximage:"$work/art/oat/boot.art" \
+    -Xbootclasspath:"$audio_properties_boot_class_path" \
+    -Xbootclasspath-locations:"$audio_properties_boot_class_path_locations" \
+    -Ximage-compiler-option --no-generate-debug-info \
+    -Ximage-compiler-option --no-generate-mini-debug-info \
+    -Declipse.audio.output_sample_rate=48000 \
+    -Declipse.audio.output_frames_per_buffer=512 \
+    AudioPropertiesProbe)"
+[ "$audio_properties_output" = 'audio-properties-ok' ] \
+    || fail "audio properties regression probe returned '$audio_properties_output'"
+
 webview_probe="$here/tests/WebViewCallbacksProbe.java"
 [ -f "$webview_probe" ] || fail "WebView callback regression probe missing at $webview_probe"
 mkdir -p "$work/webview-probe/classes" "$work/webview-probe/cache" "$work/webview-probe/data"
@@ -1566,5 +1662,5 @@ classes_dex_size="$(stat -c '%s' "$work/jar/classes.dex")"
 classes2_dex_size="$(stat -c '%s' "$work/jar/classes2.dex")"
 classes3_dex_size="$(stat -c '%s' "$work/jar/classes3.dex")"
 echo "    classes.dex (javac-patched): $classes_dex_size bytes; classes2.dex (smali Android API gaps, including LocationManager): $classes2_dex_size bytes; classes3.dex (stock): $classes3_dex_size bytes"
-echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, date-time, display refresh-rate, WebView callback, and wolfSSL contracts verified"
+echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, date-time, display refresh-rate, voice chat, audio properties, WebView callback, and wolfSSL contracts verified"
 echo "    use it with: export ECLIPSE_ANDROID_FRAMEWORK_DIR=\"$OUT\""
