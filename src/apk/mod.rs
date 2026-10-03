@@ -697,19 +697,6 @@ fn is_bundle(path: &Path) -> bool {
         })
 }
 
-fn shell_word(path: &Path) -> String {
-    const PLAIN: &[u8] = b"/._-+,:@%=";
-    let text = path.to_string_lossy();
-    let plain = !text.is_empty()
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || PLAIN.contains(&byte));
-    if plain {
-        return text.into_owned();
-    }
-    format!("'{}'", text.replace('\'', r"'\''"))
-}
-
 fn regular_file_exists(path: &Path) -> Result<bool, ApkSetError> {
     match std::fs::metadata(path) {
         Ok(metadata) => Ok(metadata.is_file()),
@@ -1124,7 +1111,7 @@ impl fmt::Display for ApkSetError {
                 "{} is an app bundle; install it with `eclipse install {}`, then start Roblox \
                  with `eclipse run`",
                 path.display(),
-                shell_word(path)
+                eclipse_config::shell::word(&path.to_string_lossy())
             ),
             Self::Open { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Signature { path, source } => write!(

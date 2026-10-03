@@ -55,7 +55,7 @@ struct GameWindow<'vm> {
 
     vm: Option<&'vm crate::runtime::Vm>,
 
-    touch_mode: crate::config::TouchMode,
+    touch_mode: eclipse_config::TouchMode,
 
     cursor: Option<(f32, f32)>,
 
@@ -902,11 +902,11 @@ enum HostCursor {
 
 fn host_cursor(
     handed_off: bool,
-    touch_mode: crate::config::TouchMode,
+    touch_mode: eclipse_config::TouchMode,
     web_view_window: WebViewWindow,
 ) -> HostCursor {
     if handed_off
-        && touch_mode == crate::config::TouchMode::Off
+        && touch_mode == eclipse_config::TouchMode::Off
         && web_view_window == WebViewWindow::Hidden
     {
         HostCursor::Hidden
@@ -930,11 +930,11 @@ impl PointerLockReasons {
         self,
         button: MouseButton,
         state: ElementState,
-        touch_mode: crate::config::TouchMode,
+        touch_mode: eclipse_config::TouchMode,
     ) -> Self {
         let right_drag = match (button, state) {
             (MouseButton::Right, ElementState::Pressed) => {
-                self.right_drag || touch_mode == crate::config::TouchMode::Off
+                self.right_drag || touch_mode == eclipse_config::TouchMode::Off
             }
             (MouseButton::Right, ElementState::Released) => false,
             _ => self.right_drag,
@@ -951,11 +951,11 @@ enum PrimaryRelease {
 }
 
 fn primary_release(
-    touch_mode: crate::config::TouchMode,
+    touch_mode: eclipse_config::TouchMode,
     held: &mut EngineHeldInput,
     touch_down_time: Option<i64>,
 ) -> PrimaryRelease {
-    use crate::config::TouchMode;
+    use eclipse_config::TouchMode;
 
     match touch_mode {
         TouchMode::Off if held.release_button(0) => PrimaryRelease::MouseButton,
@@ -1309,7 +1309,7 @@ impl GameWindow<'_> {
         if crate::framework::prepare_text_field_pointer_press((px, py)) {
             tracing::debug!("engine surface press queued active text field revalidation");
         }
-        if self.touch_mode == crate::config::TouchMode::Off {
+        if self.touch_mode == eclipse_config::TouchMode::Off {
             match crate::framework::dispatch_mouse_button(vm, px, py, true, 0) {
                 Ok(()) => self.engine_held.press_button(0),
                 Err(e) => {
@@ -1407,7 +1407,7 @@ impl GameWindow<'_> {
 
     fn engine_pointer_move(&mut self, motion: PointerMotion) {
         let (px, py) = motion.position;
-        if self.touch_mode == crate::config::TouchMode::Off {
+        if self.touch_mode == eclipse_config::TouchMode::Off {
             let Some(vm) = self.vm else { return };
             if let Err(e) = crate::framework::dispatch_mouse_move(vm, px, py, motion.dx, motion.dy)
             {
@@ -1446,7 +1446,7 @@ impl GameWindow<'_> {
     }
 
     fn engine_aux_mouse_button(&mut self, button: MouseButton, pressed: bool) {
-        if self.touch_mode != crate::config::TouchMode::Off {
+        if self.touch_mode != eclipse_config::TouchMode::Off {
             return;
         }
         let Some(android_button) = desktop_mouse_button(button) else {
@@ -1478,7 +1478,7 @@ impl GameWindow<'_> {
 
     fn engine_center_queryable(&self) -> bool {
         self.focused
-            && self.touch_mode == crate::config::TouchMode::Off
+            && self.touch_mode == eclipse_config::TouchMode::Off
             && !self.engine_center_query_failed
     }
 
@@ -2013,7 +2013,7 @@ pub fn run_windowed(
     activation_token: Option<ActivationToken>,
     title: &str,
     vm: Option<&crate::runtime::Vm>,
-    touch_mode: crate::config::TouchMode,
+    touch_mode: eclipse_config::TouchMode,
 ) -> Result<(), GraphicsError> {
     crate::framework::install_main_looper_waker(event_loop.create_proxy());
     let mut app = GameWindow {
@@ -6596,7 +6596,7 @@ mod tests {
 
     #[test]
     fn right_press_locks_only_on_the_engine_surface_in_touch_off() {
-        use crate::config::TouchMode;
+        use eclipse_config::TouchMode;
 
         let now = std::time::Instant::now();
         let pressed = PointerLockReasons::default().after_mouse_button(
@@ -6626,7 +6626,7 @@ mod tests {
 
     #[test]
     fn other_mouse_buttons_never_change_the_right_drag_reason() {
-        use crate::config::TouchMode;
+        use eclipse_config::TouchMode;
 
         for reasons in [PointerLockReasons::default(), RIGHT_DRAG] {
             for button in [
@@ -6648,7 +6648,7 @@ mod tests {
 
     #[test]
     fn right_release_unlocks_unless_the_engine_still_locks_the_center() {
-        use crate::config::TouchMode;
+        use eclipse_config::TouchMode;
 
         let now = std::time::Instant::now();
         let released = RIGHT_DRAG.after_mouse_button(
@@ -6759,7 +6759,7 @@ mod tests {
 
     #[test]
     fn a_primary_release_reaches_the_engine_only_after_its_press_did() {
-        use crate::config::TouchMode;
+        use eclipse_config::TouchMode;
 
         let mut held = EngineHeldInput::default();
         for mode in [TouchMode::On, TouchMode::FakeOff] {
@@ -6999,7 +6999,7 @@ mod tests {
 
     #[test]
     fn host_cursor_hides_over_the_engine_surface_like_the_null_pointer_icon() {
-        use crate::config::TouchMode;
+        use eclipse_config::TouchMode;
 
         assert_eq!(
             host_cursor(true, TouchMode::Off, WebViewWindow::Hidden),

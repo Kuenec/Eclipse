@@ -6,12 +6,12 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use directories::ProjectDirs;
+use eclipse_config::temp_file::TempFile;
+use eclipse_config::{Config, TouchMode};
 
 use crate::apk::Manifest;
-use crate::config::{Config, TouchMode};
 use crate::host_locale::HostLocale;
 use crate::host_time_zone::HostTimeZone;
-use crate::temp_file::TempFile;
 
 const DEFAULT_SDK_INT: u32 = 33;
 
@@ -131,23 +131,6 @@ compile_error!(
      instruction_set_features() needs an x86_64 host (no x86 ISA to detect on this arch)"
 );
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GraphicsBackend {
-    Vulkan,
-
-    OpenGl,
-}
-
-impl GraphicsBackend {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Vulkan => "Vulkan",
-            Self::OpenGl => "OpenGL",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootPlan {
     pub launcher_activity: String,
@@ -159,8 +142,6 @@ pub struct BootPlan {
     pub disable_hspace_compact: bool,
 
     pub instruction_set_features: String,
-
-    pub graphics_backend: GraphicsBackend,
 
     pub touch_mode: TouchMode,
 
@@ -178,11 +159,6 @@ impl BootPlan {
             heap_mib: HEAP_MIB,
             disable_hspace_compact: true,
             instruction_set_features: instruction_set_features(),
-            graphics_backend: if config.use_opengl {
-                GraphicsBackend::OpenGl
-            } else {
-                GraphicsBackend::Vulkan
-            },
             touch_mode: config.touch_mode,
             host_locale: HostLocale::from_env(|name| std::env::var_os(name)),
             host_time_zone: HostTimeZone::detect(),
@@ -1095,7 +1071,7 @@ impl std::error::Error for RuntimeError {
 mod tests {
     use super::*;
     use crate::apk::Manifest;
-    use crate::config::Config;
+    use eclipse_config::Config;
 
     fn manifest_with(target_sdk: Option<u32>) -> Manifest {
         Manifest {
@@ -1423,7 +1399,6 @@ mod tests {
         assert_eq!(plan.sdk_int, 35);
         assert_eq!(plan.heap_mib, HEAP_MIB);
         assert!(plan.disable_hspace_compact);
-        assert_eq!(plan.graphics_backend, GraphicsBackend::Vulkan);
         assert_eq!(plan.touch_mode, TouchMode::Off);
     }
 
@@ -1431,16 +1406,6 @@ mod tests {
     fn boot_plan_sdk_int_falls_back_when_manifest_omits_target() {
         let plan = BootPlan::new(&manifest_with(None), &Config::default());
         assert_eq!(plan.sdk_int, DEFAULT_SDK_INT);
-    }
-
-    #[test]
-    fn boot_plan_use_opengl_selects_opengl_backend() {
-        let config = Config {
-            use_opengl: true,
-            ..Config::default()
-        };
-        let plan = BootPlan::new(&manifest_with(Some(35)), &config);
-        assert_eq!(plan.graphics_backend, GraphicsBackend::OpenGl);
     }
 
     fn compiler_options(vm: &[String]) -> Vec<&str> {

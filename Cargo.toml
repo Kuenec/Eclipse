@@ -9,7 +9,22 @@ description = "Open-source Rust runtime for running the Android x86-64 Roblox cl
 license = "MIT"
 publish = false
 
+[workspace]
+members = ["crates/eclipse-config"]
+default-members = [".", "crates/eclipse-config"]
+exclude = ["crates/libm-shim"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+unused = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
 [dependencies]
+
+eclipse-config = { path = "crates/eclipse-config" }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -66,13 +81,8 @@ rustix = { version = "1", default-features = false, features = ["fs", "time"] }
 
 cc = "1"
 
-[lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
-unreachable_pub = "warn"
-unused = { level = "warn", priority = -1 }
-
-[lints.clippy]
-all = { level = "warn", priority = -1 }
+[lints]
+workspace = true
 
 [profile.release]
 opt-level = 3

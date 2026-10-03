@@ -610,6 +610,7 @@ dependencies = [
  "cpal",
  "crc32fast",
  "directories",
+ "eclipse-config",
  "freetype-rs",
  "harfrust",
  "jni",
@@ -637,6 +638,15 @@ dependencies = [
  "x11-clipboard",
  "yeslogic-fontconfig-sys",
  "zip",
+]
+
+[[package]]
+name = "eclipse-config"
+version = "0.0.0"
+dependencies = [
+ "directories",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

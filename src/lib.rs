@@ -5,7 +5,6 @@ pub mod bionic;
 mod bounded_child;
 pub mod client_log;
 mod clipboard;
-pub mod config;
 pub mod diagnostics;
 pub mod egl_engine;
 mod font;
@@ -20,7 +19,6 @@ pub mod performance;
 pub mod runtime;
 pub mod services;
 pub mod status;
-pub mod temp_file;
 mod text_layout;
 pub mod webview;
 

@@ -43,7 +43,7 @@ Start **Eclipse** from your app menu. From a terminal, use `flatpak run io.githu
 | `run` | Start Roblox (the default from the app menu) |
 | `update` | Check for a newer Roblox now |
 | `install <files>` | Install Roblox from your own `base.apk` + `split_config.x86_64.apk`, or an `.apks`/`.xapk` bundle |
-| `config` | Show the settings file path and the values in effect |
+| `config` | Show the settings file path, the values in effect and any problems in the file |
 
 Sign-in and other Roblox web pages open in their own window.
 

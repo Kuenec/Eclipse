@@ -186,6 +186,65 @@ fn gl_test_anw_binds_real_wsi_handle() {
 }
 
 #[test]
+fn the_config_helper_path_starts_that_helper_with_only_its_control_socket() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !roblox_apk_present() || !android_runtime_present() {
+        eprintln!(
+            "SKIP: Roblox APK or Android runtime absent (set ECLIPSE_ROBLOX_APK, ECLIPSE_LIBART \
+             and ECLIPSE_ANDROID_FRAMEWORK_DIR)"
+        );
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("config-helper-path-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let config = root.join("config").join("eclipse");
+    std::fs::create_dir_all(&config).expect("create the config directory");
+    let helper = root.join("stand-in-helper");
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\nprintf '%s\\n' \"$#:$*\" >> \"$ECLIPSE_TEST_HELPER_ARGV\"\n",
+    )
+    .expect("write the stand-in helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stand-in helper executable");
+    std::fs::write(
+        config.join("config.json"),
+        serde_json::json!({ "webview_helper_path": helper }).to_string(),
+    )
+    .expect("write config.json");
+    let argv = root.join("helper-argv");
+
+    let out = bounded_child::output(
+        Command::new(env!("CARGO_BIN_EXE_eclipse"))
+            .arg("__webview-test")
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("ECLIPSE_APP_DATA_DIR", root.join("app-data"))
+            .env("ECLIPSE_TEST_HELPER_ARGV", &argv)
+            .env("WAYLAND_DISPLAY", "eclipse-test-no-display")
+            .env_remove("DISPLAY")
+            .env_remove("ECLIPSE_WEBVIEW_HELPER"),
+        ENGINE_LIMIT,
+    );
+    let argv = std::fs::read_to_string(&argv);
+    std::fs::remove_dir_all(&root).ok();
+
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "the stand-in helper never answers the handshake\n{text}"
+    );
+    let argv = argv.unwrap_or_else(|error| {
+        panic!("the helper named in config.json did not start ({error})\n{text}")
+    });
+    assert!(
+        !argv.is_empty() && argv.lines().all(|line| line == "1:--ipc-fd=3"),
+        "{argv}\n{text}"
+    );
+}
+
+#[test]
 fn webview_test_drives_load_upcalls_the_bridge_and_cookies() {
     if !roblox_apk_present() {
         eprintln!(
