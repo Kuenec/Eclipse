@@ -9,7 +9,7 @@ use directories::ProjectDirs;
 use eclipse_config::temp_file::TempFile;
 use eclipse_config::{Config, TouchMode};
 
-use crate::apk::Manifest;
+use crate::apk::{Manifest, VersionCode, BASE_APK};
 use crate::host_locale::HostLocale;
 use crate::host_time_zone::HostTimeZone;
 use crate::loader::aaudio::{low_latency_burst_frames, APP_SAMPLE_RATE};
@@ -554,6 +554,35 @@ pub fn dalvik_cache_stem(location: &Path) -> Option<OsString> {
         .map(|&byte| if byte == b'/' { b'@' } else { byte })
         .collect();
     Some(OsString::from_vec(stem))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreArtCode {
+    prefix: OsString,
+}
+
+impl StoreArtCode {
+    #[must_use]
+    pub fn in_store(store_root: &Path) -> Option<Self> {
+        let mut prefix = dalvik_cache_stem(store_root)?;
+        prefix.push("@");
+        Some(Self { prefix })
+    }
+
+    #[must_use]
+    pub fn version_of(&self, name: &OsStr) -> Option<VersionCode> {
+        let rest = name.as_bytes().strip_prefix(self.prefix.as_bytes())?;
+        let split = rest.iter().position(|&byte| byte == b'@')?;
+        let (code, artefact) = (&rest[..split], &rest[split + 1..]);
+        artefact
+            .strip_prefix(BASE_APK.as_bytes())?
+            .strip_prefix(b"@classes.")?;
+        std::str::from_utf8(code)
+            .ok()?
+            .parse()
+            .ok()
+            .map(VersionCode)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1796,6 +1825,30 @@ mod tests {
             Some(OsString::from("x@data@eclipse@roblox@3170@base.apk"))
         );
         assert_eq!(dalvik_cache_stem(Path::new("roblox/base.apk")), None);
+    }
+
+    #[test]
+    fn art_code_names_yield_the_store_version_of_base_apk_code_only() {
+        let names = StoreArtCode::in_store(Path::new("/x/data/eclipse/roblox")).unwrap();
+        let version = |name: &str| names.version_of(OsStr::new(name));
+        assert_eq!(
+            version("x@data@eclipse@roblox@3170@base.apk@classes.dex"),
+            Some(VersionCode(3170))
+        );
+        assert_eq!(
+            version("x@data@eclipse@roblox@3056@base.apk@classes.vdex"),
+            Some(VersionCode(3056))
+        );
+        for foreign in [
+            "x@data@eclipse@roblox@3056@other.apk@classes.dex",
+            "x@data@eclipse@roblox@custom@base.apk@classes.dex",
+            "x@data@eclipse@roblox-old@3056@base.apk@classes.dex",
+            "x@data@eclipse@roblox@3056@base.apk",
+            "app@lib@eclipse@framework@api-impl.jar@classes.dex",
+        ] {
+            assert_eq!(version(foreign), None, "{foreign}");
+        }
+        assert_eq!(StoreArtCode::in_store(Path::new("roblox")), None);
     }
 
     #[test]

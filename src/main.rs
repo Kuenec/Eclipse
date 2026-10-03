@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant, SystemTime};
 
 use eclipse::apk::store::{
-    CheckOutcome, Committed, InstalledVersion, Release, Store, UpdateCheck, UpdateOutcome,
+    Attempt, CheckMode, CheckOutcome, InstalledVersion, Proof, Rollback, Store, UpdateCheck,
+    UpdateOutcome,
 };
 use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode};
 use eclipse::framework::ActivityStart;
@@ -12,7 +14,7 @@ use eclipse::graphics::launch_window::{LaunchWindow, WindowClosed};
 use eclipse::links::LaunchTarget;
 use eclipse::runtime::{ClientCacheDir, NativeLibRoot};
 use eclipse::status::{StatusSink, StatusUpdate};
-use eclipse::storage::Trim;
+use eclipse::storage::{StorageLayout, Trim};
 
 mod desktop_integration;
 mod instance_control;
@@ -30,10 +32,11 @@ const CLIENT_SETTINGS_PATH_SHIM: &[u8] =
 const MAXIMUM_FRAME_RATE_ROW_FLAG: &str = "FFlagGameBasicSettingsFramerateCap5";
 
 const RUN_COMMAND: &str = "run";
+const CHECK_UPDATE_OPTION: &str = "--check-update";
 const OPEN_COMMAND: &str = "open";
 const LAUNCH_LINK_COMMAND: &str = "__launch-link";
 const LAUNCH_LINK_ENV: &str = "ECLIPSE_LAUNCH_LINK";
-const RUN_USAGE: &str = "usage: eclipse run [APK | DIRECTORY]";
+const RUN_USAGE: &str = "usage: eclipse run [--check-update | APK | DIRECTORY]";
 const OPEN_USAGE: &str = "usage: eclipse open <LINK | PLACE ID>";
 const OPEN_CONTEXT: &str = "eclipse open";
 const HAND_OFF_CONTEXT: &str = "eclipse launch";
@@ -42,6 +45,7 @@ const FRAME_LOG_CONTEXT: &str = "eclipse frame-time log";
 const UNSUPERVISED: &str = "the Android client must be started by Eclipse's supervisor; start \
      Eclipse without ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE in its environment";
 const BROWSER_LAUNCH_CONTEXT: &str = "eclipse browser launch";
+const LAUNCH_CHECK_BUDGET: Duration = Duration::from_secs(3);
 
 const HELP: &str = "\
 eclipse — run the Android Roblox build on Linux (open-source, Rust)
@@ -50,10 +54,16 @@ USAGE:
     eclipse <COMMAND>
 
 COMMANDS:
-    run [PATH]  Verify the Roblox client, boot the ART VM (Roblox on the classpath) and open
+    run [--check-update | PATH]
+                Verify the Roblox client, boot the ART VM (Roblox on the classpath) and open
                 the window. With no PATH, runs the installed client in a window that shows the
                 download and any error: the first run downloads Roblox, and later runs check
-                for a Roblox update at most every 6 hours, or 30 minutes after a failed check.
+                for a Roblox update at most every 6 hours, or 30 minutes after a failed check,
+                and start the installed Roblox if APKCombo has not answered within 3 seconds.
+                --check-update checks now and waits for the answer. With roblox_auto_update set
+                to false in config.json, only `update`, `run --check-update` and a first install
+                download Roblox.
+                A new Roblox that fails to start twice is replaced by the version kept before it.
                 PATH may be an APK file or a directory holding base.apk and
                 split_config.x86_64.apk. Only one Roblox client runs at a time; running it
                 again asks its window to come to the front.
@@ -69,8 +79,14 @@ COMMANDS:
                 account. With --play, download it from Google Play with the account saved by
                 play-login instead.
     play-login  Sign in to Google Play with your own Google account (once, for update --play).
+    rollback    Go back to the Roblox version before the current one, which Eclipse keeps until a
+                new version has been played and closed once. Automatic updates skip the one left.
     install-url-handler
                 Register Eclipse for browser Play clicks (they open the link as `open` does).
+    storage [--json | --clean]
+                Show the disk space Roblox and Eclipse use, and where. --json prints it as JSON.
+                --clean empties Roblox's cache and the WebView cache, removes older logs and the
+                Roblox versions Eclipse no longer keeps; Roblox must be closed.
     config      Show effective configuration and its path
     help        Show this help
     --version   Show version
@@ -152,7 +168,21 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("rollback") => match rollback_command(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("eclipse rollback: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Some("config") => show_config(),
+        Some("storage") => match storage_command(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("eclipse storage: {error}");
+                ExitCode::FAILURE
+            }
+        },
 
         Some("__run-libroblox-init") => {
             let outcome = parse_libroblox_init_lib_dir(&args[1..]).and_then(|lib_dir| {
@@ -250,9 +280,51 @@ fn main() -> ExitCode {
 
 #[derive(Debug, PartialEq, Eq)]
 enum LaunchCommand {
-    Run,
+    Run(RunCheck),
     RunFile(PathBuf),
     Link(LaunchTarget),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunCheck {
+    Configured,
+    Now,
+}
+
+impl RunCheck {
+    fn check(self, auto_update: bool) -> LaunchCheck {
+        match (self, auto_update) {
+            (Self::Now, _) => LaunchCheck::Now,
+            (Self::Configured, true) => LaunchCheck::WhenDue,
+            (Self::Configured, false) => LaunchCheck::OnlyWhenMissing,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchCheck {
+    WhenDue,
+    OnlyWhenMissing,
+    Now,
+}
+
+impl LaunchCheck {
+    fn wanted(
+        self,
+        installed: Option<VersionCode>,
+        last_check: Option<&UpdateCheck>,
+        now: SystemTime,
+    ) -> bool {
+        match self {
+            Self::WhenDue => eclipse::apk::store::update_due(installed, last_check, now),
+            Self::OnlyWhenMissing => installed.is_none(),
+            Self::Now => true,
+        }
+    }
+
+    fn time_limit(self, installed: Option<VersionCode>) -> Option<Duration> {
+        (self == Self::WhenDue && installed.is_some()).then_some(LAUNCH_CHECK_BUDGET)
+    }
 }
 
 impl LaunchCommand {
@@ -265,7 +337,11 @@ impl LaunchCommand {
         };
         let launch = match command.to_str() {
             Some(RUN_COMMAND) => match rest {
-                [] => Self::Run,
+                [] => Self::Run(RunCheck::Configured),
+                [option] if option == CHECK_UPDATE_OPTION => Self::Run(RunCheck::Now),
+                [option] if option.as_encoded_bytes().starts_with(b"-") => {
+                    return Err(LaunchCommandError::UnknownRunOption(option.clone()))
+                }
                 [path] => Self::RunFile(PathBuf::from(path)),
                 _ => return Err(LaunchCommandError::Usage(RUN_USAGE)),
             },
@@ -305,7 +381,7 @@ impl LaunchCommand {
 
     fn launch(&self) -> Launch {
         match self {
-            Self::Run => Launch::Installed,
+            Self::Run(_) => Launch::Installed,
             Self::RunFile(_) => Launch::File,
             Self::Link(target) => Launch::Link(target.clone()),
         }
@@ -313,8 +389,11 @@ impl LaunchCommand {
 
     fn restart(&self, command: &mut std::process::Command) {
         match self {
-            Self::Run => {
+            Self::Run(RunCheck::Configured) => {
                 command.arg(RUN_COMMAND);
+            }
+            Self::Run(RunCheck::Now) => {
+                command.arg(RUN_COMMAND).arg(CHECK_UPDATE_OPTION);
             }
             Self::RunFile(path) => {
                 command.arg(RUN_COMMAND).arg(path);
@@ -331,6 +410,7 @@ impl LaunchCommand {
 #[derive(Debug, PartialEq, Eq)]
 enum LaunchCommandError {
     Usage(&'static str),
+    UnknownRunOption(OsString),
     Link {
         context: &'static str,
         message: String,
@@ -341,6 +421,13 @@ impl LaunchCommandError {
     fn report(&self) {
         match self {
             Self::Usage(usage) => eprintln!("{usage}"),
+            Self::UnknownRunOption(option) => {
+                let option = option.to_string_lossy();
+                eprintln!(
+                    "eclipse run: unknown option `{option}`; give a file whose name starts with \
+                     `-` as `./{option}`\n{RUN_USAGE}"
+                );
+            }
             Self::Link { context, message } => {
                 eprintln!("{context}: {message}");
                 show_error_window(message, None);
@@ -603,10 +690,21 @@ fn run_client(launch: LaunchCommand, supervision: Option<Supervision>) -> ExitCo
     eclipse::diagnostics::init(eclipse::diagnostics::LogSink::Supervisor(records));
     tracing::debug!(version = eclipse::VERSION, "eclipse client starting");
     let loaded = eclipse_config::load();
+    let auto_update = loaded.config.roblox_auto_update;
     let end = match launch {
-        LaunchCommand::Run => launch_in_window(&Launch::Installed, &loaded, &run_log),
+        LaunchCommand::Run(run) => launch_in_window(
+            &Launch::Installed,
+            run.check(auto_update),
+            &loaded,
+            &run_log,
+        ),
         LaunchCommand::RunFile(path) => run_file(&path, &loaded),
-        LaunchCommand::Link(target) => launch_in_window(&Launch::Link(target), &loaded, &run_log),
+        LaunchCommand::Link(target) => launch_in_window(
+            &Launch::Link(target),
+            RunCheck::Configured.check(auto_update),
+            &loaded,
+            &run_log,
+        ),
     };
     finish_android_process(end, exit)
 }
@@ -715,6 +813,9 @@ fn show_config() -> ExitCode {
 const NOT_INSTALLED: &str = "Roblox is not installed; run `eclipse update` to download it, or \
      install the APKs with `eclipse install <PATH>`";
 
+const NOTHING_KEPT: &str = "Eclipse keeps no other Roblox version to go back to; it keeps the \
+     previous one only until the current one has been played and closed once";
+
 const NO_APP_DATA_DIR: &str = "cannot resolve Eclipse's app-data directory; set HOME, \
      XDG_DATA_HOME, or ECLIPSE_APP_DATA_DIR";
 
@@ -747,14 +848,47 @@ fn install_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Err
     let _client = lock_out_clients()?;
     let status = StatusSink::terminal();
     status.step("Verifying and installing the Roblox client…");
-    let committed = Store::open()?.install(&sources, &status)?;
+    let store = Store::open()?;
+    let installed = store.install(&sources, &status)?;
     status.outcome(format!(
         "installed Roblox {}",
-        InstalledVersion::from(&committed.set)
+        InstalledVersion::from(&installed)
     ));
-    if let Some(leftover) = committed.leftover {
-        status.warning(leftover.to_string());
+    remove_unkept_versions(&store, &status);
+    prepare_for_next_launch(installed, &status);
+    Ok(())
+}
+
+fn remove_unkept_versions(store: &Store, status: &StatusSink) {
+    if let Err(error) = store.prune() {
+        status.warning(format!(
+            "could not remove the Roblox versions Eclipse no longer keeps: {error}"
+        ));
     }
+}
+
+fn prepare_for_next_launch(mut apks: ApkSet, status: &StatusSink) {
+    if let Err(error) = extract_client(&mut apks, status) {
+        status.warning(format!(
+            "could not prepare Roblox now, so its next launch prepares it: {error}"
+        ));
+    }
+}
+
+fn rollback_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    if !arguments.is_empty() {
+        return Err("usage: eclipse rollback".into());
+    }
+    let _client = lock_out_clients()?;
+    let status = StatusSink::terminal();
+    let store = Store::open()?;
+    let rolled_back = match store.roll_back(eclipse::VERSION)? {
+        Rollback::RolledBack(rolled_back) => rolled_back,
+        Rollback::NotInstalled => return Err(NOT_INSTALLED.into()),
+        Rollback::NothingKept => return Err(NOTHING_KEPT.into()),
+    };
+    status.outcome(rolled_back.to_string());
+    prepare_for_next_launch(store.verified_current()?.ok_or(NOT_INSTALLED)?, &status);
     Ok(())
 }
 
@@ -798,6 +932,52 @@ fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum StorageAction {
+    Table,
+    Json,
+    Clean,
+}
+
+fn parse_storage_action(arguments: &[OsString]) -> Result<StorageAction, String> {
+    match arguments {
+        [] => Ok(StorageAction::Table),
+        [flag] if flag == "--json" => Ok(StorageAction::Json),
+        [flag] if flag == "--clean" => Ok(StorageAction::Clean),
+        _ => Err("usage: eclipse storage [--json | --clean]".to_owned()),
+    }
+}
+
+fn storage_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let action = parse_storage_action(arguments)?;
+    let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
+    let layout = StorageLayout::resolve(app_data_dir)?;
+    match action {
+        StorageAction::Table => print!("{}", layout.report()?),
+        StorageAction::Json => println!("{}", layout.report()?.to_json()?),
+        StorageAction::Clean => print!("{}", clean_storage(&layout, &StatusSink::terminal())?),
+    }
+    Ok(())
+}
+
+fn clean_storage(
+    layout: &StorageLayout,
+    status: &StatusSink,
+) -> Result<eclipse::storage::Cleanup, Box<dyn std::error::Error>> {
+    let _client = match instance_control::lock_client(&layout.app_data.join(RUNTIME_DIR))? {
+        ClientLock::Acquired(lock) => lock,
+        ClientLock::Held(lock) => {
+            return Err(format!(
+                "close Roblox, or wait for Eclipse to finish installing it, before cleaning \
+                 (another Eclipse holds {})",
+                lock.display()
+            )
+            .into())
+        }
+    };
+    Ok(eclipse::storage::clean(layout, status)?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum UpdateSource {
     ApkCombo,
     GooglePlay,
@@ -818,21 +998,28 @@ fn update_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Erro
     let store = Store::open()?;
     let current = store.usable_current()?;
     let status = StatusSink::terminal();
-    match source {
-        UpdateSource::ApkCombo => update_from_apkcombo(&store, current.as_ref(), None, &status),
+    let updated = match source {
+        UpdateSource::ApkCombo => {
+            update_from_apkcombo(&store, current.as_ref(), CheckMode::Explicit, None, &status)
+        }
         UpdateSource::GooglePlay => update_from_play(&store, current.as_ref(), &status),
+    }?;
+    remove_unkept_versions(&store, &status);
+    if let Some(updated) = updated {
+        prepare_for_next_launch(updated, &status);
     }
-    .map(drop)
+    Ok(())
 }
 
 fn update_from_apkcombo(
     store: &Store,
     current: Option<&ApkSet>,
-    rejected: Option<Release>,
+    mode: CheckMode,
+    check_deadline: Option<Instant>,
     status: &StatusSink,
 ) -> Result<Option<ApkSet>, Box<dyn std::error::Error>> {
     status.step("Checking APKCombo for the newest Roblox client…");
-    let outcome = eclipse::apk::apkcombo::update(store, current, rejected, status)?;
+    let outcome = eclipse::apk::apkcombo::update(store, current, mode, check_deadline, status)?;
     finish_update(store, outcome, status)
 }
 
@@ -856,50 +1043,44 @@ fn finish_update(
 ) -> Result<Option<ApkSet>, Box<dyn std::error::Error>> {
     store.record_check(&UpdateCheck {
         at: std::time::SystemTime::now(),
-        rejected: None,
         outcome: CheckOutcome::Completed,
     })?;
-    let (previous, committed) = match outcome {
+    let (previous, set) = match outcome {
         UpdateOutcome::UpToDate { installed } => {
             status.outcome(format!("Roblox {installed} is up to date"));
             return Ok(None);
         }
-        UpdateOutcome::Updated {
-            previous,
-            committed,
-        } => (previous, committed),
+        UpdateOutcome::Updated { previous, set } => (previous, set),
     };
-    let Committed { set, leftover } = *committed;
-    let installed = InstalledVersion::from(&set);
+    let installed = InstalledVersion::from(&*set);
     match previous {
         Some(previous) => status.outcome(format!("updated Roblox from {previous} to {installed}")),
         None => status.outcome(format!("installed Roblox {installed}")),
     }
-    if let Some(leftover) = leftover {
-        status.warning(leftover.to_string());
-    }
-    Ok(Some(set))
+    Ok(Some(*set))
 }
 
 fn update_if_due(
     store: &Store,
     installed: Option<VersionCode>,
-    update: impl FnOnce(Option<Release>) -> Result<Option<ApkSet>, Box<dyn std::error::Error>>,
+    check: LaunchCheck,
+    update: impl FnOnce(Option<Instant>) -> Result<Option<ApkSet>, Box<dyn std::error::Error>>,
 ) -> Result<Option<ApkSet>, Box<dyn std::error::Error>> {
     let last_check = store.last_check()?;
-    let now = std::time::SystemTime::now();
-    if !eclipse::apk::store::update_due(installed, last_check.as_ref(), now) {
+    let now = SystemTime::now();
+    if !check.wanted(installed, last_check.as_ref(), now) {
         return Ok(None);
     }
-    let rejected = last_check.and_then(|check| check.rejected);
-    let error = match update(rejected) {
+    let deadline = check
+        .time_limit(installed)
+        .map(|limit| Instant::now() + limit);
+    let error = match update(deadline) {
         Ok(updated) => return Ok(updated),
         Err(error) => error,
     };
     if store.last_check()? == last_check {
         let failed = UpdateCheck {
             at: now,
-            rejected,
             outcome: CheckOutcome::Failed,
         };
         if let Err(record) = store.record_check(&failed) {
@@ -913,22 +1094,74 @@ fn update_if_due(
     Err(error)
 }
 
-fn installed_apk_set(status: &StatusSink) -> Result<ApkSet, Box<dyn std::error::Error>> {
+struct InstalledClient {
+    apks: ApkSet,
+    proving: Option<Proving>,
+}
+
+struct Proving {
+    store: Store,
+    version: VersionCode,
+    proof: Proof,
+}
+
+fn installed_apk_set(
+    check: LaunchCheck,
+    status: &StatusSink,
+) -> Result<InstalledClient, Box<dyn std::error::Error>> {
     let store = Store::open()?;
+    match store.settle_launch() {
+        Ok(Some(both_failed)) => status.warning(both_failed.to_string()),
+        Ok(None) => {}
+        Err(error) => status.warning(format!(
+            "could not count how the last start of Roblox ended: {error}"
+        )),
+    }
     status.step(VERIFYING_SIGNATURE);
-    let set = installed_or_updated_set(&store, status, |current| {
-        update_if_due(&store, current.map(ApkSet::version_code), |rejected| {
-            update_from_apkcombo(&store, current, rejected, status)
-        })
+    let mut set = installed_or_updated_set(&store, status, |current| {
+        update_if_due(
+            &store,
+            current.map(ApkSet::version_code),
+            check,
+            |deadline| {
+                update_from_apkcombo(&store, current, CheckMode::Scheduled, deadline, status)
+            },
+        )
     })?;
+    match store.fall_back_if_failing(eclipse::VERSION) {
+        Ok(Some(fell_back)) => {
+            set = store.verified_current()?.ok_or(NOT_INSTALLED)?;
+            status.warning(fell_back.to_string());
+        }
+        Ok(None) => {}
+        Err(error) => status.warning(format!(
+            "could not go back to the Roblox version Eclipse kept: {error}"
+        )),
+    }
+    remove_unkept_versions(&store, status);
     if let Some(cache) = eclipse::runtime::dalvik_cache_dir() {
         remove_other_version_oats(&cache, store.root(), set.base_path(), set.version_code())?;
     }
+    let version = set.version_code();
+    let proving = match store.proof_needed(version) {
+        Ok(proof) => proof.map(|proof| Proving {
+            store,
+            version,
+            proof,
+        }),
+        Err(error) => {
+            status.warning(format!(
+                "could not read which Roblox versions started before, so this start is not \
+                 counted: {error}"
+            ));
+            None
+        }
+    };
     status.step(format!(
         "Launching the installed Roblox {}",
         InstalledVersion::from(&set)
     ));
-    Ok(set)
+    Ok(InstalledClient { apks: set, proving })
 }
 
 fn remove_other_version_oats(
@@ -937,12 +1170,9 @@ fn remove_other_version_oats(
     apk: &std::path::Path,
     keep: eclipse::apk::VersionCode,
 ) -> Result<(), String> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let (Some(mut prefix), Some(mut kept), Some(apk_name)) = (
-        eclipse::runtime::dalvik_cache_stem(store_root),
+    let (Some(art_code), Some(mut kept)) = (
+        eclipse::runtime::StoreArtCode::in_store(store_root),
         eclipse::runtime::dalvik_cache_stem(apk),
-        apk.file_name(),
     ) else {
         return Err(format!(
             "the Roblox store {} and its APK {} must be absolute paths",
@@ -950,20 +1180,8 @@ fn remove_other_version_oats(
             apk.display()
         ));
     };
-    prefix.push("@");
     kept.push("@classes.dex");
-    let mut artefact = apk_name.to_os_string();
-    artefact.push("@classes.");
-    let version_of = |name: &[u8]| -> Option<u32> {
-        let rest = name.strip_prefix(prefix.as_bytes())?;
-        let split = rest.iter().position(|&byte| byte == b'@')?;
-        let (code, file) = (&rest[..split], &rest[split + 1..]);
-        if !file.starts_with(artefact.as_bytes()) {
-            return None;
-        }
-        std::str::from_utf8(code).ok()?.parse().ok()
-    };
-    if version_of(kept.as_bytes()) != Some(keep.0) {
+    if art_code.version_of(&kept) != Some(keep) {
         return Err(format!(
             "the installed Roblox APK {} is not in the version {} directory of the store {}",
             apk.display(),
@@ -980,7 +1198,10 @@ fn remove_other_version_oats(
     };
     for entry in entries {
         let entry = entry.map_err(list_error)?;
-        if version_of(entry.file_name().as_bytes()).is_some_and(|code| code != keep.0) {
+        if art_code
+            .version_of(&entry.file_name())
+            .is_some_and(|code| code != keep)
+        {
             let path = entry.path();
             std::fs::remove_file(&path).map_err(|error| {
                 format!(
@@ -1351,12 +1572,19 @@ fn play_file(
             window: None,
         },
         &loaded.config,
+        None,
+        &mut None,
     )
 }
 
-type Preparation = std::thread::JoinHandle<Result<PreparedClient, String>>;
+type Preparation = std::thread::JoinHandle<Result<(PreparedClient, Option<Proving>), String>>;
 
-fn launch_in_window(launch: &Launch, loaded: &eclipse_config::Loaded, log: &Path) -> ClientEnd {
+fn launch_in_window(
+    launch: &Launch,
+    check: LaunchCheck,
+    loaded: &eclipse_config::Loaded,
+    log: &Path,
+) -> ClientEnd {
     let (sender, updates) = std::sync::mpsc::channel();
     let status = StatusSink::with_window(sender.clone());
     report_config(loaded, &status);
@@ -1364,7 +1592,7 @@ fn launch_in_window(launch: &Launch, loaded: &eclipse_config::Loaded, log: &Path
         Ok(listener) => listener,
         Err(failure) => return show_setup_failure(launch, failure, log),
     };
-    let preparation = prepare_in_background(sender);
+    let preparation = prepare_in_background(check, sender);
     let mut window = match LaunchWindow::open(&window_title()) {
         Ok(window) => window,
         Err(error) => {
@@ -1446,14 +1674,17 @@ fn show_setup_failure(launch: &Launch, failure: SetupFailure, log: &Path) -> Cli
 }
 
 fn prepare_in_background(
+    check: LaunchCheck,
     updates: std::sync::mpsc::Sender<StatusUpdate>,
 ) -> std::io::Result<Preparation> {
     std::thread::Builder::new()
         .name("eclipse-install".to_owned())
         .spawn(move || {
             let status = StatusSink::with_window(updates);
-            installed_apk_set(&status)
-                .and_then(|apks| prepare_client(apks, &status))
+            installed_apk_set(check, &status)
+                .and_then(|installed| {
+                    Ok((prepare_client(installed.apks, &status)?, installed.proving))
+                })
                 .map_err(|error| error.to_string())
         })
 }
@@ -1467,11 +1698,12 @@ fn play_in_window(
     config: &eclipse_config::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     window.wait_for(updates, &worker)?;
-    let prepared = worker
+    let (prepared, proving) = worker
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
     let target = slot.begin_play();
-    boot_and_play(
+    let mut attempt = None;
+    let played = boot_and_play(
         prepared,
         target.as_ref(),
         &mut Host {
@@ -1479,7 +1711,45 @@ fn play_in_window(
             window: Some((window, updates)),
         },
         config,
-    )
+        proving.as_ref(),
+        &mut attempt,
+    );
+    let closed_by_user = played
+        .as_ref()
+        .err()
+        .is_none_or(|error| error.is::<WindowClosed>());
+    if closed_by_user {
+        record_normal_end(proving, attempt, eclipse::first_frame::shown(), status);
+    }
+    played
+}
+
+fn record_normal_end(
+    proving: Option<Proving>,
+    attempt: Option<Attempt>,
+    frame_shown: bool,
+    status: &StatusSink,
+) {
+    if !frame_shown {
+        if let Some(Err(error)) = attempt.map(Attempt::closed_by_user) {
+            status.warning(format!(
+                "could not record that Roblox was closed before it started, so the next launch \
+                 counts this start as failed: {error}"
+            ));
+        }
+        return;
+    }
+    let Some(Proving { store, version, .. }) = proving else {
+        return;
+    };
+    if let Err(error) = store.record_normal_close(version) {
+        status.warning(format!(
+            "could not record that Roblox {version} was played and closed, so Eclipse keeps the \
+             version before it for now: {error}"
+        ));
+        return;
+    }
+    remove_unkept_versions(&store, status);
 }
 
 struct Host<'a> {
@@ -1544,37 +1814,81 @@ fn prepare_client(
     status: &StatusSink,
 ) -> Result<PreparedClient, Box<dyn std::error::Error>> {
     let client_cache = prepare_client_cache(status)?;
-    let app_lib_dir = native_lib_dir(eclipse::runtime::native_lib_root()?, apks.version_code())?;
-    status.step(format!(
-        "Extracting native libs (lib/x86_64/) to {}…",
-        app_lib_dir.display()
-    ));
-    let lib_count = apks
-        .native_libs_mut()
-        .extract_native_libs(eclipse::apk::TARGET_ABI, &app_lib_dir)?;
-    println!("extracted {lib_count} native lib(s) ✓");
-
-    let assets_dir = eclipse::framework::app_data_dir()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "cannot resolve the app data directory (no $HOME/XDG base and ECLIPSE_APP_DATA_DIR \
-                 unset); set ECLIPSE_APP_DATA_DIR to the engine content root",
-            )
-        })?
-        .join("files")
-        .join("assets");
-    status.step(format!(
-        "Extracting Roblox bundled assets (assets/ → files/assets/) to {}…",
-        assets_dir.display()
-    ));
-    let asset_count = apks.base_mut().extract_assets(&assets_dir)?;
-    println!("extracted {asset_count} asset file(s) ✓");
+    let app_lib_dir = extract_client(&mut apks, status)?;
     Ok(PreparedClient {
         apks,
         app_lib_dir,
         client_cache,
     })
+}
+
+fn begin_attempt(proving: &Proving, status: &StatusSink) -> Option<Attempt> {
+    proving
+        .store
+        .begin_attempt(proving.version)
+        .inspect_err(|error| {
+            status.warning(format!(
+                "could not record this start of Roblox, so a failure would not count toward \
+                 going back to the version Eclipse kept: {error}"
+            ));
+        })
+        .ok()
+}
+
+fn prove_at_first_frame(proving: &Proving, status: &StatusSink) {
+    let (store, version) = (proving.store.clone(), proving.version);
+    let watching = std::thread::Builder::new()
+        .name("eclipse-first-frame".to_owned())
+        .spawn(move || {
+            eclipse::first_frame::wait();
+            if let Err(error) = store.record_first_frame(version) {
+                tracing::warn!(
+                    %version,
+                    %error,
+                    "cannot record that Roblox showed its first frame"
+                );
+            }
+        });
+    if let Err(error) = watching {
+        status.warning(format!(
+            "cannot watch for Roblox's first frame, so this start does not show that Roblox \
+             {version} works: {error}"
+        ));
+    }
+}
+
+fn extract_client(
+    apks: &mut ApkSet,
+    status: &StatusSink,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let app_lib_dir = native_lib_dir(eclipse::runtime::native_lib_root()?, apks.version_code())?;
+    status.step(format!(
+        "Extracting native libs (lib/x86_64/) to {}…",
+        app_lib_dir.display()
+    ));
+    let lib_count = apks.native_libs_mut().extract_native_libs(
+        eclipse::apk::TARGET_ABI,
+        &app_lib_dir,
+        status,
+    )?;
+    println!("extracted {lib_count} native lib(s) ✓");
+
+    let assets_dir = eclipse::storage::extracted_assets_dir(
+        &eclipse::framework::app_data_dir().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot resolve the app data directory (no $HOME/XDG base and ECLIPSE_APP_DATA_DIR \
+                 unset); set ECLIPSE_APP_DATA_DIR to the engine content root",
+            )
+        })?,
+    );
+    status.step(format!(
+        "Extracting Roblox bundled assets (assets/ → files/assets/) to {}…",
+        assets_dir.display()
+    ));
+    let asset_count = apks.base_mut().extract_assets(&assets_dir, status)?;
+    println!("extracted {asset_count} asset file(s) ✓");
+    Ok(app_lib_dir)
 }
 
 fn prepare_client_cache(status: &StatusSink) -> Result<ClientCacheDir, Box<dyn std::error::Error>> {
@@ -1612,12 +1926,15 @@ fn boot_and_play(
     target: Option<&LaunchTarget>,
     host: &mut Host<'_>,
     config: &eclipse_config::Config,
+    proving: Option<&Proving>,
+    attempt: &mut Option<Attempt>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let PreparedClient {
         apks,
         app_lib_dir,
         client_cache,
     } = prepared;
+    let proving_start = proving.filter(|proving| proving.proof == Proof::FirstFrame);
     let base_path = apks.base_path().to_path_buf();
     let apk_path = base_path
         .to_str()
@@ -1677,6 +1994,7 @@ fn boot_and_play(
     ))?;
     println!("\n# Booting the ART VM with Roblox on the classpath…");
 
+    *attempt = proving_start.and_then(|proving| begin_attempt(proving, host.status));
     let vm = eclipse::runtime::boot(&plan, Some(&base_path), Some(&app_lib_dir))?;
     println!("ART VM booted with Roblox's Java on the classpath ✓");
     host.refresh()?;
@@ -1721,6 +2039,9 @@ fn boot_and_play(
         println!("official Roblox web login opened (WebView handle {handle}) ✓");
     }
 
+    if let Some(proving) = proving_start {
+        prove_at_first_frame(proving, host.status);
+    }
     println!("# Opening the host window (winit; close it to exit)…");
     host.run_game(
         &eclipse::window_title(&manifest.package),
@@ -2309,21 +2630,27 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 #[cfg(test)]
 mod tests {
     use super::{
-        finish_android_process, installed_client_note, installed_or_updated_set, lock_run_in,
-        native_lib_dir, parse_libroblox_init_lib_dir, parse_update_source,
+        clean_storage, finish_android_process, finish_update, installed_client_note,
+        installed_or_updated_set, lock_run_in, native_lib_dir, parse_libroblox_init_lib_dir,
+        parse_storage_action, parse_update_source, record_normal_end,
         remove_other_native_lib_versions, remove_other_version_oats, update_if_due,
-        url_handler_message, ClientEnd, ClientLock, ExitRecord, Launch, LaunchCommand,
-        LaunchCommandError, RunStart, UpdateSource, LAUNCH_LINK_COMMAND, LAUNCH_LINK_ENV,
-        NOT_INSTALLED, OPEN_USAGE, RUN_USAGE,
+        url_handler_message, ClientEnd, ClientLock, ExitRecord, Launch, LaunchCheck, LaunchCommand,
+        LaunchCommandError, Proving, RunCheck, RunStart, StorageAction, StorageLayout,
+        UpdateSource, HELP, LAUNCH_CHECK_BUDGET, LAUNCH_LINK_COMMAND, LAUNCH_LINK_ENV,
+        NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE,
     };
     use crate::desktop_integration::BROWSER_HANDLER_COMMAND;
-    use eclipse::apk::store::{CheckOutcome, Release, Store, UpdateCheck};
+    use eclipse::apk::store::{
+        CheckOutcome, DeclaredFile, InstalledVersion, Proof, Rejections, Store, UpdateCheck,
+        UpdateOutcome, VersionState,
+    };
     use eclipse::apk::VersionCode;
     use eclipse::links::LaunchTarget;
     use eclipse::runtime::NativeLibRoot;
     use eclipse::status::StatusSink;
     use std::collections::BTreeMap;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
+    use std::time::{Duration, Instant, SystemTime};
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -2353,16 +2680,57 @@ mod tests {
     }
 
     #[test]
-    fn run_accepts_at_most_one_path_argument() {
-        assert_eq!(launch_command(&["run"], None), Ok(Some(LaunchCommand::Run)));
+    fn run_arguments_parse_into_a_typed_target() {
+        assert_eq!(
+            launch_command(&["run"], None),
+            Ok(Some(LaunchCommand::Run(RunCheck::Configured)))
+        );
+        assert_eq!(
+            launch_command(&["run", "--check-update"], None),
+            Ok(Some(LaunchCommand::Run(RunCheck::Now)))
+        );
         assert_eq!(
             launch_command(&["run", "roblox.apk"], None),
             Ok(Some(LaunchCommand::RunFile("roblox.apk".into())))
         );
         assert_eq!(
-            launch_command(&["run", "roblox.apk", "roblox://placeId=1"], None),
-            Err(LaunchCommandError::Usage(RUN_USAGE))
+            launch_command(&["run", "./--check-update"], None),
+            Ok(Some(LaunchCommand::RunFile("./--check-update".into())))
         );
+        for option in ["--bogus", "--check-updates", "-h"] {
+            assert_eq!(
+                launch_command(&["run", option], None),
+                Err(LaunchCommandError::UnknownRunOption(option.into()))
+            );
+        }
+        for arguments in [
+            &["run", "roblox.apk", "roblox://placeId=1"][..],
+            &["run", "--check-update", "roblox.apk"],
+            &["run", "--check-update", "--check-update"],
+        ] {
+            assert_eq!(
+                launch_command(arguments, None),
+                Err(LaunchCommandError::Usage(RUN_USAGE)),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_supervised_client_starts_with_the_same_run_target() {
+        for arguments in [
+            &["run"][..],
+            &["run", "--check-update"],
+            &["run", "./--check-update"],
+        ] {
+            let launch = launch_command(arguments, None).unwrap().unwrap();
+            let mut client = std::process::Command::new("eclipse");
+            launch.restart(&mut client);
+            let restarted: Vec<&OsStr> = client.get_args().collect();
+            assert_eq!(restarted, arguments);
+            let restarted: Vec<OsString> = restarted.into_iter().map(OsStr::to_owned).collect();
+            assert_eq!(LaunchCommand::parse(&restarted, None), Ok(Some(launch)));
+        }
     }
 
     #[test]
@@ -2424,7 +2792,7 @@ mod tests {
         }
         assert_eq!(
             launch_command(&["run"], Some(place)),
-            Ok(Some(LaunchCommand::Run))
+            Ok(Some(LaunchCommand::Run(RunCheck::Configured)))
         );
     }
 
@@ -2441,6 +2809,151 @@ mod tests {
                 "usage: eclipse update [--play]"
             );
         }
+    }
+
+    #[test]
+    fn storage_takes_json_or_clean_but_not_both() {
+        let action = |arguments: &[&str]| {
+            let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+            parse_storage_action(&arguments)
+        };
+        assert_eq!(action(&[]), Ok(StorageAction::Table));
+        assert_eq!(action(&["--json"]), Ok(StorageAction::Json));
+        assert_eq!(action(&["--clean"]), Ok(StorageAction::Clean));
+        for refused in [&["--json", "--clean"][..], &["--bogus"], &["clean"]] {
+            assert_eq!(
+                action(refused),
+                Err("usage: eclipse storage [--json | --clean]".to_owned()),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_refuses_while_a_client_runs() {
+        let root = temp_root("storage-clean-refused");
+        let app_data = root.join("app-data");
+        let layout = StorageLayout {
+            store: Store::at(root.join("data/roblox")),
+            native_libs: root.join("cache/native-libs"),
+            art_cache: root.join("cache/art/x86_64"),
+            client_cache: root.join("cache/client-cache"),
+            webview: eclipse::webview::client::Storage {
+                data: app_data.join("webview"),
+                cache: root.join("cache/webview"),
+                cef_profile: app_data.join("webview-cef"),
+            },
+            app_data,
+            private_cache_root: None,
+        };
+        let cached = layout.client_cache.join("rbx-storage/blob");
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, b"cached").unwrap();
+        let runtime = layout.app_data.join(RUNTIME_DIR);
+        let Ok(ClientLock::Acquired(client)) = super::instance_control::lock_client(&runtime)
+        else {
+            panic!("the test takes the client lock first");
+        };
+
+        let error = clean_storage(&layout, &StatusSink::terminal())
+            .expect_err("a running client keeps its caches")
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "close Roblox, or wait for Eclipse to finish installing it, before cleaning \
+                 (another Eclipse holds {})",
+                runtime.join("client.lock").display()
+            )
+        );
+        assert!(cached.is_file());
+        drop(client);
+        clean_storage(&layout, &StatusSink::terminal()).unwrap();
+        assert!(!cached.exists());
+        assert!(layout.client_cache.is_dir());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn played_then_updated(tag: &str) -> (std::path::PathBuf, Store) {
+        let root = temp_root(tag);
+        let store = Store::at(root.clone());
+        for (code, current) in [(3170, false), (3212, true)] {
+            std::fs::create_dir_all(root.join(code.to_string())).unwrap();
+            std::fs::write(
+                root.join("current.json"),
+                format!(r#"{{"version_code":{code}}}"#),
+            )
+            .unwrap();
+            if !current {
+                store.record_first_frame(VersionCode(code)).unwrap();
+                store.record_normal_close(VersionCode(code)).unwrap();
+            }
+        }
+        (root, store)
+    }
+
+    fn proving(store: &Store, code: u32, proof: Proof) -> Proving {
+        Proving {
+            store: store.clone(),
+            version: VersionCode(code),
+            proof,
+        }
+    }
+
+    #[test]
+    fn a_normal_close_after_the_first_frame_drops_the_kept_version() {
+        let (root, store) = played_then_updated("normal-close");
+        let attempt = store.begin_attempt(VersionCode(3212)).unwrap();
+        store.record_first_frame(VersionCode(3212)).unwrap();
+        store.prune().unwrap();
+        assert!(root.join("3170").is_dir(), "a first frame alone keeps 3170");
+
+        record_normal_end(
+            Some(proving(&store, 3212, Proof::FirstFrame)),
+            Some(attempt),
+            true,
+            &StatusSink::terminal(),
+        );
+
+        assert!(!root.join("3170").exists());
+        assert!(root.join("3212").is_dir());
+        assert_eq!(store.proof_needed(VersionCode(3212)).unwrap(), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_close_before_the_first_frame_neither_counts_nor_drops_the_kept_version() {
+        let (root, store) = played_then_updated("close-before-frame");
+        let attempt = store.begin_attempt(VersionCode(3212)).unwrap();
+
+        record_normal_end(
+            Some(proving(&store, 3212, Proof::FirstFrame)),
+            Some(attempt),
+            false,
+            &StatusSink::terminal(),
+        );
+
+        assert_eq!(store.settle_launch().unwrap(), None);
+        let states: Vec<(VersionCode, VersionState)> = store
+            .versions()
+            .unwrap()
+            .into_iter()
+            .map(|stored| (stored.version.version_code, stored.state))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                (
+                    VersionCode(3212),
+                    VersionState::Unproven { failed_starts: 0 }
+                ),
+                (VersionCode(3170), VersionState::Played),
+            ]
+        );
+        store.prune().unwrap();
+        assert!(root.join("3170").is_dir());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2694,6 +3207,7 @@ mod tests {
         let place = "roblox://placeId=1818";
         for (arguments, launch_link) in [
             (&["run"][..], None),
+            (&["run", "--check-update"], None),
             (&["open", place], None),
             (&[BROWSER_HANDLER_COMMAND, place], None),
             (&[LAUNCH_LINK_COMMAND], Some(place)),
@@ -2712,31 +3226,35 @@ mod tests {
     fn a_failed_check_is_not_retried_for_thirty_minutes() {
         let root = temp_root("failed-check");
         let store = Store::at(root.clone());
-        let rejected = Release {
-            version_code: VersionCode(3171),
-            base_sha1: [0x41; 20],
-        };
         store
             .record_check(&UpdateCheck {
                 at: std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 60 * 60),
-                rejected: Some(rejected),
                 outcome: CheckOutcome::Completed,
             })
             .unwrap();
 
         let mut attempts = 0;
-        let failed = update_if_due(&store, Some(VersionCode(3170)), |previous| {
-            attempts += 1;
-            assert_eq!(previous, Some(rejected));
-            Err("APKCombo is unreachable".into())
-        })
+        let failed = update_if_due(
+            &store,
+            Some(VersionCode(3170)),
+            LaunchCheck::WhenDue,
+            |_| {
+                attempts += 1;
+                Err("APKCombo is unreachable".into())
+            },
+        )
         .err()
         .expect("the check fails");
         assert_eq!(failed.to_string(), "APKCombo is unreachable");
-        let next_launch = update_if_due(&store, Some(VersionCode(3170)), |_| {
-            attempts += 1;
-            Ok(None)
-        });
+        let next_launch = update_if_due(
+            &store,
+            Some(VersionCode(3170)),
+            LaunchCheck::WhenDue,
+            |_| {
+                attempts += 1;
+                Ok(None)
+            },
+        );
         assert!(matches!(next_launch, Ok(None)));
         assert_eq!(
             attempts, 1,
@@ -2744,35 +3262,175 @@ mod tests {
         );
         let recorded = store.last_check().unwrap().unwrap();
         assert_eq!(recorded.outcome, CheckOutcome::Failed);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_check_recorded_by_a_failed_update_is_kept() {
+        let root = temp_root("rejected-check");
+        let store = Store::at(root.clone());
+        let recorded = UpdateCheck {
+            at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
+            outcome: CheckOutcome::Completed,
+        };
+        let error = update_if_due(
+            &store,
+            Some(VersionCode(3170)),
+            LaunchCheck::WhenDue,
+            |_| {
+                store.record_check(&recorded)?;
+                Err("the download failed verification".into())
+            },
+        )
+        .err()
+        .expect("the update failed");
+        assert_eq!(error.to_string(), "the download failed verification");
+        assert_eq!(store.last_check().unwrap(), Some(recorded));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn checks_made(
+        store: &Store,
+        installed: Option<VersionCode>,
+        check: LaunchCheck,
+    ) -> Vec<Option<Instant>> {
+        let mut deadlines = Vec::new();
+        update_if_due(store, installed, check, |deadline| {
+            deadlines.push(deadline);
+            Ok(None)
+        })
+        .expect("the mock source answers");
+        deadlines
+    }
+
+    fn completed_check(ago: Duration) -> UpdateCheck {
+        UpdateCheck {
+            at: SystemTime::now() - ago,
+            outcome: CheckOutcome::Completed,
+        }
+    }
+
+    #[test]
+    fn auto_update_off_never_contacts_a_source_when_roblox_is_installed() {
+        let root = temp_root("auto-update-off");
+        let store = Store::at(root.clone());
+        let installed = Some(VersionCode(3170));
+        let auto_update_off = RunCheck::Configured.check(false);
+        assert_eq!(auto_update_off, LaunchCheck::OnlyWhenMissing);
+        assert_eq!(checks_made(&store, installed, auto_update_off), []);
+        store
+            .record_check(&completed_check(Duration::from_secs(7 * 60 * 60)))
+            .unwrap();
+        assert_eq!(checks_made(&store, installed, auto_update_off), []);
         assert_eq!(
-            recorded.rejected,
-            Some(rejected),
-            "a failed check keeps the release rejected before it"
+            checks_made(&store, installed, RunCheck::Configured.check(true)).len(),
+            1,
+            "with the setting on, the same launch checks"
         );
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn a_rejection_recorded_by_a_failed_check_is_kept() {
-        let root = temp_root("rejected-check");
+    fn auto_update_off_still_downloads_a_first_install() {
+        let root = temp_root("auto-update-off-first-install");
         let store = Store::at(root.clone());
-        let rejected = Release {
-            version_code: VersionCode(3171),
-            base_sha1: [0x41; 20],
-        };
-        let recorded = UpdateCheck {
-            at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
-            rejected: Some(rejected),
-            outcome: CheckOutcome::Completed,
-        };
-        let error = update_if_due(&store, Some(VersionCode(3170)), |_| {
-            store.record_check(&recorded)?;
-            Err("the download failed verification".into())
-        })
+        assert_eq!(
+            checks_made(&store, None, RunCheck::Configured.check(false)),
+            [None],
+            "a first install is downloaded, and nothing cuts its check short"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn check_update_checks_even_when_not_due_and_auto_update_is_off() {
+        let root = temp_root("check-update-now");
+        let store = Store::at(root.clone());
+        store
+            .record_check(&completed_check(Duration::from_secs(60)))
+            .unwrap();
+        let installed = Some(VersionCode(3170));
+        assert_eq!(
+            checks_made(&store, installed, RunCheck::Configured.check(true)),
+            []
+        );
+        for auto_update in [false, true] {
+            let check = RunCheck::Now.check(auto_update);
+            assert_eq!(check, LaunchCheck::Now);
+            assert_eq!(
+                checks_made(&store, installed, check),
+                [None],
+                "the asked-for check waits for its answer"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_due_check_waits_at_most_three_seconds_while_roblox_is_installed() {
+        let root = temp_root("launch-check-deadline");
+        let store = Store::at(root.clone());
+        let started = Instant::now();
+        let mut given = None;
+        let error = update_if_due(
+            &store,
+            Some(VersionCode(3170)),
+            LaunchCheck::WhenDue,
+            |deadline| {
+                given = deadline;
+                Err("APKCombo's Roblox download page did not load in time".into())
+            },
+        )
         .err()
-        .expect("the update failed");
-        assert_eq!(error.to_string(), "the download failed verification");
-        assert_eq!(store.last_check().unwrap(), Some(recorded));
+        .expect("the check ran out of time");
+        let deadline = given.expect("a due check of an installed Roblox has a deadline");
+        assert!(
+            deadline >= started + LAUNCH_CHECK_BUDGET
+                && deadline <= Instant::now() + LAUNCH_CHECK_BUDGET,
+            "{:?}",
+            deadline - started
+        );
+        assert_eq!(
+            error.to_string(),
+            "APKCombo's Roblox download page did not load in time"
+        );
+        assert_eq!(
+            store.last_check().unwrap().map(|check| check.outcome),
+            Some(CheckOutcome::Failed),
+            "a check that ran out of time is retried after 30 minutes, like any failed check"
+        );
+        assert!(
+            HELP.contains(&format!("within {} seconds", LAUNCH_CHECK_BUDGET.as_secs())),
+            "{HELP}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_completed_check_keeps_every_rejection() {
+        let root = temp_root("completed-check-rejections");
+        let store = Store::at(root.clone());
+        store
+            .reject_file(DeclaredFile::ApkComboBaseSha1([0x41; 20]))
+            .unwrap();
+        let rejected = store.rejections(eclipse::VERSION).unwrap();
+        assert_ne!(rejected, Rejections::default());
+        let installed = InstalledVersion {
+            version_code: VersionCode(3170),
+            version_name: None,
+        };
+        let updated = finish_update(
+            &store,
+            UpdateOutcome::UpToDate { installed },
+            &StatusSink::terminal(),
+        )
+        .unwrap();
+        assert!(updated.is_none());
+        assert_eq!(
+            store.last_check().unwrap().map(|check| check.outcome),
+            Some(CheckOutcome::Completed)
+        );
+        assert_eq!(store.rejections(eclipse::VERSION).unwrap(), rejected);
         std::fs::remove_dir_all(&root).ok();
     }
 

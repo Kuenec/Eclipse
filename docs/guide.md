@@ -37,6 +37,7 @@ Voice chat uses your system's default microphone. Choose it in your desktop's so
 | `touch_mode` | `"off"` | `"on"` sends clicks as touch input |
 | `graphics_optimization_mode` | `"balanced"` | `"performance"` pins Eclipse to physical cores |
 | `enable_gamemode` | `true` | Turns on GameMode while Roblox runs, if GameMode is installed |
+| `roblox_auto_update` | `true` | `false` stops launches from updating Roblox; `update` and `run --check-update` still do |
 
 ## Files
 
@@ -52,5 +53,5 @@ Eclipse keeps its files in `~/.var/app/io.github.kuenec.Eclipse/`:
 
 ## Safety
 
-- Eclipse only runs files signed by Roblox Corporation (certificate SHA-256 `44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477`), and it never installs an older version.
+- Eclipse only runs files signed by Roblox Corporation (certificate SHA-256 `44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477`), and it never downloads an older version. It keeps the previous Roblox until a new one has been played and closed once: if the new one fails to start twice, Eclipse goes back to it, and `rollback` goes back to it by hand.
 - It never modifies the game. The only Fast Flag it sets on its own is `FFlagGameBasicSettingsFramerateCap5`, which shows Roblox's frame rate menu.

@@ -87,6 +87,8 @@ pub struct Config {
 
     pub enable_gamemode: bool,
 
+    pub roblox_auto_update: bool,
+
     pub fflags: BTreeMap<String, serde_json::Value>,
 
     pub webview_helper_path: Option<PathBuf>,
@@ -98,6 +100,7 @@ impl Default for Config {
             graphics_optimization_mode: GraphicsOptimizationMode::default(),
             touch_mode: TouchMode::default(),
             enable_gamemode: true,
+            roblox_auto_update: true,
             fflags: BTreeMap::new(),
             webview_helper_path: None,
         }
@@ -112,6 +115,7 @@ impl Config {
                 Setting::TouchMode(mode) => self.touch_mode = mode,
                 Setting::GraphicsOptimizationMode(mode) => self.graphics_optimization_mode = mode,
                 Setting::EnableGamemode(enabled) => self.enable_gamemode = enabled,
+                Setting::RobloxAutoUpdate(enabled) => self.roblox_auto_update = enabled,
             },
             Key::FileOnly(FileOnlyKey::Fflags) => {
                 self.fflags = serde_json::from_value(value).map_err(reason)?;
@@ -132,6 +136,7 @@ pub enum Setting {
     TouchMode(TouchMode),
     GraphicsOptimizationMode(GraphicsOptimizationMode),
     EnableGamemode(bool),
+    RobloxAutoUpdate(bool),
 }
 
 impl Setting {
@@ -141,6 +146,7 @@ impl Setting {
             Self::TouchMode(_) => SettingKey::TouchMode,
             Self::GraphicsOptimizationMode(_) => SettingKey::GraphicsOptimizationMode,
             Self::EnableGamemode(_) => SettingKey::EnableGamemode,
+            Self::RobloxAutoUpdate(_) => SettingKey::RobloxAutoUpdate,
         }
     }
 }
@@ -150,13 +156,15 @@ pub enum SettingKey {
     TouchMode,
     GraphicsOptimizationMode,
     EnableGamemode,
+    RobloxAutoUpdate,
 }
 
 impl SettingKey {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
         Self::TouchMode,
         Self::GraphicsOptimizationMode,
         Self::EnableGamemode,
+        Self::RobloxAutoUpdate,
     ];
 
     #[must_use]
@@ -165,6 +173,7 @@ impl SettingKey {
             Self::TouchMode => "touch_mode",
             Self::GraphicsOptimizationMode => "graphics_optimization_mode",
             Self::EnableGamemode => "enable_gamemode",
+            Self::RobloxAutoUpdate => "roblox_auto_update",
         }
     }
 
@@ -189,6 +198,7 @@ impl SettingKey {
                 .and_then(GraphicsOptimizationMode::from_name)
                 .map(Setting::GraphicsOptimizationMode),
             Self::EnableGamemode => value.as_bool().map(Setting::EnableGamemode),
+            Self::RobloxAutoUpdate => value.as_bool().map(Setting::RobloxAutoUpdate),
         };
         setting.ok_or_else(|| format!("expected one of {}", self.accepted_values()))
     }
@@ -199,7 +209,7 @@ impl SettingKey {
             Self::GraphicsOptimizationMode => {
                 &GraphicsOptimizationMode::ALL.map(GraphicsOptimizationMode::as_str)
             }
-            Self::EnableGamemode => &["true", "false"],
+            Self::EnableGamemode | Self::RobloxAutoUpdate => &["true", "false"],
         };
         let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
         quoted.join(", ")
@@ -314,7 +324,7 @@ mod tests {
         assert_eq!(
             SettingError::UnknownKey("use_opengl".to_owned()).to_string(),
             "`use_opengl` is not a setting; the settings are `touch_mode`, \
-             `graphics_optimization_mode`, `enable_gamemode`"
+             `graphics_optimization_mode`, `enable_gamemode`, `roblox_auto_update`"
         );
     }
 
@@ -412,6 +422,35 @@ mod tests {
     }
 
     #[test]
+    fn roblox_auto_update_takes_only_a_json_boolean() {
+        for enabled in [true, false] {
+            let setting = SettingKey::RobloxAutoUpdate
+                .parse(enabled.into())
+                .expect("a boolean");
+            assert_eq!(setting, Setting::RobloxAutoUpdate(enabled));
+            assert_eq!(setting.key(), SettingKey::RobloxAutoUpdate);
+            assert_eq!(
+                serde_json::to_string(&setting).expect("serialize"),
+                enabled.to_string()
+            );
+        }
+        for value in [
+            serde_json::json!("false"),
+            serde_json::json!(0),
+            serde_json::json!(null),
+        ] {
+            assert_eq!(
+                SettingKey::RobloxAutoUpdate.parse(value.clone()),
+                Err(SettingError::Invalid {
+                    key: SettingKey::RobloxAutoUpdate,
+                    message: "expected one of `true`, `false`".to_owned(),
+                }),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn every_schema_key_is_a_setting_or_file_only() {
         let written = serde_json::to_value(Config::default()).expect("serialize");
         let mut schema: Vec<&str> = written
@@ -444,6 +483,7 @@ mod tests {
         assert_eq!(default_json("touch_mode"), r#""off""#);
         assert_eq!(default_json("graphics_optimization_mode"), r#""balanced""#);
         assert_eq!(default_json("enable_gamemode"), "true");
+        assert_eq!(default_json("roblox_auto_update"), "true");
         assert_eq!(default_json("fflags"), "{}");
         assert_eq!(default_json("webview_helper_path"), "null");
     }

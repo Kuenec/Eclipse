@@ -2,15 +2,15 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY, SHA1_OUTPUT_LEN};
 use ureq::http::header::USER_AGENT;
 use ureq::http::{Request, Response, Uri};
 
 use super::store::{
-    CheckOutcome, Committed, InstalledVersion, Release, Staging, Store, StoreError, UpdateCheck,
-    UpdateOutcome,
+    plan, Candidate, CheckMode, CheckOutcome, DeclaredFile, InstalledVersion, LeftBecause, Plan,
+    Rejection, Staging, Store, StoreError, UpdateCheck, UpdateOutcome,
 };
 use super::{
     ApkSet, ApkSetError, VersionCode, BASE_APK, MAX_APK_BYTES, ROBLOX_PACKAGE, TARGET_ABI,
@@ -133,10 +133,10 @@ struct Offer {
 }
 
 impl Offer {
-    fn release(&self) -> Release {
-        Release {
-            version_code: self.version_code,
-            base_sha1: self.base_sha1,
+    fn candidate(&self) -> Candidate {
+        Candidate {
+            version: self.version_code,
+            file: DeclaredFile::ApkComboBaseSha1(self.base_sha1),
         }
     }
 }
@@ -244,7 +244,8 @@ impl fmt::Display for Choice {
 pub fn update(
     store: &Store,
     current: Option<&ApkSet>,
-    rejected: Option<Release>,
+    mode: CheckMode,
+    check_deadline: Option<Instant>,
     status: &StatusSink,
 ) -> Result<UpdateOutcome, ApkComboError> {
     let pages = https::request_agent();
@@ -252,9 +253,10 @@ pub fn update(
     update_from(
         store,
         current,
-        rejected,
+        mode,
+        check_deadline,
         status,
-        |page| fetch_page(&pages, page),
+        |page, deadline| fetch_page(&pages, page, deadline),
         |url, resume| https::open_download(&downloads, &url.to_string(), DOWNLOAD_HOSTS, resume),
     )
 }
@@ -262,13 +264,14 @@ pub fn update(
 fn update_from<R: Read>(
     store: &Store,
     current: Option<&ApkSet>,
-    rejected: Option<Release>,
+    mode: CheckMode,
+    check_deadline: Option<Instant>,
     status: &StatusSink,
-    mut fetch: impl FnMut(&Page) -> Result<String, ApkComboError>,
+    mut fetch: impl FnMut(&Page, Option<Instant>) -> Result<String, ApkComboError>,
     mut open: impl FnMut(&Uri, Option<&Resume>) -> Result<Download<R>, DownloadError>,
 ) -> Result<UpdateOutcome, ApkComboError> {
     let installed = current.map(InstalledVersion::from);
-    let choice = choose(installed.as_ref(), &mut fetch)?;
+    let choice = choose(installed.as_ref(), |page| fetch(page, check_deadline))?;
     status.step(choice.to_string());
     let offer = match choice {
         Choice::Offered { offer, .. } => offer,
@@ -276,9 +279,9 @@ fn update_from<R: Read>(
     };
     let own_page = Page::Release(offer.version_name.clone());
     let mut link = offer.url.clone();
-    update_with(&offer, store, current, rejected, status, |resume| {
+    update_with(&offer, store, current, mode, status, |resume| {
         open_renewing(&offer, &mut link, resume, &mut open, || {
-            parse_listing(&fetch(&own_page)?, &own_page)
+            parse_listing(&fetch(&own_page, None)?, &own_page)
         })
     })
 }
@@ -370,7 +373,7 @@ fn update_with<R: Read>(
     offer: &Offer,
     store: &Store,
     current: Option<&ApkSet>,
-    rejected: Option<Release>,
+    mode: CheckMode,
     status: &StatusSink,
     open: impl FnMut(Option<&Resume>) -> Result<Download<R>, ApkComboError>,
 ) -> Result<UpdateOutcome, ApkComboError> {
@@ -389,45 +392,64 @@ fn update_with<R: Read>(
         let set = store.usable_current()?;
         (set.as_ref().map(InstalledVersion::from), set)
     };
-    match plan(offer, verified.as_ref(), recorded.as_ref(), rejected)? {
+    let rejections = store.rejections(crate::VERSION)?;
+    match plan(
+        offer.candidate(),
+        verified.as_ref(),
+        recorded.as_ref(),
+        &rejections,
+        mode,
+    ) {
         Plan::UpToDate(installed) => Ok(match refreshed {
             Some(set) => UpdateOutcome::Updated {
                 previous,
-                committed: Box::new(Committed {
-                    set,
-                    leftover: None,
-                }),
+                set: Box::new(set),
             },
             None => UpdateOutcome::UpToDate { installed },
         }),
-        Plan::Skip => Err(remember_rejection(
+        Plan::Older(installed) => Err(ApkComboError::Older {
+            offered: offer.to_string(),
+            installed,
+        }),
+        Plan::Rejected(rejection) => Err(remember_rejection(
             store,
-            offer,
+            None,
             ApkComboError::RejectedBefore {
                 offered: offer.to_string(),
+                rejection,
             },
         )),
         Plan::Download => {
             status.step(format!("Downloading {offer}…"));
             match install(offer, staging, open, status) {
-                Ok(committed) => Ok(UpdateOutcome::Updated {
+                Ok(set) => Ok(UpdateOutcome::Updated {
                     previous,
-                    committed: Box::new(committed),
+                    set: Box::new(set),
                 }),
-                Err(error) if error.rejects_offer() => Err(remember_rejection(store, offer, error)),
+                Err(error) if error.rejects_offer() => Err(remember_rejection(
+                    store,
+                    Some(offer.candidate().file),
+                    error,
+                )),
                 Err(error) => Err(error),
             }
         }
     }
 }
 
-fn remember_rejection(store: &Store, offer: &Offer, rejection: ApkComboError) -> ApkComboError {
+fn remember_rejection(
+    store: &Store,
+    rejected_file: Option<DeclaredFile>,
+    rejection: ApkComboError,
+) -> ApkComboError {
     let check = UpdateCheck {
         at: SystemTime::now(),
-        rejected: Some(offer.release()),
         outcome: CheckOutcome::Completed,
     };
-    match store.record_check(&check) {
+    let recorded = rejected_file
+        .map_or(Ok(()), |file| store.reject_file(file))
+        .and_then(|()| store.record_check(&check));
+    match recorded {
         Ok(()) => rejection,
         Err(source) => ApkComboError::NotRemembered {
             rejection: Box::new(rejection),
@@ -436,44 +458,12 @@ fn remember_rejection(store: &Store, offer: &Offer, rejection: ApkComboError) ->
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Plan {
-    UpToDate(InstalledVersion),
-    Skip,
-    Download,
-}
-
-fn plan(
-    offer: &Offer,
-    verified: Option<&InstalledVersion>,
-    recorded: Option<&InstalledVersion>,
-    rejected: Option<Release>,
-) -> Result<Plan, ApkComboError> {
-    if let Some(installed) =
-        verified.filter(|installed| installed.version_code >= offer.version_code)
-    {
-        return Ok(Plan::UpToDate(installed.clone()));
-    }
-    if let Some(installed) =
-        recorded.filter(|installed| installed.version_code > offer.version_code)
-    {
-        return Err(ApkComboError::Older {
-            offered: offer.to_string(),
-            installed: installed.clone(),
-        });
-    }
-    if rejected == Some(offer.release()) {
-        return Ok(Plan::Skip);
-    }
-    Ok(Plan::Download)
-}
-
 fn install<R: Read>(
     offer: &Offer,
     staging: Staging<'_>,
     open: impl FnMut(Option<&Resume>) -> Result<Download<R>, ApkComboError>,
     status: &StatusSink,
-) -> Result<Committed, ApkComboError> {
+) -> Result<ApkSet, ApkComboError> {
     let base = staging.dir().join(BASE_APK);
     match offer.packaging {
         Packaging::Apk => save_download(open, offer.size, &base, status)?,
@@ -518,11 +508,29 @@ fn store_failure(error: StoreError) -> ApkComboError {
     }
 }
 
-fn fetch_page(agent: &ureq::Agent, page: &Page) -> Result<String, ApkComboError> {
+fn fetch_page(
+    agent: &ureq::Agent,
+    page: &Page,
+    deadline: Option<Instant>,
+) -> Result<String, ApkComboError> {
+    let request = match deadline {
+        None => page_request(page),
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(ApkComboError::OutOfTime { page: page.clone() });
+            }
+            agent
+                .configure_request(page_request(page))
+                .timeout_global(Some(left))
+                .timeout_connect(None)
+                .build()
+        }
+    };
     let response = agent
-        .run(page_request(page))
-        .map_err(|error| ApkComboError::page(page, error))?;
-    page_text(page, response)
+        .run(request)
+        .map_err(|error| ApkComboError::page(page, deadline, error))?;
+    page_text(page, deadline, response)
 }
 
 fn page_request(page: &Page) -> Request<()> {
@@ -532,7 +540,11 @@ fn page_request(page: &Page) -> Request<()> {
         .expect("a GET of an APKCombo page with an ASCII User-Agent is a valid request")
 }
 
-fn page_text(page: &Page, response: Response<ureq::Body>) -> Result<String, ApkComboError> {
+fn page_text(
+    page: &Page,
+    deadline: Option<Instant>,
+    response: Response<ureq::Body>,
+) -> Result<String, ApkComboError> {
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(ApkComboError::PageStatus {
@@ -545,7 +557,7 @@ fn page_text(page: &Page, response: Response<ureq::Body>) -> Result<String, ApkC
         .into_with_config()
         .limit(MAX_PAGE_BYTES)
         .read_to_vec()
-        .map_err(|error| ApkComboError::page(page, error))?;
+        .map_err(|error| ApkComboError::page(page, deadline, error))?;
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
@@ -833,6 +845,10 @@ pub enum ApkComboError {
         detail: String,
     },
 
+    OutOfTime {
+        page: Page,
+    },
+
     PageStatus {
         page: Page,
         status: u16,
@@ -874,6 +890,7 @@ pub enum ApkComboError {
 
     RejectedBefore {
         offered: String,
+        rejection: Rejection,
     },
 
     Io {
@@ -892,10 +909,13 @@ pub enum ApkComboError {
 }
 
 impl ApkComboError {
-    fn page(page: &Page, error: ureq::Error) -> Self {
-        Self::Page {
-            page: page.clone(),
-            detail: https::redacted(error),
+    fn page(page: &Page, deadline: Option<Instant>, error: ureq::Error) -> Self {
+        match (deadline, error) {
+            (Some(_), ureq::Error::Timeout(_)) => Self::OutOfTime { page: page.clone() },
+            (_, error) => Self::Page {
+                page: page.clone(),
+                detail: https::redacted(error),
+            },
         }
     }
 
@@ -921,6 +941,11 @@ impl fmt::Display for ApkComboError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Page { page, detail } => write!(f, "cannot load {page}: {detail}"),
+            Self::OutOfTime { page } => write!(
+                f,
+                "{page} did not load in the time a launch gives the update check; run `eclipse \
+                 update` to check without that limit"
+            ),
             Self::PageStatus {
                 page,
                 status: status @ (403 | 429 | 503),
@@ -971,11 +996,32 @@ impl fmt::Display for ApkComboError {
                 "APKCombo offers {offered}, which is older than the installed Roblox \
                  {installed}; Eclipse never installs an older Roblox"
             ),
-            Self::RejectedBefore { offered } => write!(
+            Self::RejectedBefore {
+                offered,
+                rejection: Rejection::FailedVerification,
+            } => write!(
                 f,
                 "APKCombo still offers {offered}, which Eclipse downloaded and rejected before, \
                  so it is not downloaded again automatically; run `eclipse update` to retry it, \
                  or wait for a newer Roblox"
+            ),
+            Self::RejectedBefore {
+                offered,
+                rejection: Rejection::Left(LeftBecause::FailedToStart),
+            } => write!(
+                f,
+                "APKCombo still offers {offered}, which failed to start twice with this Eclipse, \
+                 so it is not installed again automatically; run `eclipse update` to retry it, \
+                 or wait for a newer Roblox"
+            ),
+            Self::RejectedBefore {
+                offered,
+                rejection: Rejection::Left(LeftBecause::RolledBack),
+            } => write!(
+                f,
+                "APKCombo still offers {offered}, which you went back from with \
+                 `eclipse rollback`, so it is not installed again automatically; run \
+                 `eclipse update` to install it, or wait for a newer Roblox"
             ),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Rejected(error) => write!(
@@ -1002,6 +1048,7 @@ impl std::error::Error for ApkComboError {
             | Self::Store(error)
             | Self::NotRemembered { source: error, .. } => Some(error),
             Self::Page { .. }
+            | Self::OutOfTime { .. }
             | Self::PageStatus { .. }
             | Self::PageLayout { .. }
             | Self::NoX86_64 { .. }
@@ -1031,8 +1078,11 @@ impl From<DownloadError> for ApkComboError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apk::store::Rejections;
     use crate::apk::{ApkSetPaths, NATIVE_SPLIT_APK};
     use std::io::Write;
+    use std::net::TcpListener;
+    use std::time::Duration;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
@@ -1120,19 +1170,19 @@ mod tests {
     fn the_page_is_read_only_from_a_success_status_and_below_four_mebibytes() {
         let newest = &Page::Newest;
         assert_eq!(
-            page_text(newest, page_response(200, LATEST_PAGE)).unwrap(),
+            page_text(newest, None, page_response(200, LATEST_PAGE)).unwrap(),
             LATEST_PAGE
         );
         let largest = MAX_PAGE_BYTES as usize - 1;
         assert_eq!(
-            page_text(newest, page_response(200, vec![b'a'; largest]))
+            page_text(newest, None, page_response(200, vec![b'a'; largest]))
                 .unwrap()
                 .len(),
             largest
         );
 
         let older = &release("2.740.931");
-        let err = page_text(older, page_response(200, vec![b'a'; largest + 1])).unwrap_err();
+        let err = page_text(older, None, page_response(200, vec![b'a'; largest + 1])).unwrap_err();
         assert!(
             matches!(&err, ApkComboError::Page { page, .. } if page == older),
             "{err:?}"
@@ -1143,14 +1193,15 @@ mod tests {
             "{err}"
         );
         for status in [403, 429, 503] {
-            let err = page_text(newest, page_response(status, "Just a moment...")).unwrap_err();
+            let err =
+                page_text(newest, None, page_response(status, "Just a moment...")).unwrap_err();
             assert!(
                 matches!(err, ApkComboError::PageStatus { status: code, .. } if code == status),
                 "{err:?}"
             );
             assert!(err.to_string().contains("eclipse install"), "{err}");
         }
-        let err = page_text(older, page_response(404, "")).unwrap_err();
+        let err = page_text(older, None, page_response(404, "")).unwrap_err();
         assert_eq!(
             err.to_string(),
             "APKCombo's download page for Roblox 2.740.931 answered HTTP 404"
@@ -1188,10 +1239,10 @@ mod tests {
             "Roblox 2.740.931 (versionCode 3170, XAPK, about 234 MiB)"
         );
         assert_eq!(
-            offer.release(),
-            Release {
-                version_code: VersionCode(3170),
-                base_sha1: parse_sha1(LATEST_BASE_SHA1).unwrap()
+            offer.candidate(),
+            Candidate {
+                version: VersionCode(3170),
+                file: DeclaredFile::ApkComboBaseSha1(parse_sha1(LATEST_BASE_SHA1).unwrap())
             }
         );
     }
@@ -1918,13 +1969,15 @@ mod tests {
             let dir = temp_dir("renew");
             let store = Store::at(dir.join("store"));
             let mut fetched = Vec::new();
+            let mut serve = served_pages(&site, &mut fetched);
             let mut opened = Vec::new();
             let err = update_from(
                 &store,
                 None,
+                CheckMode::Scheduled,
                 None,
                 &StatusSink::terminal(),
-                served_pages(&site, &mut fetched),
+                move |page: &Page, _| serve(page),
                 |url: &Uri, resume: Option<&Resume>| {
                     opened.push((url.path().to_owned(), resume.map(|resume| resume.offset)));
                     match opened.len() {
@@ -1963,6 +2016,140 @@ mod tests {
     }
 
     #[test]
+    fn only_the_release_check_waits_on_the_check_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let site = gap_site();
+        let dir = temp_dir("check-deadline");
+        let store = Store::at(dir.join("store"));
+        let mut fetched = Vec::new();
+        let mut serve = served_pages(&site, &mut fetched);
+        let mut deadlines = Vec::new();
+        let mut opened = 0;
+        let err = update_from(
+            &store,
+            None,
+            CheckMode::Scheduled,
+            Some(deadline),
+            &StatusSink::terminal(),
+            |page: &Page, page_deadline| {
+                deadlines.push(page_deadline);
+                serve(page)
+            },
+            |_: &Uri, _: Option<&Resume>| {
+                opened += 1;
+                if opened == 1 {
+                    Ok(whole(
+                        Box::new((&[0u8; 60][..]).chain(FailingBody)) as Box<dyn Read>,
+                        Some(234 * MEBIBYTE),
+                    ))
+                } else {
+                    Err(DownloadError::Status(EXPIRED_LINK_STATUS))
+                }
+            },
+        )
+        .err()
+        .expect("the renewed link has expired too");
+        drop(serve);
+        assert!(
+            matches!(
+                err,
+                ApkComboError::Download(DownloadError::Status(EXPIRED_LINK_STATUS))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            fetched,
+            [Page::Newest, release("2.740.931"), release("2.740.931")]
+        );
+        assert_eq!(
+            deadlines,
+            [Some(deadline), Some(deadline), None],
+            "the pages that decide whether to update wait only until the deadline; renewing \
+             the link of a download already under way does not"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_timeout_while_a_deadline_applies_is_reported_as_out_of_time() {
+        let deadline = Some(Instant::now() + Duration::from_secs(3));
+        for timeout in [
+            ureq::Timeout::Global,
+            ureq::Timeout::Connect,
+            ureq::Timeout::RecvBody,
+        ] {
+            let err = ApkComboError::page(&Page::Newest, deadline, ureq::Error::Timeout(timeout));
+            assert!(
+                matches!(&err, ApkComboError::OutOfTime { page } if *page == Page::Newest),
+                "{timeout:?}: {err:?}"
+            );
+        }
+        let err = ApkComboError::page(
+            &Page::Newest,
+            None,
+            ureq::Error::Timeout(ureq::Timeout::Connect),
+        );
+        assert_eq!(
+            err.to_string(),
+            "cannot load APKCombo's Roblox download page: timeout: connect"
+        );
+        let err = ApkComboError::page(&Page::Newest, deadline, ureq::Error::HostNotFound);
+        assert!(matches!(err, ApkComboError::Page { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_page_request_ends_at_the_check_deadline() {
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = proxy.local_addr().unwrap();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .https_only(true)
+            .timeout_global(Some(Duration::from_secs(60)))
+            .proxy(Some(
+                ureq::Proxy::new(&format!("http://{address}")).unwrap(),
+            ))
+            .build()
+            .into();
+
+        let started = Instant::now();
+        let err = fetch_page(
+            &agent,
+            &Page::Newest,
+            Some(started + Duration::from_millis(300)),
+        )
+        .expect_err("the proxy never answers");
+        let waited = started.elapsed();
+        assert!(
+            matches!(&err, ApkComboError::OutOfTime { page } if *page == Page::Newest),
+            "{err:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(10),
+            "the request ended at the deadline, not at the agent's own timeouts: {waited:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "APKCombo's Roblox download page did not load in the time a launch gives the update \
+             check; run `eclipse update` to check without that limit"
+        );
+
+        let passed = fetch_page(&agent, &release("2.740.931"), Some(Instant::now()));
+        assert!(
+            matches!(&passed, Err(ApkComboError::OutOfTime { page }) if *page == release("2.740.931")),
+            "{passed:?}"
+        );
+        proxy.set_nonblocking(true).unwrap();
+        assert!(
+            proxy.accept().is_ok(),
+            "the first request reached the proxy"
+        );
+        assert_eq!(
+            proxy.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "a page asked for after the deadline is not requested at all"
+        );
+    }
+
+    #[test]
     fn sha1_digests_match_the_standard_test_vector_and_parse_from_hex() {
         let dir = temp_dir("sha1");
         let path = dir.join("abc");
@@ -1983,65 +2170,24 @@ mod tests {
     }
 
     #[test]
-    fn only_a_newer_release_is_downloaded_and_roblox_is_never_downgraded() {
-        let offer = offer_on(LATEST_PAGE);
-        assert_eq!(plan(&offer, None, None, None).unwrap(), Plan::Download);
-        assert_eq!(
-            plan(&offer, Some(&installed(3056)), Some(&installed(3056)), None).unwrap(),
-            Plan::Download
-        );
-        for code in [3170, 3200] {
-            assert_eq!(
-                plan(&offer, Some(&installed(code)), Some(&installed(code)), None).unwrap(),
-                Plan::UpToDate(installed(code))
-            );
-        }
-        assert_eq!(
-            plan(&offer, None, Some(&installed(3170)), None).unwrap(),
-            Plan::Download,
-            "a damaged install of the offered release is repaired"
-        );
-        let err = plan(&offer, None, Some(&installed(3200)), None).unwrap_err();
+    fn an_offer_older_than_the_installed_roblox_is_refused() {
+        let dir = temp_dir("older");
+        let root = dir.join("store");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("current.json"), b"{\"version_code\": 3200}").unwrap();
+        let err = update_with(
+            &small_offer(),
+            &Store::at(root),
+            None,
+            CheckMode::Explicit,
+            &StatusSink::terminal(),
+            |_| -> Result<Download<&[u8]>, _> { panic!("an older release is not downloaded") },
+        )
+        .err()
+        .expect("an older release is refused");
         assert!(matches!(err, ApkComboError::Older { .. }), "{err:?}");
         assert!(err.to_string().contains("never installs an older"), "{err}");
-    }
-
-    #[test]
-    fn a_rejected_release_is_skipped_but_an_installed_or_other_one_is_not() {
-        let offer = offer_on(LATEST_PAGE);
-        let rejected = Some(offer.release());
-        assert_eq!(
-            plan(
-                &offer,
-                Some(&installed(3056)),
-                Some(&installed(3056)),
-                rejected
-            )
-            .unwrap(),
-            Plan::Skip
-        );
-        assert_eq!(plan(&offer, None, None, rejected).unwrap(), Plan::Skip);
-        assert_eq!(
-            plan(
-                &offer,
-                Some(&installed(3170)),
-                Some(&installed(3170)),
-                rejected
-            )
-            .unwrap(),
-            Plan::UpToDate(installed(3170)),
-            "an installed release is up to date whatever was rejected"
-        );
-        let mut other_file = offer.release();
-        other_file.base_sha1[0] ^= 1;
-        let mut older = offer.release();
-        older.version_code = VersionCode(3120);
-        for other in [other_file, older] {
-            assert_eq!(
-                plan(&offer, None, None, Some(other)).unwrap(),
-                Plan::Download
-            );
-        }
+        fs::remove_dir_all(&dir).ok();
     }
 
     fn small_offer() -> Offer {
@@ -2061,7 +2207,7 @@ mod tests {
             &offer,
             &store,
             None,
-            None,
+            CheckMode::Scheduled,
             &StatusSink::terminal(),
             served(&[0u8; 150][..], Some(150)),
         )
@@ -2075,14 +2221,14 @@ mod tests {
             .last_check()
             .unwrap()
             .expect("the rejection completes the check");
-        assert_eq!(check.rejected, Some(offer.release()));
+        assert_eq!(check.outcome, CheckOutcome::Completed);
 
         let mut opened = false;
         let err = update_with(
             &offer,
             &store,
             None,
-            check.rejected,
+            CheckMode::Scheduled,
             &StatusSink::terminal(),
             |_| {
                 opened = true;
@@ -2093,29 +2239,32 @@ mod tests {
         .expect("the rejected release is not installed");
         assert!(!opened, "the rejected release is not downloaded again");
         assert!(
-            matches!(err, ApkComboError::RejectedBefore { .. }),
+            matches!(
+                err,
+                ApkComboError::RejectedBefore {
+                    rejection: Rejection::FailedVerification,
+                    ..
+                }
+            ),
             "{err:?}"
         );
         assert!(err.to_string().contains("eclipse update"), "{err}");
         let skipped = store.last_check().unwrap().unwrap();
-        assert_eq!(skipped.rejected, Some(offer.release()));
+        assert_eq!(skipped.outcome, CheckOutcome::Completed);
         assert!(skipped.at >= check.at, "skipping completes the check too");
 
         let mut newer = small_offer();
         newer.version_code = VersionCode(3171);
-        for (offer, rejected) in [(&newer, check.rejected), (&offer, None)] {
+        newer.base_sha1[0] ^= 1;
+        for (offer, mode) in [
+            (&newer, CheckMode::Scheduled),
+            (&offer, CheckMode::Explicit),
+        ] {
             let mut opened = false;
-            let err = update_with(
-                offer,
-                &store,
-                None,
-                rejected,
-                &StatusSink::terminal(),
-                |_| {
-                    opened = true;
-                    Ok(whole(&[0u8; 150][..], Some(150)))
-                },
-            )
+            let err = update_with(offer, &store, None, mode, &StatusSink::terminal(), |_| {
+                opened = true;
+                Ok(whole(&[0u8; 150][..], Some(150)))
+            })
             .err()
             .expect("the download is rejected");
             assert!(
@@ -2127,17 +2276,36 @@ mod tests {
     }
 
     #[test]
+    fn a_version_left_with_rollback_is_skipped_as_the_users_choice() {
+        let skipped = |because| {
+            ApkComboError::RejectedBefore {
+                offered: "Roblox 2.740.931 (versionCode 3170)".to_owned(),
+                rejection: Rejection::Left(because),
+            }
+            .to_string()
+        };
+        let rolled_back = skipped(LeftBecause::RolledBack);
+        assert!(
+            rolled_back.contains("which you went back from with `eclipse rollback`")
+                && !rolled_back.contains("failed to start"),
+            "{rolled_back}"
+        );
+        let failed = skipped(LeftBecause::FailedToStart);
+        assert!(failed.contains("failed to start twice"), "{failed}");
+    }
+
+    #[test]
     fn a_rejection_that_cannot_be_recorded_still_says_why_it_was_rejected() {
         let dir = temp_dir("unrecorded");
         let root = dir.join("store");
-        fs::create_dir_all(root.join("last-update-check.json").join("taken")).unwrap();
+        fs::create_dir_all(root.join("state.lock").join("taken")).unwrap();
         let store = Store::at(root);
 
         let err = update_with(
             &small_offer(),
             &store,
             None,
-            None,
+            CheckMode::Scheduled,
             &StatusSink::terminal(),
             served(&[0u8; 150][..], Some(150)),
         )
@@ -2150,7 +2318,7 @@ mod tests {
             matches!(**rejection, ApkComboError::SizeMismatch { actual: 150, .. }),
             "{err:?}"
         );
-        assert!(matches!(source, StoreError::Replace { .. }), "{err:?}");
+        assert!(matches!(source, StoreError::Io { .. }), "{err:?}");
         let text = err.to_string();
         assert!(
             text.contains("has 150 bytes") && text.contains("could not record the rejection"),
@@ -2169,7 +2337,7 @@ mod tests {
             &offer,
             &store,
             None,
-            None,
+            CheckMode::Scheduled,
             &StatusSink::terminal(),
             served(FailingBody, None),
         )
@@ -2183,7 +2351,7 @@ mod tests {
             &offer,
             &store,
             None,
-            None,
+            CheckMode::Scheduled,
             &StatusSink::terminal(),
             served(&[0u8; 95][..], Some(100)),
         )
@@ -2200,7 +2368,7 @@ mod tests {
             &offer,
             &store,
             None,
-            None,
+            CheckMode::Scheduled,
             &StatusSink::terminal(),
             |_| -> Result<Download<&[u8]>, _> {
                 Err(ApkComboError::Download(DownloadError::Status(403)))
@@ -2305,7 +2473,6 @@ mod tests {
             served(File::open(download).unwrap(), Some(length)),
             &status,
         )
-        .map(|committed| committed.set)
     }
 
     fn store_entries(root: &Path) -> Vec<String> {
@@ -2421,12 +2588,12 @@ mod tests {
         );
         assert_eq!(
             plan(
-                &offer,
+                offer.candidate(),
                 Some(&InstalledVersion::from(&set)),
                 store.current().unwrap().as_ref(),
-                None
-            )
-            .unwrap(),
+                &Rejections::default(),
+                CheckMode::Scheduled,
+            ),
             Plan::UpToDate(InstalledVersion::from(&official))
         );
 
@@ -2434,7 +2601,7 @@ mod tests {
             &offer,
             &store,
             Some(&set),
-            None,
+            CheckMode::Scheduled,
             &StatusSink::terminal(),
             |_| -> Result<Download<&[u8]>, _> {
                 panic!("an up-to-date install is not downloaded again")
@@ -2455,12 +2622,14 @@ mod tests {
             ),
         ];
         let mut fetched = Vec::new();
+        let mut serve = served_pages(&site, &mut fetched);
         let outcome = update_from(
             &store,
             Some(&set),
+            CheckMode::Scheduled,
             None,
             &StatusSink::terminal(),
-            served_pages(&site, &mut fetched),
+            move |page: &Page, _| serve(page),
             |_: &Uri, _: Option<&Resume>| -> Result<Download<&[u8]>, DownloadError> {
                 panic!("the installed release is kept, not downloaded again")
             },
@@ -2482,7 +2651,7 @@ mod tests {
             &offer,
             &store,
             None,
-            None,
+            CheckMode::Scheduled,
             &StatusSink::terminal(),
             |_| -> Result<Download<&[u8]>, _> {
                 panic!("a release another launch installed meanwhile is not downloaded again")
@@ -2491,12 +2660,11 @@ mod tests {
         .expect("the release another launch installed is used");
         let UpdateOutcome::Updated {
             previous: None,
-            committed,
+            set,
         } = outcome
         else {
             panic!("the release installed meanwhile is handed back as the update");
         };
-        let set = committed.set;
         assert_eq!(set.version_code(), offer.version_code);
         assert_eq!(set.base_path(), version_dir.join(BASE_APK));
         drop(set);

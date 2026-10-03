@@ -823,6 +823,7 @@ mod tests {
                 graphics_optimization_mode: GraphicsOptimizationMode::Quality,
                 touch_mode: TouchMode::FakeOff,
                 enable_gamemode: false,
+                roblox_auto_update: false,
                 fflags: BTreeMap::from([("DFIntExample".to_owned(), 42.into())]),
                 webview_helper_path: Some(PathBuf::from("/opt/eclipse-webview")),
             },
@@ -859,6 +860,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             [format!(
                 "{}:1:21: enable_gamemode: expected one of `true`, `false`; Eclipse uses the \
+                 default (true)",
+                path.display()
+            )]
+        );
+    }
+
+    #[test]
+    fn roblox_auto_update_can_be_turned_off() {
+        let (_, loaded) = load_bytes("auto-update-off", br#"{"roblox_auto_update": false}"#);
+        assert_eq!(loaded.problems, []);
+        assert!(loaded.unused_keys.is_empty(), "{:?}", loaded.unused_keys);
+        assert!(!loaded.config.roblox_auto_update);
+        let (_, loaded) = load_bytes("auto-update-absent", b"{}");
+        assert!(loaded.config.roblox_auto_update);
+    }
+
+    #[test]
+    fn a_roblox_auto_update_that_is_not_a_boolean_keeps_updates_on() {
+        let (path, loaded) = load_bytes("auto-update-string", br#"{"roblox_auto_update": "no"}"#);
+        assert!(loaded.config.roblox_auto_update);
+        assert_eq!(
+            loaded
+                .problems
+                .iter()
+                .map(Problem::to_string)
+                .collect::<Vec<_>>(),
+            [format!(
+                "{}:1:24: roblox_auto_update: expected one of `true`, `false`; Eclipse uses the \
                  default (true)",
                 path.display()
             )]

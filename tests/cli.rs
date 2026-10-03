@@ -81,6 +81,30 @@ fn a_malformed_config_is_reported_with_its_position_and_the_launch_continues() {
 }
 
 #[test]
+fn an_unknown_run_option_is_named_and_nothing_starts() {
+    let root = sandbox("unknown-run-option");
+    let app_data = root.join("app-data");
+
+    let output = eclipse(
+        &root,
+        &app_data,
+        &[OsStr::new("run"), OsStr::new("--check-updates")],
+    );
+    let set_up = app_data.exists();
+    std::fs::remove_dir_all(&root).ok();
+
+    let stderr = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        "eclipse run: unknown option `--check-updates`; give a file whose name starts with `-` \
+         as `./--check-updates`\nusage: eclipse run [--check-update | APK | DIRECTORY]\n"
+    );
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    assert!(!set_up, "nothing is prepared for a launch");
+}
+
+#[test]
 fn an_app_data_directory_that_cannot_be_created_is_named() {
     let root = sandbox("blocked-app-data");
     std::fs::write(root.join("blocker"), b"a file where a directory belongs").unwrap();
@@ -188,6 +212,7 @@ fn installs_and_updates_are_refused_while_roblox_runs() {
         &[OsStr::new("update"), OsStr::new("--play")],
     );
     let store_touched = store.exists();
+    let assets_extracted = app_data.join("files").exists();
     drop(client);
     let after_exit = eclipse(
         &root,
@@ -202,10 +227,92 @@ fn installs_and_updates_are_refused_while_roblox_runs() {
         assert!(stderr.contains("Roblox is running in Eclipse"), "{stderr}");
     }
     assert!(!store_touched, "a refused install leaves the store alone");
+    assert!(!assets_extracted, "a refused install prepares nothing");
     let after_exit = stderr(&after_exit);
     assert!(
         !after_exit.contains("Roblox is running in Eclipse"),
         "{after_exit}"
+    );
+}
+
+#[test]
+fn a_terminal_install_prepares_the_client_for_its_next_launch() {
+    let Some(paths) =
+        eclipse::apk::ApkSetPaths::from_env().expect("ECLIPSE_ROBLOX_APK must be usable")
+    else {
+        eprintln!("SKIP: set ECLIPSE_ROBLOX_APK to install the official Roblox APK set");
+        return;
+    };
+    let root = sandbox("install-prepares");
+    let app_data = root.join("app-data");
+    let mut install = vec![OsStr::new("install"), paths.base.as_os_str()];
+    install.extend(paths.native_split.iter().map(|split| split.as_os_str()));
+
+    let output = eclipse(&root, &app_data, &install);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let mut set = eclipse::apk::store::Store::at(root.join("data").join("eclipse").join("roblox"))
+        .verified_current()
+        .expect("the installed set opens")
+        .expect("Roblox is installed");
+    let libs = root
+        .join("cache")
+        .join("eclipse")
+        .join("native-libs")
+        .join(set.version_code().to_string());
+    let status = eclipse::status::StatusSink::terminal();
+    let libs_written = set
+        .native_libs_mut()
+        .extract_native_libs(eclipse::apk::TARGET_ABI, &libs, &status)
+        .expect("the installed native libs are checked");
+    let assets_written = set
+        .base_mut()
+        .extract_assets(&app_data.join("files").join("assets"), &status)
+        .expect("the installed assets are checked");
+    std::fs::remove_dir_all(&root).ok();
+
+    assert_eq!(libs_written, 0, "the install extracted the native libs");
+    assert_eq!(assets_written, 0, "the install extracted the assets");
+}
+
+#[test]
+fn pruning_waits_while_another_process_holds_the_client_lock() {
+    let Some(paths) =
+        eclipse::apk::ApkSetPaths::from_env().expect("ECLIPSE_ROBLOX_APK must be usable")
+    else {
+        eprintln!("SKIP: set ECLIPSE_ROBLOX_APK to install the official Roblox APK set");
+        return;
+    };
+    let root = sandbox("prune-waits-for-client");
+    let app_data = root.join("app-data");
+    let unkept = root.join("data").join("eclipse").join("roblox").join("1");
+    let mut install = vec![OsStr::new("install"), paths.base.as_os_str()];
+    install.extend(paths.native_split.iter().map(|split| split.as_os_str()));
+
+    let first = eclipse(&root, &app_data, &install);
+    std::fs::create_dir_all(&unkept).unwrap();
+    let client = std::fs::File::create(app_data.join("runtime").join("client.lock")).unwrap();
+    client.lock().unwrap();
+    let while_running = eclipse(&root, &app_data, &install);
+    let kept_while_running = unkept.exists();
+    drop(client);
+    let after_exit = eclipse(&root, &app_data, &install);
+    let kept_after_exit = unkept.exists();
+    std::fs::remove_dir_all(&root).ok();
+
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(
+        !while_running.status.success(),
+        "{}",
+        stderr(&while_running)
+    );
+    assert!(
+        kept_while_running,
+        "nothing is removed while Roblox may still open it"
+    );
+    assert!(after_exit.status.success(), "{}", stderr(&after_exit));
+    assert!(
+        !kept_after_exit,
+        "the install after Roblox closed removes what is not kept"
     );
 }
 

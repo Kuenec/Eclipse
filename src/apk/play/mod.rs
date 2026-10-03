@@ -207,11 +207,8 @@ pub fn update(
         status,
     )?;
     status.step("Checking Roblox's signature and installing it…");
-    let committed = Box::new(staging.commit(Some(latest))?);
-    Ok(UpdateOutcome::Updated {
-        previous,
-        committed,
-    })
+    let set = Box::new(staging.commit(Some(latest))?);
+    Ok(UpdateOutcome::Updated { previous, set })
 }
 
 struct Session<'a> {

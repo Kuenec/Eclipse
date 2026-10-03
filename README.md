@@ -41,10 +41,13 @@ Start **Eclipse** from your app menu. From a terminal, use `flatpak run io.githu
 | Command | What it does |
 |---|---|
 | `run` | Start Roblox (the default from the app menu) |
+| `run --check-update` | Check for a newer Roblox, then start it |
 | `open <link>` | Start Roblox at a game, server, private-server, friend or share link, or a place ID |
 | `update` | Check for a newer Roblox now |
+| `rollback` | Go back to the Roblox version before the current one, if Eclipse still keeps it |
 | `install <files>` | Install Roblox from your own `base.apk` + `split_config.x86_64.apk`, or an `.apks`/`.xapk` bundle |
 | `config` | Show the settings file path, the values in effect and any problems in the file |
+| `storage` | Show the disk space Eclipse uses; `storage --clean` empties the caches and old logs |
 
 Sign-in and other Roblox web pages open inside the game window on Wayland and as a window of their own on X11.
 

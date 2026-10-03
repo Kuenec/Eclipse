@@ -729,13 +729,22 @@ fn prepare_private_dir(requested: &Path) -> Result<PathBuf, ClientError> {
     Ok(dir)
 }
 
-struct Storage {
-    data: PathBuf,
-    cache: PathBuf,
-    cef_profile: PathBuf,
+pub struct Storage {
+    pub data: PathBuf,
+    pub cache: PathBuf,
+    pub cef_profile: PathBuf,
 }
 
 fn webview_storage() -> Result<Storage, ClientError> {
+    let dirs = storage_dirs()?;
+    Ok(Storage {
+        data: prepare_private_dir(&dirs.data)?,
+        cache: prepare_private_dir(&dirs.cache)?,
+        cef_profile: dirs.cef_profile,
+    })
+}
+
+pub fn storage_dirs() -> Result<Storage, ClientError> {
     let app_data = crate::framework::app_data_dir().ok_or_else(|| {
         ClientError::Storage(
             "no XDG/home app-data directory is available; set ECLIPSE_APP_DATA_DIR to an \
@@ -749,8 +758,8 @@ fn webview_storage() -> Result<Storage, ClientError> {
         )
     })?;
     Ok(Storage {
-        data: prepare_private_dir(&app_data.join("webview"))?,
-        cache: prepare_private_dir(&dirs.cache_dir().join("webview"))?,
+        data: app_data.join("webview"),
+        cache: dirs.cache_dir().join("webview"),
         cef_profile: app_data.join(CEF_PROFILE_DIR),
     })
 }

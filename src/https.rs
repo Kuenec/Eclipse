@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use ureq::http::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LOCATION, RANGE};
 use ureq::http::{HeaderMap, Uri};
 
-use crate::status::{continuation_text, transfer_text, StatusSink};
+use crate::status::{continuation_text, transfer_text, StatusSink, WINDOW_PROGRESS_INTERVAL};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -20,7 +20,6 @@ const MAX_CONTINUATIONS: u32 = 256;
 const MAX_REDIRECTS: usize = 5;
 const BUFFER_BYTES: usize = 256 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
-const WINDOW_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const PARTIAL_CONTENT: u16 = 206;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
