@@ -42,6 +42,7 @@ struct Heap {
     returns: HashMap<(usize, String), usize>,
     fields: Vec<String>,
     long_fields: HashMap<(usize, String), jlong>,
+    boolean_fields: HashMap<(usize, String), jboolean>,
 }
 
 impl Heap {
@@ -308,6 +309,18 @@ unsafe extern "system" fn get_long_field(
         .unwrap_or(0)
 }
 
+unsafe extern "system" fn get_boolean_field(
+    _env: *mut JNIEnv,
+    obj: jobject,
+    field: jfieldID,
+) -> jboolean {
+    let heap = heap();
+    let name = heap.field_name(field);
+    heap.live_object(obj)
+        .and_then(|object| heap.boolean_fields.get(&(object, name)).copied())
+        .unwrap_or(false)
+}
+
 unsafe extern "system" fn call_boolean_method_a(
     _env: *mut JNIEnv,
     obj: jobject,
@@ -473,6 +486,10 @@ fn env_ptr() -> *mut JNIEnv {
             (offset_of!(Table, GetFieldID), get_field_id as *const ()),
             (offset_of!(Table, GetLongField), get_long_field as *const ()),
             (
+                offset_of!(Table, GetBooleanField),
+                get_boolean_field as *const (),
+            ),
+            (
                 offset_of!(Table, GetStaticMethodID),
                 get_static_method_id as *const (),
             ),
@@ -558,6 +575,13 @@ pub(super) fn on_call_return(obj: &JObject, method: &str, result: &JObject) {
 pub(super) fn set_long_field(obj: &JObject, field: &str, value: jlong) {
     let object = object_of(obj);
     heap().long_fields.insert((object, field.to_owned()), value);
+}
+
+pub(super) fn set_boolean_field(obj: &JObject, field: &str, value: jboolean) {
+    let object = object_of(obj);
+    heap()
+        .boolean_fields
+        .insert((object, field.to_owned()), value);
 }
 
 pub(super) fn strong_refs(obj: &JObject) -> usize {

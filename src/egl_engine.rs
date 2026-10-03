@@ -15,6 +15,8 @@ type EglInstance = egl::DynamicInstance<EglApi>;
 
 const EGL_OPENGL_ES2_BIT: egl::Int = 0x0004;
 
+pub(crate) const MIN_ENGINE_EDGE: u32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowGeometry {
     pub width: i32,
@@ -26,8 +28,8 @@ impl WindowGeometry {
     #[must_use]
     pub fn from_physical(width: u32, height: u32) -> Self {
         Self {
-            width: width.max(1).min(i32::MAX as u32) as i32,
-            height: height.max(1).min(i32::MAX as u32) as i32,
+            width: width.clamp(MIN_ENGINE_EDGE, i32::MAX as u32) as i32,
+            height: height.clamp(MIN_ENGINE_EDGE, i32::MAX as u32) as i32,
         }
     }
 }
@@ -885,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn geometry_from_physical_clamps_to_at_least_one() {
+    fn geometry_from_physical_keeps_every_edge_at_two_pixels_or_more() {
         assert_eq!(
             WindowGeometry::from_physical(1280, 720),
             WindowGeometry {
@@ -893,15 +895,26 @@ mod tests {
                 height: 720
             }
         );
-
         assert_eq!(
-            WindowGeometry::from_physical(0, 0),
+            WindowGeometry::from_physical(2, 2),
             WindowGeometry {
-                width: 1,
-                height: 1
+                width: 2,
+                height: 2
             }
         );
-        assert_eq!(WindowGeometry::from_physical(800, 0).height, 1);
+
+        for (width, height) in [(0, 0), (1, 1)] {
+            assert_eq!(
+                WindowGeometry::from_physical(width, height),
+                WindowGeometry {
+                    width: 2,
+                    height: 2
+                },
+                "Roblox halves the surface for some targets and asserts on a 0-pixel texture"
+            );
+        }
+        assert_eq!(WindowGeometry::from_physical(800, 1).height, 2);
+        assert_eq!(WindowGeometry::from_physical(1, 600).width, 2);
     }
 
     #[repr(C)]

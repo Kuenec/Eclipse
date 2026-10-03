@@ -117,6 +117,8 @@ pub enum IdleInhibit {
 pub enum NoticeId {
     Share,
     Link,
+    Attestation,
+    ServerLocation,
     Client(i32),
 }
 
@@ -125,6 +127,8 @@ impl NoticeId {
         match self {
             Self::Share => "eclipse-share".to_owned(),
             Self::Link => "eclipse-link".to_owned(),
+            Self::Attestation => "eclipse-attestation".to_owned(),
+            Self::ServerLocation => "eclipse-server-location".to_owned(),
             Self::Client(id) => format!("client-{id}"),
         }
     }
@@ -840,6 +844,11 @@ mod tests {
     fn notice_ids_map_to_stable_wire_ids() {
         assert_eq!(NoticeId::Share.wire_id(), "eclipse-share");
         assert_eq!(NoticeId::Link.wire_id(), "eclipse-link");
+        assert_eq!(NoticeId::Attestation.wire_id(), "eclipse-attestation");
+        assert_eq!(
+            NoticeId::ServerLocation.wire_id(),
+            "eclipse-server-location"
+        );
         assert_eq!(NoticeId::Client(7).wire_id(), "client-7");
         assert_eq!(NoticeId::Client(-2).wire_id(), "client--2");
     }

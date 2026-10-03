@@ -9,10 +9,16 @@ use eclipse::apk::store::{
     UpdateOutcome,
 };
 use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode};
+use eclipse::framework::lifecycle::{
+    finish_android_process, record_normal_close_at_client_exit, ClientEnd,
+};
 use eclipse::framework::ActivityStart;
-use eclipse::graphics::launch_window::{LaunchWindow, WindowClosed};
+use eclipse::graphics::activation::Token;
+use eclipse::graphics::launch_window::{Answer, Answered, LaunchWindow, Prompt, WindowClosed};
+use eclipse::graphics::window_state::WindowStateFile;
 use eclipse::links::LaunchTarget;
 use eclipse::runtime::{ClientCacheDir, NativeLibRoot};
+use eclipse::session::LaunchOrigin;
 use eclipse::status::{StatusSink, StatusUpdate};
 use eclipse::storage::{StorageLayout, Trim};
 
@@ -21,7 +27,7 @@ mod instance_control;
 mod supervisor;
 
 use instance_control::{ClientLock, HandOff, LaunchSlot, Request};
-use supervisor::{ClientEnd, ExitRecord, Supervision};
+use supervisor::Supervision;
 
 const CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV: &str = "ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE";
 const CLIENT_SETTINGS_PATH_ENV: &str = "ECLIPSE_CLIENT_APP_SETTINGS_PATH";
@@ -40,6 +46,10 @@ const RUN_USAGE: &str = "usage: eclipse run [--check-update | APK | DIRECTORY]";
 const OPEN_USAGE: &str = "usage: eclipse open <LINK | PLACE ID>";
 const OPEN_CONTEXT: &str = "eclipse open";
 const HAND_OFF_CONTEXT: &str = "eclipse launch";
+const LEAVE_AND_JOIN: &str = "Leave and join";
+const STAY: &str = "Stay";
+const LEAVING: &str = "Leaving the current experience…";
+const ALREADY_ASKING: &str = "Eclipse is already asking whether to leave the current experience";
 const SETTINGS_CONTEXT: &str = "eclipse Android settings setup";
 const FRAME_LOG_CONTEXT: &str = "eclipse frame-time log";
 const UNSUPERVISED: &str = "the Android client must be started by Eclipse's supervisor; start \
@@ -70,7 +80,7 @@ COMMANDS:
     open <LINK>
                 Start Roblox as `run` does and open a Roblox link or place ID: a game, server,
                 private-server, friend or share link. While Roblox is starting, the link goes
-                to it instead.
+                to it instead; while it is in an experience, Eclipse asks before leaving it.
     install <PATH>...
                 Verify and install the Roblox client: base.apk plus split_config.x86_64.apk,
                 a directory holding them, or an .apks/.xapk/.apkm bundle.
@@ -454,16 +464,7 @@ fn take_launch_link() -> Option<OsString> {
 }
 
 fn restart_without_link_arguments(launch: &LaunchCommand) -> ExitCode {
-    use std::os::unix::process::CommandExt as _;
-
-    let error = match std::env::current_exe() {
-        Ok(current_exe) => {
-            let mut eclipse = std::process::Command::new(current_exe);
-            launch.restart(&mut eclipse);
-            eclipse.exec()
-        }
-        Err(error) => error,
-    };
+    let error = restart(launch, None);
     report_setup_failure(
         launch,
         HAND_OFF_CONTEXT,
@@ -472,10 +473,26 @@ fn restart_without_link_arguments(launch: &LaunchCommand) -> ExitCode {
     ExitCode::FAILURE
 }
 
+fn restart(launch: &LaunchCommand, token: Option<&Token>) -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+
+    let current_exe = match std::env::current_exe() {
+        Ok(current_exe) => current_exe,
+        Err(error) => return error,
+    };
+    let mut eclipse = std::process::Command::new(current_exe);
+    launch.restart(&mut eclipse);
+    if let Some(token) = token {
+        token.pass_to(&mut eclipse);
+    }
+    eclipse.exec()
+}
+
 fn start_client(launch: &LaunchCommand) -> ExitCode {
     match hand_off_before_restart(launch) {
         Ok(HandOff::Boot) => supervise(launch),
         Ok(HandOff::Delivered) => ExitCode::SUCCESS,
+        Ok(HandOff::InExperience) => ask_to_leave(launch),
         Err(error) => {
             report_setup_failure(launch, HAND_OFF_CONTEXT, &error);
             ExitCode::FAILURE
@@ -485,12 +502,120 @@ fn start_client(launch: &LaunchCommand) -> ExitCode {
 
 fn hand_off_before_restart(launch: &LaunchCommand) -> Result<HandOff, String> {
     let launch = launch.launch();
-    let Some(request) = launch.control_request() else {
+    let Some(request) = launch.control_request(Token::from_launch_environment()) else {
         return Ok(HandOff::Boot);
     };
+    let (socket, runtime_dir) = control_paths()?;
+    hand_off(&launch, &request, &socket, &runtime_dir)
+}
+
+fn control_paths() -> Result<(PathBuf, PathBuf), String> {
     let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
     let socket = instance_control::control_socket(&app_data_dir)?;
-    hand_off(&launch, &request, &socket, &app_data_dir.join(RUNTIME_DIR))
+    Ok((socket, app_data_dir.join(RUNTIME_DIR)))
+}
+
+fn ask_to_leave(launch: &LaunchCommand) -> ExitCode {
+    let LaunchCommand::Link(target) = launch else {
+        report_setup_failure(
+            launch,
+            HAND_OFF_CONTEXT,
+            "Roblox in Eclipse answered as if this launch carried a link; close it and try again",
+        );
+        return ExitCode::FAILURE;
+    };
+    let asked = control_paths().and_then(|(socket, runtime_dir)| {
+        let asking = instance_control::lock_prompt(&socket)?;
+        Ok((socket, runtime_dir, asking))
+    });
+    let (socket, runtime_dir, _asking) = match asked {
+        Ok((socket, runtime_dir, Some(asking))) => (socket, runtime_dir, asking),
+        Ok((_, _, None)) => {
+            println!("{ALREADY_ASKING}");
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            report_setup_failure(launch, HAND_OFF_CONTEXT, &error);
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut window = match LaunchWindow::open(&window_title()) {
+        Ok(window) => window,
+        Err(error) => {
+            eprintln!(
+                "{HAND_OFF_CONTEXT}: Roblox is already running in Eclipse, and no window could \
+                 ask whether to leave the current experience ({error}); close Roblox, then open \
+                 the link again"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let question = Prompt {
+        question: format!(
+            "Roblox is already running in Eclipse. Leave the current experience and join \
+             {target}?"
+        ),
+        confirm: LEAVE_AND_JOIN.to_owned(),
+        cancel: STAY.to_owned(),
+    };
+    match window.ask(question) {
+        Ok(Answered {
+            answer: Answer::Confirm,
+            token,
+        }) => leave_and_join(launch, &mut window, (&socket, &runtime_dir), token),
+        Ok(Answered {
+            answer: Answer::Cancel,
+            token,
+        }) => match instance_control::stay(&socket, token) {
+            Ok(()) => {
+                window.close();
+                println!("Roblox stays in its current experience");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{HAND_OFF_CONTEXT}: {error}");
+                window.show_error(&error, None);
+                ExitCode::FAILURE
+            }
+        },
+        Err(closed) => {
+            eprintln!(
+                "{HAND_OFF_CONTEXT}: Roblox is already running in Eclipse, and {closed}; close \
+                 Roblox, then open the link again"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn leave_and_join(
+    launch: &LaunchCommand,
+    window: &mut LaunchWindow,
+    (socket, runtime_dir): (&Path, &Path),
+    token: Option<Token>,
+) -> ExitCode {
+    let (status, updates) = std::sync::mpsc::channel();
+    status.send(StatusUpdate::Step(LEAVING.to_owned())).ok();
+    let (socket, runtime_dir) = (socket.to_owned(), runtime_dir.to_owned());
+    let closing =
+        std::thread::spawn(move || instance_control::close_running(&socket, &runtime_dir));
+    if let Err(closed) = window.wait_for(&updates, &closing) {
+        eprintln!("{HAND_OFF_CONTEXT}: {closed}");
+        return ExitCode::FAILURE;
+    }
+    let closed = closing
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let error = match closed {
+        Ok(()) => format!(
+            "cannot restart Eclipse to join the new experience: {}",
+            restart(launch, token.as_ref())
+        ),
+        Err(error) => error,
+    };
+    eprintln!("{HAND_OFF_CONTEXT}: {error}");
+    window.show_error(&error, None);
+    ExitCode::FAILURE
 }
 
 fn hand_off(
@@ -553,6 +678,7 @@ fn supervise(launch: &LaunchCommand) -> ExitCode {
     let run = match lock_run(&bridge.app_data_dir, &target) {
         Ok(RunStart::Locked(run)) => run,
         Ok(RunStart::HandedOff) => return ExitCode::SUCCESS,
+        Ok(RunStart::InExperience) => return ask_to_leave(launch),
         Err(error) => {
             report_setup_failure(launch, target.context(), &error);
             return ExitCode::FAILURE;
@@ -570,7 +696,8 @@ fn supervise(launch: &LaunchCommand) -> ExitCode {
         stderr: std::io::stderr(),
         echo_records: echo_client_records(),
     };
-    match supervisor::run(client, run.lock, run.log, output) {
+    let runtime_dir = bridge.app_data_dir.join(RUNTIME_DIR);
+    match supervisor::run(client, run.lock, &runtime_dir, run.log, output) {
         Ok(finished) => {
             present_failure(launch, &target, &finished);
             finished.exit_code()
@@ -670,22 +797,17 @@ fn run_client(launch: LaunchCommand, supervision: Option<Supervision>) -> ExitCo
     if let Err(error) = client_settings_path() {
         report_setup_failure(&launch, SETTINGS_CONTEXT, &error);
         return match supervision {
-            Some(supervision) => finish_android_process(ClientEnd::FailureShown, supervision.exit),
+            Some(_) => finish_android_process(ClientEnd::FailureShown),
             None => ExitCode::FAILURE,
         };
     }
-    let Some(Supervision {
-        records,
-        exit,
-        run_log,
-    }) = supervision
-    else {
+    let Some(Supervision { records, run_log }) = supervision else {
         report_setup_failure(&launch, launch.launch().context(), UNSUPERVISED);
         return ExitCode::FAILURE;
     };
     if let Err(error) = eclipse::loader::frame_log::arm_from_env() {
         report_setup_failure(&launch, FRAME_LOG_CONTEXT, &error.to_string());
-        finish_android_process(ClientEnd::FailureShown, exit);
+        finish_android_process(ClientEnd::FailureShown);
     }
     eclipse::diagnostics::init(eclipse::diagnostics::LogSink::Supervisor(records));
     tracing::debug!(version = eclipse::VERSION, "eclipse client starting");
@@ -706,7 +828,7 @@ fn run_client(launch: LaunchCommand, supervision: Option<Supervision>) -> ExitCo
             &run_log,
         ),
     };
-    finish_android_process(end, exit)
+    finish_android_process(end)
 }
 
 fn prepend_search_list_entry(
@@ -760,23 +882,8 @@ fn write_client_settings(
 }
 
 fn replace_runtime_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
-    let path = dir.join(name);
-    let write_error = |error: std::io::Error| format!("cannot write {}: {error}", path.display());
-    let mut temp = eclipse_config::temp_file::TempFile::create(dir, name).map_err(write_error)?;
-    temp.write_all(bytes).map_err(write_error)?;
-    temp.persist(&path).map_err(write_error)
-}
-
-fn finish_android_process(end: ClientEnd, exit: ExitRecord) -> ! {
-    use std::io::Write as _;
-
-    if let Err(error) = exit.write(end) {
-        eprintln!("eclipse: cannot tell Eclipse's supervisor how Roblox ended: {error}");
-    }
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-
-    unsafe { libc::_exit(end.status()) }
+    eclipse_config::temp_file::replace(dir, name, bytes)
+        .map_err(|error| format!("cannot write {}: {error}", dir.join(name).display()))
 }
 
 fn report_config(loaded: &eclipse_config::Loaded, status: &StatusSink) {
@@ -1389,17 +1496,17 @@ impl Launch {
         }
     }
 
-    fn control_request(&self) -> Option<Request> {
+    fn control_request(&self, token: Option<Token>) -> Option<Request> {
         match self {
-            Self::Installed => Some(Request::Show {}),
+            Self::Installed => Some(Request::Show { token }),
             Self::File => None,
-            Self::Link(target) => Some(Request::open(target)),
+            Self::Link(target) => Some(Request::open(target, token)),
         }
     }
 }
 
 fn window_title() -> String {
-    eclipse::window_title(eclipse::apk::ROBLOX_PACKAGE)
+    eclipse::window_title("Roblox")
 }
 
 fn show_error_window(message: &str, log: Option<&Path>) {
@@ -1427,30 +1534,39 @@ struct LockedRun {
 enum RunStart {
     Locked(LockedRun),
     HandedOff,
+    InExperience,
 }
 
 fn lock_run(app_data_dir: &Path, launch: &Launch) -> Result<RunStart, String> {
-    let control = match launch.control_request() {
-        Some(_) => Some(instance_control::control_socket(app_data_dir)?),
+    let control = match launch.control_request(Token::from_launch_environment()) {
+        Some(request) => Some((instance_control::control_socket(app_data_dir)?, request)),
         None => None,
     };
-    lock_run_in(app_data_dir, launch, control.as_deref())
+    lock_run_in(
+        app_data_dir,
+        launch,
+        control
+            .as_ref()
+            .map(|(socket, request)| (socket.as_path(), request)),
+    )
 }
 
 fn lock_run_in(
     app_data_dir: &Path,
     launch: &Launch,
-    control: Option<&Path>,
+    control: Option<(&Path, &Request)>,
 ) -> Result<RunStart, String> {
     let runtime_dir = app_data_dir.join(RUNTIME_DIR);
     let lock = match instance_control::lock_client(&runtime_dir)? {
         ClientLock::Acquired(lock) => lock,
         ClientLock::Held(lock) => {
-            let (Some(socket), Some(request)) = (control, launch.control_request()) else {
+            let Some((socket, request)) = control else {
                 return Err(launch.already_running(&lock));
             };
-            if hand_off(launch, &request, socket, &runtime_dir)? == HandOff::Delivered {
-                return Ok(RunStart::HandedOff);
+            match hand_off(launch, request, socket, &runtime_dir)? {
+                HandOff::Boot => {}
+                HandOff::Delivered => return Ok(RunStart::HandedOff),
+                HandOff::InExperience => return Ok(RunStart::InExperience),
             }
             match instance_control::lock_client(&runtime_dir)? {
                 ClientLock::Acquired(lock) => lock,
@@ -1485,7 +1601,7 @@ fn start_client_run(
     launch: &Launch,
     fflags: &BTreeMap<String, serde_json::Value>,
 ) -> Result<Option<std::os::unix::net::UnixListener>, SetupFailure> {
-    let control = match launch.control_request() {
+    let control = match launch.control_request(None) {
         Some(_) => {
             let app_data_dir =
                 eclipse::framework::app_data_dir().ok_or_else(|| NO_APP_DATA_DIR.to_owned())?;
@@ -1778,6 +1894,7 @@ impl Host<'_> {
         title: &str,
         vm: &eclipse::runtime::Vm,
         touch_mode: eclipse_config::TouchMode,
+        window_state: WindowStateFile,
     ) -> Result<(), eclipse::graphics::GraphicsError> {
         match &mut self.window {
             Some((window, _)) => {
@@ -1789,6 +1906,7 @@ impl Host<'_> {
                     Some(vm),
                     touch_mode,
                     Some(commands),
+                    window_state,
                 )
             }
             None => eclipse::graphics::run_windowed(
@@ -1798,6 +1916,7 @@ impl Host<'_> {
                 Some(vm),
                 touch_mode,
                 None,
+                window_state,
             ),
         }
     }
@@ -1947,6 +2066,15 @@ fn boot_and_play(
     eclipse::performance::configure_engine_cpu_affinity(config.graphics_optimization_mode);
     request_game_mode(config);
     let plan = eclipse::runtime::BootPlan::new(&manifest, config, client_cache);
+    let runtime_dir = eclipse::framework::app_data_dir()
+        .ok_or(NO_APP_DATA_DIR)?
+        .join(RUNTIME_DIR);
+    let window_state = WindowStateFile::load(&runtime_dir);
+    let origin = match target {
+        Some(_) => LaunchOrigin::Link,
+        None => LaunchOrigin::App,
+    };
+    eclipse::session::start(&runtime_dir, config, origin)?;
     let link = target.map(|target| (target, target.android_uri()));
     let start = match &link {
         None => ActivityStart::Launcher(&plan.launcher_activity),
@@ -2042,12 +2170,11 @@ fn boot_and_play(
     if let Some(proving) = proving_start {
         prove_at_first_frame(proving, host.status);
     }
+    if let Some(proving) = proving {
+        record_normal_close_at_client_exit(proving.store.clone(), proving.version);
+    }
     println!("# Opening the host window (winit; close it to exit)…");
-    host.run_game(
-        &eclipse::window_title(&manifest.package),
-        &vm,
-        config.touch_mode,
-    )?;
+    host.run_game(&window_title(), &vm, config.touch_mode, window_state)?;
     Ok(())
 }
 
@@ -2630,14 +2757,13 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_storage, finish_android_process, finish_update, installed_client_note,
-        installed_or_updated_set, lock_run_in, native_lib_dir, parse_libroblox_init_lib_dir,
-        parse_storage_action, parse_update_source, record_normal_end,
-        remove_other_native_lib_versions, remove_other_version_oats, update_if_due,
-        url_handler_message, ClientEnd, ClientLock, ExitRecord, Launch, LaunchCheck, LaunchCommand,
-        LaunchCommandError, Proving, RunCheck, RunStart, StorageAction, StorageLayout,
-        UpdateSource, HELP, LAUNCH_CHECK_BUDGET, LAUNCH_LINK_COMMAND, LAUNCH_LINK_ENV,
-        NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE,
+        clean_storage, finish_update, installed_client_note, installed_or_updated_set, lock_run_in,
+        native_lib_dir, parse_libroblox_init_lib_dir, parse_storage_action, parse_update_source,
+        record_normal_end, remove_other_native_lib_versions, remove_other_version_oats,
+        update_if_due, url_handler_message, window_title, ClientLock, Launch, LaunchCheck,
+        LaunchCommand, LaunchCommandError, Proving, Request, RunCheck, RunStart, StorageAction,
+        StorageLayout, Token, UpdateSource, HELP, LAUNCH_CHECK_BUDGET, LAUNCH_LINK_COMMAND,
+        LAUNCH_LINK_ENV, NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE,
     };
     use crate::desktop_integration::BROWSER_HANDLER_COMMAND;
     use eclipse::apk::store::{
@@ -2659,12 +2785,6 @@ mod tests {
         ));
         std::fs::remove_dir_all(&root).ok();
         root
-    }
-
-    const RAW_EXIT_CHILD: &str = "ECLIPSE_TEST_RAW_ANDROID_EXIT_CHILD";
-
-    extern "C" fn abort_if_atexit_runs() {
-        std::process::abort();
     }
 
     fn launch_command(
@@ -3163,8 +3283,10 @@ mod tests {
         let access_code = "8f3c2a10-5b6d-4e7f-9a1b-2c3d4e5f6a7b";
         let link = format!("roblox://placeId=1818&accessCode={access_code}");
         let target = eclipse::links::parse(&link).unwrap();
+        let token = Token::parse("launch-token".to_owned()).unwrap();
+        let open = Request::open(&target, Some(token));
 
-        let started = lock_run_in(&root, &Launch::Link(target), Some(&socket));
+        let started = lock_run_in(&root, &Launch::Link(target), Some((&socket, &open)));
         assert!(matches!(started, Ok(RunStart::HandedOff)));
         let request = server.join().unwrap();
         assert_eq!(
@@ -3172,13 +3294,37 @@ mod tests {
             [
                 b"\x01{\"open\":{\"link\":\"".as_slice(),
                 link.as_bytes(),
-                b"\"}}"
+                b"\",\"token\":\"launch-token\"}}"
             ]
             .concat()
         );
         assert!(
             !root.join("logs").exists(),
             "a handed-off launch writes no run log"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_link_that_loses_the_race_to_a_client_in_an_experience_asks_before_leaving() {
+        let root = super::instance_control::socket_test_root("in-experience");
+        let runtime = root.join(super::RUNTIME_DIR);
+        let ClientLock::Acquired(_running) =
+            super::instance_control::lock_client(&runtime).unwrap()
+        else {
+            panic!("the running client holds the lock");
+        };
+        let socket = root.join("c.sock");
+        let server = answer_one_request(&socket, r#""playing""#);
+        let target = eclipse::links::parse("1818").unwrap();
+        let open = Request::open(&target, None);
+
+        let started = lock_run_in(&root, &Launch::Link(target), Some((&socket, &open)));
+        assert!(matches!(started, Ok(RunStart::InExperience)));
+        server.join().unwrap();
+        assert!(
+            !root.join("logs").exists(),
+            "a launch waiting to ask writes no run log"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3486,6 +3632,11 @@ mod tests {
         });
         assert!(flatpak.contains("nothing was written"), "{flatpak}");
         assert!(!flatpak.contains("handler installed"), "{flatpak}");
+    }
+
+    #[test]
+    fn the_launch_and_game_windows_share_the_eclipse_roblox_title() {
+        assert_eq!(window_title(), "Eclipse — Roblox");
     }
 
     #[test]
@@ -3840,37 +3991,6 @@ mod tests {
         assert_eq!(
             client_app_settings(&fflags),
             serde_json::json!({"FFlagGameBasicSettingsFramerateCap5": "False"})
-        );
-    }
-
-    #[test]
-    fn android_process_exit_skips_unsafe_foreign_atexit_handlers() {
-        if std::env::var_os(RAW_EXIT_CHILD).is_some() {
-            let registered = unsafe { libc::atexit(abort_if_atexit_runs) };
-            assert_eq!(registered, 0, "the child must register its atexit sentinel");
-            let discarded = std::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/null")
-                .unwrap();
-            finish_android_process(ClientEnd::Played, ExitRecord(discarded));
-        }
-
-        let output = std::process::Command::new(
-            std::env::current_exe().expect("the test harness executable must have a path"),
-        )
-        .args([
-            "--exact",
-            "tests::android_process_exit_skips_unsafe_foreign_atexit_handlers",
-        ])
-        .env(RAW_EXIT_CHILD, "1")
-        .output()
-        .expect("the raw-exit child must start");
-
-        assert!(
-            output.status.success(),
-            "the raw-exit child ran an atexit handler: status={:?}, stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

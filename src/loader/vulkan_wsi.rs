@@ -12,12 +12,20 @@ static HOST_PDSC2: AtomicU64 = AtomicU64::new(0);
 static HOST_PDSPM: AtomicU64 = AtomicU64::new(0);
 static REPORTED_PHYSICAL_DEVICE: AtomicU64 = AtomicU64::new(0);
 
-fn fix_undefined_extent(caps: &mut vk::SurfaceCapabilitiesKHR) {
+fn fit_engine_extent(caps: &mut vk::SurfaceCapabilitiesKHR) {
     const UNDEF: u32 = u32::MAX;
     if caps.current_extent.width == UNDEF || caps.current_extent.height == UNDEF {
         let win = ndk_registry::engine_window_geometry().unwrap_or((800, 600));
         caps.current_extent =
             clamp_window_extent(win, caps.min_image_extent, caps.max_image_extent);
+    }
+    for extent in [
+        &mut caps.current_extent,
+        &mut caps.min_image_extent,
+        &mut caps.max_image_extent,
+    ] {
+        extent.width = extent.width.max(crate::egl_engine::MIN_ENGINE_EDGE);
+        extent.height = extent.height.max(crate::egl_engine::MIN_ENGINE_EDGE);
     }
 }
 
@@ -45,7 +53,7 @@ pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capa
         if r != vk::Result::SUCCESS {
             return r;
         }
-        fix_undefined_extent(&mut *p_caps);
+        fit_engine_extent(&mut *p_caps);
     }
     if super::vk_overlay::take_pending_rebuild(surface) {
         return vk::Result::ERROR_SURFACE_LOST_KHR;
@@ -68,7 +76,7 @@ pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capa
             std::mem::transmute(host as usize as *const ());
         let r = host_fn(physical_device, p_surface_info, p_caps);
         if r == vk::Result::SUCCESS {
-            fix_undefined_extent(&mut (*p_caps).surface_capabilities);
+            fit_engine_extent(&mut (*p_caps).surface_capabilities);
         }
         r
     }
@@ -447,7 +455,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fix_undefined_extent_replaces_wayland_undefined_and_keeps_concrete() {
+    fn engine_extent_replaces_wayland_undefined_and_keeps_concrete() {
         let min = vk::Extent2D {
             width: 1,
             height: 1,
@@ -490,7 +498,7 @@ mod tests {
             max_image_extent: max,
             ..Default::default()
         };
-        fix_undefined_extent(&mut caps);
+        fit_engine_extent(&mut caps);
         assert_ne!(
             caps.current_extent.width,
             u32::MAX,
@@ -507,7 +515,7 @@ mod tests {
             max_image_extent: max,
             ..Default::default()
         };
-        fix_undefined_extent(&mut concrete);
+        fit_engine_extent(&mut concrete);
         assert_eq!(
             concrete.current_extent,
             vk::Extent2D {
@@ -516,6 +524,36 @@ mod tests {
             },
             "a concrete extent must not be touched"
         );
+    }
+
+    #[test]
+    fn a_window_one_pixel_high_or_wide_reaches_roblox_as_two_pixels() {
+        for (window, offered) in [((1, 1), (2, 2)), ((300, 1), (300, 2)), ((1, 300), (2, 300))] {
+            let window = vk::Extent2D {
+                width: window.0,
+                height: window.1,
+            };
+            let mut caps = vk::SurfaceCapabilitiesKHR {
+                current_extent: window,
+                min_image_extent: window,
+                max_image_extent: window,
+                ..Default::default()
+            };
+            fit_engine_extent(&mut caps);
+            let offered = vk::Extent2D {
+                width: offered.0,
+                height: offered.1,
+            };
+            assert_eq!(
+                (
+                    caps.current_extent,
+                    caps.min_image_extent,
+                    caps.max_image_extent
+                ),
+                (offered, offered, offered),
+                "Roblox asserts on a 0-pixel texture when it halves a 1-pixel edge"
+            );
+        }
     }
 
     #[test]

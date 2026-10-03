@@ -16,6 +16,8 @@ const REQUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_BODY_BUDGET: Duration = Duration::from_secs(2 * 60);
+const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const API_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTINUATIONS: u32 = 256;
 const MAX_REDIRECTS: usize = 5;
 const BUFFER_BYTES: usize = 256 * 1024;
@@ -56,6 +58,17 @@ pub(crate) fn request_agent() -> ureq::Agent {
         .max_redirects(0)
         .timeout_global(Some(REQUEST_TIMEOUT))
         .timeout_connect(Some(REQUEST_CONNECT_TIMEOUT))
+        .build()
+        .into()
+}
+
+pub(crate) fn api_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .https_only(true)
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(API_TIMEOUT))
+        .timeout_connect(Some(API_CONNECT_TIMEOUT))
         .build()
         .into()
 }
@@ -159,6 +172,27 @@ pub(crate) fn open_download(
             Hop::Redirect(next) => uri = next,
         }
     }
+}
+
+pub(crate) fn fetch_capped(
+    agent: &ureq::Agent,
+    url: &str,
+    allowed: &'static [Host],
+    limit: u64,
+) -> Result<Vec<u8>, DownloadError> {
+    let download = open_download(agent, url, allowed, None)?;
+    read_capped(download.body, limit)
+}
+
+fn read_capped(body: impl Read, limit: u64) -> Result<Vec<u8>, DownloadError> {
+    let mut bytes = Vec::new();
+    body.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(DownloadError::Interrupted)?;
+    if bytes.len() as u64 > limit {
+        return Err(DownloadError::TooLarge { limit });
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -615,6 +649,22 @@ mod tests {
         dest: &Path,
     ) -> Result<u64, DownloadError> {
         save_download(open, limit, dest, &StatusSink::terminal(), |_| {})
+    }
+
+    #[test]
+    fn a_capped_read_accepts_the_limit_and_rejects_one_byte_more() {
+        const LIMIT: u64 = 64 * 1024;
+        let body = vec![b'x'; LIMIT as usize + 1];
+        let read = read_capped(served(&body[..LIMIT as usize], false), LIMIT).unwrap();
+        assert_eq!(read.len() as u64, LIMIT);
+        assert!(matches!(
+            read_capped(served(&body, false), LIMIT),
+            Err(DownloadError::TooLarge { limit: LIMIT })
+        ));
+        assert!(matches!(
+            read_capped(served(b"{}", true), LIMIT),
+            Err(DownloadError::Interrupted(error)) if error.kind() == io::ErrorKind::TimedOut
+        ));
     }
 
     #[test]

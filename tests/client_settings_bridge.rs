@@ -285,7 +285,7 @@ fn an_unreadable_config_stages_only_the_default_flag() {
 fn keys_eclipse_does_not_use_are_logged_on_one_line() {
     let root = sandbox_with_config(
         "sober-config",
-        br#"{"use_opengl": false, "touch_mode": "fake_off", "close_on_leave": true}"#,
+        br#"{"use_opengl": false, "touch_mode": "fake_off", "use_console_experience": true}"#,
     );
     let app_data = root.join("app-data");
     let output = run_missing_apk(&root, &app_data, false);
@@ -296,12 +296,15 @@ fn keys_eclipse_does_not_use_are_logged_on_one_line() {
     let log = log.expect("read eclipse.log");
     let naming: Vec<&str> = log
         .lines()
-        .filter(|line| line.contains("use_opengl") || line.contains("close_on_leave"))
+        .filter(|line| line.contains("use_opengl") || line.contains("use_console_experience"))
         .collect();
     let [line] = naming.as_slice() else {
         panic!("expected one line naming the unused keys:\n{log}\n{stderr}");
     };
-    assert!(line.contains(r#""use_opengl", "close_on_leave""#), "{line}");
+    assert!(
+        line.contains(r#""use_opengl", "use_console_experience""#),
+        "{line}"
+    );
     assert!(!stderr.contains("use_opengl"), "{stderr}");
 }
 

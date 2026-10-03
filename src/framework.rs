@@ -32,6 +32,7 @@ mod external_intents;
 #[cfg(test)]
 mod fake_jvm;
 pub(crate) mod keep_screen_on;
+pub mod lifecycle;
 pub mod matrix_registry;
 pub(crate) mod memory;
 mod message_queue;
@@ -11939,6 +11940,9 @@ impl TrackedActivity {
 static TRACKED_ACTIVITIES: std::sync::Mutex<Vec<TrackedActivity>> =
     std::sync::Mutex::new(Vec::new());
 
+#[cfg(test)]
+static ACTIVITY_TRACKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn track_activity(env: &Env, activity: &JObject) {
     match env.new_global_ref(activity) {
         Ok(global) => match TRACKED_ACTIVITIES.lock() {
@@ -12716,7 +12720,7 @@ pub fn install_main_looper_waker(proxy: winit::event_loop::EventLoopProxy<HostWa
     }
 }
 
-fn wake_main_looper() {
+pub(crate) fn wake_main_looper() {
     let Some(proxy) = MAIN_LOOPER_WAKER.get() else {
         return;
     };
@@ -18879,8 +18883,6 @@ mod tests {
         );
         path_registry::free(builder).expect("free builder");
     }
-
-    static ACTIVITY_TRACKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn click_listener_can_reenter_view_natives_while_perform_click_runs() {

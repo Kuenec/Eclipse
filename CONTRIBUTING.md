@@ -39,7 +39,8 @@ To record frame times, run `flatpak run --filesystem=xdg-run/eclipse-perf:create
 | Path | Contents |
 |---|---|
 | `src/apk/` | APK parsing, signature verification, install store, downloads |
-| `src/https.rs` | Resumable HTTPS downloads from allow-listed hosts |
+| `src/https.rs` | Resumable HTTPS downloads and size-capped requests to allow-listed hosts |
+| `src/client_log.rs`, `src/session.rs`, `src/server_location.rs` | Roblox's log events, session.json, close on leave and the server location |
 | `src/links.rs` | Roblox link parsing, Android link rendering and join-code redaction |
 | `src/loader/` | ELF/Bionic loader, JNI, NDK, audio and graphics bridges |
 | `src/framework.rs` | Android framework natives and lifecycle |

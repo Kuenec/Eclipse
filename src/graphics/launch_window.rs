@@ -8,8 +8,9 @@ use ash::vk;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::error::OsError;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, AsyncRequestSerial, EventLoopProxy};
+use winit::keyboard::{Key, NamedKey};
 use winit::platform::pump_events::{EventLoopExtPumpEvents as _, PumpStatus};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
 use winit::platform::startup_notify::{
@@ -17,9 +18,10 @@ use winit::platform::startup_notify::{
     WindowExtStartupNotify as _,
 };
 use winit::platform::wayland::{ActiveEventLoopExtWayland as _, WindowAttributesExtWayland as _};
-use winit::window::{ActivationToken, UserAttentionType, Window, WindowId};
+use winit::window::{ActivationToken, Window, WindowId};
 
-use super::{GlyphAtlas, GraphicsError, HostEventLoop, TextMeasure, VulkanRenderer};
+use super::activation::Token;
+use super::{layout_views, GlyphAtlas, GraphicsError, HostEventLoop, TextMeasure, VulkanRenderer};
 use crate::framework::view_registry::{LayoutParams, RenderNode, MATCH_PARENT, WRAP_CONTENT};
 use crate::framework::HostWake;
 use crate::status::{Progress, StatusUpdate};
@@ -36,6 +38,7 @@ const BAR_TRACK: i32 = 0xFFD5_DBE5_u32 as i32;
 const BAR_FILL: i32 = 0xFF2F_6FD6_u32 as i32;
 const WARNING_BACKGROUND: i32 = 0xFFFF_F2CC_u32 as i32;
 const ERROR_BACKGROUND: i32 = 0xFFFD_E2E1_u32 as i32;
+pub(super) const BUTTON_BACKGROUND: i32 = 0xFFC9_D8F2_u32 as i32;
 const LINEAR_LAYOUT: &str = "android.widget.LinearLayout";
 const FRAME_LAYOUT: &str = "android.widget.FrameLayout";
 const TEXT_VIEW: &str = "android.widget.TextView";
@@ -56,8 +59,39 @@ impl std::fmt::Display for WindowClosed {
 impl std::error::Error for WindowClosed {}
 
 pub enum WindowCommand {
-    Raise { done: Option<Sender<()>> },
+    Raise {
+        token: Option<Token>,
+        done: Option<Sender<()>>,
+    },
     Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Confirm,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prompt {
+    pub question: String,
+    pub confirm: String,
+    pub cancel: String,
+}
+
+impl Prompt {
+    fn choice(&self, answer: Answer) -> String {
+        match answer {
+            Answer::Confirm => format!("{} (Enter)", self.confirm),
+            Answer::Cancel => format!("{} (Esc)", self.cancel),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answered {
+    pub answer: Answer,
+    pub token: Option<Token>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,17 +112,9 @@ impl WindowControl {
     }
 }
 
-pub(super) fn raise(
-    window: Option<&Window>,
-    event_loop: &ActiveEventLoop,
-    done: Option<Sender<()>>,
-) {
+pub(super) fn raise(window: Option<&Window>, token: Option<&Token>, done: Option<Sender<()>>) {
     if let Some(window) = window {
-        if event_loop.is_wayland() {
-            window.request_user_attention(Some(UserAttentionType::Informational));
-        } else {
-            window.focus_window();
-        }
+        super::activation::raise(window, token);
     }
     if let Some(done) = done {
         done.send(()).ok();
@@ -163,6 +189,43 @@ impl LaunchWindow {
         Option<ActivationToken>,
         &Receiver<WindowCommand>,
     ) {
+        let token = self.activation_token();
+        self.close();
+        (&mut self.event_loop, token, &self.screen.commands)
+    }
+
+    pub fn ask(&mut self, prompt: Prompt) -> Result<Answered, WindowClosed> {
+        self.screen.content.prompt = Some(prompt);
+        self.screen.answer = None;
+        self.screen.content_changed();
+        let answer = loop {
+            if let Some(answer) = self.screen.answer {
+                break answer;
+            }
+            if self.screen.session != Session::Showing || !self.pumping {
+                return Err(WindowClosed);
+            }
+            self.pump(None);
+        };
+        let token = self.activation_token().and_then(|token| {
+            Token::parse(token.into_raw())
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "the compositor's activation token cannot be passed on");
+                })
+                .ok()
+        });
+        self.screen.content.prompt = None;
+        Ok(Answered { answer, token })
+    }
+
+    pub fn close(&mut self) {
+        self.screen.end();
+        while self.pumping {
+            self.pump(Some(Duration::ZERO));
+        }
+    }
+
+    fn activation_token(&mut self) -> Option<ActivationToken> {
         if self.screen.request_activation() {
             let deadline = Instant::now() + ACTIVATION_WAIT;
             while self.pumping && self.screen.activation_pending() {
@@ -172,12 +235,7 @@ impl LaunchWindow {
                 self.pump(Some(left.min(POLL_INTERVAL)));
             }
         }
-        let token = self.screen.take_activation_token();
-        self.screen.end();
-        while self.pumping {
-            self.pump(Some(Duration::ZERO));
-        }
-        (&mut self.event_loop, token, &self.screen.commands)
+        self.screen.take_activation_token()
     }
 
     pub fn show_error(&mut self, message: &str, log: Option<&Path>) {
@@ -252,6 +310,9 @@ struct StatusScreen {
     scale: f64,
     activation: Activation,
     commands: Receiver<WindowCommand>,
+    answer: Option<Answer>,
+    cursor: Option<(f32, f32)>,
+    pressed: Option<Answer>,
 }
 
 impl StatusScreen {
@@ -266,7 +327,43 @@ impl StatusScreen {
             scale: 1.0,
             activation: Activation::Unrequested,
             commands,
+            answer: None,
+            cursor: None,
+            pressed: None,
         }
+    }
+
+    fn awaiting_answer(&self) -> bool {
+        self.content.error.is_none() && self.content.prompt.is_some() && self.answer.is_none()
+    }
+
+    fn give(&mut self, answer: Answer) {
+        if self.awaiting_answer() {
+            self.answer = Some(answer);
+        }
+    }
+
+    fn click(&mut self, state: ElementState, under_cursor: Option<Answer>) {
+        match state {
+            ElementState::Pressed => self.pressed = under_cursor,
+            ElementState::Released => {
+                if let Some(answer) = self
+                    .pressed
+                    .take()
+                    .filter(|&pressed| Some(pressed) == under_cursor)
+                {
+                    self.give(answer);
+                }
+            }
+        }
+    }
+
+    fn answer_under_cursor(&self) -> Option<Answer> {
+        let cursor = self.cursor?;
+        let renderer = self.renderer.as_ref()?;
+        let text = renderer.text.as_ref()?;
+        self.content
+            .answer_at(&text.atlas, renderer.swapchain_extent, self.scale, cursor)
     }
 
     fn dismiss(&mut self, event_loop: &ActiveEventLoop) {
@@ -277,10 +374,12 @@ impl StatusScreen {
 
     fn wait_without_window(&mut self, timeout: Duration) {
         match self.commands.recv_timeout(timeout) {
-            Ok(WindowCommand::Raise { done: Some(done) }) => {
+            Ok(WindowCommand::Raise {
+                done: Some(done), ..
+            }) => {
                 done.send(()).ok();
             }
-            Ok(WindowCommand::Raise { done: None }) | Err(_) => {}
+            Ok(WindowCommand::Raise { done: None, .. }) | Err(_) => {}
             Ok(WindowCommand::Close) => self.session = Session::Dismissed,
         }
     }
@@ -288,7 +387,9 @@ impl StatusScreen {
     fn run_commands(&mut self, event_loop: &ActiveEventLoop) {
         while let Ok(command) = self.commands.try_recv() {
             match command {
-                WindowCommand::Raise { done } => raise(self.window.as_ref(), event_loop, done),
+                WindowCommand::Raise { token, done } => {
+                    raise(self.window.as_ref(), token.as_ref(), done);
+                }
                 WindowCommand::Close => self.dismiss(event_loop),
             }
         }
@@ -452,7 +553,29 @@ impl ApplicationHandler<HostWake> for StatusScreen {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => self.dismiss(event_loop),
+            WindowEvent::CloseRequested => {
+                self.give(Answer::Cancel);
+                self.dismiss(event_loop);
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat =>
+            {
+                if let Some(answer) = key_answer(&event.logical_key) {
+                    self.give(answer);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Some((position.x as f32, position.y as f32));
+            }
+            WindowEvent::CursorLeft { .. } => self.cursor = None,
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let under_cursor = self.answer_under_cursor();
+                self.click(state, under_cursor);
+            }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.mark_resized(size.width, size.height);
@@ -489,12 +612,21 @@ struct Failure {
     log: Option<PathBuf>,
 }
 
+fn key_answer(key: &Key) -> Option<Answer> {
+    match key {
+        Key::Named(NamedKey::Enter) => Some(Answer::Confirm),
+        Key::Named(NamedKey::Escape) => Some(Answer::Cancel),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct Content {
     step: Option<String>,
     progress: Option<Progress>,
     warnings: VecDeque<String>,
     error: Option<Failure>,
+    prompt: Option<Prompt>,
 }
 
 impl Content {
@@ -514,7 +646,17 @@ impl Content {
         }
     }
 
+    fn showing_prompt(&self) -> Option<&Prompt> {
+        self.prompt.as_ref().filter(|_| self.error.is_none())
+    }
+
     fn summary(&self) -> String {
+        if let Some(prompt) = self.showing_prompt() {
+            return format!(
+                "{} Enter: {}, Esc: {}",
+                prompt.question, prompt.confirm, prompt.cancel
+            );
+        }
         match &self.error {
             Some(Failure {
                 message,
@@ -532,6 +674,9 @@ impl Content {
     }
 
     fn nodes(&self, atlas: &GlyphAtlas, extent: vk::Extent2D, scale: f64) -> Vec<RenderNode> {
+        if let Some(prompt) = self.showing_prompt() {
+            return Screen::asking(prompt, atlas, extent, scale).nodes;
+        }
         let mut screen = Screen::new(scale);
         let width = extent.width as i32 - 2 * screen.px(PADDING);
         let gap = screen.px(SECTION_GAP);
@@ -562,17 +707,42 @@ impl Content {
         }
         screen.nodes
     }
+
+    fn answer_at(
+        &self,
+        atlas: &GlyphAtlas,
+        extent: vk::Extent2D,
+        scale: f64,
+        point: (f32, f32),
+    ) -> Option<Answer> {
+        let prompt = self.showing_prompt()?;
+        let screen = Screen::asking(prompt, atlas, extent, scale);
+        action_at(&screen.nodes, &screen.answers, atlas, extent, point)
+    }
 }
 
 struct Screen {
     scale: f64,
     nodes: Vec<RenderNode>,
+    answers: Vec<Option<Answer>>,
 }
 
 impl Screen {
+    fn asking(prompt: &Prompt, atlas: &GlyphAtlas, extent: vk::Extent2D, scale: f64) -> Self {
+        let mut screen = Self::new(scale);
+        let width = extent.width as i32 - 2 * screen.px(PADDING);
+        let measure = TextMeasure { atlas };
+        screen.paragraph(&prompt.question, measure, width, BACKGROUND, 0);
+        for answer in [Answer::Confirm, Answer::Cancel] {
+            screen.button(&prompt.choice(answer), answer, measure, width);
+        }
+        screen
+    }
+
     fn new(scale: f64) -> Self {
         Self {
             scale,
+            answers: vec![None],
             nodes: vec![node(
                 LINEAR_LAYOUT,
                 None,
@@ -595,8 +765,26 @@ impl Screen {
     fn push(&mut self, child: RenderNode, parent: usize) -> usize {
         let index = self.nodes.len();
         self.nodes.push(child);
+        self.answers.push(None);
         self.nodes[parent].children.push(index);
         index
+    }
+
+    fn button(&mut self, label: &str, answer: Answer, measure: TextMeasure<'_>, width: i32) {
+        let gap = self.px(SECTION_GAP);
+        for (index, line) in wrap(&displayable(label, measure.atlas), measure, width as f32)
+            .into_iter()
+            .enumerate()
+        {
+            let layout = LayoutParams {
+                width: MATCH_PARENT,
+                height: WRAP_CONTENT,
+                margins: [0, if index == 0 { gap } else { 0 }, 0, 0],
+                ..LayoutParams::default()
+            };
+            let pushed = self.push(node(TEXT_VIEW, Some(line), 1, layout, BUTTON_BACKGROUND), 0);
+            self.answers[pushed] = Some(answer);
+        }
     }
 
     fn paragraph(
@@ -656,6 +844,28 @@ impl Screen {
             track,
         );
     }
+}
+
+pub(super) fn action_at<A: Copy>(
+    nodes: &[RenderNode],
+    actions: &[Option<A>],
+    atlas: &GlyphAtlas,
+    extent: vk::Extent2D,
+    (x, y): (f32, f32),
+) -> Option<A> {
+    let views = layout_views(nodes, extent, Some(TextMeasure { atlas }));
+    views
+        .iter()
+        .zip(actions)
+        .rev()
+        .find(|(view, action)| {
+            action.is_some()
+                && x >= view.x
+                && x < view.x + view.w
+                && y >= view.y
+                && y < view.y + view.h
+        })
+        .and_then(|(_, action)| *action)
 }
 
 pub(super) fn scaled(value: i32, scale: f64) -> i32 {
@@ -891,6 +1101,145 @@ mod tests {
         }
     }
 
+    fn prompt() -> Prompt {
+        Prompt {
+            question: "Leave the current experience?".to_owned(),
+            confirm: "Leave and join".to_owned(),
+            cancel: "Stay".to_owned(),
+        }
+    }
+
+    fn asking_screen() -> StatusScreen {
+        let mut screen = StatusScreen::new("Eclipse", mpsc::channel().1);
+        screen.content.prompt = Some(prompt());
+        screen
+    }
+
+    const PROMPT_EXTENT: vk::Extent2D = vk::Extent2D {
+        width: 800,
+        height: 600,
+    };
+
+    #[test]
+    fn the_prompt_shows_the_question_and_both_choices_until_an_error_replaces_it() {
+        let atlas = monospace_atlas();
+        let mut content = Content::default();
+        content.apply(StatusUpdate::Step("Launching Roblox".to_owned()));
+        content.prompt = Some(prompt());
+        let nodes = content.nodes(&atlas, PROMPT_EXTENT, 1.0);
+        assert_eq!(
+            texts(&nodes),
+            [
+                "Leave the current experience?",
+                "Leave and join (Enter)",
+                "Stay (Esc)"
+            ]
+        );
+        let buttons: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.background_color == Some(BUTTON_BACKGROUND))
+            .collect();
+        assert_eq!(buttons.len(), 2);
+        assert!(buttons
+            .iter()
+            .all(|button| button.layout.width == MATCH_PARENT));
+
+        content.error = Some(Failure {
+            message: "Roblox did not close".to_owned(),
+            log: None,
+        });
+        assert_eq!(
+            texts(&content.nodes(&atlas, PROMPT_EXTENT, 1.0))[..2],
+            [ERROR_HEADING, "Roblox did not close"]
+        );
+    }
+
+    #[test]
+    fn enter_escape_and_closing_answer_the_prompt_once() {
+        assert_eq!(
+            key_answer(&Key::Named(NamedKey::Enter)),
+            Some(Answer::Confirm)
+        );
+        assert_eq!(
+            key_answer(&Key::Named(NamedKey::Escape)),
+            Some(Answer::Cancel)
+        );
+        assert_eq!(key_answer(&Key::Named(NamedKey::Space)), None);
+
+        let mut screen = asking_screen();
+        screen.give(Answer::Confirm);
+        screen.give(Answer::Cancel);
+        assert_eq!(screen.answer, Some(Answer::Confirm));
+
+        let mut closed = asking_screen();
+        closed.give(Answer::Cancel);
+        assert_eq!(closed.answer, Some(Answer::Cancel));
+
+        let mut status = StatusScreen::new("Eclipse", mpsc::channel().1);
+        status.give(Answer::Confirm);
+        assert_eq!(status.answer, None, "only a prompt takes answers");
+    }
+
+    #[test]
+    fn a_click_answers_only_when_pressed_and_released_on_the_same_choice() {
+        let atlas = monospace_atlas();
+        let content = Content {
+            prompt: Some(prompt()),
+            ..Content::default()
+        };
+        let nodes = content.nodes(&atlas, PROMPT_EXTENT, 1.0);
+        let views = layout_views(&nodes, PROMPT_EXTENT, Some(TextMeasure { atlas: &atlas }));
+        let center_of = |text: &str| {
+            let view = &views[nodes
+                .iter()
+                .position(|node| node.text.as_deref() == Some(text))
+                .expect("a laid-out row")];
+            (view.x + view.w / 2.0, view.y + view.h / 2.0)
+        };
+        let at = |point| content.answer_at(&atlas, PROMPT_EXTENT, 1.0, point);
+        assert_eq!(
+            at(center_of("Leave and join (Enter)")),
+            Some(Answer::Confirm)
+        );
+        assert_eq!(at(center_of("Stay (Esc)")), Some(Answer::Cancel));
+        assert_eq!(at(center_of("Leave the current experience?")), None);
+        assert_eq!(at((1.0, 1.0)), None);
+        assert_eq!(at((799.0, 599.0)), None);
+
+        for (pressed, released, answer) in [
+            (Some(Answer::Confirm), None, None),
+            (None, Some(Answer::Cancel), None),
+            (Some(Answer::Confirm), Some(Answer::Cancel), None),
+            (
+                Some(Answer::Confirm),
+                Some(Answer::Confirm),
+                Some(Answer::Confirm),
+            ),
+            (
+                Some(Answer::Cancel),
+                Some(Answer::Cancel),
+                Some(Answer::Cancel),
+            ),
+        ] {
+            let mut screen = asking_screen();
+            screen.click(ElementState::Pressed, pressed);
+            screen.click(ElementState::Released, released);
+            assert_eq!(screen.answer, answer, "{pressed:?} then {released:?}");
+        }
+    }
+
+    #[test]
+    fn the_title_carries_the_question_and_both_keys_when_text_cannot_be_drawn() {
+        let content = Content {
+            prompt: Some(prompt()),
+            ..Content::default()
+        };
+        assert_eq!(
+            content.summary(),
+            "Leave the current experience? Enter: Leave and join, Esc: Stay"
+        );
+    }
+
     #[test]
     fn a_window_that_cannot_map_without_drawing_ends_instead_of_waiting_for_a_close() {
         let error = GraphicsError::Vulkan("no physical device".to_owned());
@@ -910,7 +1259,10 @@ mod tests {
         screen.end();
         let (done, raised) = mpsc::channel();
         commands
-            .send(WindowCommand::Raise { done: Some(done) })
+            .send(WindowCommand::Raise {
+                token: None,
+                done: Some(done),
+            })
             .unwrap();
         screen.wait_without_window(Duration::from_secs(5));
         assert_eq!(raised.try_recv(), Ok(()));

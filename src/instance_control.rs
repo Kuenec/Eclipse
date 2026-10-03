@@ -10,13 +10,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use eclipse::graphics::activation::Token;
 use eclipse::graphics::launch_window::{WindowCommand, WindowControl, WindowGone};
 use eclipse::links::LaunchTarget;
+use eclipse::session::Experience;
 use rustix::process::Uid;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const CLIENT_LOCK_FILE: &str = "client.lock";
+const PROMPT_LOCK_EXTENSION: &str = "prompt";
 const HOST_SOCKET_DIR: &str = "eclipse";
 const FLATPAK_RUNTIME_DIRS: &str = "app";
 const SOCKET_HASH_BYTES: usize = 8;
@@ -37,8 +40,8 @@ const CLOSE_POLL: Duration = Duration::from_millis(50);
 const NO_RUNTIME_DIR: &str =
     "XDG_RUNTIME_DIR is not set to an absolute path; start Eclipse from a desktop session.";
 const NO_ANSWER: &str = "Roblox in Eclipse did not answer; close it and try again";
-const IN_EXPERIENCE: &str = "Roblox is already running in Eclipse and cannot switch to another \
-     experience yet, so this link was not opened; close Roblox, then open the link again.";
+const UNEXPECTED_ANSWER: &str =
+    "Roblox in Eclipse gave an answer this Eclipse does not understand; close it and try again";
 
 pub(crate) enum ClientLock {
     Acquired(File),
@@ -49,15 +52,26 @@ pub(crate) fn lock_client(runtime_dir: &Path) -> Result<ClientLock, String> {
     std::fs::create_dir_all(runtime_dir)
         .map_err(|error| format!("cannot create {}: {error}", runtime_dir.display()))?;
     let path = runtime_dir.join(CLIENT_LOCK_FILE);
+    Ok(match try_lock(&path)? {
+        Some(lock) => ClientLock::Acquired(lock),
+        None => ClientLock::Held(path),
+    })
+}
+
+pub(crate) fn lock_prompt(socket: &Path) -> Result<Option<File>, String> {
+    try_lock(&socket.with_extension(PROMPT_LOCK_EXTENSION))
+}
+
+fn try_lock(path: &Path) -> Result<Option<File>, String> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
+        .open(path)
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     match lock.try_lock() {
-        Ok(()) => Ok(ClientLock::Acquired(lock)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(ClientLock::Held(path)),
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(error)) => {
             Err(format!("cannot lock {}: {error}", path.display()))
         }
@@ -145,15 +159,23 @@ pub(crate) fn listen(socket: &Path) -> Result<UnixListener, String> {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Request {
-    Show {},
-    Open { link: String },
+    Show {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<Token>,
+    },
+    Open {
+        link: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<Token>,
+    },
     Quit,
 }
 
 impl Request {
-    pub(crate) fn open(target: &LaunchTarget) -> Self {
+    pub(crate) fn open(target: &LaunchTarget, token: Option<Token>) -> Self {
         Self::Open {
             link: target.android_uri(),
+            token,
         }
     }
 }
@@ -161,7 +183,7 @@ impl Request {
 impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Show {} => "Show",
+            Self::Show { .. } => "Show",
             Self::Open { .. } => "Open",
             Self::Quit => "Quit",
         })
@@ -222,13 +244,16 @@ impl LaunchSlot {
         matches!(*self.state(), SlotState::Starting(_) | SlotState::Playing)
     }
 
-    fn retarget(&self, target: LaunchTarget) -> Reply {
+    fn retarget(&self, target: LaunchTarget, experience: Experience) -> Reply {
         match &mut *self.state() {
             SlotState::Starting(slot) => {
                 *slot = Some(target);
                 Reply::Accepted
             }
-            SlotState::Playing => Reply::Playing,
+            SlotState::Playing => match experience {
+                Experience::Joined => Reply::Playing,
+                Experience::NotJoined => Reply::Ended,
+            },
             SlotState::Ended | SlotState::Closing => Reply::Ended,
         }
     }
@@ -245,7 +270,14 @@ pub(crate) fn serve_in_background(
 ) -> io::Result<()> {
     std::thread::Builder::new()
         .name("eclipse-control".to_owned())
-        .spawn(move || serve(&listener, &slot, |command| window.send(command)))
+        .spawn(move || {
+            serve(
+                &listener,
+                &slot,
+                |command| window.send(command),
+                eclipse::session::experience,
+            )
+        })
         .map(drop)
 }
 
@@ -253,6 +285,7 @@ fn serve(
     listener: &UnixListener,
     slot: &LaunchSlot,
     window: impl Fn(WindowCommand) -> Result<(), WindowGone>,
+    experience: impl Fn() -> Experience,
 ) {
     for stream in listener.incoming() {
         let stream = match stream {
@@ -262,7 +295,7 @@ fn serve(
                 return;
             }
         };
-        if let Err(error) = serve_connection(stream, slot, &window) {
+        if let Err(error) = serve_connection(stream, slot, &window, &experience) {
             tracing::debug!(%error, "a control connection ended without an answer");
         }
     }
@@ -305,6 +338,7 @@ fn serve_connection(
     mut stream: UnixStream,
     slot: &LaunchSlot,
     window: &impl Fn(WindowCommand) -> Result<(), WindowGone>,
+    experience: &impl Fn() -> Experience,
 ) -> io::Result<()> {
     let peer = peer_uid(&stream)?;
     if !peer_allowed(peer, rustix::process::geteuid()) {
@@ -321,7 +355,7 @@ fn serve_connection(
         Instant::now() + REQUEST_TIMEOUT,
     )?;
     let reply = match parse_request(&message) {
-        Ok(request) => answer(request, slot, window),
+        Ok(request) => answer(request, slot, window, experience),
         Err(reason) => {
             tracing::warn!(%reason, "refused a request from another Eclipse launch");
             Some(Reply::Refused { reason })
@@ -375,16 +409,17 @@ fn answer(
     request: Request,
     slot: &LaunchSlot,
     window: &impl Fn(WindowCommand) -> Result<(), WindowGone>,
+    experience: &impl Fn() -> Experience,
 ) -> Option<Reply> {
     match request {
-        Request::Show {} => {
+        Request::Show { token } => {
             if !slot.running() {
                 return Some(Reply::Ended);
             }
             tracing::info!("another Eclipse launch asked to bring Roblox to the front");
-            raise_and_wait(window)
+            raise_and_wait(window, token)
         }
-        Request::Open { link } => {
+        Request::Open { link, token } => {
             let target = match eclipse::links::parse(&link) {
                 Ok(target) => target,
                 Err(error) => {
@@ -394,10 +429,10 @@ fn answer(
                 }
             };
             let joining = target.to_string();
-            let reply = slot.retarget(target);
+            let reply = slot.retarget(target, experience());
             if reply == Reply::Accepted {
                 tracing::info!(link = %joining, "another Eclipse launch handed its link to the starting Roblox");
-                window(WindowCommand::Raise { done: None }).ok();
+                window(WindowCommand::Raise { token, done: None }).ok();
             }
             Some(reply)
         }
@@ -410,9 +445,16 @@ fn answer(
     }
 }
 
-fn raise_and_wait(window: &impl Fn(WindowCommand) -> Result<(), WindowGone>) -> Option<Reply> {
+fn raise_and_wait(
+    window: &impl Fn(WindowCommand) -> Result<(), WindowGone>,
+    token: Option<Token>,
+) -> Option<Reply> {
     let (done, raised) = mpsc::channel();
-    if window(WindowCommand::Raise { done: Some(done) }).is_err() {
+    let raise = WindowCommand::Raise {
+        token,
+        done: Some(done),
+    };
+    if window(raise).is_err() {
         return Some(Reply::Ended);
     }
     match raised.recv_timeout(RAISE_TIMEOUT) {
@@ -433,6 +475,7 @@ fn raise_and_wait(window: &impl Fn(WindowCommand) -> Result<(), WindowGone>) -> 
 pub(crate) enum HandOff {
     Boot,
     Delivered,
+    InExperience,
 }
 
 pub(crate) fn hand_off(
@@ -457,22 +500,31 @@ pub(crate) fn hand_off(
         std::thread::sleep(backoff.min(left));
         backoff = (backoff * 2).min(LONGEST_BACKOFF);
     };
-    match reply {
-        Reply::Accepted => Ok(HandOff::Delivered),
-        Reply::Ended => close_ended_client(socket, runtime_dir),
-        Reply::Playing => Err(IN_EXPERIENCE.to_owned()),
-        Reply::Refused { reason } => Err(refused(&reason)),
+    match (reply, request) {
+        (Reply::Accepted, _) => Ok(HandOff::Delivered),
+        (Reply::Ended, _) => close_running(socket, runtime_dir).map(|()| HandOff::Boot),
+        (Reply::Playing, Request::Open { .. }) => Ok(HandOff::InExperience),
+        (Reply::Playing, Request::Show { .. } | Request::Quit) => Err(UNEXPECTED_ANSWER.to_owned()),
+        (Reply::Refused { reason }, _) => Err(refused(&reason)),
     }
 }
 
-fn close_ended_client(socket: &Path, runtime_dir: &Path) -> Result<HandOff, String> {
+pub(crate) fn stay(socket: &Path, token: Option<Token>) -> Result<(), String> {
+    match exchange(socket, &Request::Show { token })? {
+        None | Some(Reply::Accepted | Reply::Ended) => Ok(()),
+        Some(Reply::Playing) => Err(UNEXPECTED_ANSWER.to_owned()),
+        Some(Reply::Refused { reason }) => Err(refused(&reason)),
+    }
+}
+
+pub(crate) fn close_running(socket: &Path, runtime_dir: &Path) -> Result<(), String> {
     if let Some(Reply::Refused { reason }) = exchange(socket, &Request::Quit)? {
         return Err(refused(&reason));
     }
     let deadline = Instant::now() + CLOSE_TIMEOUT;
     loop {
         if let ClientLock::Acquired(_) = lock_client(runtime_dir)? {
-            return Ok(HandOff::Boot);
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -507,11 +559,9 @@ fn exchange(socket: &Path, request: &Request) -> Result<Option<Reply>, String> {
         }
     };
     let reply = send_request(&mut stream, request).map_err(|_| NO_ANSWER.to_owned())?;
-    serde_json::from_slice(&reply).map(Some).map_err(|_| {
-        "Roblox in Eclipse gave an answer this Eclipse does not understand; close it and try \
-         again"
-            .to_owned()
-    })
+    serde_json::from_slice(&reply)
+        .map(Some)
+        .map_err(|_| UNEXPECTED_ANSWER.to_owned())
 }
 
 fn send_request(stream: &mut UnixStream, request: &Request) -> io::Result<Vec<u8>> {
@@ -567,41 +617,67 @@ mod tests {
         format!("already running ({})", lock.display())
     }
 
-    fn acquired(runtime_dir: &Path) -> File {
-        match lock_client(runtime_dir).unwrap() {
-            ClientLock::Acquired(lock) => lock,
-            ClientLock::Held(lock) => panic!("{} is held", lock.display()),
+    fn once_spawned_children_let_go<T>(mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let value = attempt();
+            if value.is_some() || Instant::now() >= deadline {
+                return value;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn acquired(runtime_dir: &Path) -> File {
+        once_spawned_children_let_go(|| match lock_client(runtime_dir).unwrap() {
+            ClientLock::Acquired(lock) => Some(lock),
+            ClientLock::Held(_) => None,
+        })
+        .unwrap_or_else(|| panic!("{} stays held", runtime_dir.display()))
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Seen {
+        Raise(Option<Token>),
+        Close,
+    }
+
+    fn token(text: &str) -> Token {
+        Token::parse(text.to_owned()).unwrap()
     }
 
     fn serve_fake(
         socket: &Path,
         slot: Arc<LaunchSlot>,
         mut lock: Option<File>,
-    ) -> mpsc::Receiver<&'static str> {
+        experience: Experience,
+    ) -> mpsc::Receiver<Seen> {
         let listener = listen(socket).unwrap();
         let (window, commands) = mpsc::channel();
         let (seen, handled) = mpsc::channel();
         std::thread::spawn(move || {
             for command in commands {
                 match command {
-                    WindowCommand::Raise { done } => {
+                    WindowCommand::Raise { token, done } => {
                         if let Some(done) = done {
                             done.send(()).ok();
                         }
-                        seen.send("raise").ok();
+                        seen.send(Seen::Raise(token)).ok();
                     }
                     WindowCommand::Close => {
                         lock.take();
-                        seen.send("close").ok();
+                        seen.send(Seen::Close).ok();
                     }
                 }
             }
         });
         std::thread::spawn(move || {
-            serve(&listener, &slot, |command: WindowCommand| {
-                window.send(command).map_err(|_| WindowGone)
-            })
+            serve(
+                &listener,
+                &slot,
+                |command: WindowCommand| window.send(command).map_err(|_| WindowGone),
+                || experience,
+            )
         });
         handled
     }
@@ -725,10 +801,20 @@ mod tests {
     #[test]
     fn requests_and_replies_have_a_fixed_wire_form() {
         for (request, json) in [
-            (Request::Show {}, r#"{"show":{}}"#),
+            (Request::Show { token: None }, r#"{"show":{}}"#),
             (
-                Request::open(&target("1818")),
+                Request::Show {
+                    token: Some(token("t-1")),
+                },
+                r#"{"show":{"token":"t-1"}}"#,
+            ),
+            (
+                Request::open(&target("1818"), None),
                 r#"{"open":{"link":"roblox://placeId=1818"}}"#,
+            ),
+            (
+                Request::open(&target("1818"), Some(token("t-2"))),
+                r#"{"open":{"link":"roblox://placeId=1818","token":"t-2"}}"#,
             ),
             (Request::Quit, r#""quit""#),
         ] {
@@ -750,9 +836,10 @@ mod tests {
             assert_eq!(serde_json::from_str::<Reply>(json).unwrap(), reply);
         }
         let access_code = "8f3c2a10-5b6d-4e7f-9a1b-2c3d4e5f6a7b";
-        let private = Request::open(&target(&format!(
-            "roblox://placeId=1818&accessCode={access_code}"
-        )));
+        let private = Request::open(
+            &target(&format!("roblox://placeId=1818&accessCode={access_code}")),
+            None,
+        );
         assert_eq!(format!("{private:?}"), "Open");
     }
 
@@ -760,18 +847,32 @@ mod tests {
     fn the_newest_target_written_while_starting_is_the_one_played() {
         let slot = LaunchSlot::new(Some(target("1")));
         assert!(slot.running());
-        assert_eq!(slot.retarget(target("2")), Reply::Accepted);
-        assert_eq!(slot.retarget(target("3")), Reply::Accepted);
+        assert_eq!(
+            slot.retarget(target("2"), Experience::NotJoined),
+            Reply::Accepted
+        );
+        assert_eq!(
+            slot.retarget(target("3"), Experience::NotJoined),
+            Reply::Accepted
+        );
         assert_eq!(slot.begin_play(), Some(target("3")));
-        assert_eq!(slot.retarget(target("4")), Reply::Playing);
+        assert_eq!(
+            slot.retarget(target("4"), Experience::Joined),
+            Reply::Playing
+        );
+        assert_eq!(
+            slot.retarget(target("4"), Experience::NotJoined),
+            Reply::Ended,
+            "outside an experience a link replaces the running Roblox without asking"
+        );
         assert_eq!(slot.begin_play(), None);
         slot.end();
         assert!(!slot.running());
-        assert_eq!(slot.retarget(target("5")), Reply::Ended);
+        assert_eq!(slot.retarget(target("5"), Experience::Joined), Reply::Ended);
         slot.close();
         slot.end();
         assert!(slot.closing());
-        assert_eq!(slot.retarget(target("6")), Reply::Ended);
+        assert_eq!(slot.retarget(target("6"), Experience::Joined), Reply::Ended);
     }
 
     #[test]
@@ -779,7 +880,7 @@ mod tests {
         let root = socket_test_root("refuse");
         let socket = root.join(SOCKET);
         let slot = Arc::new(LaunchSlot::new(Some(target("1818"))));
-        let handled = serve_fake(&socket, Arc::clone(&slot), None);
+        let handled = serve_fake(&socket, Arc::clone(&slot), None, Experience::NotJoined);
 
         let duplicate = "roblox://placeId=1&placeId=2";
         let secret = "roblox://placeId=1818&accessCode=SECRET-0042";
@@ -811,6 +912,14 @@ mod tests {
                 message(&format!(r#"{{"open":{{"link":"{secret}"}}}}"#)),
                 link_reason(secret),
             ),
+            (
+                message(r#"{"show":{"token":"two words"}}"#),
+                "this Eclipse does not understand the request".to_owned(),
+            ),
+            (
+                message(r#"{"open":{"link":"roblox://placeId=1","token":""}}"#),
+                "this Eclipse does not understand the request".to_owned(),
+            ),
         ] {
             assert_eq!(raw_exchange(&socket, &request), Reply::Refused { reason });
         }
@@ -820,7 +929,8 @@ mod tests {
                 &socket,
                 &root,
                 &Request::Open {
-                    link: duplicate.to_owned()
+                    link: duplicate.to_owned(),
+                    token: None,
                 },
                 not_held
             ),
@@ -832,7 +942,7 @@ mod tests {
             raw_exchange(&socket, &padded(r#"{"show":{}}"#, MESSAGE_LIMIT)),
             Reply::Accepted
         );
-        assert_eq!(handled.recv().unwrap(), "raise");
+        assert_eq!(handled.recv().unwrap(), Seen::Raise(None));
         assert_eq!(slot.begin_play(), Some(target("1818")));
         std::fs::remove_dir_all(&root).ok();
     }
@@ -841,7 +951,12 @@ mod tests {
     fn a_silent_client_is_dropped_after_two_seconds_and_the_next_is_served() {
         let root = socket_test_root("silent");
         let socket = root.join(SOCKET);
-        serve_fake(&socket, Arc::new(LaunchSlot::new(None)), None);
+        serve_fake(
+            &socket,
+            Arc::new(LaunchSlot::new(None)),
+            None,
+            Experience::NotJoined,
+        );
 
         let _silent = UnixStream::connect(&socket).unwrap();
         let started = Instant::now();
@@ -867,7 +982,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        let error = exchange(&socket, &Request::Show {});
+        let error = exchange(&socket, &Request::Show { token: None });
         let waited = started.elapsed();
         mute.join().unwrap();
         std::fs::remove_dir_all(&root).ok();
@@ -881,10 +996,14 @@ mod tests {
         let (socket, runtime) = (root.join(SOCKET), root.join("runtime"));
         drop(listen(&socket).unwrap());
         assert!(socket.exists());
+        assert!(
+            once_spawned_children_let_go(|| UnixStream::connect(&socket).err()).is_some(),
+            "the stale socket refuses connections"
+        );
 
         let started = Instant::now();
         assert_eq!(
-            hand_off(&socket, &runtime, &Request::Show {}, not_held),
+            hand_off(&socket, &runtime, &Request::Show { token: None }, not_held),
             Ok(HandOff::Boot)
         );
         assert!(started.elapsed() < FIRST_BACKOFF * 4);
@@ -904,7 +1023,13 @@ mod tests {
         let _running = acquired(&runtime);
 
         let started = Instant::now();
-        let error = hand_off(&socket, &runtime, &Request::Show {}, already_running).unwrap_err();
+        let error = hand_off(
+            &socket,
+            &runtime,
+            &Request::Show { token: None },
+            already_running,
+        )
+        .unwrap_err();
         let waited = started.elapsed();
         assert_eq!(error, already_running(&runtime.join(CLIENT_LOCK_FILE)));
         assert!(
@@ -920,14 +1045,157 @@ mod tests {
         let (socket, runtime) = (root.join(SOCKET), root.join("runtime"));
         let slot = Arc::new(LaunchSlot::new(None));
         slot.end();
-        let handled = serve_fake(&socket, slot, Some(acquired(&runtime)));
+        let handled = serve_fake(
+            &socket,
+            slot,
+            Some(acquired(&runtime)),
+            Experience::NotJoined,
+        );
 
         assert_eq!(
-            hand_off(&socket, &runtime, &Request::open(&target("1818")), not_held),
+            hand_off(
+                &socket,
+                &runtime,
+                &Request::open(&target("1818"), None),
+                not_held
+            ),
             Ok(HandOff::Boot)
         );
-        assert_eq!(handled.recv().unwrap(), "close");
+        assert_eq!(handled.recv().unwrap(), Seen::Close);
         assert!(handled.try_recv().is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_launch_token_reaches_the_window_it_raises() {
+        let root = socket_test_root("token");
+        let socket = root.join(SOCKET);
+        let slot = Arc::new(LaunchSlot::new(None));
+        let handled = serve_fake(&socket, Arc::clone(&slot), None, Experience::NotJoined);
+
+        assert_eq!(
+            hand_off(
+                &socket,
+                &root,
+                &Request::open(&target("1818"), Some(token("open-token"))),
+                not_held
+            ),
+            Ok(HandOff::Delivered)
+        );
+        assert_eq!(
+            handled.recv().unwrap(),
+            Seen::Raise(Some(token("open-token")))
+        );
+        let show = Request::Show {
+            token: Some(token("show-token")),
+        };
+        assert_eq!(
+            hand_off(&socket, &root, &show, not_held),
+            Ok(HandOff::Delivered)
+        );
+        assert_eq!(
+            handled.recv().unwrap(),
+            Seen::Raise(Some(token("show-token")))
+        );
+        assert_eq!(slot.begin_play(), Some(target("1818")));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_link_while_roblox_is_outside_an_experience_replaces_it_without_asking() {
+        let root = socket_test_root("outside");
+        let (socket, runtime) = (root.join(SOCKET), root.join("runtime"));
+        let slot = Arc::new(LaunchSlot::new(None));
+        slot.begin_play();
+        let handled = serve_fake(
+            &socket,
+            Arc::clone(&slot),
+            Some(acquired(&runtime)),
+            Experience::NotJoined,
+        );
+
+        assert_eq!(
+            hand_off(
+                &socket,
+                &runtime,
+                &Request::open(&target("1818"), None),
+                not_held
+            ),
+            Ok(HandOff::Boot)
+        );
+        assert_eq!(handled.recv().unwrap(), Seen::Close);
+        assert!(slot.closing());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_link_during_an_experience_asks_and_staying_raises_with_the_prompt_token() {
+        let root = socket_test_root("stay");
+        let socket = root.join(SOCKET);
+        let slot = Arc::new(LaunchSlot::new(None));
+        slot.begin_play();
+        let handled = serve_fake(&socket, slot, None, Experience::Joined);
+
+        assert_eq!(
+            hand_off(
+                &socket,
+                &root,
+                &Request::open(&target("1818"), Some(token("launch-token"))),
+                not_held
+            ),
+            Ok(HandOff::InExperience)
+        );
+        assert!(
+            handled.try_recv().is_err(),
+            "the running experience is left alone until the user answers"
+        );
+        assert_eq!(stay(&socket, Some(token("prompt-token"))), Ok(()));
+        assert_eq!(
+            handled.recv().unwrap(),
+            Seen::Raise(Some(token("prompt-token")))
+        );
+        assert_eq!(
+            stay(&root.join("gone.sock"), None),
+            Ok(()),
+            "staying in a client that already exited does nothing"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn only_an_open_request_may_be_answered_with_an_experience_in_progress() {
+        let root = socket_test_root("playing");
+        let socket = root.join(SOCKET);
+        let listener = listen(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                stream.write_all(br#""playing""#).unwrap();
+            }
+        });
+
+        assert_eq!(
+            hand_off(&socket, &root, &Request::Show { token: None }, not_held),
+            Err(UNEXPECTED_ANSWER.to_owned())
+        );
+        assert_eq!(stay(&socket, None), Err(UNEXPECTED_ANSWER.to_owned()));
+        server.join().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn only_one_launch_asks_whether_to_leave_at_a_time() {
+        let root = socket_test_root("prompt");
+        let socket = root.join("control-0123456789abcdef.sock");
+
+        let asking = lock_prompt(&socket).unwrap();
+        assert!(asking.is_some());
+        assert!(root.join("control-0123456789abcdef.prompt").exists());
+        assert!(lock_prompt(&socket).unwrap().is_none());
+        drop(asking);
+        assert!(once_spawned_children_let_go(|| lock_prompt(&socket).unwrap()).is_some());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -957,15 +1225,18 @@ mod tests {
         let (window, commands) = mpsc::channel();
         let served = Arc::clone(&slot);
         std::thread::spawn(move || {
-            serve(&listener, &served, |command: WindowCommand| {
-                window.send(command).map_err(|_| WindowGone)
-            })
+            serve(
+                &listener,
+                &served,
+                |command: WindowCommand| window.send(command).map_err(|_| WindowGone),
+                || Experience::Joined,
+            )
         });
         println!("listening");
         let mut raises = 0;
         for command in commands {
             match command {
-                WindowCommand::Raise { done } => {
+                WindowCommand::Raise { done, .. } => {
                     raises += 1;
                     if let Some(done) = done {
                         done.send(()).ok();
@@ -1015,20 +1286,30 @@ mod tests {
 
         for place in ["1", "2"] {
             assert_eq!(
-                hand_off(&socket, &runtime, &Request::open(&target(place)), not_held),
+                hand_off(
+                    &socket,
+                    &runtime,
+                    &Request::open(&target(place), None),
+                    not_held
+                ),
                 Ok(HandOff::Delivered)
             );
         }
         expect_line(&lines, "playing roblox://placeId=2");
         assert_eq!(
-            hand_off(&socket, &runtime, &Request::open(&target("3")), not_held),
-            Err(IN_EXPERIENCE.to_owned())
+            hand_off(
+                &socket,
+                &runtime,
+                &Request::open(&target("3"), None),
+                not_held
+            ),
+            Ok(HandOff::InExperience)
         );
         assert_eq!(
-            hand_off(&socket, &runtime, &Request::Show {}, not_held),
+            hand_off(&socket, &runtime, &Request::Show { token: None }, not_held),
             Ok(HandOff::Delivered)
         );
-        assert_eq!(close_ended_client(&socket, &runtime), Ok(HandOff::Boot));
+        assert_eq!(close_running(&socket, &runtime), Ok(()));
         let status = child.0.wait().unwrap();
         assert!(status.success(), "the child exited with {status}");
         std::fs::remove_dir_all(&root).ok();

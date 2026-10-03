@@ -3,6 +3,7 @@ use std::fmt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 
 use directories::ProjectDirs;
@@ -825,10 +826,17 @@ pub struct Vm {
     vm: *mut jni_sys::JavaVM,
 }
 
+static BOOTED_VM: AtomicPtr<jni_sys::JavaVM> = AtomicPtr::new(std::ptr::null_mut());
+
 impl Vm {
     #[must_use]
     pub fn as_raw(&self) -> *mut jni_sys::JavaVM {
         self.vm
+    }
+
+    pub(crate) fn booted() -> Option<Self> {
+        let vm = BOOTED_VM.load(Ordering::Acquire);
+        (!vm.is_null()).then_some(Self { vm })
     }
 }
 
@@ -882,12 +890,17 @@ pub fn boot(
         option_strings.push(class_path_option(&fw, apk)?);
         option_strings.push(library_path_option(&fw, app_lib_dir)?);
     }
+    let exit_hook = jni_sys::JavaVMOption {
+        optionString: c"exit".as_ptr().cast_mut(),
+        extraInfo: crate::framework::lifecycle::client_exit_hook as *mut c_void,
+    };
     let mut options: Vec<jni_sys::JavaVMOption> = option_strings
         .iter()
         .map(|s| jni_sys::JavaVMOption {
             optionString: s.as_ptr().cast_mut(),
             extraInfo: std::ptr::null_mut(),
         })
+        .chain([exit_hook])
         .collect();
 
     let mut args = jni_sys::JavaVMInitArgs {
@@ -926,6 +939,7 @@ pub fn boot(
     if vm.is_null() || env.is_null() {
         return Err(RuntimeError::NullEnv);
     }
+    BOOTED_VM.store(vm, Ordering::Release);
 
     match crate::loader::native_provider::install_guarded_altstack() {
         Ok(st) => {

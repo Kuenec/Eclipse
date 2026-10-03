@@ -29,9 +29,9 @@ You need an x86-64 Linux desktop (Wayland or X11) and a Vulkan driver. Eclipse t
 
 - **No setup.** Eclipse downloads and updates Roblox by itself, with no account needed.
 - **Official and unmodified.** Only files signed by Roblox run, and the game is never patched.
-- **Plays like the desktop client.** Mouse lock, clipboard, input methods and F11 fullscreen.
+- **Plays like the desktop client.** Mouse lock, clipboard, input methods and F11 or Alt+Enter fullscreen.
 - **Uncapped frame rate.** Roblox's own frame rate menu, up to 240 FPS on any monitor.
-- **Browser Play button.** `roblox://` and `roblox-player:` links open in Eclipse.
+- **Browser Play button.** `roblox://` and `roblox-player:` links open in Eclipse, which closes when you leave that experience.
 - **Sandboxed** in Flatpak, with no telemetry.
 
 ## Usage
@@ -89,6 +89,7 @@ flowchart LR
 - **Something failed?** Logs of the last five launches are in `~/.var/app/io.github.kuenec.Eclipse/data/eclipse/app-data/logs/`; `eclipse.log` is the newest, and a long launch continues in its `.tail.log` file.
 - **More detail:** `flatpak run --env=RUST_LOG=debug io.github.kuenec.Eclipse run`
 - **Signature error:** the files are not Roblox's official release. Install a clean copy.
+- **Error 318:** that experience requires Android device attestation, which Eclipse cannot pass. Other experiences are not affected.
 - **Logged out after updating from 0.1.4 or older?** Eclipse carries your login over from the old web engine once. If it could not, the log says why; sign in again.
 - **Uninstall everything:** `flatpak uninstall --user --delete-data io.github.kuenec.Eclipse`
 
