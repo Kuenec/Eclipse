@@ -24,7 +24,7 @@
   <screenshots>
     <screenshot type="default">
       <caption>The launch window downloading the official Roblox client</caption>
-      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.7/packaging/flatpak/screenshots/first-launch.png</image>
+      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.8/packaging/flatpak/screenshots/first-launch.png</image>
     </screenshot>
   </screenshots>
   <url type="homepage">https://github.com/Kuenec/Eclipse</url>
@@ -55,6 +55,23 @@
     <color type="primary" scheme_preference="dark">#9e391b</color>
   </branding>
   <releases>
+    <release version="0.1.8" date="2026-10-03">
+      <description>
+        <ul>
+          <li>
+            On Wayland, Buy Robux, sign-in and other Roblox web pages now open inside the game
+            window: they move with it and cannot be dragged off it. X11 keeps a separate window.
+          </li>
+          <li>
+            Links and shares from Roblox open through your desktop, Roblox notifications show on
+            it, and the screen stays awake while you play. GameMode is used when it is installed.
+          </li>
+          <li>
+            Steam's on-screen keyboard opens when you select a text box while Steam runs.
+          </li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.7" date="2026-10-03">
       <description>
         <ul>
