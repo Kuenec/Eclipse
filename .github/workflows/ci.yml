@@ -58,6 +58,11 @@ jobs:
       - name: Lint shell scripts
         run: git ls-files -z '*.sh' | xargs -0 --no-run-if-empty shellcheck
 
+      - name: Check the release notes of the current version
+        run: |
+          python3 packaging/flatpak/release-notes-test.py
+          python3 packaging/flatpak/release-notes.py > /dev/null
+
       - name: Lint GitHub Actions workflows
         uses: docker://rhysd/actionlint:1.7.12
         with:

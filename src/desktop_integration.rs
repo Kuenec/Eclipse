@@ -465,6 +465,14 @@ mod tests {
         let exported =
             include_str!("../packaging/flatpak/io.github.kuenec.Eclipse.UrlHandler.desktop");
         assert!(exported.contains(mime_line), "{exported}");
+        let listing = include_str!("../packaging/flatpak/io.github.kuenec.Eclipse.metainfo.xml");
+        let provided: Vec<&str> = listing
+            .split("<mediatype>")
+            .skip(1)
+            .filter_map(|rest| rest.split_once("</mediatype>"))
+            .map(|(mime, _)| mime)
+            .collect();
+        assert_eq!(provided, URL_HANDLER_MIMES);
 
         let player_launch = "roblox-player:1+launchmode:play+gameinfo:TICKET+placelauncherurl:\
                              https%3A%2F%2Fassetgame.roblox.com%2Fgame%2FPlaceLauncher.ashx%3F\

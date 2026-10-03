@@ -7,14 +7,20 @@ on:
     tags:
       - "v*.*.*"
     paths:
-      - "**/Cargo.lock"
-      - packaging/flatpak/cargo-sources.json
-      - packaging/flatpak/check-cargo-sources.py
+      - "**"
+      - "!**.md"
+      - "!docs/**"
+      - "!tests/**"
+      - "!.github/**"
+      - .github/workflows/flatpak.yml
   pull_request:
     paths:
-      - "**/Cargo.lock"
-      - packaging/flatpak/cargo-sources.json
-      - packaging/flatpak/check-cargo-sources.py
+      - "**"
+      - "!**.md"
+      - "!docs/**"
+      - "!tests/**"
+      - "!.github/**"
+      - .github/workflows/flatpak.yml
   workflow_dispatch:
 
 concurrency:
@@ -40,13 +46,39 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Test the vendored source check
+        run: python3 packaging/flatpak/check-cargo-sources-test.py
+
       - name: Check that cargo-sources.json vendors every crate in the Cargo.lock files
         run: python3 packaging/flatpak/check-cargo-sources.py
+
+  listing:
+    name: Lint the desktop files, manifest and metainfo
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Validate the desktop files
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes desktop-file-utils
+          desktop-file-validate packaging/flatpak/*.desktop
+
+      - name: Lint the manifest with Flathub's linter
+        uses: docker://ghcr.io/flathub/flatpak-builder-lint@sha256:8ed347aa44505db9f786a797ab78239bdd7c92027bd7a6817af51add26a20b83
+        with:
+          args: --exceptions --user-exceptions packaging/flatpak/lint-exceptions.json --gha-format manifest packaging/flatpak/io.github.kuenec.Eclipse.yml
+
+      - name: Lint the metainfo with Flathub's linter
+        uses: docker://ghcr.io/flathub/flatpak-builder-lint@sha256:8ed347aa44505db9f786a797ab78239bdd7c92027bd7a6817af51add26a20b83
+        with:
+          args: appstream packaging/flatpak/io.github.kuenec.Eclipse.metainfo.xml
 
   build:
     name: Build Flatpak
     needs: cargo-sources
-    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
@@ -55,12 +87,22 @@ jobs:
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
       options: --privileged
+    env:
+      PUBLISH: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Check the release notes of the tagged version before anything is published
+        if: github.ref_type == 'tag'
+        run: python3 packaging/flatpak/release-notes.py "${GITHUB_REF_NAME#v}" > /dev/null
+
+      - name: Test the installed-size gate
+        run: packaging/flatpak/check-installed-size-test.sh
+
       - name: Resolve the GitHub Pages URL (Settings, Pages, Source must be GitHub Actions)
         id: pages
+        if: env.PUBLISH == 'true'
         uses: actions/configure-pages@v6
 
       - name: Build the Flatpak
@@ -69,11 +111,27 @@ jobs:
           manifest-path: packaging/flatpak/io.github.kuenec.Eclipse.yml
           branch: ${{ env.FLATPAK_BRANCH }}
           build-bundle: false
+          build-dir: flatpak_app
           repo-dir: build-repo
-          cache-key: flatpak-builder-x86_64-${{ hashFiles('packaging/flatpak/**') }}
+          cache-key: flatpak-builder-x86_64-${{ hashFiles('packaging/flatpak/io.github.kuenec.Eclipse.yml', 'packaging/flatpak/patches/**', 'tools/framework-overlay/**') }}
+
+      - name: Check the installed size against the budget
+        run: packaging/flatpak/check-installed-size.sh build-repo "app/$FLATPAK_ID/x86_64/$FLATPAK_BRANCH"
+
+      - name: Pack the build directory without its debug symbols
+        run: tar -C flatpak_app --exclude=./files/lib/debug -cf flatpak-builddir.tar .
+
+      - name: Upload the build directory for the build lint
+        uses: actions/upload-artifact@v7
+        with:
+          name: flatpak-builddir
+          path: flatpak-builddir.tar
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Import the repository signing key from the FLATPAK_GPG_PRIVATE_KEY secret
         id: gpg
+        if: env.PUBLISH == 'true'
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
         run: |
@@ -91,6 +149,7 @@ jobs:
           echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
 
       - name: Restore the published OSTree repository
+        if: env.PUBLISH == 'true'
         env:
           PAGES_URL: ${{ steps.pages.outputs.base_url }}
         run: |
@@ -112,6 +171,7 @@ jobs:
           esac
 
       - name: Sign the application build into the repository without its debug symbols
+        if: env.PUBLISH == 'true'
         env:
           GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
         run: |
@@ -119,6 +179,7 @@ jobs:
             --no-update-summary repo "app/$FLATPAK_ID/x86_64/$FLATPAK_BRANCH"
 
       - name: Prune the repository and create the bundle and repository descriptions
+        if: env.PUBLISH == 'true'
         env:
           PAGES_URL: ${{ steps.pages.outputs.base_url }}
           GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
@@ -155,6 +216,7 @@ jobs:
           EOF
 
       - name: Upload the Flatpak bundle
+        if: env.PUBLISH == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.FLATPAK_BUNDLE }}
@@ -168,9 +230,33 @@ jobs:
         with:
           path: site
 
+  lint-build:
+    name: Lint the Flatpak build directory
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Download the build directory
+        uses: actions/download-artifact@v8
+        with:
+          name: flatpak-builddir
+
+      - name: Unpack the build directory
+        run: |
+          mkdir flatpak_app
+          tar -C flatpak_app -xf flatpak-builddir.tar
+
+      - name: Lint the build directory with Flathub's linter
+        uses: docker://ghcr.io/flathub/flatpak-builder-lint@sha256:8ed347aa44505db9f786a797ab78239bdd7c92027bd7a6817af51add26a20b83
+        with:
+          args: --exceptions --user-exceptions packaging/flatpak/lint-exceptions.json --gha-format builddir flatpak_app
+
   pages:
     name: Publish the OSTree repository
-    needs: build
+    needs: [build, lint-build]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
@@ -186,12 +272,22 @@ jobs:
 
   release:
     name: Attach the bundle to the GitHub release
-    needs: build
+    needs: [build, lint-build]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Write the release notes from the metainfo
+        run: |
+          python3 packaging/flatpak/release-notes.py "${GITHUB_REF_NAME#v}" \
+            > "$RUNNER_TEMP/notes.md"
+
       - name: Download the Flatpak bundle
         uses: actions/download-artifact@v8
         with:
@@ -202,7 +298,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
-              --title "Eclipse $GITHUB_REF_NAME" --verify-tag \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --notes-file "$RUNNER_TEMP/notes.md" --title "Eclipse $GITHUB_REF_NAME" --verify-tag \
             || gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
           gh release upload "$GITHUB_REF_NAME" "$FLATPAK_BUNDLE" --repo "$GITHUB_REPOSITORY" --clobber

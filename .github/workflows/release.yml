@@ -86,6 +86,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Write the release notes from the metainfo
+        run: |
+          python3 packaging/flatpak/release-notes.py "${GITHUB_REF_NAME#v}" \
+            > "$RUNNER_TEMP/notes.md"
+
       - name: Download the payload
         uses: actions/download-artifact@v8
         with:
@@ -97,7 +107,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
-              --title "Eclipse $GITHUB_REF_NAME" --verify-tag \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --notes-file "$RUNNER_TEMP/notes.md" --title "Eclipse $GITHUB_REF_NAME" --verify-tag \
             || gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
           gh release upload "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --clobber
