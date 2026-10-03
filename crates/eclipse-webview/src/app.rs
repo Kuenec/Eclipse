@@ -99,6 +99,8 @@ pub(crate) struct App {
     parent: RefCell<Option<ParentWindow>>,
     parent_size: Cell<Option<ParentSize>>,
     unparented_logged: Cell<bool>,
+    show_count: Cell<u64>,
+    awaiting_first_frame: Cell<Option<i64>>,
 }
 
 fn failure_reply(msg: &HelperMsg) -> Option<HelperMsg> {
@@ -141,6 +143,8 @@ impl App {
             parent: RefCell::default(),
             parent_size: Cell::new(None),
             unparented_logged: Cell::new(false),
+            show_count: Cell::new(0),
+            awaiting_first_frame: Cell::new(None),
         });
         let weak = Rc::downgrade(&app);
         app.engine.cookie_manager().connect_changed(move |_| {
@@ -213,11 +217,59 @@ impl App {
         }
     }
 
+    fn set_visible(&self, id: i64, visible: bool) {
+        self.with_view(id, |view| {
+            if !visible {
+                view.show_order.set(None);
+                view.window.set_visible(false);
+            } else if view.show_order.get().is_none() {
+                let order = self.show_count.get();
+                self.show_count.set(order + 1);
+                view.show_order.set(Some(order));
+            }
+        });
+        self.present_next();
+    }
+
+    fn present_next(&self) {
+        let next = {
+            let views = self.views.borrow();
+            let awaiting = self
+                .awaiting_first_frame
+                .get()
+                .and_then(|id| views.get(&id))
+                .is_some_and(|view| view.window.is_visible());
+            if awaiting {
+                return;
+            }
+            views
+                .iter()
+                .filter(|(_, view)| view.show_order.get().is_some() && !view.window.is_visible())
+                .min_by_key(|(_, view)| view.show_order.get())
+                .map(|(id, view)| (*id, Rc::clone(view)))
+        };
+        self.awaiting_first_frame
+            .set(next.as_ref().map(|(id, _)| *id));
+        if let Some((_, view)) = next {
+            self.adopt_parent(&view.window);
+            view.window.present();
+        }
+    }
+
+    pub(crate) fn frame_painted(&self, id: i64) {
+        if self.awaiting_first_frame.get() == Some(id) {
+            self.awaiting_first_frame.set(None);
+            self.present_next();
+        }
+    }
+
     fn parent_resized(&self, size: ParentSize) {
         self.parent_size.set(Some(size));
         for view in self.all_views() {
+            view.window.set_visible(false);
             view.fit(Some(size));
         }
+        self.present_next();
     }
 
     fn next_id(&self) -> u32 {
@@ -310,14 +362,7 @@ impl App {
             }
             ConsumerMsg::CreateView { view } => self.create_view(view),
             ConsumerMsg::CloseView { view } => self.close_view(view),
-            ConsumerMsg::SetVisible { view, visible } => self.with_view(view, |view| {
-                if !visible {
-                    view.window.set_visible(false);
-                } else if !view.window.is_visible() {
-                    self.adopt_parent(&view.window);
-                    view.window.present();
-                }
-            }),
+            ConsumerMsg::SetVisible { view, visible } => self.set_visible(view, visible),
             ConsumerMsg::Activate { view, token } => {
                 self.with_view(view, |view| view.activate(&token))
             }
@@ -446,6 +491,7 @@ impl App {
         }
         view.window.destroy();
         self.send(HelperMsg::ViewClosed { view: id });
+        self.present_next();
     }
 
     pub(crate) fn bridge_message(

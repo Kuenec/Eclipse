@@ -523,7 +523,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                 if let (Some(parent), Some(window)) =
                     (self.web_view_parent.as_ref(), self.window.as_ref())
                 {
-                    parent.resized(size, window.scale_factor());
+                    parent.resized(window);
                 }
 
                 self.publish_engine_display_refresh_rates();
@@ -851,7 +851,7 @@ fn web_view_parent(window: &Window) -> Option<crate::web_view_parent::WebViewPar
     let parent = unsafe {
         crate::web_view_parent::WebViewParent::for_window_whose_display_outlives_it(display, handle)
     };
-    parent.resized(window.inner_size(), window.scale_factor());
+    parent.resized(window);
     Some(parent)
 }
 
