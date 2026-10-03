@@ -1116,7 +1116,7 @@ pub(crate) mod tests {
     fn staged_apk_library(apk: &mut crate::apk::Apk, filename: &str) -> (std::fs::File, PathBuf) {
         use std::os::fd::AsRawFd;
 
-        let entry = format!("lib/x86_64/{filename}");
+        let entry = format!("lib/{}/{filename}", crate::apk::TARGET_ABI);
         let bytes = apk
             .read_entry(&entry)
             .unwrap_or_else(|e| panic!("read {entry} from APK: {e}"));
@@ -1752,7 +1752,7 @@ pub(crate) mod tests {
         };
 
         let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
-        let filenames = apk.native_lib_filenames("x86_64");
+        let filenames = apk.native_lib_filenames(crate::apk::TARGET_ABI);
         let boot_path_libs: Vec<&String> = filenames
             .iter()
             .filter(|f| {

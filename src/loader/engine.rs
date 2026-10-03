@@ -448,13 +448,15 @@ pub fn load_app_native_lib(
     log: &mut impl Write,
 ) -> Result<Option<PreloadedLib>, EngineLoadError> {
     super::native_provider::bind_art_signal_chain().map_err(EngineLoadError::SignalChain)?;
-    static EARLY_FAULT_TAP: std::sync::Once = std::sync::Once::new();
-    EARLY_FAULT_TAP.call_once(|| {
-        if let Err(e) = super::native_provider::install_early_fault_tap(libc::SIGSEGV) {
-            let _ = writeln!(
-                log,
-                "engine-load: early-fault tap install failed ({e}) — continuing without the diagnostic"
-            );
+    static EARLY_FAULT_TAPS: std::sync::Once = std::sync::Once::new();
+    EARLY_FAULT_TAPS.call_once(|| {
+        for signal in super::native_provider::FaultSignal::ALL {
+            if let Err(e) = super::native_provider::install_early_fault_tap(signal) {
+                let _ = writeln!(
+                    log,
+                    "engine-load: early-fault tap install failed ({e}) — continuing without the diagnostic"
+                );
+            }
         }
     });
     let Some((engine, constructors_run)) = link_and_construct(lib_dir, filename, log)? else {

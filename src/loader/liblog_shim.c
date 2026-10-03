@@ -4,13 +4,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-extern int eclipse_liblog_enabled(int prio);
+extern int eclipse_liblog_enabled(int prio, const char* tag);
 extern void eclipse_liblog_emit(int prio, const char* tag, const char* msg);
 
 #define ECLIPSE_LIBLOG_BUF 4096
 
 int __android_log_print(int prio, const char* tag, const char* fmt, ...) {
-  if (!eclipse_liblog_enabled(prio)) {
+  if (!eclipse_liblog_enabled(prio, tag)) {
     return -EPERM;
   }
 
@@ -38,7 +38,7 @@ int __android_log_print(int prio, const char* tag, const char* fmt, ...) {
 
 int __android_log_vprint(int prio, const char* tag, const char* fmt,
                          va_list ap) {
-  if (!eclipse_liblog_enabled(prio)) {
+  if (!eclipse_liblog_enabled(prio, tag)) {
     return -EPERM;
   }
 

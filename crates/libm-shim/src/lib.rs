@@ -3,10 +3,16 @@
 
 use core::ffi::{c_char, c_int, c_long, c_longlong};
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe { core::arch::asm!("ud2", options(noreturn)) }
+}
+
+#[cfg(all(not(test), target_arch = "aarch64"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    unsafe { core::arch::asm!("udf #0", options(noreturn)) }
 }
 
 macro_rules! fwd1_f64 {

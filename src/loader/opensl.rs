@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::ffi::{c_void, CStr};
+use std::ffi::{c_char, c_void, CStr};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
@@ -422,8 +422,8 @@ struct EngineItfVtable {
     query_num_supported_interfaces: extern "C" fn(*mut c_void, u32, *mut u32) -> u32,
     query_supported_interfaces: extern "C" fn(*mut c_void, u32, u32, *mut c_void) -> u32,
     query_num_supported_extensions: extern "C" fn(*mut c_void, *mut u32) -> u32,
-    query_supported_extension: extern "C" fn(*mut c_void, u32, *mut i8, *mut i16) -> u32,
-    is_extension_supported: extern "C" fn(*mut c_void, *const i8, *mut u32) -> u32,
+    query_supported_extension: extern "C" fn(*mut c_void, u32, *mut c_char, *mut i16) -> u32,
+    is_extension_supported: extern "C" fn(*mut c_void, *const c_char, *mut u32) -> u32,
 }
 
 #[repr(C)]
@@ -465,8 +465,8 @@ struct VolumeItfVtable {
 
 #[repr(C)]
 struct AndroidConfigurationItfVtable {
-    set_configuration: extern "C" fn(*mut c_void, *const i8, *const c_void, u32) -> u32,
-    get_configuration: extern "C" fn(*mut c_void, *const i8, *mut u32, *mut c_void) -> u32,
+    set_configuration: extern "C" fn(*mut c_void, *const c_char, *const c_void, u32) -> u32,
+    get_configuration: extern "C" fn(*mut c_void, *const c_char, *mut u32, *mut c_void) -> u32,
     acquire_java_proxy: extern "C" fn(*mut c_void, u32, *mut c_void) -> u32,
     release_java_proxy: extern "C" fn(*mut c_void, u32) -> u32,
 }
@@ -981,7 +981,7 @@ extern "C" fn eng_query_num_extensions(_s: *mut c_void, p_num: *mut u32) -> u32 
 extern "C" fn eng_query_extension(
     _s: *mut c_void,
     _index: u32,
-    _p_name: *mut i8,
+    _p_name: *mut c_char,
     _p_len: *mut i16,
 ) -> u32 {
     SL_RESULT_PARAMETER_INVALID
@@ -989,7 +989,7 @@ extern "C" fn eng_query_extension(
 
 extern "C" fn eng_is_extension_supported(
     _s: *mut c_void,
-    _name: *const i8,
+    _name: *const c_char,
     p_supported: *mut u32,
 ) -> u32 {
     if !p_supported.is_null() {
@@ -1354,7 +1354,7 @@ fn with_player_config_state<R>(
     })?
 }
 
-fn android_config_key(config_key: *const i8) -> Result<&'static [u8], ()> {
+fn android_config_key(config_key: *const c_char) -> Result<&'static [u8], ()> {
     if config_key.is_null() {
         return Err(());
     }
@@ -1369,7 +1369,7 @@ fn android_config_key(config_key: *const i8) -> Result<&'static [u8], ()> {
 
 extern "C" fn android_config_set(
     self_itf: *mut c_void,
-    config_key: *const i8,
+    config_key: *const c_char,
     value: *const c_void,
     value_size: u32,
 ) -> u32 {
@@ -1397,7 +1397,7 @@ extern "C" fn android_config_set(
 
 extern "C" fn android_config_get(
     self_itf: *mut c_void,
-    config_key: *const i8,
+    config_key: *const c_char,
     value_size: *mut u32,
     value: *mut c_void,
 ) -> u32 {

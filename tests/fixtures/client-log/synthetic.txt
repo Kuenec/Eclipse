@@ -1,0 +1,8 @@
+2026-09-28T18:40:12.133Z,1372.133032,7a2fb6c0,6,Info [FLog::UgcExperienceController] UgcExperienceController: doTeleport: joinScriptUrl https://assetgame.roblox.com/Game/Join.ashx?...
+2026-09-28T18:41:28.924Z,1448.924449,7a3fc6c0,7 [FLog::Network] Disconnect reason received: 318
+2026-09-28T18:42:13.007Z,1493.007065,7a1fe6c0,6 [LOGCHANNELS + 1] RBXCRASH: OutOfMemoryGraphics (Failed to allocate memory. size = 1399808, alignment = 1024)
+[LOGCHANNELS + 1] RBXCRASH: OutOfMemoryGraphics (Failed to allocate memory. size = 1399808, alignment = 1024)
+2026-09-28T18:42:13.007Z,1493.007081,7a1fe6c0,6 [LOGCHANNELS + 1] RBXCRASH: OutOfMemory (Failed to allocate memory. size = 5594112, alignment = 1024)
+[LOGCHANNELS + 1] RBXCRASH: OutOfMemory (swOcc_alloc failed on 4096 bytes 4 alignment)
+2026-09-28T18:42:13.007Z,1493.007095,7a1fe6c0,6 [LOGCHANNELS + 1] RBXCRASH: FatalRuntimeError (VK_ERROR_DEVICE_LOST)
+2026-09-28T18:43:18.201Z,1558.201172,7a4f06c0,6,Info [FLog::CreatorOutput] [BloxstrapRPC] {"command":"SetRichPresence","data":{"details":"Standard Solo","startTime":1786841923,"state":"Level 19"}}
