@@ -105,7 +105,7 @@ enum MemoryPool {
 }
 
 impl CrashKind<'_> {
-    fn explanation(&self) -> String {
+    fn explanation(&self, graphics: crate::gpu::Graphics) -> String {
         match self {
             Self::OutOfMemory { pool, bytes } => {
                 let memory = match pool {
@@ -115,10 +115,15 @@ impl CrashKind<'_> {
                 let size = bytes
                     .map(|bytes| format!(" ({bytes} bytes)"))
                     .unwrap_or_default();
+                let remedy = if graphics.hides_vulkan() {
+                    "lower the graphics quality in Roblox's settings"
+                } else {
+                    "lower the graphics quality in Roblox's settings or turn on Use OpenGL ES in \
+                     Eclipse Settings"
+                };
                 format!(
                     "Roblox stopped: it reported that it could not allocate {memory}{size}. \
-                     If this repeats, lower the graphics quality in Roblox's settings and report \
-                     it with this log."
+                     If this repeats, {remedy}, and report it with this log."
                 )
             }
             Self::Other(kind) => format!("Roblox stopped with RBXCRASH: {kind}."),
@@ -427,7 +432,7 @@ fn route(deliver: impl Fn(&Tap)) {
 }
 
 fn explain(kind: &CrashKind<'_>) {
-    let explanation = kind.explanation();
+    let explanation = kind.explanation(crate::gpu::client_graphics());
     #[cfg(test)]
     if TEST_TAP
         .with_borrow_mut(|test| {

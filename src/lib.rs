@@ -12,6 +12,7 @@ pub mod flatpak;
 mod font;
 pub mod framework;
 pub mod gamepad;
+pub mod gpu;
 pub mod graphics;
 mod host_fonts;
 mod host_locale;

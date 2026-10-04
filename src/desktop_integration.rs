@@ -432,6 +432,8 @@ fn run_checked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{LaunchCommand, LaunchCommandError, RunCheck};
+    use std::ffi::OsString;
 
     #[test]
     fn a_desktop_file_that_cannot_be_written_leaves_no_temporary() {
@@ -544,6 +546,62 @@ mod tests {
                 eclipse::links::parse("90441122676618"),
                 "{mime}"
             );
+        }
+    }
+
+    fn launch_commands(
+        entry: &str,
+    ) -> Vec<(&str, Result<Option<LaunchCommand>, LaunchCommandError>)> {
+        let mut group = "";
+        let mut commands = Vec::new();
+        for line in entry.lines() {
+            if let Some(name) = line
+                .strip_prefix('[')
+                .and_then(|line| line.strip_suffix(']'))
+            {
+                group = name;
+            } else if let Some(exec) = line.strip_prefix("Exec=") {
+                let mut words = exec.split_whitespace();
+                assert_eq!(words.next(), Some("eclipse"), "[{group}] {exec}");
+                let arguments: Vec<OsString> = words.map(OsString::from).collect();
+                commands.push((group, LaunchCommand::parse(&arguments, None)));
+            }
+        }
+        commands
+    }
+
+    #[test]
+    fn desktop_entry_actions_run_the_launch_commands_they_name() {
+        let entry = include_str!("../packaging/flatpak/io.github.kuenec.Eclipse.desktop");
+        assert_eq!(
+            launch_commands(entry),
+            [
+                (
+                    "Desktop Entry",
+                    Ok(Some(LaunchCommand::Run(RunCheck::Configured)))
+                ),
+                ("Desktop Action settings", Ok(None)),
+                (
+                    "Desktop Action check-update",
+                    Ok(Some(LaunchCommand::Run(RunCheck::Now)))
+                ),
+            ]
+        );
+        assert!(
+            entry.contains("\nActions=settings;check-update;\n"),
+            "{entry}"
+        );
+    }
+
+    #[test]
+    fn desktop_entries_leave_the_gpu_choice_to_eclipse() {
+        let generated = desktop_entry(Path::new("/usr/bin/eclipse")).unwrap();
+        for entry in [
+            include_str!("../packaging/flatpak/io.github.kuenec.Eclipse.desktop"),
+            include_str!("../packaging/flatpak/io.github.kuenec.Eclipse.UrlHandler.desktop"),
+            &generated,
+        ] {
+            assert!(!entry.contains("PrefersNonDefaultGPU"), "{entry}");
         }
     }
 

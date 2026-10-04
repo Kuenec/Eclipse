@@ -10,7 +10,7 @@ const SECTIONS: [&str; 10] = [
     "Eclipse",
     "System",
     "CPU",
-    "Vulkan",
+    "Graphics",
     "Storage",
     "Roblox",
     "Config",

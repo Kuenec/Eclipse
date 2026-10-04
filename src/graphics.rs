@@ -1,4 +1,3 @@
-use std::ffi::CStr;
 use std::fmt;
 
 use ash::{khr, vk};
@@ -17,6 +16,7 @@ use crate::web_view_parent::WebViewParent;
 
 pub mod activation;
 mod dialog_window;
+mod gles_renderer;
 pub mod launch_window;
 pub(crate) mod title_suffix;
 pub mod window_state;
@@ -55,7 +55,9 @@ const TEXT_PAD_X: f32 = 12.0;
 struct GameWindow<'vm> {
     title: String,
 
-    renderer: Option<VulkanRenderer>,
+    graphics: crate::gpu::Graphics,
+
+    renderer: Option<WindowRenderer>,
 
     engine_window: Option<crate::egl_engine::EngineNativeWindow>,
 
@@ -463,25 +465,6 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
             }
         };
 
-        match VulkanRenderer::new(&window) {
-            Ok(renderer) => {
-                tracing::info!(
-                    format = ?renderer.swapchain_format,
-                    extent = ?renderer.swapchain_extent,
-                    images = renderer.frame_count(),
-                    "Vulkan surface + swapchain initialized; clear-and-present loop active"
-                );
-                self.renderer = Some(renderer);
-                window.request_redraw();
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Vulkan init failed; window stays open without GPU presentation"
-                );
-            }
-        }
-
         match window.window_handle() {
             Ok(handle) => {
                 let size = window.inner_size();
@@ -515,6 +498,20 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                 tracing::warn!(
                     error = %e,
                     "no raw window handle; engine WSI publish skipped (geometry-only ANativeWindow)"
+                );
+            }
+        }
+
+        match WindowRenderer::start(&window, self.engine_window.as_ref(), self.graphics) {
+            Ok(renderer) => {
+                tracing::info!(%renderer, "the game window draws until Roblox takes it over");
+                self.renderer = Some(renderer);
+                window.request_redraw();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "the game window stays open without drawing until Roblox takes it over"
                 );
             }
         }
@@ -604,7 +601,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
-                                "Vulkan frame draw failed; window stays open without GPU presentation"
+                                "drawing the game window failed; it stays open without drawing"
                             );
                             self.renderer = None;
                         }
@@ -761,7 +758,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
             return;
         }
         match crate::framework::window_registry::showing_dialogs() {
-            Ok(showing) => self.dialogs.sync(event_loop, &showing),
+            Ok(showing) => self.dialogs.sync(event_loop, &showing, self.graphics),
             Err(e) => tracing::error!(error = %e, "the showing dialogs could not be read"),
         }
 
@@ -790,7 +787,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                     tracing::info!(
                         width = w,
                         height = h,
-                        "Eclipse released its Vulkan renderer then dispatched the SurfaceView lifecycle \
+                        "Eclipse released its renderer then dispatched the SurfaceView lifecycle \
                          (surfaceCreated + surfaceChanged); present-loop handoff (drop-before-dispatch)"
                     );
                     self.start_gamepads();
@@ -2686,6 +2683,7 @@ pub fn run_windowed(
     crate::framework::install_main_looper_waker(event_loop.create_proxy());
     let mut app = GameWindow {
         title: title.to_owned(),
+        graphics: crate::gpu::graphics(crate::gpu::Requested::of(config)),
         window: None,
         renderer: None,
         create_error: None,
@@ -4239,6 +4237,21 @@ fn build_glyph_atlas(font: &RasterFont, text_px: f32, max_width: u32) -> Option<
     })
 }
 
+fn host_glyph_atlas(text_px: f32) -> Option<GlyphAtlas> {
+    let font = crate::host_fonts::system_font()?;
+    let Some(atlas) = build_glyph_atlas(font, text_px, 1024) else {
+        tracing::warn!("glyph atlas came out empty; text disabled");
+        return None;
+    };
+    tracing::info!(
+        atlas_w = atlas.width,
+        atlas_h = atlas.height,
+        glyphs = atlas.glyphs.len(),
+        "text: built R8 glyph atlas from the host font"
+    );
+    Some(atlas)
+}
+
 fn build_text_vertices(
     views: &[LaidOutView],
     atlas: &GlyphAtlas,
@@ -4293,6 +4306,222 @@ fn build_text_vertices(
         }
     }
     verts
+}
+
+enum WindowRenderer {
+    Vulkan(Box<VulkanRenderer>),
+    Gles(Box<gles_renderer::GlesRenderer>),
+}
+
+impl WindowRenderer {
+    fn start(
+        window: &Window,
+        engine_window: Option<&crate::egl_engine::EngineNativeWindow>,
+        graphics: crate::gpu::Graphics,
+    ) -> Result<Self, GraphicsError> {
+        if let crate::gpu::Graphics::Gles(_) = graphics {
+            return gles_renderer::GlesRenderer::new(window, engine_window)
+                .map(|renderer| Self::Gles(Box::new(renderer)))
+                .map_err(GraphicsError::Gles);
+        }
+        let vulkan = match VulkanRenderer::new(window) {
+            Ok(renderer) => return Ok(Self::Vulkan(Box::new(renderer))),
+            Err(error) => error,
+        };
+        match gles_renderer::GlesRenderer::new(window, engine_window) {
+            Ok(renderer) => {
+                tracing::warn!(
+                    %vulkan,
+                    %renderer,
+                    "Vulkan cannot draw Eclipse's window, so it draws with OpenGL ES"
+                );
+                Ok(Self::Gles(Box::new(renderer)))
+            }
+            Err(gles) => Err(GraphicsError::NoRenderer {
+                vulkan: Box::new(vulkan),
+                gles,
+            }),
+        }
+    }
+
+    fn for_status_window(
+        window: &Window,
+        requested: crate::gpu::Requested,
+    ) -> Result<Self, GraphicsError> {
+        if let Some(graphics) = crate::gpu::planned_graphics() {
+            return Self::start(window, None, graphics);
+        }
+        let (renderer, plan) = Self::first(
+            requested,
+            || VulkanRenderer::new(window),
+            || gles_renderer::GlesRenderer::new(window, None),
+        );
+        crate::gpu::record_plan(plan);
+        renderer
+    }
+
+    fn first(
+        requested: crate::gpu::Requested,
+        mut vulkan: impl FnMut() -> Result<VulkanRenderer, GraphicsError>,
+        gles: impl FnOnce() -> Result<gles_renderer::GlesRenderer, crate::egl_engine::EglError>,
+    ) -> (Result<Self, GraphicsError>, crate::gpu::Plan) {
+        let started = crate::gpu::start_drawing(
+            requested,
+            || {
+                vulkan().map(|renderer| {
+                    let fit = renderer.device_fit.clone();
+                    (renderer, fit)
+                })
+            },
+            || {
+                gles().map(|renderer| {
+                    let gl = renderer.gl_renderer().to_owned();
+                    (renderer, gl)
+                })
+            },
+        );
+        let renderer = match started.drawing {
+            Ok(crate::gpu::Drawing::Vulkan(renderer)) => Ok(Self::Vulkan(Box::new(renderer))),
+            Ok(crate::gpu::Drawing::Gles(renderer)) => Ok(Self::Gles(Box::new(renderer))),
+            Err(crate::gpu::Undrawn::Gles(error)) => Err(GraphicsError::Gles(error)),
+            Err(crate::gpu::Undrawn::Neither { vulkan, gles }) => Err(GraphicsError::NoRenderer {
+                vulkan: Box::new(vulkan),
+                gles,
+            }),
+        };
+        (renderer, started.plan)
+    }
+
+    fn extent(&self) -> vk::Extent2D {
+        match self {
+            Self::Vulkan(renderer) => renderer.swapchain_extent,
+            Self::Gles(renderer) => renderer.extent(),
+        }
+    }
+
+    fn atlas(&self) -> Option<&GlyphAtlas> {
+        match self {
+            Self::Vulkan(renderer) => renderer.text.as_ref().map(|text| &text.atlas),
+            Self::Gles(renderer) => renderer.atlas(),
+        }
+    }
+
+    fn mark_resized(&mut self, width: u32, height: u32) {
+        match self {
+            Self::Vulkan(renderer) => renderer.mark_resized(width, height),
+            Self::Gles(renderer) => renderer.mark_resized(width, height),
+        }
+    }
+
+    fn set_text_scale(&mut self, scale: f64) -> Result<(), GraphicsError> {
+        match self {
+            Self::Vulkan(renderer) => renderer.set_text_scale(scale),
+            Self::Gles(renderer) => renderer.set_text_scale(scale).map_err(GraphicsError::Gles),
+        }
+    }
+
+    fn set_drawn_canvases(&mut self, drawn: Vec<crate::framework::DrawnCanvas>) {
+        match self {
+            Self::Vulkan(renderer) => renderer.set_drawn_canvases(drawn),
+            Self::Gles(renderer) => renderer.set_drawn_canvases(drawn),
+        }
+    }
+
+    fn current_extent(&mut self, window: &Window) -> Result<Option<vk::Extent2D>, GraphicsError> {
+        match self {
+            Self::Vulkan(renderer) => renderer.current_extent(window),
+            Self::Gles(renderer) => {
+                let extent = renderer.extent();
+                Ok((extent.width != 0 && extent.height != 0).then_some(extent))
+            }
+        }
+    }
+
+    fn draw_nodes(&mut self, window: &Window, nodes: &[RenderNode]) -> Result<(), GraphicsError> {
+        match self {
+            Self::Vulkan(renderer) => renderer.draw_nodes(window, nodes),
+            Self::Gles(renderer) => renderer
+                .draw_nodes(window, nodes)
+                .map_err(GraphicsError::Gles),
+        }
+    }
+
+    fn draw_frame(&mut self, window: &Window) -> Result<(), GraphicsError> {
+        self.draw_nodes(window, &crate::framework::view_registry::snapshot_tree())
+    }
+
+    fn laid_out_tree(&self) -> Option<(Vec<RenderNode>, Vec<LaidOutView>)> {
+        let nodes = crate::framework::view_registry::snapshot_tree();
+        if nodes.is_empty() {
+            return None;
+        }
+        let measure = self.atlas().map(|atlas| TextMeasure { atlas });
+        let views = layout_views(&nodes, self.extent(), measure);
+        Some((nodes, views))
+    }
+
+    fn hit_test_at(&self, x: f32, y: f32) -> Option<ViewHandle> {
+        let (_, views) = self.laid_out_tree()?;
+        hit_test(&views, x, y)
+    }
+
+    fn first_clickable_center(&self) -> Option<(f32, f32)> {
+        let (_, views) = self.laid_out_tree()?;
+        views
+            .iter()
+            .find(|v| v.clickable)
+            .map(|v| (v.x + v.w / 2.0, v.y + v.h / 2.0))
+    }
+
+    fn first_view_center(&self) -> Option<(ViewHandle, f32, f32)> {
+        let (nodes, views) = self.laid_out_tree()?;
+        nodes
+            .iter()
+            .zip(views.iter())
+            .rev()
+            .find(|(n, _)| n.children.is_empty())
+            .map(|(_, v)| (v.handle, v.x + v.w / 2.0, v.y + v.h / 2.0))
+    }
+
+    fn custom_view_draw_targets(&self) -> Vec<crate::framework::DrawTarget> {
+        let Some((nodes, views)) = self.laid_out_tree() else {
+            return Vec::new();
+        };
+        let mut targets = Vec::new();
+        for (n, v) in nodes.iter().zip(views.iter()) {
+            if !is_custom_view_class(&n.class_name) {
+                continue;
+            }
+
+            let w = v.w.ceil();
+            let h = v.h.ceil();
+            if !(w >= 1.0 && h >= 1.0 && w.is_finite() && h.is_finite()) {
+                continue;
+            }
+            targets.push(crate::framework::DrawTarget {
+                handle: v.handle,
+                width: w as u32,
+                height: h as u32,
+            });
+        }
+        targets
+    }
+}
+
+impl fmt::Display for WindowRenderer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vulkan(renderer) => write!(
+                f,
+                "Vulkan, {:?} {}x{}, {} images",
+                renderer.swapchain_format,
+                renderer.swapchain_extent.width,
+                renderer.swapchain_extent.height,
+                renderer.frame_count()
+            ),
+            Self::Gles(renderer) => fmt::Display::fmt(renderer, f),
+        }
+    }
 }
 
 struct Swapchain {
@@ -4392,6 +4621,7 @@ struct VulkanRenderer {
     host: &'static HostVulkan,
     surface: vk::SurfaceKHR,
     physical_device: vk::PhysicalDevice,
+    device_fit: crate::gpu::DeviceFit,
 
     device: ash::Device,
     queue: vk::Queue,
@@ -4456,14 +4686,17 @@ impl VulkanRenderer {
         }
         .map_err(|e| GraphicsError::Vulkan(format!("vkCreate*SurfaceKHR failed: {e}")))?;
 
-        let (physical_device, queue_family_index) =
-            match Self::pick_device(&host.instance, &host.surface_loader, surface) {
-                Ok(v) => v,
-                Err(e) => {
-                    unsafe { host.surface_loader.destroy_surface(surface, None) };
-                    return Err(e);
-                }
-            };
+        let crate::gpu::PickedDevice {
+            handle: physical_device,
+            queue_family: queue_family_index,
+            fit: device_fit,
+        } = match crate::gpu::pick_device(&host.instance, &host.surface_loader, surface) {
+            Ok(picked) => picked,
+            Err(e) => {
+                unsafe { host.surface_loader.destroy_surface(surface, None) };
+                return Err(GraphicsError::Vulkan(e));
+            }
+        };
 
         let queue_priorities = [1.0_f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
@@ -4498,6 +4731,7 @@ impl VulkanRenderer {
                 host,
                 surface,
                 physical_device,
+                device_fit,
                 device,
                 queue: objects.queue,
                 swapchain_loader: objects.swapchain_loader,
@@ -4529,63 +4763,6 @@ impl VulkanRenderer {
                 Err(e)
             }
         }
-    }
-
-    fn pick_device(
-        instance: &ash::Instance,
-        surface_loader: &khr::surface::Instance,
-        surface: vk::SurfaceKHR,
-    ) -> Result<(vk::PhysicalDevice, u32), GraphicsError> {
-        let devices = unsafe { instance.enumerate_physical_devices() }
-            .map_err(|e| GraphicsError::Vulkan(format!("vkEnumeratePhysicalDevices: {e}")))?;
-        if devices.is_empty() {
-            return Err(GraphicsError::Vulkan(
-                "no Vulkan physical devices found".to_owned(),
-            ));
-        }
-
-        let mut fallback: Option<(vk::PhysicalDevice, u32)> = None;
-        for &pd in &devices {
-            let exts = match unsafe { instance.enumerate_device_extension_properties(pd) } {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let has_swapchain = exts.iter().any(|e| {
-                let name = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
-                name == khr::swapchain::NAME
-            });
-            if !has_swapchain {
-                continue;
-            }
-
-            let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
-            for (i, family) in families.iter().enumerate() {
-                let index = i as u32;
-                if !family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                    continue;
-                }
-
-                let present_ok = unsafe {
-                    surface_loader.get_physical_device_surface_support(pd, index, surface)
-                }
-                .unwrap_or(false);
-                if !present_ok {
-                    continue;
-                }
-
-                let props = unsafe { instance.get_physical_device_properties(pd) };
-                if props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
-                    return Ok((pd, index));
-                }
-                fallback.get_or_insert((pd, index));
-            }
-        }
-
-        fallback.ok_or_else(|| {
-            GraphicsError::Vulkan(
-                "no Vulkan device with a graphics+present queue for this surface".to_owned(),
-            )
-        })
     }
 
     fn create_quad_pipeline(
@@ -4936,72 +5113,6 @@ impl VulkanRenderer {
         self.swapchain.framebuffers.len()
     }
 
-    fn hit_test_at(&self, x: f32, y: f32) -> Option<ViewHandle> {
-        let nodes = crate::framework::view_registry::snapshot_tree();
-        if nodes.is_empty() {
-            return None;
-        }
-        let measure = self.text.as_ref().map(|t| TextMeasure { atlas: &t.atlas });
-        let views = layout_views(&nodes, self.swapchain.extent, measure);
-        hit_test(&views, x, y)
-    }
-
-    fn first_clickable_center(&self) -> Option<(f32, f32)> {
-        let nodes = crate::framework::view_registry::snapshot_tree();
-        if nodes.is_empty() {
-            return None;
-        }
-        let measure = self.text.as_ref().map(|t| TextMeasure { atlas: &t.atlas });
-        let views = layout_views(&nodes, self.swapchain.extent, measure);
-        views
-            .iter()
-            .find(|v| v.clickable)
-            .map(|v| (v.x + v.w / 2.0, v.y + v.h / 2.0))
-    }
-
-    fn first_view_center(&self) -> Option<(ViewHandle, f32, f32)> {
-        let nodes = crate::framework::view_registry::snapshot_tree();
-        if nodes.is_empty() {
-            return None;
-        }
-        let measure = self.text.as_ref().map(|t| TextMeasure { atlas: &t.atlas });
-        let views = layout_views(&nodes, self.swapchain.extent, measure);
-
-        nodes
-            .iter()
-            .zip(views.iter())
-            .rev()
-            .find(|(n, _)| n.children.is_empty())
-            .map(|(_, v)| (v.handle, v.x + v.w / 2.0, v.y + v.h / 2.0))
-    }
-
-    fn custom_view_draw_targets(&self) -> Vec<crate::framework::DrawTarget> {
-        let nodes = crate::framework::view_registry::snapshot_tree();
-        if nodes.is_empty() {
-            return Vec::new();
-        }
-        let measure = self.text.as_ref().map(|t| TextMeasure { atlas: &t.atlas });
-        let views = layout_views(&nodes, self.swapchain.extent, measure);
-        let mut targets = Vec::new();
-        for (n, v) in nodes.iter().zip(views.iter()) {
-            if !is_custom_view_class(&n.class_name) {
-                continue;
-            }
-
-            let w = v.w.ceil();
-            let h = v.h.ceil();
-            if !(w >= 1.0 && h >= 1.0 && w.is_finite() && h.is_finite()) {
-                continue;
-            }
-            targets.push(crate::framework::DrawTarget {
-                handle: v.handle,
-                width: w as u32,
-                height: h as u32,
-            });
-        }
-        targets
-    }
-
     fn set_drawn_canvases(&mut self, drawn: Vec<crate::framework::DrawnCanvas>) {
         for d in self.drawn_canvases.drain(..) {
             let _ = crate::framework::canvas_registry::free(d.canvas);
@@ -5073,10 +5184,6 @@ impl VulkanRenderer {
             unsafe { previous.destroy(&self.device) };
         }
         Ok(())
-    }
-
-    fn draw_frame(&mut self, window: &Window) -> Result<(), GraphicsError> {
-        self.draw_nodes(window, &crate::framework::view_registry::snapshot_tree())
     }
 
     fn current_extent(&mut self, window: &Window) -> Result<Option<vk::Extent2D>, GraphicsError> {
@@ -5601,19 +5708,9 @@ impl TextRenderer {
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
         text_px: f32,
     ) -> Result<Option<Self>, GraphicsError> {
-        let Some(font) = crate::host_fonts::system_font() else {
+        let Some(atlas) = host_glyph_atlas(text_px) else {
             return Ok(None);
         };
-        let Some(atlas) = build_glyph_atlas(font, text_px, 1024) else {
-            tracing::warn!("glyph atlas came out empty; text disabled");
-            return Ok(None);
-        };
-        tracing::info!(
-            atlas_w = atlas.width,
-            atlas_h = atlas.height,
-            glyphs = atlas.glyphs.len(),
-            "text: built R8 glyph atlas from the host font"
-        );
 
         Self::build_gpu(
             device,
@@ -6579,7 +6676,17 @@ pub enum GraphicsError {
 
     Vulkan(String),
 
-    EngineSurfaceUnavailable { width: i32, height: i32 },
+    Gles(crate::egl_engine::EglError),
+
+    NoRenderer {
+        vulkan: Box<GraphicsError>,
+        gles: crate::egl_engine::EglError,
+    },
+
+    EngineSurfaceUnavailable {
+        width: i32,
+        height: i32,
+    },
 
     EngineSurfaceHandoff(crate::framework::FrameworkError),
 }
@@ -6590,6 +6697,11 @@ impl fmt::Display for GraphicsError {
             Self::EventLoop(e) => write!(f, "winit event loop error: {e}"),
             Self::CreateWindow(e) => write!(f, "failed to create host window: {e}"),
             Self::Vulkan(msg) => write!(f, "Vulkan error: {msg}"),
+            Self::Gles(e) => write!(f, "OpenGL ES error: {e}"),
+            Self::NoRenderer { vulkan, gles } => write!(
+                f,
+                "neither Vulkan nor OpenGL ES can draw the window ({vulkan}; OpenGL ES error: {gles})"
+            ),
             Self::EngineSurfaceUnavailable { width, height } => write!(
                 f,
                 "Roblox's SurfaceView stopped accepting the {width}x{height} window right after \
@@ -6610,6 +6722,8 @@ impl std::error::Error for GraphicsError {
             Self::EventLoop(e) => Some(e),
             Self::CreateWindow(e) => Some(e),
             Self::EngineSurfaceHandoff(e) => Some(e),
+            Self::Gles(e) => Some(e),
+            Self::NoRenderer { vulkan, .. } => Some(vulkan),
             Self::Vulkan(_) | Self::EngineSurfaceUnavailable { .. } => None,
         }
     }
@@ -6619,7 +6733,7 @@ impl std::error::Error for GraphicsError {
 mod tests {
     use super::*;
     use crate::framework::view_registry::WRAP_CONTENT;
-    use crate::loader::vulkan_wsi::unmapped_xlib::UnmappedXlibWindow;
+    use unmapped_xlib_window::UnmappedXlibWindow;
 
     #[test]
     fn events_of_a_closed_window_never_reach_the_game_window() {
@@ -7073,7 +7187,10 @@ mod tests {
             );
             return;
         }
-        let windows = match (UnmappedXlibWindow::open(), UnmappedXlibWindow::open()) {
+        let windows = match (
+            UnmappedXlibWindow::open(64, 64),
+            UnmappedXlibWindow::open(64, 64),
+        ) {
             (Ok(first), Ok(second)) => [first, second],
             (Err(e), _) | (_, Err(e)) => {
                 eprintln!("SKIP: no usable X11 display ({e})");
@@ -9339,6 +9456,12 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod unmapped_xlib_window;
+
+#[cfg(test)]
+pub(crate) mod roleless_wayland_surface;
 
 #[cfg(test)]
 pub(crate) mod headless_vulkan {

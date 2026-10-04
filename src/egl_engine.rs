@@ -1,4 +1,4 @@
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_void, CStr};
 use std::fmt;
 
 use crate::loader::native_provider::{HOST_EGL_SONAME, HOST_GLESV2_SONAME};
@@ -11,11 +11,19 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 type EglApi = egl::EGL1_4;
 
-type EglInstance = egl::DynamicInstance<EglApi>;
+pub(crate) type EglInstance = egl::DynamicInstance<EglApi>;
 
 const EGL_OPENGL_ES2_BIT: egl::Int = 0x0004;
 
 pub(crate) const MIN_ENGINE_EDGE: u32 = 2;
+
+const SURFACELESS_CONFIG: [egl::Int; 5] = [
+    egl::RENDERABLE_TYPE,
+    EGL_OPENGL_ES2_BIT,
+    egl::SURFACE_TYPE,
+    0,
+    egl::NONE,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowGeometry {
@@ -104,6 +112,81 @@ impl fmt::Display for EglError {
 
 impl std::error::Error for EglError {}
 
+pub(crate) fn load_host_egl() -> Result<EglInstance, EglError> {
+    unsafe {
+        let lib = libloading::Library::new(HOST_EGL_SONAME)
+            .map_err(|e| EglError::LoadEgl(e.to_string()))?;
+        EglInstance::load_required_from(lib).map_err(|e| EglError::LoadEgl(e.to_string()))
+    }
+}
+
+pub(crate) fn initialized_display(
+    egl: &EglInstance,
+    display_handle: RawDisplayHandle,
+) -> Result<egl::Display, EglError> {
+    let native_display: egl::NativeDisplayType = match display_handle {
+        RawDisplayHandle::Wayland(d) => d.display.as_ptr(),
+        RawDisplayHandle::Xlib(d) => match d.display {
+            Some(p) => p.as_ptr(),
+            None => egl::DEFAULT_DISPLAY,
+        },
+        _ => return Err(EglError::UnsupportedDisplay),
+    };
+
+    let display = unsafe { egl.get_display(native_display) }
+        .ok_or_else(|| EglError::Display("eglGetDisplay returned EGL_NO_DISPLAY".into()))?;
+    egl.initialize(display)
+        .map_err(|e| EglError::Display(format!("eglInitialize failed: {e}")))?;
+    Ok(display)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GlDriver {
+    pub(crate) renderer: String,
+    pub(crate) version: String,
+}
+
+pub(crate) fn probe_gl(display_handle: RawDisplayHandle) -> Result<GlDriver, EglError> {
+    let egl = load_host_egl()?;
+    let display = initialized_display(&egl, display_handle)?;
+    let driver = surfaceless_gl_driver(&egl, display);
+    if let Err(error) = egl.terminate(display) {
+        tracing::warn!(%error, "terminating the EGL display that named the OpenGL ES driver failed");
+    }
+    driver
+}
+
+fn surfaceless_gl_driver(egl: &EglInstance, display: egl::Display) -> Result<GlDriver, EglError> {
+    egl.bind_api(egl::OPENGL_ES_API)
+        .map_err(EglError::Context)?;
+    let config = egl
+        .choose_first_config(display, &SURFACELESS_CONFIG)
+        .map_err(|e| EglError::Display(format!("eglChooseConfig failed: {e}")))?
+        .ok_or(EglError::NoConfig)?;
+    let context = egl
+        .create_context(display, config, None, &gles2_context_attribs())
+        .map_err(EglError::Context)?;
+    let driver = egl
+        .make_current(display, None, None, Some(context))
+        .map_err(EglError::Present)
+        .and_then(|()| {
+            let gl = Gles2::load(egl)?;
+            unsafe {
+                Ok(GlDriver {
+                    renderer: gl_string(&gl, GL_RENDERER, "GL_RENDERER")?,
+                    version: gl_string(&gl, GL_VERSION, "GL_VERSION")?,
+                })
+            }
+        });
+    if let Err(error) = egl.make_current(display, None, None, None) {
+        tracing::warn!(%error, "releasing the OpenGL ES context that named the driver failed");
+    }
+    if let Err(error) = egl.destroy_context(display, context) {
+        tracing::warn!(%error, "destroying the OpenGL ES context that named the driver failed");
+    }
+    driver
+}
+
 pub struct EngineGlSurface {
     egl: EglInstance,
     display: egl::Display,
@@ -143,26 +226,8 @@ impl EngineGlSurface {
         native: EngineNativeWindow,
         geometry: WindowGeometry,
     ) -> Result<Self, EglError> {
-        let egl = unsafe {
-            let lib = libloading::Library::new(HOST_EGL_SONAME)
-                .map_err(|e| EglError::LoadEgl(e.to_string()))?;
-            EglInstance::load_required_from(lib).map_err(|e| EglError::LoadEgl(e.to_string()))?
-        };
-
-        let native_display: egl::NativeDisplayType = match display_handle {
-            RawDisplayHandle::Wayland(d) => d.display.as_ptr(),
-            RawDisplayHandle::Xlib(d) => match d.display {
-                Some(p) => p.as_ptr(),
-                None => egl::DEFAULT_DISPLAY,
-            },
-            _ => return Err(EglError::UnsupportedDisplay),
-        };
-
-        let display = unsafe { egl.get_display(native_display) }
-            .ok_or_else(|| EglError::Display("eglGetDisplay returned EGL_NO_DISPLAY".into()))?;
-        let (_major, _minor) = egl
-            .initialize(display)
-            .map_err(|e| EglError::Display(format!("eglInitialize failed: {e}")))?;
+        let egl = load_host_egl()?;
+        let display = initialized_display(&egl, display_handle)?;
 
         let config = egl
             .choose_first_config(display, &gles2_config_attribs())
@@ -241,6 +306,8 @@ impl Drop for EngineGlSurface {
 pub struct EngineNativeWindow {
     backing: NativeWindowBacking,
 
+    publication: Publication,
+
     native_window: *mut c_void,
     geometry: WindowGeometry,
 }
@@ -253,27 +320,17 @@ enum NativeWindowBacking {
     Borrowed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Publication {
+    Engine,
+
+    Private,
+}
+
 impl EngineNativeWindow {
     pub fn new(window_handle: RawWindowHandle, geometry: WindowGeometry) -> Result<Self, EglError> {
-        let window = match window_handle {
-            RawWindowHandle::Wayland(w) => {
-                let wl = WaylandEglWindow::new(w.surface.as_ptr(), geometry)?;
-                let native_window = wl.window;
-                Self {
-                    backing: NativeWindowBacking::Wayland(wl),
-                    native_window,
-                    geometry,
-                }
-            }
-            RawWindowHandle::Xlib(w) => Self {
-                backing: NativeWindowBacking::X11,
-
-                native_window: w.window as *mut c_void,
-                geometry,
-            },
-            _ => return Err(EglError::UnsupportedDisplay),
-        };
-
+        let mut window = Self::private(window_handle, geometry)?;
+        window.publication = Publication::Engine;
         crate::loader::ndk_registry::register_wsi_window(
             window.native_window as usize,
             geometry.width,
@@ -282,10 +339,36 @@ impl EngineNativeWindow {
         Ok(window)
     }
 
+    pub(crate) fn private(
+        window_handle: RawWindowHandle,
+        geometry: WindowGeometry,
+    ) -> Result<Self, EglError> {
+        match window_handle {
+            RawWindowHandle::Wayland(w) => {
+                let wl = WaylandEglWindow::new(w.surface.as_ptr(), geometry)?;
+                let native_window = wl.window;
+                Ok(Self {
+                    backing: NativeWindowBacking::Wayland(wl),
+                    publication: Publication::Private,
+                    native_window,
+                    geometry,
+                })
+            }
+            RawWindowHandle::Xlib(w) => Ok(Self {
+                backing: NativeWindowBacking::X11,
+                publication: Publication::Private,
+                native_window: w.window as *mut c_void,
+                geometry,
+            }),
+            _ => Err(EglError::UnsupportedDisplay),
+        }
+    }
+
     #[must_use]
     pub fn borrowed(native_window: egl::NativeWindowType, geometry: WindowGeometry) -> Self {
         Self {
             backing: NativeWindowBacking::Borrowed,
+            publication: Publication::Private,
             native_window,
             geometry,
         }
@@ -312,11 +395,12 @@ impl EngineNativeWindow {
 
 impl Drop for EngineNativeWindow {
     fn drop(&mut self) {
-        if matches!(self.backing, NativeWindowBacking::Borrowed) {
-            return;
+        match self.publication {
+            Publication::Engine => {
+                crate::loader::ndk_registry::unregister_wsi_window(self.native_window as usize);
+            }
+            Publication::Private => {}
         }
-
-        crate::loader::ndk_registry::unregister_wsi_window(self.native_window as usize);
     }
 }
 
@@ -376,6 +460,9 @@ impl Drop for WaylandEglWindow {
 
 const GL_NO_ERROR: u32 = 0;
 
+pub(crate) const GL_RENDERER: u32 = 0x1F01;
+pub(crate) const GL_VERSION: u32 = 0x1F02;
+
 pub const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
 
 pub const GL_VERTEX_SHADER: u32 = 0x8B31;
@@ -384,9 +471,22 @@ pub const GL_FRAGMENT_SHADER: u32 = 0x8B30;
 const GL_COMPILE_STATUS: u32 = 0x8B81;
 const GL_LINK_STATUS: u32 = 0x8B82;
 
-const GL_FLOAT: u32 = 0x1406;
+pub(crate) const GL_FLOAT: u32 = 0x1406;
 pub const GL_TRIANGLES: u32 = 0x0004;
-const GL_FALSE: u8 = 0;
+pub(crate) const GL_FALSE: u8 = 0;
+pub(crate) const GL_TRUE: u8 = 1;
+pub(crate) const GL_ARRAY_BUFFER: u32 = 0x8892;
+pub(crate) const GL_STREAM_DRAW: u32 = 0x88E0;
+pub(crate) const GL_TEXTURE_2D: u32 = 0x0DE1;
+pub(crate) const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
+pub(crate) const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
+pub(crate) const GL_TEXTURE_WRAP_S: u32 = 0x2802;
+pub(crate) const GL_TEXTURE_WRAP_T: u32 = 0x2803;
+pub(crate) const GL_CLAMP_TO_EDGE: i32 = 0x812F;
+pub(crate) const GL_RGBA: u32 = 0x1908;
+pub(crate) const GL_UNSIGNED_BYTE: u32 = 0x1401;
+pub(crate) const GL_BLEND: u32 = 0x0BE2;
+pub(crate) const GL_ONE_MINUS_SRC_ALPHA: u32 = 0x0303;
 
 type PfnGlGetError = unsafe extern "C" fn() -> u32;
 type PfnGlClearColor = unsafe extern "C" fn(f32, f32, f32, f32);
@@ -407,13 +507,29 @@ type PfnGlVertexAttribPointer = unsafe extern "C" fn(u32, i32, u32, u8, i32, *co
 type PfnGlDrawArrays = unsafe extern "C" fn(u32, i32, i32);
 type PfnGlDeleteShader = unsafe extern "C" fn(u32);
 type PfnGlDeleteProgram = unsafe extern "C" fn(u32);
+type PfnGlGetUniformLocation = unsafe extern "C" fn(u32, *const c_char) -> i32;
+type PfnGlUniform4f = unsafe extern "C" fn(i32, f32, f32, f32, f32);
+type PfnGlGenObjects = unsafe extern "C" fn(i32, *mut u32);
+type PfnGlDeleteObjects = unsafe extern "C" fn(i32, *const u32);
+type PfnGlBindObject = unsafe extern "C" fn(u32, u32);
+type PfnGlBufferData = unsafe extern "C" fn(u32, isize, *const c_void, u32);
+type PfnGlTexImage2D = unsafe extern "C" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const c_void);
+type PfnGlTexSubImage2D =
+    unsafe extern "C" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const c_void);
+type PfnGlTexParameteri = unsafe extern "C" fn(u32, u32, i32);
+type PfnGlPixelStorei = unsafe extern "C" fn(u32, i32);
+type PfnGlEnable = unsafe extern "C" fn(u32);
+type PfnGlBlendFunc = unsafe extern "C" fn(u32, u32);
+type PfnGlColorMask = unsafe extern "C" fn(u8, u8, u8, u8);
+type PfnGlGetString = unsafe extern "C" fn(u32) -> *const c_char;
+type PfnGlReadPixels = unsafe extern "C" fn(i32, i32, i32, i32, u32, u32, *mut c_void);
 
 pub struct Gles2 {
     _lib: libloading::Library,
-    gl_get_error: PfnGlGetError,
-    gl_clear_color: PfnGlClearColor,
-    gl_clear: PfnGlClear,
-    gl_viewport: PfnGlViewport,
+    pub(crate) gl_get_error: PfnGlGetError,
+    pub(crate) gl_clear_color: PfnGlClearColor,
+    pub(crate) gl_clear: PfnGlClear,
+    pub(crate) gl_viewport: PfnGlViewport,
     gl_create_shader: PfnGlCreateShader,
     gl_shader_source: PfnGlShaderSource,
     gl_compile_shader: PfnGlCompileShader,
@@ -422,17 +538,34 @@ pub struct Gles2 {
     gl_attach_shader: PfnGlAttachShader,
     gl_link_program: PfnGlLinkProgram,
     gl_get_programiv: PfnGlGetProgramiv,
-    gl_use_program: PfnGlUseProgram,
-    gl_get_attrib_location: PfnGlGetAttribLocation,
-    gl_enable_vertex_attrib_array: PfnGlEnableVertexAttribArray,
-    gl_vertex_attrib_pointer: PfnGlVertexAttribPointer,
-    gl_draw_arrays: PfnGlDrawArrays,
+    pub(crate) gl_use_program: PfnGlUseProgram,
+    pub(crate) gl_get_attrib_location: PfnGlGetAttribLocation,
+    pub(crate) gl_enable_vertex_attrib_array: PfnGlEnableVertexAttribArray,
+    pub(crate) gl_vertex_attrib_pointer: PfnGlVertexAttribPointer,
+    pub(crate) gl_draw_arrays: PfnGlDrawArrays,
     gl_delete_shader: PfnGlDeleteShader,
     gl_delete_program: PfnGlDeleteProgram,
+    pub(crate) gl_get_uniform_location: PfnGlGetUniformLocation,
+    pub(crate) gl_uniform_4f: PfnGlUniform4f,
+    pub(crate) gl_gen_buffers: PfnGlGenObjects,
+    pub(crate) gl_bind_buffer: PfnGlBindObject,
+    pub(crate) gl_buffer_data: PfnGlBufferData,
+    pub(crate) gl_gen_textures: PfnGlGenObjects,
+    pub(crate) gl_delete_textures: PfnGlDeleteObjects,
+    pub(crate) gl_bind_texture: PfnGlBindObject,
+    pub(crate) gl_tex_image_2d: PfnGlTexImage2D,
+    pub(crate) gl_tex_sub_image_2d: PfnGlTexSubImage2D,
+    pub(crate) gl_tex_parameteri: PfnGlTexParameteri,
+    pub(crate) gl_pixel_storei: PfnGlPixelStorei,
+    pub(crate) gl_enable: PfnGlEnable,
+    pub(crate) gl_blend_func: PfnGlBlendFunc,
+    pub(crate) gl_color_mask: PfnGlColorMask,
+    pub(crate) gl_get_string: PfnGlGetString,
+    pub(crate) gl_read_pixels: PfnGlReadPixels,
 }
 
 impl Gles2 {
-    fn load(egl: &EglInstance) -> Result<Self, EglError> {
+    pub(crate) fn load(egl: &EglInstance) -> Result<Self, EglError> {
         unsafe {
             let lib = libloading::Library::new(HOST_GLESV2_SONAME)
                 .map_err(|e| EglError::Gl(format!("no {HOST_GLESV2_SONAME}: {e}")))?;
@@ -480,6 +613,23 @@ impl Gles2 {
                 gl_draw_arrays: load_fn!("glDrawArrays", PfnGlDrawArrays),
                 gl_delete_shader: load_fn!("glDeleteShader", PfnGlDeleteShader),
                 gl_delete_program: load_fn!("glDeleteProgram", PfnGlDeleteProgram),
+                gl_get_uniform_location: load_fn!("glGetUniformLocation", PfnGlGetUniformLocation),
+                gl_uniform_4f: load_fn!("glUniform4f", PfnGlUniform4f),
+                gl_gen_buffers: load_fn!("glGenBuffers", PfnGlGenObjects),
+                gl_bind_buffer: load_fn!("glBindBuffer", PfnGlBindObject),
+                gl_buffer_data: load_fn!("glBufferData", PfnGlBufferData),
+                gl_gen_textures: load_fn!("glGenTextures", PfnGlGenObjects),
+                gl_delete_textures: load_fn!("glDeleteTextures", PfnGlDeleteObjects),
+                gl_bind_texture: load_fn!("glBindTexture", PfnGlBindObject),
+                gl_tex_image_2d: load_fn!("glTexImage2D", PfnGlTexImage2D),
+                gl_tex_sub_image_2d: load_fn!("glTexSubImage2D", PfnGlTexSubImage2D),
+                gl_tex_parameteri: load_fn!("glTexParameteri", PfnGlTexParameteri),
+                gl_pixel_storei: load_fn!("glPixelStorei", PfnGlPixelStorei),
+                gl_enable: load_fn!("glEnable", PfnGlEnable),
+                gl_blend_func: load_fn!("glBlendFunc", PfnGlBlendFunc),
+                gl_color_mask: load_fn!("glColorMask", PfnGlColorMask),
+                gl_get_string: load_fn!("glGetString", PfnGlGetString),
+                gl_read_pixels: load_fn!("glReadPixels", PfnGlReadPixels),
                 _lib: lib,
             })
         }
@@ -489,7 +639,7 @@ impl Gles2 {
         unsafe { (self.gl_get_error)() }
     }
 
-    fn check(&self, op: &str) -> Result<(), EglError> {
+    pub(crate) fn check(&self, op: &str) -> Result<(), EglError> {
         let mut first = GL_NO_ERROR;
         loop {
             let e = self.get_error();
@@ -563,7 +713,21 @@ pub fn render_test_frames(surface: &EngineGlSurface, frames: u32) -> Result<(), 
     Ok(())
 }
 
-unsafe fn compile_program(gl: &Gles2, vert: &[u8], frag: &[u8]) -> Result<u32, EglError> {
+pub(crate) unsafe fn gl_string(gl: &Gles2, name: u32, label: &str) -> Result<String, EglError> {
+    let text = unsafe { (gl.gl_get_string)(name) };
+    if text.is_null() {
+        return Err(EglError::Gl(format!("glGetString({label}) returned NULL")));
+    }
+    Ok(unsafe { CStr::from_ptr(text) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+pub(crate) unsafe fn compile_program(
+    gl: &Gles2,
+    vert: &[u8],
+    frag: &[u8],
+) -> Result<u32, EglError> {
     unsafe {
         let vs = compile_shader(gl, GL_VERTEX_SHADER, vert)?;
         let fs = match compile_shader(gl, GL_FRAGMENT_SHADER, frag) {
@@ -951,6 +1115,7 @@ mod tests {
         let native_window = wl.window;
         let mut window = EngineNativeWindow {
             backing: NativeWindowBacking::Wayland(wl),
+            publication: Publication::Private,
             native_window,
             geometry: initial,
         };

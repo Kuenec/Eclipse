@@ -124,7 +124,7 @@ class Marker(Enum):
     ART_BOOTED = "ART VM booted"
     WINDOW = "host window created"
     HANDOFF = "present-loop handoff"
-    FIRST_FRAME = "present seam armed"
+    FIRST_FRAME = "seam armed"
 
 
 class Discard(Enum):

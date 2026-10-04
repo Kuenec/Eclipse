@@ -49,6 +49,8 @@ Controllers need Flatpak 1.16 or newer. On older Flatpak, run `flatpak override 
 | `roblox_auto_update` | `true` | `false` stops launches from updating Roblox; `update` and `run --check-update` still do |
 | `close_on_leave` | `"browser"` | Closes Eclipse when you leave an experience that a link started; `true` closes it after any experience, `false` never |
 | `server_location_indicator_enabled` | `false` | Shows where the Roblox server is in the window title and a notification. ipinfo.io receives the server's address and sees your IP address |
+| `vulkan_device` | `null` | The GPU Roblox and Eclipse render on, as `"vendor:device"` from `lspci -nn`, such as `"10de:2f04"`; `null` prefers a discrete GPU |
+| `use_opengl` | `false` | `true` makes Roblox draw with OpenGL ES instead of Vulkan, which Eclipse also does when it finds no usable Vulkan GPU; on X11, OpenGL ES is capped at the monitor's refresh rate |
 
 The settings window, `config set KEY VALUE` and `config unset KEY` change one key and keep every other key and value as written.
 
@@ -69,4 +71,4 @@ Eclipse keeps its files in `~/.var/app/io.github.kuenec.Eclipse/`:
 ## Safety
 
 - Eclipse only runs files signed by Roblox Corporation (certificate SHA-256 `44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477`), and it never downloads an older version. It keeps the previous Roblox until a new one has been played and closed once: if the new one fails to start twice, Eclipse goes back to it, and `rollback` goes back to it by hand.
-- It never modifies the game. The only Fast Flag it sets on its own is `FFlagGameBasicSettingsFramerateCap5`, which shows Roblox's frame rate menu.
+- It never modifies the game. The only Fast Flag it sets on its own is `FFlagGameBasicSettingsFramerateCap5`, which shows Roblox's frame rate menu; it sets no texture flags.

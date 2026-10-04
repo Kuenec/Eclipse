@@ -64,6 +64,7 @@ struct Rows {
     server_location: adw::SwitchRow,
     physical_cores: adw::SwitchRow,
     gamemode: adw::SwitchRow,
+    opengl: adw::SwitchRow,
     bug_report: adw::ActionRow,
     log_folder: adw::ActionRow,
 }
@@ -101,7 +102,11 @@ pub(crate) fn open(
     ));
     page.add(&group(
         "Performance",
-        &[rows.physical_cores.upcast_ref(), rows.gamemode.upcast_ref()],
+        &[
+            rows.physical_cores.upcast_ref(),
+            rows.gamemode.upcast_ref(),
+            rows.opengl.upcast_ref(),
+        ],
     ));
     page.add(&group(
         "Troubleshooting",
@@ -191,6 +196,10 @@ impl Rows {
                 "GameMode",
                 "Turn on GameMode while Roblox runs, if it is installed",
             ),
+            opengl: switch_row(
+                "Use OpenGL ES",
+                "Instead of Vulkan; may stop repeated out-of-memory crashes",
+            ),
             bug_report: action_row("Copy Bug Report", BUG_REPORT_SUBTITLE, "edit-copy-symbolic"),
             log_folder: action_row(
                 "Open Log Folder",
@@ -211,6 +220,8 @@ impl Rows {
             allow_gamepad_permission,
             fflags: _,
             webview_helper_path: _,
+            vulkan_device: _,
+            use_opengl,
         } = config;
         self.auto_update.set_active(*roblox_auto_update);
         self.pointer_input
@@ -223,12 +234,13 @@ impl Rows {
             .set_active(*graphics_optimization_mode == GraphicsOptimizationMode::Performance);
         self.gamemode.set_active(*enable_gamemode);
         self.controllers.set_active(*allow_gamepad_permission);
+        self.opengl.set_active(*use_opengl);
         for row in self.settings() {
             row.set_sensitive(editable);
         }
     }
 
-    fn settings(&self) -> [&gtk::Widget; 7] {
+    fn settings(&self) -> [&gtk::Widget; 8] {
         [
             self.auto_update.upcast_ref(),
             self.pointer_input.upcast_ref(),
@@ -237,6 +249,7 @@ impl Rows {
             self.server_location.upcast_ref(),
             self.physical_cores.upcast_ref(),
             self.gamemode.upcast_ref(),
+            self.opengl.upcast_ref(),
         ]
     }
 }
@@ -247,6 +260,7 @@ impl Settings {
         self.on_switch(&rows.auto_update, Setting::RobloxAutoUpdate);
         self.on_switch(&rows.gamemode, Setting::EnableGamemode);
         self.on_switch(&rows.controllers, Setting::AllowGamepadPermission);
+        self.on_switch(&rows.opengl, Setting::UseOpengl);
         self.on_switch(&rows.physical_cores, |on| {
             Setting::GraphicsOptimizationMode(if on {
                 GraphicsOptimizationMode::Performance
@@ -943,6 +957,30 @@ mod tests {
             written,
             "{\n  \"server_location_indicator_enabled\": true\n}\n"
         );
+    }
+
+    #[test]
+    fn the_opengl_es_switch_writes_use_opengl() {
+        if let Some(root) = headless::child_root() {
+            let settings = show(&root);
+            let row = &settings.rows.opengl;
+            assert!(!row.is_active());
+            row.set_active(true);
+            headless::settle();
+            assert!(row.is_active());
+            return;
+        }
+        let root = headless::root("opengl");
+
+        headless::run_child(
+            "window::tests::the_opengl_es_switch_writes_use_opengl",
+            "opengl",
+            &root,
+        );
+
+        let written = fs::read_to_string(headless::config_path(&root)).expect("read config.json");
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(written, "{\n  \"use_opengl\": true\n}\n");
     }
 
     #[test]

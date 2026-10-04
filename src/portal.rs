@@ -119,6 +119,7 @@ pub enum NoticeId {
     Link,
     Attestation,
     ServerLocation,
+    Graphics,
     Client(i32),
 }
 
@@ -129,6 +130,7 @@ impl NoticeId {
             Self::Link => "eclipse-link".to_owned(),
             Self::Attestation => "eclipse-attestation".to_owned(),
             Self::ServerLocation => "eclipse-server-location".to_owned(),
+            Self::Graphics => "eclipse-graphics".to_owned(),
             Self::Client(id) => format!("client-{id}"),
         }
     }
@@ -849,6 +851,7 @@ mod tests {
             NoticeId::ServerLocation.wire_id(),
             "eclipse-server-location"
         );
+        assert_eq!(NoticeId::Graphics.wire_id(), "eclipse-graphics");
         assert_eq!(NoticeId::Client(7).wire_id(), "client-7");
         assert_eq!(NoticeId::Client(-2).wire_id(), "client--2");
     }

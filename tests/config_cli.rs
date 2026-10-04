@@ -125,7 +125,7 @@ fn an_invalid_config_fails_validation_at_its_position_and_shows_what_applies() {
 fn keys_eclipse_does_not_use_are_named_once_and_pass_validation() {
     let sandbox = Sandbox::with_config(
         "unused",
-        r#"{"use_opengl": true, "touch_mode": "fake_off", "enable_mobile_home_screen": false}"#,
+        r#"{"use_console_experience": true, "touch_mode": "fake_off", "enable_mobile_home_screen": false}"#,
     );
 
     let output = sandbox.eclipse_config(&[]);
@@ -135,7 +135,8 @@ fn keys_eclipse_does_not_use_are_named_once_and_pass_validation() {
     assert_eq!(
         stderr,
         format!(
-            "{}: Eclipse does not use these keys: \"use_opengl\", \"enable_mobile_home_screen\"\n",
+            "{}: Eclipse does not use these keys: \"use_console_experience\", \
+             \"enable_mobile_home_screen\"\n",
             sandbox.config().display()
         )
     );
@@ -218,8 +219,8 @@ fn a_bad_value_a_hand_edited_key_or_an_unknown_key_is_refused() {
             format!("`webview_helper_path` is edited by hand in {config}"),
         ),
         (
-            &["set", "use_opengl", "true"],
-            "`use_opengl` is not a setting; the settings are `touch_mode`, ".to_owned(),
+            &["set", "use_console_experience", "true"],
+            "`use_console_experience` is not a setting; the settings are `touch_mode`, ".to_owned(),
         ),
         (
             &["set", "touch_mode"],

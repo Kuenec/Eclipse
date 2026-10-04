@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::*;
+use crate::gpu::{GlesReason, Graphics};
 
 const ECLIPSE_STARTUP: &str = include_str!("../../tests/fixtures/client-log/2.740.0.931.txt");
 const SYNTHETIC_JOINS: &str = include_str!("../../tests/fixtures/client-log/synthetic-joins.txt");
@@ -231,7 +232,7 @@ fn parsed_values_never_carry_the_user_id() {
     {
         let text = match record {
             Record::Event(event) => format!("{event:?}"),
-            Record::Crash(kind) => format!("{kind:?} {}", kind.explanation()),
+            Record::Crash(kind) => format!("{kind:?} {}", kind.explanation(Graphics::Vulkan)),
             Record::BloxstrapRpc(message) => message.to_owned(),
         };
         assert!(!text.contains(USER_ID), "{text}");
@@ -262,13 +263,10 @@ fn out_of_memory_crashes_are_explained_in_eclipse_words() {
         let Some(Record::Crash(kind)) = parse(&record) else {
             panic!("{record} is a crash record");
         };
-        let text = kind.explanation();
+        let text = kind.explanation(Graphics::Vulkan);
         assert!(text.contains("graphics memory"), "{text}");
         assert!(text.contains("1399808"), "{text}");
-        assert!(
-            !text.contains("FFlag") && !text.contains("use_opengl"),
-            "{text}"
-        );
+        assert!(!text.contains("FFlag"), "{text}");
     }
 
     let system = CrashKind::OutOfMemory {
@@ -276,13 +274,19 @@ fn out_of_memory_crashes_are_explained_in_eclipse_words() {
         bytes: None,
     };
     assert_eq!(
-        system.explanation(),
+        system.explanation(Graphics::Vulkan),
         "Roblox stopped: it reported that it could not allocate memory. If this repeats, lower \
-         the graphics quality in Roblox's settings and report it with this log."
+         the graphics quality in Roblox's settings or turn on Use OpenGL ES in Eclipse Settings, \
+         and report it with this log."
+    );
+    assert_eq!(
+        system.explanation(Graphics::Gles(GlesReason::Configured)),
+        "Roblox stopped: it reported that it could not allocate memory. If this repeats, lower \
+         the graphics quality in Roblox's settings, and report it with this log."
     );
     assert_eq!(
         CrashKind::Other("An error occurred that wasn't supposed to.  Contact support")
-            .explanation(),
+            .explanation(Graphics::Vulkan),
         "Roblox stopped with RBXCRASH: An error occurred that wasn't supposed to.  Contact support."
     );
     assert_eq!(
@@ -466,7 +470,8 @@ fn the_installed_tap_receives_events_and_explains_crashes_in_the_run_log() {
         log.contains(
             " ERROR eclipse::status: Roblox stopped: it reported that it could not allocate \
              graphics memory (1399808 bytes). If this repeats, lower the graphics quality in \
-             Roblox's settings and report it with this log.\n"
+             Roblox's settings or turn on Use OpenGL ES in Eclipse Settings, and report it with \
+             this log.\n"
         ),
         "{log}"
     );

@@ -1,6 +1,7 @@
 mod document;
 pub mod edit;
 mod load;
+mod pci_id;
 pub mod shell;
 pub mod temp_file;
 
@@ -12,6 +13,7 @@ use serde::{Serialize, Serializer};
 
 pub use document::Position;
 pub use load::{config_path, load, load_from, Loaded, Problem};
+pub use pci_id::PciId;
 
 const SOBER_FAKE_OFF: &str = "fake_off";
 
@@ -137,6 +139,10 @@ pub struct Config {
 
     pub allow_gamepad_permission: bool,
 
+    pub vulkan_device: Option<PciId>,
+
+    pub use_opengl: bool,
+
     pub fflags: BTreeMap<String, serde_json::Value>,
 
     pub webview_helper_path: Option<PathBuf>,
@@ -152,6 +158,8 @@ impl Default for Config {
             close_on_leave: CloseOnLeave::default(),
             server_location_indicator_enabled: false,
             allow_gamepad_permission: true,
+            vulkan_device: None,
+            use_opengl: false,
             fflags: BTreeMap::new(),
             webview_helper_path: None,
         }
@@ -172,6 +180,8 @@ impl Config {
                     self.server_location_indicator_enabled = enabled;
                 }
                 Setting::AllowGamepadPermission(allowed) => self.allow_gamepad_permission = allowed,
+                Setting::VulkanDevice(device) => self.vulkan_device = device,
+                Setting::UseOpengl(enabled) => self.use_opengl = enabled,
             },
             Key::FileOnly(FileOnlyKey::Fflags) => {
                 self.fflags = serde_json::from_value(value).map_err(reason)?;
@@ -196,6 +206,8 @@ pub enum Setting {
     CloseOnLeave(CloseOnLeave),
     ServerLocationIndicatorEnabled(bool),
     AllowGamepadPermission(bool),
+    VulkanDevice(Option<PciId>),
+    UseOpengl(bool),
 }
 
 impl Setting {
@@ -209,6 +221,8 @@ impl Setting {
             Self::CloseOnLeave(_) => SettingKey::CloseOnLeave,
             Self::ServerLocationIndicatorEnabled(_) => SettingKey::ServerLocationIndicatorEnabled,
             Self::AllowGamepadPermission(_) => SettingKey::AllowGamepadPermission,
+            Self::VulkanDevice(_) => SettingKey::VulkanDevice,
+            Self::UseOpengl(_) => SettingKey::UseOpengl,
         }
     }
 }
@@ -222,10 +236,12 @@ pub enum SettingKey {
     CloseOnLeave,
     ServerLocationIndicatorEnabled,
     AllowGamepadPermission,
+    VulkanDevice,
+    UseOpengl,
 }
 
 impl SettingKey {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 9] = [
         Self::TouchMode,
         Self::GraphicsOptimizationMode,
         Self::EnableGamemode,
@@ -233,6 +249,8 @@ impl SettingKey {
         Self::CloseOnLeave,
         Self::ServerLocationIndicatorEnabled,
         Self::AllowGamepadPermission,
+        Self::VulkanDevice,
+        Self::UseOpengl,
     ];
 
     #[must_use]
@@ -245,6 +263,8 @@ impl SettingKey {
             Self::CloseOnLeave => "close_on_leave",
             Self::ServerLocationIndicatorEnabled => "server_location_indicator_enabled",
             Self::AllowGamepadPermission => "allow_gamepad_permission",
+            Self::VulkanDevice => "vulkan_device",
+            Self::UseOpengl => "use_opengl",
         }
     }
 
@@ -280,8 +300,10 @@ impl SettingKey {
                 value.as_bool().map(Setting::ServerLocationIndicatorEnabled)
             }
             Self::AllowGamepadPermission => value.as_bool().map(Setting::AllowGamepadPermission),
+            Self::VulkanDevice => PciId::from_json(value).map(Setting::VulkanDevice),
+            Self::UseOpengl => value.as_bool().map(Setting::UseOpengl),
         };
-        setting.ok_or_else(|| format!("expected one of {}", self.accepted_values()))
+        setting.ok_or_else(|| format!("expected {}", self.accepted_values()))
     }
 
     fn accepted_values(self) -> String {
@@ -293,11 +315,13 @@ impl SettingKey {
             Self::EnableGamemode
             | Self::RobloxAutoUpdate
             | Self::ServerLocationIndicatorEnabled
-            | Self::AllowGamepadPermission => &["true", "false"],
+            | Self::AllowGamepadPermission
+            | Self::UseOpengl => &["true", "false"],
             Self::CloseOnLeave => &CloseOnLeave::ALL.map(CloseOnLeave::json_form),
+            Self::VulkanDevice => return PciId::ACCEPTED.to_owned(),
         };
         let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
-        quoted.join(", ")
+        format!("one of {}", quoted.join(", "))
     }
 }
 
@@ -409,15 +433,17 @@ mod tests {
             Err(SettingError::FileOnly("webview_helper_path"))
         );
         assert_eq!(
-            SettingKey::from_name("use_opengl"),
-            Err(SettingError::UnknownKey("use_opengl".to_owned()))
+            SettingKey::from_name("use_console_experience"),
+            Err(SettingError::UnknownKey(
+                "use_console_experience".to_owned()
+            ))
         );
         assert_eq!(
-            SettingError::UnknownKey("use_opengl".to_owned()).to_string(),
-            "`use_opengl` is not a setting; the settings are `touch_mode`, \
+            SettingError::UnknownKey("use_console_experience".to_owned()).to_string(),
+            "`use_console_experience` is not a setting; the settings are `touch_mode`, \
              `graphics_optimization_mode`, `enable_gamemode`, `roblox_auto_update`, \
              `close_on_leave`, `server_location_indicator_enabled`, \
-             `allow_gamepad_permission`"
+             `allow_gamepad_permission`, `vulkan_device`, `use_opengl`"
         );
     }
 
@@ -565,6 +591,54 @@ mod tests {
     }
 
     #[test]
+    fn vulkan_device_takes_null_or_a_pci_id() {
+        let key = SettingKey::VulkanDevice;
+        let id = PciId {
+            vendor: 0x1002,
+            device: 0x164e,
+        };
+        for (json, device) in [
+            (serde_json::json!("1002:164e"), Some(id)),
+            (serde_json::json!(null), None),
+        ] {
+            let setting = key.parse(json.clone()).expect("a vulkan_device value");
+            assert_eq!(setting, Setting::VulkanDevice(device));
+            assert_eq!(setting.key(), key);
+            assert_eq!(serde_json::to_value(setting).expect("serialize"), json);
+        }
+        assert_eq!(
+            key.parse(serde_json::json!("amd")),
+            Err(SettingError::Invalid {
+                key,
+                message: "expected `null` or a PCI ID \"vendor:device\" in hex, as `lspci -nn` \
+                          shows it, such as `\"10de:2f04\"`"
+                    .to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn use_opengl_takes_only_a_json_boolean() {
+        let key = SettingKey::UseOpengl;
+        for enabled in [true, false] {
+            let setting = key.parse(enabled.into()).expect("a boolean");
+            assert_eq!(setting, Setting::UseOpengl(enabled));
+            assert_eq!(setting.key(), key);
+            assert_eq!(
+                serde_json::to_string(&setting).expect("serialize"),
+                enabled.to_string()
+            );
+        }
+        assert_eq!(
+            key.parse(serde_json::json!("true")),
+            Err(SettingError::Invalid {
+                key,
+                message: "expected one of `true`, `false`".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn close_on_leave_takes_sober_booleans_and_browser() {
         for (json, policy) in [
             (serde_json::json!(false), CloseOnLeave::Never),
@@ -653,6 +727,8 @@ mod tests {
         assert_eq!(default_json("close_on_leave"), r#""browser""#);
         assert_eq!(default_json("server_location_indicator_enabled"), "false");
         assert_eq!(default_json("allow_gamepad_permission"), "true");
+        assert_eq!(default_json("vulkan_device"), "null");
+        assert_eq!(default_json("use_opengl"), "false");
         assert_eq!(default_json("fflags"), "{}");
         assert_eq!(default_json("webview_helper_path"), "null");
         for key in SettingKey::ALL {

@@ -1,302 +1,43 @@
 use super::frame_log::{self, FrameLog, HostCall, MonotonicNs};
-use crate::framework::{ActiveTextOverlay, TextSelection};
+use super::text_overlay::{
+    self, ByteOrder, SurfaceRect, SurfaceSize, TextLayer, TextPlan, TextRequest,
+};
+use crate::framework::ActiveTextOverlay;
 use crate::graphics::FrameFence;
-use crate::text_layout::{FieldStyle, PixelRect, Scroll, Selection, Viewport};
 use ash::vk;
 use ash::vk::Handle;
 use std::cell::Cell;
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
+use std::time::Instant;
 
-fn encode_png_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
-    fn crc32(buf: &[u8]) -> u32 {
-        let mut crc = 0xFFFF_FFFFu32;
-        for &b in buf {
-            crc ^= u32::from(b);
-            for _ in 0..8 {
-                crc = if crc & 1 != 0 {
-                    (crc >> 1) ^ 0xEDB8_8320
-                } else {
-                    crc >> 1
-                };
-            }
-        }
-        !crc
-    }
-    fn adler32(buf: &[u8]) -> u32 {
-        let (mut a, mut b) = (1u32, 0u32);
-        for &x in buf {
-            a = (a + u32::from(x)) % 65521;
-            b = (b + a) % 65521;
-        }
-        (b << 16) | a
-    }
-    fn chunk(out: &mut Vec<u8>, typ: &[u8; 4], data: &[u8]) {
-        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        out.extend_from_slice(typ);
-        out.extend_from_slice(data);
-        let mut crc_in = typ.to_vec();
-        crc_in.extend_from_slice(data);
-        out.extend_from_slice(&crc32(&crc_in).to_be_bytes());
-    }
-    let mut out = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&w.to_be_bytes());
-    ihdr.extend_from_slice(&h.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-    chunk(&mut out, b"IHDR", &ihdr);
-
-    let mut raw = Vec::with_capacity((w * h * 4 + h) as usize);
-    for y in 0..h as usize {
-        raw.push(0);
-        let row = &rgba[y * w as usize * 4..(y + 1) * w as usize * 4];
-        raw.extend_from_slice(row);
-    }
-
-    let mut zlib = vec![0x78u8, 0x01];
-    let mut i = 0;
-    while i < raw.len() {
-        let block = (raw.len() - i).min(65535);
-        let bfinal = u8::from(i + block >= raw.len());
-        zlib.push(bfinal);
-        zlib.extend_from_slice(&(block as u16).to_le_bytes());
-        zlib.extend_from_slice(&(!(block as u16)).to_le_bytes());
-        zlib.extend_from_slice(&raw[i..i + block]);
-        i += block;
-    }
-    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
-    chunk(&mut out, b"IDAT", &zlib);
-    chunk(&mut out, b"IEND", &[]);
-    out
-}
-
-const CARET_BLINK_HALF_PERIOD: Duration = Duration::from_millis(500);
-const SELECTION_HIGHLIGHT_ALPHA: u8 = 0x66;
-const TEXT_TEST_FONT: i32 = 46;
-
-fn caret_visible(since_change: Duration) -> bool {
-    (since_change.as_millis() / CARET_BLINK_HALF_PERIOD.as_millis()).is_multiple_of(2)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ByteOrder {
-    Rgba,
-    Bgra,
-}
-
-impl ByteOrder {
-    fn of_swapchain(format_raw: i32) -> Option<Self> {
-        match vk::Format::from_raw(format_raw) {
-            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => Some(Self::Bgra),
-            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => Some(Self::Rgba),
-            _ => None,
-        }
-    }
-
-    fn arrange(self, [r, g, b, a]: [u8; 4]) -> [u8; 4] {
-        match self {
-            Self::Rgba => [r, g, b, a],
-            Self::Bgra => [b, g, r, a],
-        }
+fn byte_order_of_swapchain(format_raw: i32) -> Option<ByteOrder> {
+    match vk::Format::from_raw(format_raw) {
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => Some(ByteOrder::Bgra),
+        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => Some(ByteOrder::Rgba),
+        _ => None,
     }
 }
 
-fn text_rgba(argb: i32) -> [u8; 4] {
-    let [a, r, g, b] = (argb as u32).to_be_bytes();
-    [r, g, b, a]
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct TextRequest {
-    widget: i64,
-    text: String,
-    selection: Selection,
-    font: i32,
-    style: FieldStyle,
-    viewport: Viewport,
-    text_color: i32,
-    order: ByteOrder,
-}
-
-impl TextRequest {
-    fn of(overlay: &ActiveTextOverlay, rect: vk::Rect2D, order: ByteOrder) -> Self {
-        let (field_x, field_y, width, height) = overlay.geometry;
-        Self {
-            widget: overlay.widget,
-            text: crate::framework::displayed_text_box_text(&overlay.text, overlay.input_type)
-                .into_owned(),
-            selection: match overlay.selection {
-                TextSelection::All => Selection::All,
-                TextSelection::Cursor(utf16) => Selection::Caret(
-                    crate::text_layout::char_index_at_utf16(&overlay.text, utf16),
-                ),
-            },
-            font: overlay.font,
-            style: FieldStyle::of_text_box(
-                overlay.font_size,
-                (width, height),
-                overlay.multiline,
-                overlay.text_wrapped,
-                overlay.x_alignment,
-                overlay.y_alignment,
-            ),
-            viewport: Viewport {
-                x: rect.offset.x.saturating_sub(field_x),
-                y: rect.offset.y.saturating_sub(field_y),
-                width: rect.extent.width,
-                height: rect.extent.height,
-            },
-            text_color: overlay.text_color,
-            order,
-        }
+fn vk_rect(rect: SurfaceRect) -> vk::Rect2D {
+    vk::Rect2D {
+        offset: vk::Offset2D {
+            x: rect.x,
+            y: rect.y,
+        },
+        extent: vk::Extent2D {
+            width: rect.width,
+            height: rect.height,
+        },
     }
 }
 
-struct TextLayer {
-    request: TextRequest,
-    generation: u64,
-    pixels: Vec<[u8; 4]>,
-    caret: Option<PixelRect>,
-    caret_color: [u8; 4],
-}
-
-fn build_text_layer(
-    request: &TextRequest,
-    generation: u64,
-    previous: Scroll,
-) -> Option<(TextLayer, Scroll)> {
-    let chain = crate::framework::roblox_fonts::face_chain(request.font)?;
-    let layout = crate::text_layout::lay_out(
-        &request.text,
-        request.selection,
-        &request.style,
-        chain,
-        previous,
-    );
-    let color = text_rgba(request.text_color);
-    let highlight = [
-        color[0],
-        color[1],
-        color[2],
-        crate::text_layout::scale_byte(color[3], SELECTION_HIGHLIGHT_ALPHA),
-    ];
-    let pixels = layout
-        .paint(request.viewport, color, highlight)
-        .into_iter()
-        .map(|pixel| request.order.arrange(pixel))
-        .collect();
-    let layer = TextLayer {
-        request: request.clone(),
-        generation,
-        pixels,
-        caret: layout.caret_pixels(request.viewport),
-        caret_color: request.order.arrange(color),
-    };
-    Some((layer, layout.scroll()))
-}
-
-struct TextWorkerState {
-    wanted: Option<TextRequest>,
-    generation: u64,
-    changed_at: Instant,
-    ready: Option<Arc<TextLayer>>,
-}
-
-struct TextWorker {
-    state: Mutex<TextWorkerState>,
-    wake: Condvar,
-}
-
-fn text_worker() -> Option<&'static TextWorker> {
-    static WORKER: OnceLock<Option<&'static TextWorker>> = OnceLock::new();
-    *WORKER.get_or_init(|| {
-        let worker: &'static TextWorker = Box::leak(Box::new(TextWorker {
-            state: Mutex::new(TextWorkerState {
-                wanted: None,
-                generation: 0,
-                changed_at: Instant::now(),
-                ready: None,
-            }),
-            wake: Condvar::new(),
-        }));
-        match std::thread::Builder::new()
-            .name("eclipse-text".to_owned())
-            .spawn(move || run_text_worker(worker))
-        {
-            Ok(_) => Some(worker),
-            Err(error) => {
-                tracing::error!(%error, "vk-overlay: could not start the text layout thread");
-                None
-            }
-        }
-    })
-}
-
-fn run_text_worker(worker: &TextWorker) {
-    let mut built = 0;
-    let mut scroll: Option<(i64, Scroll)> = None;
-    loop {
-        let (request, generation) = {
-            let mut state = worker
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            while state.generation == built {
-                state = worker
-                    .wake
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            (state.wanted.clone(), state.generation)
-        };
-        built = generation;
-        let Some(request) = request else {
-            continue;
-        };
-        let previous = scroll
-            .filter(|(widget, _)| *widget == request.widget)
-            .map_or_else(Scroll::default, |(_, scroll)| scroll);
-        let layer = build_text_layer(&request, generation, previous).map(|(layer, next)| {
-            scroll = Some((request.widget, next));
-            crate::framework::record_text_scroll(request.widget, next);
-            Arc::new(layer)
-        });
-        worker
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .ready = layer;
+fn surface_size(extent: vk::Extent2D) -> SurfaceSize {
+    SurfaceSize {
+        width: extent.width,
+        height: extent.height,
     }
-}
-
-fn current_text_layer(request: &TextRequest, now: Instant) -> Option<(Arc<TextLayer>, bool)> {
-    let worker = text_worker()?;
-    let mut state = worker
-        .state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if state.wanted.as_ref() != Some(request) {
-        state.wanted = Some(request.clone());
-        state.generation += 1;
-        state.changed_at = now;
-        worker.wake.notify_one();
-    }
-    let layer = state.ready.clone().filter(|layer| {
-        layer.request.widget == request.widget
-            && layer.request.viewport == request.viewport
-            && layer.request.order == request.order
-    })?;
-    Some((
-        layer,
-        caret_visible(now.saturating_duration_since(state.changed_at)),
-    ))
-}
-
-fn overlay_enabled() -> bool {
-    static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("ECLIPSE_NO_VK_OVERLAY").is_none())
 }
 
 static HOST_GDPA: AtomicU64 = AtomicU64::new(0);
@@ -804,79 +545,6 @@ unsafe extern "system" fn eclipse_vk_get_swapchain_images_khr(
     r
 }
 
-fn login_field_rect(extent: vk::Extent2D) -> vk::Rect2D {
-    let x = 181u32.min(extent.width.saturating_sub(1));
-    let y = 149u32.min(extent.height.saturating_sub(1));
-    let w = 438u32.min(extent.width - x);
-    let h = 46u32.min(extent.height - y);
-    vk::Rect2D {
-        offset: vk::Offset2D {
-            x: x as i32,
-            y: y as i32,
-        },
-        extent: vk::Extent2D {
-            width: w,
-            height: h,
-        },
-    }
-}
-
-fn resolve_field_rect(
-    geom: Option<(i32, i32, u32, u32)>,
-    extent: vk::Extent2D,
-) -> Option<vk::Rect2D> {
-    let (gx, gy, gw, gh) = geom?;
-    let span = |origin: i32, length: u32, limit: u32| {
-        let start = i64::from(origin).max(0);
-        let end = (i64::from(origin) + i64::from(length)).min(i64::from(limit));
-        (start < end).then(|| (start as i32, (end - start) as u32))
-    };
-    let (x, width) = span(gx, gw, extent.width)?;
-    let (y, height) = span(gy, gh, extent.height)?;
-    Some(vk::Rect2D {
-        offset: vk::Offset2D { x, y },
-        extent: vk::Extent2D { width, height },
-    })
-}
-
-fn screenshot_enabled() -> bool {
-    static SHOT: OnceLock<bool> = OnceLock::new();
-    *SHOT.get_or_init(|| std::env::var_os("ECLIPSE_VK_SCREENSHOT").is_some())
-}
-
-fn full_surface_rect(extent: vk::Extent2D) -> Option<vk::Rect2D> {
-    if extent.width == 0 || extent.height == 0 {
-        return None;
-    }
-    Some(vk::Rect2D {
-        offset: vk::Offset2D { x: 0, y: 0 },
-        extent,
-    })
-}
-
-fn select_text_probe_rect(
-    geometry: Option<(i32, i32, u32, u32)>,
-    extent: vk::Extent2D,
-    drawing_text: bool,
-    probing: bool,
-    full_screenshot: bool,
-) -> Option<vk::Rect2D> {
-    let live = resolve_field_rect(geometry, extent);
-    if drawing_text {
-        return live;
-    }
-    if !probing {
-        return None;
-    }
-    if full_screenshot {
-        return full_surface_rect(extent);
-    }
-    live.or_else(|| {
-        let rect = login_field_rect(extent);
-        (rect.extent.width != 0 && rect.extent.height != 0).then_some(rect)
-    })
-}
-
 unsafe fn locate_image_index(pi: &vk::PresentInfoKHR<'_>, our_sc: u64) -> Option<u32> {
     if our_sc == 0
         || pi.swapchain_count == 0
@@ -893,11 +561,6 @@ unsafe fn locate_image_index(pi: &vk::PresentInfoKHR<'_>, our_sc: u64) -> Option
         .iter()
         .position(|sc| sc.as_raw() == our_sc)
         .map(|i| indices[i])
-}
-
-fn probe_enabled() -> bool {
-    static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("ECLIPSE_VK_PROBE").is_some())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -958,48 +621,6 @@ fn rect_copy(rect: vk::Rect2D) -> vk::BufferImageCopy {
             height: rect.extent.height,
             depth: 1,
         })
-}
-
-fn write_field_probe(data: &[u8], w: usize, h: usize, order: ByteOrder) {
-    let png_rgba: Vec<u8> = data
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .flat_map(|&pixel| {
-            let [r, g, b, _] = order.arrange(pixel);
-            [r, g, b, 255]
-        })
-        .collect();
-    let png = encode_png_rgba(&png_rgba, w as u32, h as u32);
-    if let Err(error) = std::fs::write("/tmp/eclipse_field_probe.png", png) {
-        tracing::warn!(%error, "vk-overlay: could not write the field probe image");
-    }
-
-    static LOG_TICK: AtomicU64 = AtomicU64::new(0);
-    if !LOG_TICK.fetch_add(1, Ordering::Relaxed).is_multiple_of(60) {
-        return;
-    }
-    const BUCKETS: usize = 64;
-    let mut col_ink = [0u32; BUCKETS];
-    let mut total_ink = 0u32;
-    let (y0, y1) = (h * 3 / 10, h * 7 / 10);
-    for y in y0..y1 {
-        for x in 0..w {
-            let i = (y * w + x) * 4;
-            let lum = (u32::from(data[i]) + u32::from(data[i + 1]) + u32::from(data[i + 2])) / 3;
-            if lum > 90 {
-                total_ink += 1;
-                col_ink[x * BUCKETS / w] += 1;
-            }
-        }
-    }
-    let max = col_ink.iter().copied().max().unwrap_or(1).max(1);
-    let levels = [' ', '.', ':', '-', '=', '+', '*', '#', '@'];
-    let spark: String = col_ink
-        .iter()
-        .map(|&c| levels[(c as usize * (levels.len() - 1) / max as usize).min(levels.len() - 1)])
-        .collect();
-    tracing::info!(total_ink, "vk-overlay field-probe ink |{spark}|");
 }
 
 fn color_range() -> vk::ImageSubresourceRange {
@@ -1490,7 +1111,7 @@ impl Probe {
             let w = self.rect.extent.width as usize;
             let h = self.rect.extent.height as usize;
             let data = std::slice::from_raw_parts(self.mapped, w * h * 4);
-            write_field_probe(data, w, h, order);
+            text_overlay::write_field_probe(data, w, h, order);
             OverlayBatch::Completed
         }
     }
@@ -2124,44 +1745,11 @@ fn field_bytes(rect: vk::Rect2D) -> u64 {
     u64::from(rect.extent.width) * u64::from(rect.extent.height) * 4
 }
 
-fn text_test_overlay(extent: vk::Extent2D) -> Option<ActiveTextOverlay> {
-    static TEXT: OnceLock<Option<String>> = OnceLock::new();
-    let text = TEXT
-        .get_or_init(|| std::env::var("ECLIPSE_VK_TEXT_TEST").ok())
-        .as_ref()?;
-    let rect = login_field_rect(extent);
-    Some(ActiveTextOverlay {
-        widget: 0,
-        text: text.clone(),
-        selection: TextSelection::Cursor(text.encode_utf16().count()),
-        geometry: (
-            rect.offset.x,
-            rect.offset.y,
-            rect.extent.width,
-            rect.extent.height,
-        ),
-        input_type: 0,
-        font: TEXT_TEST_FONT,
-        font_size: 25.0,
-        multiline: false,
-        text_wrapped: false,
-        text_color: -1,
-        x_alignment: 0,
-        y_alignment: 1,
-    })
-}
-
-struct TextPlan {
-    overlay: Option<ActiveTextOverlay>,
-    rect: vk::Rect2D,
-    order: ByteOrder,
-}
-
 fn text_plan(extent: vk::Extent2D, image_raw: u64, format_raw: i32) -> Option<TextPlan> {
-    if image_raw == 0 || !(probe_enabled() || overlay_enabled()) {
+    if image_raw == 0 {
         return None;
     }
-    let Some(order) = ByteOrder::of_swapchain(format_raw) else {
+    let Some(order) = byte_order_of_swapchain(format_raw) else {
         static FORMAT_WARNED: AtomicBool = AtomicBool::new(false);
         if !FORMAT_WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
@@ -2172,31 +1760,7 @@ fn text_plan(extent: vk::Extent2D, image_raw: u64, format_raw: i32) -> Option<Te
         }
         return None;
     };
-    let live = if overlay_enabled() {
-        crate::framework::active_text_overlay()
-    } else {
-        None
-    };
-    let overlay = live.or_else(|| text_test_overlay(extent));
-    if overlay.is_none() && !probe_enabled() {
-        return None;
-    }
-    let geometry = match &overlay {
-        Some(overlay) => Some(overlay.geometry),
-        None => crate::framework::textbox_geometry(),
-    };
-    let rect = select_text_probe_rect(
-        geometry,
-        extent,
-        overlay.is_some(),
-        probe_enabled(),
-        screenshot_enabled(),
-    )?;
-    Some(TextPlan {
-        overlay,
-        rect,
-        order,
-    })
+    text_overlay::plan(surface_size(extent), order)
 }
 
 fn draw_text_field(
@@ -2207,17 +1771,17 @@ fn draw_text_field(
     overlay: &ActiveTextOverlay,
 ) -> OverlayBatch {
     let request = TextRequest::of(overlay, plan.rect, plan.order);
-    let Some((layer, caret_on)) = current_text_layer(&request, Instant::now()) else {
+    let Some((layer, caret_on)) = text_overlay::current_text_layer(&request, Instant::now()) else {
         return OverlayBatch::NotSubmitted;
     };
     let mut slot = TEXT_COMPOSITOR
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let device = STATE.lock().map(|state| state.device).unwrap_or(0);
-    let Some(compositor) = fitted_compositor(&mut slot, device, plan.rect, || {
-        super::vulkan_wsi::host_entry().and_then(|entry| {
-            TextCompositor::build(entry, EngineHandles::current(device), plan.rect)
-        })
+    let rect = vk_rect(plan.rect);
+    let Some(compositor) = fitted_compositor(&mut slot, device, rect, || {
+        super::vulkan_wsi::host_entry()
+            .and_then(|entry| TextCompositor::build(entry, EngineHandles::current(device), rect))
     }) else {
         return OverlayBatch::NotSubmitted;
     };
@@ -2265,7 +1829,7 @@ fn snapshot_field(
     engine_waits: &[vk::Semaphore],
     plan: &TextPlan,
 ) -> OverlayBatch {
-    ensure_probe(plan.rect);
+    ensure_probe(vk_rect(plan.rect));
     let Ok(mut guard) = PROBE.lock() else {
         return OverlayBatch::NotSubmitted;
     };
@@ -2284,11 +1848,7 @@ unsafe fn present_with_overlay(
         return unsafe { host(queue, p_present_info) };
     }
 
-    if !overlay_enabled() && !probe_enabled() {
-        return unsafe { host(queue, p_present_info) };
-    }
-
-    if !probe_enabled() && crate::framework::active_text_field() == 0 {
+    if !text_overlay::wanted() {
         return unsafe { host(queue, p_present_info) };
     }
 
@@ -2346,7 +1906,7 @@ unsafe fn present_with_overlay(
                 overlay,
             ));
         }
-        if probe_enabled() {
+        if text_overlay::probe_enabled() {
             gate = gate.after(snapshot_field(
                 queue,
                 image_raw,
@@ -2462,138 +2022,13 @@ unsafe fn presented_swapchains<'a>(
 mod tests {
     use super::super::frame_log::tests::{nanos, read_ring};
     use super::super::link::tests::temp_dir;
+    use super::super::text_overlay::tests::{
+        blend_reference, field_rect, focused_box, host_font_available, text_layer,
+    };
     use super::*;
     use std::num::NonZeroU64;
     use std::sync::atomic::AtomicI32;
-
-    #[test]
-    fn resolve_field_rect_draws_nothing_without_a_live_textbox_session() {
-        let extent = vk::Extent2D {
-            width: 800,
-            height: 600,
-        };
-        let as_tuple = |r: Option<vk::Rect2D>| {
-            r.map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height))
-        };
-
-        assert_eq!(as_tuple(resolve_field_rect(None, extent)), None);
-
-        assert_eq!(
-            as_tuple(resolve_field_rect(Some((181, 149, 0, 46)), extent)),
-            None
-        );
-        assert_eq!(
-            as_tuple(resolve_field_rect(Some((181, 149, 438, 0)), extent)),
-            None
-        );
-
-        assert_eq!(
-            as_tuple(resolve_field_rect(Some((181, 300, 390, 46)), extent)),
-            Some((181, 300, 390, 46))
-        );
-        assert_eq!(
-            as_tuple(resolve_field_rect(Some((181, 149, 438, 46)), extent)),
-            Some((181, 149, 438, 46))
-        );
-
-        assert_eq!(
-            as_tuple(resolve_field_rect(Some((700, 560, 438, 46)), extent)),
-            Some((700, 560, 100, 40))
-        );
-
-        assert_eq!(
-            as_tuple(resolve_field_rect(Some((-5, -7, 300, 40)), extent)),
-            Some((0, 0, 295, 33))
-        );
-        assert_eq!(
-            as_tuple(resolve_field_rect(Some((900, 0, 10, 10)), extent)),
-            None
-        );
-    }
-
-    #[test]
-    fn full_frame_probe_never_expands_or_invents_a_text_draw_rect() {
-        let extent = vk::Extent2D {
-            width: 800,
-            height: 600,
-        };
-        let as_tuple = |r: Option<vk::Rect2D>| {
-            r.map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height))
-        };
-        let live = Some((181, 300, 390, 46));
-
-        assert_eq!(
-            as_tuple(select_text_probe_rect(live, extent, true, true, true)),
-            Some((181, 300, 390, 46))
-        );
-
-        assert_eq!(
-            as_tuple(select_text_probe_rect(live, extent, false, true, true)),
-            Some((0, 0, 800, 600))
-        );
-
-        assert_eq!(
-            as_tuple(select_text_probe_rect(None, extent, true, true, true)),
-            None
-        );
-    }
-
-    fn text_overlay(text: &str, input_type: i32) -> ActiveTextOverlay {
-        ActiveTextOverlay {
-            widget: 7,
-            text: text.to_string(),
-            selection: TextSelection::Cursor(text.encode_utf16().count()),
-            geometry: (0, 0, 240, 46),
-            input_type,
-            font: TEXT_TEST_FONT,
-            font_size: 25.0,
-            multiline: false,
-            text_wrapped: false,
-            text_color: -1,
-            x_alignment: 0,
-            y_alignment: 1,
-        }
-    }
-
-    fn host_font_available() -> bool {
-        let available = crate::host_fonts::system_font().is_some();
-        if !available {
-            eprintln!("SKIP: no host font for the text overlay");
-        }
-        available
-    }
-
-    fn field_rect(overlay: &ActiveTextOverlay, extent: vk::Extent2D) -> vk::Rect2D {
-        resolve_field_rect(Some(overlay.geometry), extent).expect("field on screen")
-    }
-
-    fn text_layer(overlay: &ActiveTextOverlay, rect: vk::Rect2D, order: ByteOrder) -> TextLayer {
-        let request = TextRequest::of(overlay, rect, order);
-        build_text_layer(&request, 1, Scroll::default())
-            .expect("text layer")
-            .0
-    }
-
-    fn blend_reference(pixels: &mut [u8], layer: &TextLayer, width: u32, caret_on: bool) {
-        let caret = layer.caret.filter(|_| caret_on);
-        let caret_ink = crate::text_layout::premultiply(layer.caret_color);
-        for (index, (destination, ink)) in pixels
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(&layer.pixels)
-            .enumerate()
-        {
-            let (x, y) = (index as u32 % width, index as u32 / width);
-            let mut blended = crate::text_layout::over(*ink, *destination);
-            if caret.is_some_and(|rect| x >= rect.x0 && x < rect.x1 && y >= rect.y0 && y < rect.y1)
-            {
-                blended = crate::text_layout::over(caret_ink, blended);
-            }
-            blended[3] = destination[3];
-            *destination = blended;
-        }
-    }
+    use std::time::Duration;
 
     #[test]
     fn readback_memory_prefers_host_cached_types() {
@@ -2625,157 +2060,18 @@ mod tests {
     }
 
     #[test]
-    fn caret_blinks_every_half_second_of_wall_time() {
-        for (millis, visible) in [
-            (0, true),
-            (208, true),
-            (499, true),
-            (500, false),
-            (999, false),
-            (1000, true),
-            (1500, false),
-        ] {
-            assert_eq!(
-                caret_visible(Duration::from_millis(millis)),
-                visible,
-                "caret visibility {millis} ms after the last edit"
-            );
-        }
-    }
-
-    #[test]
-    fn text_colour_follows_the_swapchain_byte_order() {
-        let color = text_rgba(0x80FF_4020u32 as i32);
-        assert_eq!(color, [0xFF, 0x40, 0x20, 0x80]);
-        assert_eq!(ByteOrder::Rgba.arrange(color), [0xFF, 0x40, 0x20, 0x80]);
-        assert_eq!(ByteOrder::Bgra.arrange(color), [0x20, 0x40, 0xFF, 0x80]);
+    fn text_follows_the_swapchain_byte_order() {
         assert_eq!(
-            ByteOrder::of_swapchain(vk::Format::B8G8R8A8_SRGB.as_raw()),
+            byte_order_of_swapchain(vk::Format::B8G8R8A8_SRGB.as_raw()),
             Some(ByteOrder::Bgra)
         );
         assert_eq!(
-            ByteOrder::of_swapchain(vk::Format::R8G8B8A8_UNORM.as_raw()),
+            byte_order_of_swapchain(vk::Format::R8G8B8A8_UNORM.as_raw()),
             Some(ByteOrder::Rgba)
         );
         assert_eq!(
-            ByteOrder::of_swapchain(vk::Format::R16G16B16A16_SFLOAT.as_raw()),
+            byte_order_of_swapchain(vk::Format::R16G16B16A16_SFLOAT.as_raw()),
             None
-        );
-    }
-
-    #[test]
-    fn a_box_partly_off_screen_is_laid_out_at_its_real_origin() {
-        let extent = vk::Extent2D {
-            width: 800,
-            height: 600,
-        };
-        let mut overlay = text_overlay("hihihi", 0);
-        overlay.geometry = (-50, -10, 300, 40);
-        let rect = field_rect(&overlay, extent);
-        assert_eq!(
-            (
-                rect.offset.x,
-                rect.offset.y,
-                rect.extent.width,
-                rect.extent.height
-            ),
-            (0, 0, 250, 30)
-        );
-        let request = TextRequest::of(&overlay, rect, ByteOrder::Rgba);
-        assert_eq!(
-            request.viewport,
-            Viewport {
-                x: 50,
-                y: 10,
-                width: 250,
-                height: 30
-            }
-        );
-        assert_eq!(
-            request.style.width, 300.0,
-            "the layout uses the whole box, not the visible part"
-        );
-        if !host_font_available() {
-            return;
-        }
-        let whole = {
-            let mut shown = text_overlay("hihihi", 0);
-            shown.geometry = (100, 100, 300, 40);
-            text_layer(&shown, field_rect(&shown, extent), ByteOrder::Rgba)
-        };
-        let cropped = text_layer(&overlay, rect, ByteOrder::Rgba);
-        for y in 0..30usize {
-            for x in 0..250usize {
-                assert_eq!(
-                    cropped.pixels[y * 250 + x],
-                    whole.pixels[(y + 10) * 300 + x + 50],
-                    "pixel {x},{y} of the visible part"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn an_empty_focused_box_shows_a_caret() {
-        if !host_font_available() {
-            return;
-        }
-        let overlay = text_overlay("", 0);
-        let rect = field_rect(
-            &overlay,
-            vk::Extent2D {
-                width: 800,
-                height: 600,
-            },
-        );
-        let layer = text_layer(&overlay, rect, ByteOrder::Rgba);
-        let caret = layer.caret.expect("an empty focused box keeps its caret");
-        assert!(caret.x0 < 3 && caret.x1 > caret.x0 && caret.y1 > caret.y0);
-        assert!(layer.pixels.iter().all(|pixel| pixel[3] == 0));
-    }
-
-    #[test]
-    fn the_text_worker_builds_layers_off_the_present_thread_and_restarts_the_blink() {
-        if !host_font_available() {
-            return;
-        }
-        let overlay = text_overlay("worker", 0);
-        let rect = field_rect(
-            &overlay,
-            vk::Extent2D {
-                width: 800,
-                height: 600,
-            },
-        );
-        let request = TextRequest::of(&overlay, rect, ByteOrder::Rgba);
-        let edited_at = Instant::now();
-        let started = Instant::now();
-        let (layer, caret_on) = loop {
-            if let Some(ready) = current_text_layer(&request, edited_at) {
-                break ready;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "the worker never published a layer"
-            );
-            std::thread::yield_now();
-        };
-        assert_eq!(layer.request, request);
-        assert!(caret_on, "the caret shows right after an edit");
-        assert!(layer.pixels.iter().any(|pixel| pixel[3] != 0));
-        let blink_at = |millis: u64| {
-            current_text_layer(&request, edited_at + Duration::from_millis(millis))
-                .expect("layer")
-                .1
-        };
-        assert!(!blink_at(600), "the caret hides 500 ms after the last edit");
-        assert!(blink_at(1000), "and shows again after another 500 ms");
-        let edited = TextRequest::of(&text_overlay("worker!", 0), rect, ByteOrder::Rgba);
-        let (_, after_edit) = current_text_layer(&edited, edited_at + Duration::from_millis(1600))
-            .expect("the previous layer stays on screen while the edit is built");
-        assert!(
-            after_edit,
-            "an edit restarts the blink with the caret shown"
         );
     }
 
@@ -2863,11 +2159,12 @@ mod tests {
                 vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
             );
             let rendered = engine_frame(&gpu, image, vk::ImageLayout::UNDEFINED);
-            let mut overlay = text_overlay("Eclipse 42 ffi", 0);
+            let mut overlay = focused_box("Eclipse 42 ffi", 0);
             overlay.geometry = (16, 20, 240, 46);
             overlay.text_color = 0xFF00_A2FFu32 as i32;
-            let rect = field_rect(&overlay, extent);
-            let layer = text_layer(&overlay, rect, order);
+            let field = field_rect(&overlay, surface_size(extent));
+            let layer = text_layer(&overlay, field, order);
+            let rect = vk_rect(field);
             let mut compositor = TextCompositor::build(
                 &gpu.entry,
                 EngineHandles {
@@ -2975,11 +2272,12 @@ mod tests {
         ] {
             let rendered = engine_frame(&gpu, image, from);
             from = vk::ImageLayout::PRESENT_SRC_KHR;
-            let mut overlay = text_overlay("Eclipse 42", 0);
+            let mut overlay = focused_box("Eclipse 42", 0);
             overlay.geometry = geometry;
             overlay.text_color = 0xFF00_A2FFu32 as i32;
-            let rect = field_rect(&overlay, extent);
-            let layer = text_layer(&overlay, rect, ByteOrder::Rgba);
+            let field = field_rect(&overlay, surface_size(extent));
+            let layer = text_layer(&overlay, field, ByteOrder::Rgba);
+            let rect = vk_rect(field);
             let compositor =
                 fitted_compositor(&mut slot, gpu.device.handle().as_raw(), rect, || {
                     builds += 1;

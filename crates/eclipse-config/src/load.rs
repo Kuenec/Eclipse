@@ -318,7 +318,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
-    use crate::{CloseOnLeave, GraphicsOptimizationMode, TouchMode};
+    use crate::{CloseOnLeave, GraphicsOptimizationMode, PciId, TouchMode};
 
     const FLATPAK_ID: &str = "io.github.kuenec.Eclipse";
 
@@ -773,18 +773,14 @@ mod tests {
         assert_eq!(loaded.problems, []);
         assert_eq!(
             loaded.unused_keys,
-            [
-                "use_opengl",
-                "use_console_experience",
-                "enable_mobile_home_screen"
-            ]
+            ["use_console_experience", "enable_mobile_home_screen"]
         );
         assert_eq!(
             loaded.unused_keys_message().as_deref(),
             Some(
                 format!(
-                    "{}: Eclipse does not use these keys: \"use_opengl\", \
-                     \"use_console_experience\", \"enable_mobile_home_screen\"",
+                    "{}: Eclipse does not use these keys: \"use_console_experience\", \
+                     \"enable_mobile_home_screen\"",
                     path.display()
                 )
                 .as_str()
@@ -795,6 +791,7 @@ mod tests {
             Config {
                 touch_mode: TouchMode::FakeOff,
                 close_on_leave: CloseOnLeave::Never,
+                use_opengl: true,
                 ..Config::default()
             }
         );
@@ -824,6 +821,11 @@ mod tests {
                 close_on_leave: CloseOnLeave::Never,
                 server_location_indicator_enabled: true,
                 allow_gamepad_permission: false,
+                vulkan_device: Some(PciId {
+                    vendor: 0x10de,
+                    device: 0x2f04,
+                }),
+                use_opengl: true,
                 fflags: BTreeMap::from([("DFIntExample".to_owned(), 42.into())]),
                 webview_helper_path: Some(PathBuf::from("/opt/eclipse-webview")),
             },
@@ -955,6 +957,41 @@ mod tests {
         assert!(!loaded.config.allow_gamepad_permission);
         let (_, loaded) = load_bytes("gamepads-absent", b"{}");
         assert!(loaded.config.allow_gamepad_permission);
+    }
+
+    #[test]
+    fn vulkan_device_reads_a_pci_id() {
+        let (_, loaded) = load_bytes("vulkan-device", br#"{"vulkan_device":"1002:164e"}"#);
+        assert_eq!(loaded.problems, []);
+        assert!(loaded.unused_keys.is_empty(), "{:?}", loaded.unused_keys);
+        assert_eq!(
+            loaded.config.vulkan_device,
+            Some(PciId {
+                vendor: 0x1002,
+                device: 0x164e
+            })
+        );
+        let (_, loaded) = load_bytes("vulkan-device-absent", b"{}");
+        assert_eq!(loaded.config.vulkan_device, None);
+    }
+
+    #[test]
+    fn a_vulkan_device_that_is_not_a_pci_id_is_named_and_ignored() {
+        let (path, loaded) = load_bytes("vulkan-device-name", br#"{"vulkan_device":"amd"}"#);
+        assert_eq!(loaded.config.vulkan_device, None);
+        assert_eq!(
+            loaded
+                .problems
+                .iter()
+                .map(Problem::to_string)
+                .collect::<Vec<_>>(),
+            [format!(
+                "{}:1:18: vulkan_device: expected `null` or a PCI ID \"vendor:device\" in hex, \
+                 as `lspci -nn` shows it, such as `\"10de:2f04\"`; Eclipse uses the default \
+                 (null)",
+                path.display()
+            )]
+        );
     }
 
     #[test]
