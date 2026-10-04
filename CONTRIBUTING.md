@@ -35,6 +35,8 @@ Packaging changes must pass `desktop-file-validate` and Flathub's `flatpak-build
 
 To record frame times, run `flatpak run --filesystem=xdg-run/eclipse-perf:create --env=ECLIPSE_FRAMETIME_LOG=$XDG_RUNTIME_DIR/eclipse-perf/run.bin io.github.kuenec.Eclipse run`, then `tools/perf/frametimes.py $XDG_RUNTIME_DIR/eclipse-perf/run.bin --from 10`. Each run needs a new file.
 
+A hidden or minimized window draws at most 5 frames a second; set `ECLIPSE_HIDDEN_PACING=off` to measure it at full rate, as `tools/perf/measure.py` does.
+
 ## Layout
 
 | Path | Contents |

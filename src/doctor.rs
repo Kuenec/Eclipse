@@ -1340,6 +1340,7 @@ Config
     roblox_auto_update: true
     server_location_indicator_enabled: false
     touch_mode: \"off\"
+    unfocused_fps_limit: null
     use_opengl: false
     vulkan_device: null
     webview_helper_path: null

@@ -40,6 +40,7 @@ from measure import (
     Series,
     SeriesFailed,
     app_runs,
+    boot_environment,
     cpu_windows,
     desktop_windows,
     eclipse_command,
@@ -644,6 +645,17 @@ class LaunchTest(unittest.TestCase):
                 "run",
             ],
         )
+
+    def test_boots_leave_hidden_windows_unpaced_with_or_without_a_frame_log(self):
+        ring = Path("/run/user/1000/eclipse-perf-1/main-warm-1.bin")
+        self.assertEqual(
+            boot_environment(ring),
+            {
+                "ECLIPSE_HIDDEN_PACING": "off",
+                "ECLIPSE_FRAMETIME_LOG": str(ring),
+            },
+        )
+        self.assertEqual(boot_environment(None), {"ECLIPSE_HIDDEN_PACING": "off"})
 
     def test_the_installed_build_runs_without_an_app_path(self):
         command = eclipse_command(

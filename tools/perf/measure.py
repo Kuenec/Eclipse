@@ -867,6 +867,13 @@ def eclipse_command(app, profile, apk_dir, arguments, environment, frame_dir=Non
     return [*app.flatpak_run(*options), APP_ID, *assignments, "eclipse", *arguments]
 
 
+def boot_environment(ring_path):
+    environment = {"ECLIPSE_HIDDEN_PACING": "off"}
+    if ring_path is not None:
+        environment["ECLIPSE_FRAMETIME_LOG"] = str(ring_path)
+    return environment
+
+
 def sandbox_contract(metadata):
     parser = configparser.ConfigParser(interpolation=None)
     parser.optionxform = str
@@ -1170,10 +1177,9 @@ class Series:
         name = f"{app.label}-{launch.value}-{run}"
         frame_dir = self.runtime_dir / self.frame_dir
         ring_path = frame_dir / f"{name}.bin" if self.frame_log else None
-        environment = {}
+        environment = boot_environment(ring_path)
         if ring_path is not None:
             frame_dir.mkdir(mode=0o700)
-            environment["ECLIPSE_FRAMETIME_LOG"] = str(ring_path)
         run_log = RunLogLink.before_launch(profile.run_log())
         loadavg_start = load_average()
         started = time.monotonic()

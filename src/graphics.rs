@@ -15,10 +15,13 @@ use winit::window::{ActivationToken, CursorGrabMode, Fullscreen, Window, WindowI
 use crate::web_view_parent::WebViewParent;
 
 pub mod activation;
+mod content_type;
 mod dialog_window;
 mod gles_renderer;
 pub mod launch_window;
 pub(crate) mod title_suffix;
+mod wayland_window;
+mod window_activity;
 pub mod window_state;
 
 const CLEAR_COLOR: [f32; 4] = [0.149, 0.408, 0.722, 1.0];
@@ -130,6 +133,14 @@ struct GameWindow<'vm> {
     next_display_refresh_poll: std::time::Instant,
 
     focused: bool,
+
+    window_activity: window_activity::WindowActivity,
+
+    hidden_pacing: window_activity::HiddenPacing,
+
+    unfocused_fps_limit: Option<eclipse_config::FrameRateLimit>,
+
+    present_pace: crate::loader::present_pacing::PresentPace,
 
     idle_inhibit: crate::portal::IdleInhibit,
 
@@ -464,6 +475,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                 return;
             }
         };
+        content_type::mark_as_game(&window);
 
         match window.window_handle() {
             Ok(handle) => {
@@ -528,6 +540,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
         ) {
             self.relative_motion_units = RelativeMotionUnits::SurfaceLogical;
             self.ime_area_support = ImeAreaSupport::Rectangle;
+            self.window_activity = window_activity::WindowActivity::frame_callbacks();
         }
         crate::loader::ndk_registry::set_wsi_target(wsi_target);
         self.clipboard = host_clipboard(&window);
@@ -592,6 +605,9 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
 
             WindowEvent::Moved(_) => self.publish_engine_display_refresh_rates(),
             WindowEvent::RedrawRequested => {
+                if self.handed_off {
+                    self.window_frame_shown();
+                }
                 self.drive_custom_view_draw();
                 if let (Some(window), Some(renderer)) =
                     (self.window.as_ref(), self.renderer.as_mut())
@@ -626,6 +642,8 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                     self.release_engine_input_for_focus_loss();
                 }
             }
+
+            WindowEvent::Occluded(occluded) => self.window_activity.occluded(occluded),
 
             WindowEvent::CursorMoved { position, .. } => {
                 if let PointerLock::Held { anchor, grab } = self.pointer_lock {
@@ -783,7 +801,9 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                         return;
                     }
                     self.handed_off = true;
-                    self.handoff_at = Some(std::time::Instant::now());
+                    let handed_off_at = std::time::Instant::now();
+                    self.handoff_at = Some(handed_off_at);
+                    self.watch_window_activity(handed_off_at);
                     tracing::info!(
                         width = w,
                         height = h,
@@ -862,8 +882,10 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
         self.window_state.save_if_due(now);
         if now >= self.next_display_refresh_poll {
             self.publish_engine_display_refresh_rates();
+            self.watch_window_activity(now);
             self.next_display_refresh_poll = now + DISPLAY_REFRESH_POLL_INTERVAL;
         }
+        self.sync_present_pace();
         let main_thread_retry = (surface_probe_failed
             || crate::framework::textbox_geometry_pending()
             || crate::framework::global_layout_pending())
@@ -1597,6 +1619,7 @@ impl GameWindow<'_> {
             return;
         }
         self.runtime_shutdown_started = true;
+        self.sync_present_pace();
         let Some(vm) = self.vm else {
             return;
         };
@@ -2139,6 +2162,65 @@ impl GameWindow<'_> {
         self.update_pointer_lock(PointerLockReasons::default());
     }
 
+    fn watch_window_activity(&mut self, now: std::time::Instant) {
+        if !self.handed_off {
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let probe = self.window_activity.tick(
+            now,
+            crate::loader::vk_overlay::engine_present_count(),
+            window.is_minimized(),
+        );
+        send_frame_probe(window, probe);
+    }
+
+    fn window_frame_shown(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let probe = self.window_activity.frame_shown(
+            std::time::Instant::now(),
+            crate::loader::vk_overlay::engine_present_count(),
+        );
+        send_frame_probe(window, probe);
+    }
+
+    fn sync_present_pace(&mut self) {
+        use crate::loader::present_pacing::{self, PresentPace};
+        use window_activity::Focus;
+        if !self.handed_off {
+            return;
+        }
+        let focus = if self.focused {
+            Focus::Game
+        } else if self.dialogs.focused() {
+            Focus::Dialog
+        } else {
+            Focus::Elsewhere
+        };
+        let visibility = self.window_activity.visibility();
+        let pace = if self.runtime_shutdown_started {
+            PresentPace::Unpaced
+        } else {
+            window_activity::pace_for(
+                self.graphics,
+                focus,
+                visibility,
+                self.hidden_pacing,
+                self.unfocused_fps_limit,
+            )
+        };
+        if pace == self.present_pace {
+            return;
+        }
+        tracing::info!(?focus, ?visibility, ?pace, "Roblox's frame pacing changed");
+        self.present_pace = pace;
+        present_pacing::set_pace(pace);
+    }
+
     fn start_gamepads(&mut self) {
         let Gamepads::AtHandoff = self.gamepads else {
             return;
@@ -2679,6 +2761,8 @@ pub fn run_windowed(
     commands: Option<&std::sync::mpsc::Receiver<launch_window::WindowCommand>>,
     window_state: window_state::WindowStateFile,
 ) -> Result<(), GraphicsError> {
+    let hidden_pacing =
+        window_activity::HiddenPacing::from_env().map_err(GraphicsError::HiddenPacing)?;
     let _event_loop_thread = crate::framework::lifecycle::EventLoopThread::enter();
     crate::framework::install_main_looper_waker(event_loop.create_proxy());
     let mut app = GameWindow {
@@ -2690,6 +2774,8 @@ pub fn run_windowed(
         handoff_error: None,
         vm,
         touch_mode: config.touch_mode,
+        hidden_pacing,
+        unfocused_fps_limit: config.unfocused_fps_limit,
         cursor: None,
         primary_press: None,
         synthetic_tap_done: false,
@@ -2724,6 +2810,8 @@ pub fn run_windowed(
         published_display_refresh_profile: None,
         next_display_refresh_poll: std::time::Instant::now(),
         focused: false,
+        window_activity: window_activity::WindowActivity::default(),
+        present_pace: crate::loader::present_pacing::PresentPace::Unpaced,
         idle_inhibit: crate::portal::IdleInhibit::Release,
         on_screen_keyboard: crate::on_screen_keyboard::OnScreenKeyboard::from_environment(),
         fullscreen: false,
@@ -2764,6 +2852,16 @@ pub fn run_windowed(
         return Err(e);
     }
     Ok(())
+}
+
+fn send_frame_probe(window: &Window, probe: window_activity::FrameProbe) {
+    match probe {
+        window_activity::FrameProbe::Send => {
+            window.pre_present_notify();
+            window.request_redraw();
+        }
+        window_activity::FrameProbe::Skip => {}
+    }
 }
 
 fn publish_engine_window_geometry(wsi_ptr: Option<usize>, width: i32, height: i32) {
@@ -6689,6 +6787,8 @@ pub enum GraphicsError {
     },
 
     EngineSurfaceHandoff(crate::framework::FrameworkError),
+
+    HiddenPacing(window_activity::UnknownHiddenPacing),
 }
 
 impl fmt::Display for GraphicsError {
@@ -6712,6 +6812,7 @@ impl fmt::Display for GraphicsError {
                 "handing the window to Roblox's SurfaceView (surfaceCreated, then surfaceChanged) \
                  failed: {e}"
             ),
+            Self::HiddenPacing(e) => write!(f, "{e}"),
         }
     }
 }
@@ -6724,6 +6825,7 @@ impl std::error::Error for GraphicsError {
             Self::EngineSurfaceHandoff(e) => Some(e),
             Self::Gles(e) => Some(e),
             Self::NoRenderer { vulkan, .. } => Some(vulkan),
+            Self::HiddenPacing(e) => Some(e),
             Self::Vulkan(_) | Self::EngineSurfaceUnavailable { .. } => None,
         }
     }
@@ -9456,6 +9558,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod fake_compositor;
 
 #[cfg(test)]
 pub(crate) mod unmapped_xlib_window;

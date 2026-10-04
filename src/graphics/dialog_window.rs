@@ -214,6 +214,7 @@ struct OpenDialog {
     window: Window,
     scale: f64,
     clicks: ClickTracker<DialogAction>,
+    focused: bool,
 }
 
 impl OpenDialog {
@@ -248,6 +249,7 @@ impl OpenDialog {
             renderer,
             scale: 1.0,
             clicks: ClickTracker::default(),
+            focused: false,
         };
         dialog.rescale(dialog.window.scale_factor());
         dialog.window.request_redraw();
@@ -312,6 +314,7 @@ impl OpenDialog {
                 self.window.request_redraw();
             }
             WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::Focused(focused) => self.focused = focused,
             _ => {}
         }
     }
@@ -360,6 +363,10 @@ impl DialogWindows {
 
     pub(super) fn owns(&self, id: WindowId) -> bool {
         self.open.iter().any(|dialog| dialog.window.id() == id)
+    }
+
+    pub(super) fn focused(&self) -> bool {
+        self.open.iter().any(|dialog| dialog.focused)
     }
 
     pub(super) fn window_event(&mut self, vm: &Vm, id: WindowId, event: WindowEvent) {

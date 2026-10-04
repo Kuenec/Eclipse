@@ -1,20 +1,12 @@
-use std::ffi::c_void;
 use std::fmt;
-use std::marker::PhantomData;
 use std::process::Command;
-use std::ptr::NonNull;
 
-use raw_window_handle::{
-    HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
-};
 use serde::{Deserialize, Serialize};
-use wayland_client::backend::{Backend, ObjectId, WaylandError};
-use wayland_client::globals::{registry_queue_init, BindError, GlobalError, GlobalListContents};
-use wayland_client::protocol::wl_registry::{self, WlRegistry};
-use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::delegate_noop;
 use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
 use winit::window::{UserAttentionType, Window};
+
+use super::wayland_window::{RequestError, SurfaceRequests, WaylandWindow};
 
 const LONGEST_TOKEN: usize = 256;
 const LAUNCH_TOKEN_VARIABLES: [&str; 2] = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"];
@@ -83,7 +75,7 @@ impl From<Token> for String {
 }
 
 pub(crate) fn raise(window: &Window, token: Option<&Token>) {
-    let surface = match wayland_surface(window) {
+    let surface = match WaylandWindow::of(window) {
         Ok(surface) => surface,
         Err(error) => {
             tracing::warn!(%error, "the window cannot be brought to the front without its handle");
@@ -102,83 +94,13 @@ pub(crate) fn raise(window: &Window, token: Option<&Token>) {
     }
 }
 
-struct WaylandSurface<'window> {
-    display: NonNull<c_void>,
-    surface: NonNull<c_void>,
-    window: PhantomData<&'window Window>,
-}
+delegate_noop!(SurfaceRequests: XdgActivationV1);
 
-fn wayland_surface(window: &Window) -> Result<Option<WaylandSurface<'_>>, HandleError> {
-    let display = window.display_handle()?.as_raw();
-    let handle = window.window_handle()?.as_raw();
-    Ok(match (display, handle) {
-        (RawDisplayHandle::Wayland(display), RawWindowHandle::Wayland(handle)) => {
-            Some(WaylandSurface {
-                display: display.display,
-                surface: handle.surface,
-                window: PhantomData,
-            })
-        }
-        _ => None,
+fn activate(target: &WaylandWindow<'_>, token: &Token) -> Result<(), RequestError> {
+    target.send(1..=1, |activation: &XdgActivationV1, surface, _| {
+        activation.activate(token.0.clone(), surface);
+        activation.destroy();
     })
-}
-
-#[derive(Debug)]
-enum ActivationError {
-    NotASurface,
-    Globals(GlobalError),
-    Unsupported(BindError),
-    Flush(WaylandError),
-}
-
-impl fmt::Display for ActivationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotASurface => f.write_str("winit's window handle is not a wl_surface"),
-            Self::Globals(error) => write!(f, "listing the compositor's globals failed: {error}"),
-            Self::Unsupported(error) => {
-                write!(
-                    f,
-                    "the compositor offers no usable xdg_activation_v1: {error}"
-                )
-            }
-            Self::Flush(error) => write!(f, "sending the activation request failed: {error}"),
-        }
-    }
-}
-
-struct ActivationEvents;
-
-impl Dispatch<WlRegistry, GlobalListContents> for ActivationEvents {
-    fn event(
-        _: &mut Self,
-        _: &WlRegistry,
-        _: wl_registry::Event,
-        _: &GlobalListContents,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-delegate_noop!(ActivationEvents: XdgActivationV1);
-
-fn activate(target: &WaylandSurface<'_>, token: &Token) -> Result<(), ActivationError> {
-    let backend = unsafe { Backend::from_foreign_display(target.display.as_ptr().cast()) };
-    let connection = Connection::from_backend(backend);
-    let surface_id =
-        unsafe { ObjectId::from_ptr(WlSurface::interface(), target.surface.as_ptr().cast()) }
-            .map_err(|_| ActivationError::NotASurface)?;
-    let surface =
-        WlSurface::from_id(&connection, surface_id).map_err(|_| ActivationError::NotASurface)?;
-    let (globals, queue) =
-        registry_queue_init::<ActivationEvents>(&connection).map_err(ActivationError::Globals)?;
-    let activation: XdgActivationV1 = globals
-        .bind(&queue.handle(), 1..=1, ())
-        .map_err(ActivationError::Unsupported)?;
-    activation.activate(token.0.clone(), &surface);
-    activation.destroy();
-    connection.flush().map_err(ActivationError::Flush)
 }
 
 #[cfg(test)]
@@ -244,6 +166,34 @@ mod tests {
                 (OsStr::new("DESKTOP_STARTUP_ID"), Some(OsStr::new("t-1"))),
                 (OsStr::new("XDG_ACTIVATION_TOKEN"), Some(OsStr::new("t-1")))
             ])
+        );
+    }
+
+    #[test]
+    fn activation_hands_the_token_and_the_window_surface_to_xdg_activation() {
+        use crate::graphics::fake_compositor::{wire_string, FakeCompositor, Request};
+        use wayland_client::protocol::{wl_display, wl_registry};
+        use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1;
+
+        let mut compositor = FakeCompositor::offering(&[("xdg_activation_v1", 1)]);
+        let (display, window) = compositor.handles();
+        let target = unsafe { WaylandWindow::from_handles_that_outlive_it(display, window) }
+            .expect("the fake compositor hands out Wayland handles");
+        activate(&target, &Token::parse("t-1".to_owned()).unwrap()).expect("an activation");
+        let requests = compositor.requests_since_last_call();
+        assert_eq!(
+            requests.iter().map(Request::call).collect::<Vec<_>>(),
+            [
+                ("wl_display", wl_display::REQ_GET_REGISTRY_OPCODE),
+                ("wl_display", wl_display::REQ_SYNC_OPCODE),
+                ("wl_registry", wl_registry::REQ_BIND_OPCODE),
+                ("xdg_activation_v1", xdg_activation_v1::REQ_ACTIVATE_OPCODE),
+                ("xdg_activation_v1", xdg_activation_v1::REQ_DESTROY_OPCODE),
+            ]
+        );
+        assert_eq!(
+            requests[3].words,
+            [wire_string("t-1"), vec![compositor.surface_id()]].concat()
         );
     }
 

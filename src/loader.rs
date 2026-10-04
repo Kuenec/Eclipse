@@ -23,6 +23,7 @@ pub mod module_registry;
 pub mod native_provider;
 pub mod ndk_registry;
 pub mod opensl;
+pub(crate) mod present_pacing;
 pub mod reloc;
 pub mod resolve;
 mod text_overlay;

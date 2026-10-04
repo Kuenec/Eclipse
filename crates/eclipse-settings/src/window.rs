@@ -7,7 +7,9 @@ use std::rc::Rc;
 use adw::prelude::*;
 use eclipse_config::audio::{AudioDevice, DeviceList, Direction, SoundDevices};
 use eclipse_config::edit::{self, Change, EditError};
-use eclipse_config::{CloseOnLeave, Config, GraphicsOptimizationMode, Loaded, Setting, TouchMode};
+use eclipse_config::{
+    CloseOnLeave, Config, FrameRateLimit, GraphicsOptimizationMode, Loaded, Setting, TouchMode,
+};
 use gtk4::{self as gtk, gio, glib};
 
 use crate::install::{self, Outcome};
@@ -48,6 +50,8 @@ const AUDIO_NOTE: &str = "Roblox's own audio settings show these choices as Defa
 
 const SYSTEM_DEFAULT: &str = "System default";
 
+const SUGGESTED_UNFOCUSED_FPS: u8 = 30;
+
 const BUG_REPORT_SUBTITLE: &str = "Leaves out your home folder, tokens, cookies and account IDs";
 
 const SERVER_LOCATION_NOTICE: &str = "Eclipse looks up where each Roblox server is with \
@@ -85,6 +89,8 @@ struct Rows {
     physical_cores: adw::SwitchRow,
     gamemode: adw::SwitchRow,
     opengl: adw::SwitchRow,
+    unfocused_limit: adw::ExpanderRow,
+    unfocused_fps: adw::SpinRow,
     bug_report: adw::ActionRow,
     log_folder: adw::ActionRow,
 }
@@ -147,6 +153,7 @@ pub(crate) fn open(
             rows.physical_cores.upcast_ref(),
             rows.gamemode.upcast_ref(),
             rows.opengl.upcast_ref(),
+            rows.unfocused_limit.upcast_ref(),
         ],
     ));
     page.add(&group(
@@ -210,6 +217,23 @@ impl Rows {
             .activatable_widget(&choose)
             .build();
         install.add_suffix(&choose);
+        let unfocused_fps = adw::SpinRow::builder()
+            .title("Frames per second")
+            .adjustment(&gtk::Adjustment::new(
+                f64::from(SUGGESTED_UNFOCUSED_FPS),
+                f64::from(FrameRateLimit::MIN),
+                f64::from(FrameRateLimit::MAX),
+                1.0,
+                10.0,
+                0.0,
+            ))
+            .build();
+        let unfocused_limit = adw::ExpanderRow::builder()
+            .title("Limit the frame rate in the background")
+            .subtitle("While another window has focus")
+            .show_enable_switch(true)
+            .build();
+        unfocused_limit.add_row(&unfocused_fps);
         Self {
             install,
             choose,
@@ -245,6 +269,8 @@ impl Rows {
                 "Use OpenGL ES",
                 "Instead of Vulkan; may stop repeated out-of-memory crashes",
             ),
+            unfocused_limit,
+            unfocused_fps,
             bug_report: action_row("Copy Bug Report", BUG_REPORT_SUBTITLE, "edit-copy-symbolic"),
             log_folder: action_row(
                 "Open Log Folder",
@@ -269,6 +295,7 @@ impl Rows {
             webview_helper_path: _,
             vulkan_device: _,
             use_opengl,
+            unfocused_fps_limit,
         } = config;
         self.auto_update.set_active(*roblox_auto_update);
         self.pointer_input
@@ -284,12 +311,17 @@ impl Rows {
         self.opengl.set_active(*use_opengl);
         self.output.show(audio_output_device, listing);
         self.microphone.show(audio_input_device, listing);
+        if let Some(limit) = unfocused_fps_limit {
+            self.unfocused_fps.set_value(f64::from(limit.per_second()));
+        }
+        self.unfocused_limit
+            .set_enable_expansion(unfocused_fps_limit.is_some());
         for row in self.settings() {
             row.set_sensitive(editable);
         }
     }
 
-    fn settings(&self) -> [&gtk::Widget; 10] {
+    fn settings(&self) -> [&gtk::Widget; 11] {
         [
             self.auto_update.upcast_ref(),
             self.pointer_input.upcast_ref(),
@@ -301,6 +333,7 @@ impl Rows {
             self.physical_cores.upcast_ref(),
             self.gamemode.upcast_ref(),
             self.opengl.upcast_ref(),
+            self.unfocused_limit.upcast_ref(),
         ]
     }
 
@@ -309,6 +342,13 @@ impl Rows {
             Direction::Output => &self.output,
             Direction::Input => &self.microphone,
         }
+    }
+
+    fn unfocused_fps_limit(&self) -> Option<FrameRateLimit> {
+        if !self.unfocused_limit.enables_expansion() {
+            return None;
+        }
+        FrameRateLimit::new(self.unfocused_fps.value() as u8)
     }
 }
 
@@ -363,6 +403,12 @@ impl Settings {
                 GraphicsOptimizationMode::Balanced
             })
         });
+        let settings = Rc::clone(self);
+        rows.unfocused_limit
+            .connect_enable_expansion_notify(move |_| settings.change_unfocused_fps_limit());
+        let settings = Rc::clone(self);
+        rows.unfocused_fps
+            .connect_value_notify(move |_| settings.change_unfocused_fps_limit());
         self.on_choice(&rows.pointer_input, &TouchMode::ALL, Setting::TouchMode);
         self.on_choice(
             &rows.close_on_leave,
@@ -453,6 +499,10 @@ impl Settings {
                 settings.change(setting(*choice));
             }
         });
+    }
+
+    fn change_unfocused_fps_limit(self: &Rc<Self>) {
+        self.change(Setting::UnfocusedFpsLimit(self.rows.unfocused_fps_limit()));
     }
 
     fn change(self: &Rc<Self>, setting: Setting) {
@@ -1196,6 +1246,42 @@ mod tests {
         let written = fs::read_to_string(headless::config_path(&root)).expect("read config.json");
         fs::remove_dir_all(&root).ok();
         assert_eq!(written, "{\n  \"use_opengl\": true\n}\n");
+    }
+
+    #[test]
+    fn the_background_frame_rate_row_writes_unfocused_fps_limit() {
+        if let Some(root) = headless::child_root() {
+            let settings = show(&root);
+            let rows = &settings.rows;
+            assert!(rows.unfocused_limit.enables_expansion());
+            assert_eq!(rows.unfocused_fps.value(), 60.0);
+            rows.unfocused_fps.set_value(45.0);
+            headless::settle();
+            assert_eq!(
+                fs::read_to_string(headless::config_path(&root)).expect("read config.json"),
+                "{\n  \"unfocused_fps_limit\": 45\n}\n"
+            );
+            rows.unfocused_limit.set_enable_expansion(false);
+            headless::settle();
+            assert!(!rows.unfocused_limit.enables_expansion());
+            return;
+        }
+        let root = headless::root("unfocused-limit");
+        fs::write(
+            headless::config_path(&root),
+            "{\n  \"unfocused_fps_limit\": 60\n}\n",
+        )
+        .expect("write config.json");
+
+        headless::run_child(
+            "window::tests::the_background_frame_rate_row_writes_unfocused_fps_limit",
+            "unfocused-limit",
+            &root,
+        );
+
+        let written = fs::read_to_string(headless::config_path(&root)).expect("read config.json");
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(written, "{\n  \"unfocused_fps_limit\": null\n}\n");
     }
 
     #[test]
