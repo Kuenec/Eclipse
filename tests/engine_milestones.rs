@@ -1094,6 +1094,10 @@ impl PlatformTestRoot {
     }
 
     fn run(&self) -> String {
+        self.run_with_vm_options("")
+    }
+
+    fn run_with_vm_options(&self, vm_options: &str) -> String {
         let out = bounded_child::output(
             Command::new(env!("CARGO_BIN_EXE_eclipse"))
                 .arg("__platform-test")
@@ -1102,7 +1106,8 @@ impl PlatformTestRoot {
                     format!("unix:path={}", self.0.join("no-session-bus").display()),
                 )
                 .env("XDG_CONFIG_HOME", self.0.join("config"))
-                .env("ECLIPSE_APP_DATA_DIR", self.app_data()),
+                .env("ECLIPSE_APP_DATA_DIR", self.app_data())
+                .env("ECLIPSE_VM_OPTIONS", vm_options),
             ENGINE_LIMIT,
         );
         let text = combined(&out);
@@ -1229,6 +1234,26 @@ fn platform_test_keeps_the_screen_on_only_for_the_keep_screen_on_flag() {
 }
 
 #[test]
+fn platform_test_obtains_a_second_finger_motion_event_under_check_jni() {
+    if !platform_test_can_boot() {
+        return;
+    }
+
+    let root = PlatformTestRoot::create("touch");
+    let text = root.run_with_vm_options("-Xcheck:jni");
+
+    assert_lines(
+        &text,
+        &[
+            "__platform-test: MotionEvent.obtain for a second finger returned action 0x105, \
+             source 0x1002, down 1000 ms, event 1016 ms, pointer 0 at (10.5, 20.25), pointer 1 \
+             at (30.75, 40.5)"
+                .to_owned(),
+        ],
+    );
+}
+
+#[test]
 fn input_test_delivers_ident_then_looper_wake() {
     let out = run_eclipse("__input-test", &[], DIAGNOSTIC_LIMIT);
     let text = combined(&out);
@@ -1245,4 +1270,437 @@ fn input_test_delivers_ident_then_looper_wake() {
             && text.contains("parked pollOnce returned ALOOPER_POLL_WAKE"),
         "missing the ALooper poll/wake success marker (input-path regression?).\n{text}"
     );
+}
+
+const UINPUT_PAD_OPT_IN: &str = "ECLIPSE_UINPUT_GAMEPAD_TEST";
+
+const EV_SYN: u16 = 0x00;
+const EV_KEY: u16 = 0x01;
+const EV_ABS: u16 = 0x03;
+const SYN_REPORT: u16 = 0x00;
+const BTN_SOUTH: u16 = 0x130;
+const BTN_EAST: u16 = 0x131;
+const BTN_NORTH: u16 = 0x133;
+const BTN_WEST: u16 = 0x134;
+const BTN_TL: u16 = 0x136;
+const BTN_TR: u16 = 0x137;
+const BTN_SELECT: u16 = 0x13a;
+const BTN_START: u16 = 0x13b;
+const BTN_MODE: u16 = 0x13c;
+const BTN_THUMBL: u16 = 0x13d;
+const BTN_THUMBR: u16 = 0x13e;
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+const ABS_Z: u16 = 0x02;
+const ABS_RX: u16 = 0x03;
+const ABS_RY: u16 = 0x04;
+const ABS_RZ: u16 = 0x05;
+const ABS_HAT0X: u16 = 0x10;
+const ABS_HAT0Y: u16 = 0x11;
+const BUS_USB: u16 = 0x03;
+
+const UI_DEV_CREATE: libc::Ioctl = 0x5501;
+const UI_DEV_DESTROY: libc::Ioctl = 0x5502;
+const UI_DEV_SETUP: libc::Ioctl = 0x405c_5503;
+const UI_ABS_SETUP: libc::Ioctl = 0x401c_5504;
+const UI_SET_EVBIT: libc::Ioctl = 0x4004_5564;
+const UI_SET_KEYBIT: libc::Ioctl = 0x4004_5565;
+const UI_SET_ABSBIT: libc::Ioctl = 0x4004_5567;
+
+const SDL_NOTICE_LIMIT: Duration = Duration::from_secs(10);
+
+const SDL_START_ALLOWANCE: Duration = Duration::from_secs(2);
+
+const GAMEPAD_THREAD: &str = "eclipse-gamepad";
+
+struct VirtualXboxPad {
+    uinput: std::fs::File,
+}
+
+impl VirtualXboxPad {
+    fn create() -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let uinput = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open("/dev/uinput")?;
+        let fd = uinput.as_raw_fd();
+        let ioctl = |request: libc::Ioctl, argument: libc::c_ulong| {
+            ioctl_result(unsafe { libc::ioctl(fd, request, argument) })
+        };
+        ioctl(UI_SET_EVBIT, EV_KEY.into())?;
+        for button in [
+            BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST, BTN_TL, BTN_TR, BTN_SELECT, BTN_START,
+            BTN_MODE, BTN_THUMBL, BTN_THUMBR,
+        ] {
+            ioctl(UI_SET_KEYBIT, button.into())?;
+        }
+        ioctl(UI_SET_EVBIT, EV_ABS.into())?;
+        for (code, minimum, maximum) in [
+            (ABS_X, -32767, 32767),
+            (ABS_Y, -32767, 32767),
+            (ABS_RX, -32767, 32767),
+            (ABS_RY, -32767, 32767),
+            (ABS_Z, 0, 255),
+            (ABS_RZ, 0, 255),
+            (ABS_HAT0X, -1, 1),
+            (ABS_HAT0Y, -1, 1),
+        ] {
+            ioctl(UI_SET_ABSBIT, code.into())?;
+            let setup = libc::uinput_abs_setup {
+                code,
+                absinfo: libc::input_absinfo {
+                    value: 0,
+                    minimum,
+                    maximum,
+                    fuzz: 0,
+                    flat: 0,
+                    resolution: 0,
+                },
+            };
+            ioctl_result(unsafe { libc::ioctl(fd, UI_ABS_SETUP, std::ptr::from_ref(&setup)) })?;
+        }
+        let mut setup = libc::uinput_setup {
+            id: libc::input_id {
+                bustype: BUS_USB,
+                vendor: 0x045e,
+                product: 0x028e,
+                version: 0x0114,
+            },
+            name: [0; libc::UINPUT_MAX_NAME_SIZE],
+            ff_effects_max: 0,
+        };
+        for (slot, byte) in setup.name.iter_mut().zip(b"Microsoft X-Box 360 pad") {
+            *slot = *byte as libc::c_char;
+        }
+        ioctl_result(unsafe { libc::ioctl(fd, UI_DEV_SETUP, std::ptr::from_ref(&setup)) })?;
+        ioctl(UI_DEV_CREATE, 0)?;
+        Ok(Self { uinput })
+    }
+
+    fn send(&self, kind: u16, code: u16, value: i32) {
+        use std::io::Write as _;
+
+        for (kind, code, value) in [(kind, code, value), (EV_SYN, SYN_REPORT, 0)] {
+            let event = libc::input_event {
+                time: libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                },
+                type_: kind,
+                code,
+                value,
+            };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::from_ref(&event).cast::<u8>(),
+                    size_of::<libc::input_event>(),
+                )
+            };
+            (&self.uinput)
+                .write_all(bytes)
+                .expect("write a uinput event");
+        }
+    }
+}
+
+impl Drop for VirtualXboxPad {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+
+        unsafe { libc::ioctl(self.uinput.as_raw_fd(), UI_DEV_DESTROY) };
+    }
+}
+
+fn ioctl_result(returned: libc::c_int) -> std::io::Result<()> {
+    if returned < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn gamepad_thread_dir() -> PathBuf {
+    let deadline = std::time::Instant::now() + SDL_NOTICE_LIMIT;
+    loop {
+        let found = std::fs::read_dir("/proc/self/task")
+            .expect("list this process's threads")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|task| {
+                std::fs::read_to_string(task.join("comm"))
+                    .is_ok_and(|comm| comm.trim_end() == GAMEPAD_THREAD)
+            });
+        if let Some(task) = found {
+            return task;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no {GAMEPAD_THREAD} thread"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn voluntary_switches(task: &std::path::Path) -> u64 {
+    let status = std::fs::read_to_string(task.join("status")).expect("read the thread status");
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+        .and_then(|count| count.trim().parse().ok())
+        .expect("a voluntary_ctxt_switches line")
+}
+
+fn cpu_ticks(task: &std::path::Path) -> u64 {
+    let stat = std::fs::read_to_string(task.join("stat")).expect("read the thread stat");
+    let (_, fields) = stat
+        .rsplit_once(") ")
+        .expect("a stat line with a command name");
+    let fields: Vec<&str> = fields.split_whitespace().collect();
+    let tick = |index: usize| -> u64 { fields[index].parse().expect("a tick count") };
+    tick(11) + tick(12)
+}
+
+fn drain_after_notice(
+    service: &eclipse::gamepad::GamepadService,
+    engine: &mut eclipse::gamepad::EngineGamepads,
+    notified: &std::sync::atomic::AtomicBool,
+    calls: &mut Vec<eclipse::gamepad::GamepadCall>,
+    what: &str,
+) {
+    let deadline = std::time::Instant::now() + SDL_NOTICE_LIMIT;
+    while !notified.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SDL never reported {what}"
+        );
+        std::thread::park_timeout(Duration::from_millis(50));
+    }
+    calls.extend_from_slice(service.drain(engine, eclipse::gamepad::GamepadGate::Open));
+}
+
+type CallMatcher = fn(&eclipse::gamepad::GamepadCall) -> bool;
+
+fn device_of(call: &eclipse::gamepad::GamepadCall) -> eclipse::gamepad::DeviceId {
+    use eclipse::gamepad::GamepadCall;
+
+    match *call {
+        GamepadCall::SupportedKey { device, .. }
+        | GamepadCall::SupportedMotion { device, .. }
+        | GamepadCall::Connect { device, .. }
+        | GamepadCall::Disconnect { device }
+        | GamepadCall::Button { device, .. }
+        | GamepadCall::Axis { device, .. } => device,
+    }
+}
+
+#[test]
+fn gamepad_sdl_pipeline_reports_a_uinput_pad() {
+    use eclipse::gamepad::{EngineGamepads, GamepadCall, GamepadKind, GamepadService};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    if std::env::var_os(UINPUT_PAD_OPT_IN).is_none_or(|value| value != "1") {
+        eprintln!(
+            "SKIP: set {UINPUT_PAD_OPT_IN}=1 to create a virtual Xbox 360 controller, which \
+             every app on this machine can see"
+        );
+        return;
+    }
+    if unsafe { libc::access(c"/dev/uinput".as_ptr(), libc::W_OK) } != 0 {
+        eprintln!("SKIP: /dev/uinput is not writable");
+        return;
+    }
+    if unsafe { libloading::Library::new("libSDL3.so.0") }.is_err() {
+        eprintln!("SKIP: libSDL3.so.0 does not load");
+        return;
+    }
+
+    let notified = Arc::new(AtomicBool::new(false));
+    let service = GamepadService::spawn({
+        let notified = Arc::clone(&notified);
+        let test_thread = std::thread::current();
+        move || {
+            notified.store(true, Ordering::Release);
+            test_thread.unpark();
+        }
+    })
+    .expect("spawn the controller thread");
+    service.set_focused(true);
+    let task = gamepad_thread_dir();
+    std::thread::sleep(SDL_START_ALLOWANCE);
+
+    let idle_from = voluntary_switches(&task);
+    std::thread::sleep(Duration::from_secs(10));
+    let idle_switches = voluntary_switches(&task) - idle_from;
+
+    let mut engine = EngineGamepads::default();
+    let mut calls = Vec::new();
+    let pad = VirtualXboxPad::create().expect("create the uinput pad");
+    drain_after_notice(&service, &mut engine, &notified, &mut calls, "the new pad");
+    for (kind, code, value, what) in [
+        (EV_KEY, BTN_SOUTH, 1, "the A press"),
+        (EV_KEY, BTN_SOUTH, 0, "the A release"),
+        (EV_ABS, ABS_X, 32767, "the left stick"),
+        (EV_ABS, ABS_Z, 255, "the left trigger"),
+        (EV_ABS, ABS_HAT0X, -1, "the d-pad"),
+    ] {
+        pad.send(kind, code, value);
+        drain_after_notice(&service, &mut engine, &notified, &mut calls, what);
+    }
+
+    let busy_from = cpu_ticks(&task);
+    let busy_until = std::time::Instant::now() + Duration::from_secs(10);
+    let mut right = false;
+    while std::time::Instant::now() < busy_until {
+        right = !right;
+        pad.send(EV_ABS, ABS_X, if right { 16000 } else { -16000 });
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let busy_ticks = cpu_ticks(&task) - busy_from;
+
+    drop(pad);
+    let removal_deadline = std::time::Instant::now() + SDL_NOTICE_LIMIT;
+    while !matches!(calls.last(), Some(GamepadCall::Disconnect { .. })) {
+        assert!(
+            std::time::Instant::now() < removal_deadline,
+            "SDL never reported the removal; calls: {:#?}",
+            calls.iter().rev().take(40).collect::<Vec<_>>()
+        );
+        std::thread::park_timeout(Duration::from_millis(50));
+        calls.extend_from_slice(service.drain(&mut engine, eclipse::gamepad::GamepadGate::Open));
+    }
+    drop(service);
+
+    assert!(
+        idle_switches <= 50,
+        "the controller thread woke {idle_switches} times in 10 s with no pad"
+    );
+    assert!(
+        busy_ticks < 10,
+        "the controller thread used {busy_ticks} clock ticks in 10 s of 1 kHz stick input"
+    );
+
+    let device = calls
+        .iter()
+        .find_map(|call| match *call {
+            GamepadCall::Connect {
+                device,
+                kind: GamepadKind::Xbox,
+            } => Some(device),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no Xbox-class connect: {calls:#?}"));
+    let ours: Vec<GamepadCall> = calls
+        .into_iter()
+        .filter(|call| device_of(call) == device)
+        .collect();
+    assert!(ours.len() > 27 + 27, "{ours:#?}");
+    for call in &ours[..14] {
+        assert!(
+            matches!(
+                call,
+                GamepadCall::SupportedKey {
+                    supported: true,
+                    kind: GamepadKind::Xbox,
+                    ..
+                }
+            ),
+            "{call:?}"
+        );
+    }
+    for call in &ours[14..26] {
+        assert!(
+            matches!(
+                call,
+                GamepadCall::SupportedMotion {
+                    kind: GamepadKind::Xbox,
+                    ..
+                }
+            ),
+            "{call:?}"
+        );
+    }
+    assert_eq!(
+        ours[26],
+        GamepadCall::Connect {
+            device,
+            kind: GamepadKind::Xbox
+        }
+    );
+    let expected: [(&str, CallMatcher); 6] = [
+        ("A pressed", |call| {
+            matches!(
+                call,
+                GamepadCall::Button {
+                    key_code: 96,
+                    down: true,
+                    ..
+                }
+            )
+        }),
+        ("A released", |call| {
+            matches!(
+                call,
+                GamepadCall::Button {
+                    key_code: 96,
+                    down: false,
+                    ..
+                }
+            )
+        }),
+        (
+            "axis 0 at full right",
+            |call| matches!(call, GamepadCall::Axis { axis: 0, x, .. } if *x == 1.0),
+        ),
+        (
+            "axis 1 at full right",
+            |call| matches!(call, GamepadCall::Axis { axis: 1, x, .. } if *x == 1.0),
+        ),
+        ("the left trigger at full", |call| {
+            matches!(
+                call,
+                GamepadCall::Axis { axis: 17, x, y, value, .. }
+                    if *x == 0.0 && *y == 0.0 && *value == 1.0
+            )
+        }),
+        ("d-pad left pressed", |call| {
+            matches!(
+                call,
+                GamepadCall::Button {
+                    key_code: 21,
+                    down: true,
+                    ..
+                }
+            )
+        }),
+    ];
+    let mut rest = ours[27..ours.len() - 27].iter();
+    for (what, is_expected) in expected {
+        assert!(
+            rest.any(is_expected),
+            "{what} is missing or out of order: {ours:#?}"
+        );
+    }
+    let removal = &ours[ours.len() - 27..];
+    for call in &removal[..26] {
+        assert!(
+            matches!(
+                call,
+                GamepadCall::SupportedKey {
+                    supported: false,
+                    kind: GamepadKind::Generic,
+                    ..
+                } | GamepadCall::SupportedMotion {
+                    supported: false,
+                    kind: GamepadKind::Generic,
+                    ..
+                }
+            ),
+            "{call:?}"
+        );
+    }
+    assert_eq!(removal[26], GamepadCall::Disconnect { device });
 }

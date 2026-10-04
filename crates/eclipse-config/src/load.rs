@@ -832,6 +832,7 @@ mod tests {
                 roblox_auto_update: false,
                 close_on_leave: CloseOnLeave::Never,
                 server_location_indicator_enabled: true,
+                allow_gamepad_permission: false,
                 fflags: BTreeMap::from([("DFIntExample".to_owned(), 42.into())]),
                 webview_helper_path: Some(PathBuf::from("/opt/eclipse-webview")),
             },
@@ -953,6 +954,16 @@ mod tests {
                 path.display()
             )]
         );
+    }
+
+    #[test]
+    fn a_sober_allow_gamepad_permission_switch_turns_controllers_off() {
+        let (_, loaded) = load_bytes("gamepads-off", br#"{"allow_gamepad_permission": false}"#);
+        assert_eq!(loaded.problems, []);
+        assert!(loaded.unused_keys.is_empty(), "{:?}", loaded.unused_keys);
+        assert!(!loaded.config.allow_gamepad_permission);
+        let (_, loaded) = load_bytes("gamepads-absent", b"{}");
+        assert!(loaded.config.allow_gamepad_permission);
     }
 
     #[test]

@@ -683,6 +683,74 @@ done
 n="$(grep -cF '0x42700000' "$dsm")" || true
 [ "$n" = "1" ] || fail "Display.smali holds $n 60 Hz constants (expected only the <clinit> default)"
 
+mesm="$work/smali/android/view/MotionEvent.smali"
+[ -f "$mesm" ] || fail "MotionEvent.smali not found after baksmali"
+! grep -qF 'eclipseDownTime' "$mesm" || fail "MotionEvent.smali already declares eclipseDownTime — installed MotionEvent drifted; update patch-framework.sh"
+n="$(grep -cxF '.field source:I' "$mesm")" || true
+[ "$n" = "1" ] || fail "MotionEvent.smali source field anchor found $n times (expected 1) — installed MotionEvent drifted; update patch-framework.sh"
+perl -0pi -e 's{^(\.field source:I\n)}{$1\n.field eclipseDownTime:J\n}m' "$mesm"
+replace_upstream_method "$mesm" \
+    $'    iput-wide p3, p0, Landroid/view/MotionEvent;->eventTime:J\n' \
+    $'    iput-wide p3, p0, Landroid/view/MotionEvent;->eventTime:J\n\n    iput-wide p3, p0, Landroid/view/MotionEvent;->eclipseDownTime:J\n' \
+    'constructor down time'
+replace_upstream_method "$mesm" \
+    $'    iput-wide p2, v0, Landroid/view/MotionEvent;->eventTime:J\n' \
+    $'    iput-wide p2, v0, Landroid/view/MotionEvent;->eventTime:J\n\n    iput-wide p0, v0, Landroid/view/MotionEvent;->eclipseDownTime:J\n' \
+    'single-pointer obtain down time'
+replace_upstream_method "$mesm" \
+    $'    iput-wide p2, v1, Landroid/view/MotionEvent;->eventTime:J\n' \
+    $'    iput-wide p2, v1, Landroid/view/MotionEvent;->eventTime:J\n\n    iput-wide p0, v1, Landroid/view/MotionEvent;->eclipseDownTime:J\n' \
+    'multi-pointer obtain down time'
+replace_upstream_method "$mesm" \
+    $'    iget-wide v2, p0, Landroid/view/MotionEvent;->eventTime:J\n\n    iput-wide v2, v0, Landroid/view/MotionEvent;->eventTime:J\n' \
+    $'    iget-wide v2, p0, Landroid/view/MotionEvent;->eventTime:J\n\n    iput-wide v2, v0, Landroid/view/MotionEvent;->eventTime:J\n\n    iget-wide v2, p0, Landroid/view/MotionEvent;->eclipseDownTime:J\n\n    iput-wide v2, v0, Landroid/view/MotionEvent;->eclipseDownTime:J\n' \
+    'copying obtain down time'
+replace_upstream_method "$mesm" \
+    $'.method public final getDownTime()J\n    .registers 3\n\n    invoke-virtual {p0}, Landroid/view/MotionEvent;->getEventTime()J\n\n    move-result-wide v0\n\n    return-wide v0\n.end method\n' \
+    $'.method public final getDownTime()J\n    .registers 3\n\n    iget-wide v0, p0, Landroid/view/MotionEvent;->eclipseDownTime:J\n\n    return-wide v0\n.end method\n' \
+    'getDownTime'
+replace_upstream_method "$mesm" \
+    $'.method public final findPointerIndex(I)I\n    .registers 3\n\n    const/4 v0, 0x0\n\n    return v0\n.end method\n' \
+    $'.method public final findPointerIndex(I)I\n    .registers 6\n\n    iget-object v0, p0, Landroid/view/MotionEvent;->ids:[I\n\n    array-length v1, v0\n\n    const/4 v2, 0x0\n\n    :eclipse_next_pointer\n    if-ge v2, v1, :eclipse_pointer_missing\n\n    aget v3, v0, v2\n\n    if-ne v3, p1, :eclipse_other_pointer\n\n    return v2\n\n    :eclipse_other_pointer\n    add-int/lit8 v2, v2, 0x1\n\n    goto :eclipse_next_pointer\n\n    :eclipse_pointer_missing\n    const/4 v2, -0x1\n\n    return v2\n.end method\n' \
+    'findPointerIndex'
+for axis in X:0 Y:1; do
+    name="${axis%%:*}"
+    offset="${axis##*:}"
+    replace_upstream_method "$mesm" \
+        ".method public final get$name(I)F"$'\n    .registers 4\n\n    iget-object v0, p0, Landroid/view/MotionEvent;->coords:[F\n\n    mul-int/lit8 v1, p1, 0x4\n\n'"    add-int/lit8 v1, v1, 0x$offset"$'\n\n    aget v0, v0, v1\n\n    return v0\n.end method\n' \
+        ".method public final get$name(I)F"$'\n    .registers 4\n\n    invoke-direct {p0, p1}, Landroid/view/MotionEvent;->eclipseRequirePointerIndex(I)V\n\n    iget-object v0, p0, Landroid/view/MotionEvent;->coords:[F\n\n    mul-int/lit8 v1, p1, 0x4\n\n'"    add-int/lit8 v1, v1, 0x$offset"$'\n\n    aget v0, v0, v1\n\n    return v0\n.end method\n' \
+        "get$name(int)"
+done
+cat >> "$mesm" <<'ECLIPSE_MOTION_EVENT_POINTER_INDEX'
+
+.method private eclipseRequirePointerIndex(I)V
+    .registers 4
+
+    if-ltz p1, :eclipse_pointer_index_out_of_range
+
+    iget-object v0, p0, Landroid/view/MotionEvent;->ids:[I
+
+    array-length v0, v0
+
+    if-ge p1, v0, :eclipse_pointer_index_out_of_range
+
+    return-void
+
+    :eclipse_pointer_index_out_of_range
+    new-instance v0, Ljava/lang/IllegalArgumentException;
+
+    const-string v1, "pointerIndex out of range"
+
+    invoke-direct {v0, v1}, Ljava/lang/IllegalArgumentException;-><init>(Ljava/lang/String;)V
+
+    throw v0
+.end method
+ECLIPSE_MOTION_EVENT_POINTER_INDEX
+event_time_writes="$(grep -cE '^    iput-wide [pv][0-9]+, [pv][0-9]+, Landroid/view/MotionEvent;->eventTime:J$' "$mesm")" || true
+down_time_writes="$(grep -cE '^    iput-wide [pv][0-9]+, [pv][0-9]+, Landroid/view/MotionEvent;->eclipseDownTime:J$' "$mesm")" || true
+[ "$event_time_writes/$down_time_writes" = "4/4" ] \
+    || fail "MotionEvent.smali writes eventTime $event_time_writes times and eclipseDownTime $down_time_writes times (expected 4 each) — installed MotionEvent drifted; update patch-framework.sh"
+
 fsm="$work/smali/android/app/Fragment.smali"
 [ -f "$fsm" ] || fail "Fragment.smali not found after baksmali"
 n="$(grep -cF '.method public onCreate(Landroid/os/Bundle;)V' "$fsm")" || true
@@ -1327,6 +1395,7 @@ cp "$here/smali/android/net/LinkProperties.smali" "$work/smali-view/android/net/
 cp "$here/smali/android/net/LinkAddress.smali" "$work/smali-view/android/net/"
 cp "$vsm" "$work/smali-view/android/view/View.smali"
 cp "$dsm" "$work/smali-view/android/view/Display.smali"
+cp "$mesm" "$work/smali-view/android/view/MotionEvent.smali"
 cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
 cp "$here/smali/android/view/Display\$Mode.smali" "$work/smali-view/android/view/"
 cp "$asm" "$work/smali-view/android/app/Activity.smali"
@@ -1591,6 +1660,27 @@ display_output="$(env \
 [ "$display_output" = 'display-refresh-rates-ok' ] \
     || fail "display refresh-rate regression probe returned '$display_output'"
 
+motion_event_probe="$here/tests/MotionEventPointersProbe.java"
+[ -f "$motion_event_probe" ] || fail "MotionEvent pointer regression probe missing at $motion_event_probe"
+mkdir -p "$work/motion-event-probe/classes" "$work/motion-event-probe/cache" "$work/motion-event-probe/data"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/motion-event-probe/classes" "$motion_event_probe"
+"$DX" --dex --output="$work/motion-event-probe/probe.jar" "$work/motion-event-probe/classes"
+motion_event_boot_class_path="$boot_class_path:$work/jar/api-impl.jar:$work/motion-event-probe/probe.jar"
+motion_event_boot_class_path_locations="$boot_class_path_locations:/system/framework/api-impl.jar:/system/framework/probe.jar"
+motion_event_output="$(env \
+    ANDROID_DATA="$work/motion-event-probe/data" \
+    XDG_CACHE_HOME="$work/motion-event-probe/cache" \
+    BOOTCLASSPATH="$motion_event_boot_class_path" \
+    "$DALVIKVM" \
+    -Ximage:"$work/art/oat/boot.art" \
+    -Xbootclasspath:"$motion_event_boot_class_path" \
+    -Xbootclasspath-locations:"$motion_event_boot_class_path_locations" \
+    -Ximage-compiler-option --no-generate-debug-info \
+    -Ximage-compiler-option --no-generate-mini-debug-info \
+    MotionEventPointersProbe)"
+[ "$motion_event_output" = 'motion-event-pointers-ok' ] \
+    || fail "MotionEvent pointer regression probe returned '$motion_event_output'"
+
 voice_chat_probe="$here/tests/VoiceChatProbe.java"
 [ -f "$voice_chat_probe" ] || fail "voice chat regression probe missing at $voice_chat_probe"
 mkdir -p "$work/voice-chat-probe/classes" "$work/voice-chat-probe/cache" "$work/voice-chat-probe/data"
@@ -1679,5 +1769,5 @@ classes_dex_size="$(stat -c '%s' "$work/jar/classes.dex")"
 classes2_dex_size="$(stat -c '%s' "$work/jar/classes2.dex")"
 classes3_dex_size="$(stat -c '%s' "$work/jar/classes3.dex")"
 echo "    classes.dex (javac-patched): $classes_dex_size bytes; classes2.dex (smali Android API gaps, including LocationManager): $classes2_dex_size bytes; classes3.dex (stock): $classes3_dex_size bytes"
-echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, date-time, display refresh-rate, voice chat, audio properties, WebView callback, and wolfSSL contracts verified"
+echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, date-time, display refresh-rate, MotionEvent pointer, voice chat, audio properties, WebView callback, and wolfSSL contracts verified"
 echo "    use it with: export ECLIPSE_ANDROID_FRAMEWORK_DIR=\"$OUT\""

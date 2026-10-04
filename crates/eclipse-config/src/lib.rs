@@ -134,6 +134,8 @@ pub struct Config {
 
     pub server_location_indicator_enabled: bool,
 
+    pub allow_gamepad_permission: bool,
+
     pub fflags: BTreeMap<String, serde_json::Value>,
 
     pub webview_helper_path: Option<PathBuf>,
@@ -148,6 +150,7 @@ impl Default for Config {
             roblox_auto_update: true,
             close_on_leave: CloseOnLeave::default(),
             server_location_indicator_enabled: false,
+            allow_gamepad_permission: true,
             fflags: BTreeMap::new(),
             webview_helper_path: None,
         }
@@ -167,6 +170,7 @@ impl Config {
                 Setting::ServerLocationIndicatorEnabled(enabled) => {
                     self.server_location_indicator_enabled = enabled;
                 }
+                Setting::AllowGamepadPermission(allowed) => self.allow_gamepad_permission = allowed,
             },
             Key::FileOnly(FileOnlyKey::Fflags) => {
                 self.fflags = serde_json::from_value(value).map_err(reason)?;
@@ -190,6 +194,7 @@ pub enum Setting {
     RobloxAutoUpdate(bool),
     CloseOnLeave(CloseOnLeave),
     ServerLocationIndicatorEnabled(bool),
+    AllowGamepadPermission(bool),
 }
 
 impl Setting {
@@ -202,6 +207,7 @@ impl Setting {
             Self::RobloxAutoUpdate(_) => SettingKey::RobloxAutoUpdate,
             Self::CloseOnLeave(_) => SettingKey::CloseOnLeave,
             Self::ServerLocationIndicatorEnabled(_) => SettingKey::ServerLocationIndicatorEnabled,
+            Self::AllowGamepadPermission(_) => SettingKey::AllowGamepadPermission,
         }
     }
 }
@@ -214,16 +220,18 @@ pub enum SettingKey {
     RobloxAutoUpdate,
     CloseOnLeave,
     ServerLocationIndicatorEnabled,
+    AllowGamepadPermission,
 }
 
 impl SettingKey {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::TouchMode,
         Self::GraphicsOptimizationMode,
         Self::EnableGamemode,
         Self::RobloxAutoUpdate,
         Self::CloseOnLeave,
         Self::ServerLocationIndicatorEnabled,
+        Self::AllowGamepadPermission,
     ];
 
     #[must_use]
@@ -235,6 +243,7 @@ impl SettingKey {
             Self::RobloxAutoUpdate => "roblox_auto_update",
             Self::CloseOnLeave => "close_on_leave",
             Self::ServerLocationIndicatorEnabled => "server_location_indicator_enabled",
+            Self::AllowGamepadPermission => "allow_gamepad_permission",
         }
     }
 
@@ -264,6 +273,7 @@ impl SettingKey {
             Self::ServerLocationIndicatorEnabled => {
                 value.as_bool().map(Setting::ServerLocationIndicatorEnabled)
             }
+            Self::AllowGamepadPermission => value.as_bool().map(Setting::AllowGamepadPermission),
         };
         setting.ok_or_else(|| format!("expected one of {}", self.accepted_values()))
     }
@@ -276,7 +286,8 @@ impl SettingKey {
             }
             Self::EnableGamemode
             | Self::RobloxAutoUpdate
-            | Self::ServerLocationIndicatorEnabled => &["true", "false"],
+            | Self::ServerLocationIndicatorEnabled
+            | Self::AllowGamepadPermission => &["true", "false"],
             Self::CloseOnLeave => &CloseOnLeave::ALL.map(CloseOnLeave::json_form),
         };
         let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
@@ -393,7 +404,8 @@ mod tests {
             SettingError::UnknownKey("use_opengl".to_owned()).to_string(),
             "`use_opengl` is not a setting; the settings are `touch_mode`, \
              `graphics_optimization_mode`, `enable_gamemode`, `roblox_auto_update`, \
-             `close_on_leave`, `server_location_indicator_enabled`"
+             `close_on_leave`, `server_location_indicator_enabled`, \
+             `allow_gamepad_permission`"
         );
     }
 
@@ -573,6 +585,26 @@ mod tests {
     }
 
     #[test]
+    fn allow_gamepad_permission_takes_only_a_json_boolean() {
+        assert_eq!(
+            SettingKey::from_name("allow_gamepad_permission")
+                .and_then(|key| key.parse(false.into())),
+            Ok(Setting::AllowGamepadPermission(false))
+        );
+        assert_eq!(
+            Setting::AllowGamepadPermission(true).key(),
+            SettingKey::AllowGamepadPermission
+        );
+        assert_eq!(
+            SettingKey::AllowGamepadPermission.parse("false".into()),
+            Err(SettingError::Invalid {
+                key: SettingKey::AllowGamepadPermission,
+                message: "expected one of `true`, `false`".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn every_schema_key_is_a_setting_or_file_only() {
         let written = serde_json::to_value(Config::default()).expect("serialize");
         let mut schema: Vec<&str> = written
@@ -608,6 +640,7 @@ mod tests {
         assert_eq!(default_json("roblox_auto_update"), "true");
         assert_eq!(default_json("close_on_leave"), r#""browser""#);
         assert_eq!(default_json("server_location_indicator_enabled"), "false");
+        assert_eq!(default_json("allow_gamepad_permission"), "true");
         assert_eq!(default_json("fflags"), "{}");
         assert_eq!(default_json("webview_helper_path"), "null");
     }

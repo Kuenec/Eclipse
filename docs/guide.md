@@ -29,14 +29,19 @@ xdg-mime default io.github.kuenec.Eclipse.UrlHandler.desktop x-scheme-handler/ro
 
 Voice chat uses your system's default microphone. Choose it in your desktop's sound settings.
 
+## Controllers
+
+Controllers need Flatpak 1.16 or newer. On older Flatpak, run `flatpak override --user --device=all io.github.kuenec.Eclipse`. A controller SDL does not recognize needs an [SDL mapping](https://wiki.libsdl.org/SDL3/SDL_HINT_GAMECONTROLLERCONFIG): `flatpak override --user --env=SDL_GAMECONTROLLERCONFIG="<mapping>" io.github.kuenec.Eclipse`. Eclipse can read input devices for controllers, which includes keyboards if your user is in the `input` group. To remove that access, run `flatpak override --user --nodevice=input io.github.kuenec.Eclipse`; to only turn controllers off, set `allow_gamepad_permission` to `false`.
+
 ## Settings
 
 | Key | Default | Effect |
 |---|---|---|
 | `fflags` | `{}` | Fast Flags passed to Roblox |
-| `touch_mode` | `"off"` | `"on"` sends clicks as touch input |
+| `touch_mode` | `"off"` | `"on"` sends clicks and touchscreen fingers as touch and shows Roblox's mobile UI; `"fake-off"` does the same with the desktop UI; with `"off"`, a touchscreen's first finger acts as the mouse |
 | `graphics_optimization_mode` | `"balanced"` | `"performance"` pins Eclipse to physical cores |
 | `enable_gamemode` | `true` | Turns on GameMode while Roblox runs, if GameMode is installed |
+| `allow_gamepad_permission` | `true` | `false` turns controllers off |
 | `roblox_auto_update` | `true` | `false` stops launches from updating Roblox; `update` and `run --check-update` still do |
 | `close_on_leave` | `"browser"` | Closes Eclipse when you leave an experience that a link started; `true` closes it after any experience, `false` never |
 | `server_location_indicator_enabled` | `false` | Shows where the Roblox server is in the window title and a notification. ipinfo.io receives the server's address and sees your IP address |

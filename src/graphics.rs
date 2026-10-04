@@ -40,6 +40,8 @@ const DISPLAY_REFRESH_POLL_INTERVAL: std::time::Duration = std::time::Duration::
 
 const POINTER_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
+const SYNTHETIC_INPUT_DELAY: std::time::Duration = std::time::Duration::from_secs(6);
+
 const ENGINE_SURFACE_SIZE_FIRST_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_millis(100);
 
@@ -105,6 +107,14 @@ struct GameWindow<'vm> {
 
     engine_reflect_done: bool,
 
+    synthetic_gamepad_done: bool,
+
+    synthetic_touch_done: bool,
+
+    gamepads: Gamepads,
+
+    engine_gamepads: crate::gamepad::EngineGamepads,
+
     web_view_window: WebViewWindow,
 
     runtime_shutdown_started: bool,
@@ -136,6 +146,14 @@ struct GameWindow<'vm> {
     pointer_lock: PointerLock,
 
     engine_held: EngineHeldInput,
+
+    wheel_steps: crate::input::WheelSteps,
+
+    touch: crate::input::TouchTracker,
+
+    touch_route: TouchRoute,
+
+    touch_down_time: Option<i64>,
 
     relative_motion_units: RelativeMotionUnits,
 
@@ -577,6 +595,9 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                 }
                 self.focused = focused;
                 crate::framework::notifications::set_host_window_focused(focused);
+                if let Gamepads::Running(gamepads) = &self.gamepads {
+                    gamepads.set_focused(focused);
+                }
                 if !focused {
                     self.release_engine_input_for_focus_loss();
                 }
@@ -589,21 +610,21 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                     }
                     return;
                 }
-                let previous = self.cursor;
-                let cursor = (position.x as f32, position.y as f32);
-                self.cursor = Some(cursor);
-                let (dx, dy) = previous.map_or((0.0, 0.0), |(old_x, old_y)| {
-                    (cursor.0 - old_x, cursor.1 - old_y)
-                });
-
+                let Some(motion) = host_cursor_motion(
+                    &mut self.cursor,
+                    (position.x as f32, position.y as f32),
+                    self.touch.is_active(),
+                ) else {
+                    return;
+                };
                 if self.handed_off && self.web_view_window == WebViewWindow::Hidden {
-                    self.queue_pointer_motion(PendingPointerMotion::Free(PointerMotion {
-                        position: cursor,
-                        dx,
-                        dy,
-                    }));
+                    self.queue_pointer_motion(PendingPointerMotion::Free(motion));
                 }
             }
+            WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                ..
+            } if self.touch.is_active() => {}
             WindowEvent::MouseInput { state, button, .. } if self.handed_off => {
                 match self.web_view_window.button_route(button, state) {
                     HostInputRoute::Engine => self.engine_mouse_button(button, state),
@@ -648,14 +669,19 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
             WindowEvent::MouseWheel { delta, .. }
                 if self.handed_off && self.web_view_window == WebViewWindow::Hidden =>
             {
-                let d = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+                let Some(window) = self.window.as_ref() else {
+                    return;
                 };
-                if d != 0.0 {
-                    self.engine_scroll(d);
+                if let Some(notches) = self.wheel_steps.notches(delta, window.scale_factor()) {
+                    self.engine_scroll(notches);
                 }
             }
+
+            WindowEvent::Touch(touch) => self.host_touch(
+                touch.id,
+                touch.phase,
+                (touch.location.x as f32, touch.location.y as f32),
+            ),
 
             WindowEvent::ActivationTokenDone { token, .. } => {
                 crate::webview::client::activate(token.into_raw());
@@ -673,6 +699,9 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.flush_pointer_motion();
+        if let Some(motion) = self.touch.flush() {
+            self.touch_motion(motion);
+        }
         if let Some(window) = &self.window {
             if let Some(requested) = title_suffix::take_request() {
                 window.set_title(&requested.title(&self.title));
@@ -737,6 +766,7 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                         "Eclipse released its Vulkan renderer then dispatched the SurfaceView lifecycle \
                          (surfaceCreated + surfaceChanged); present-loop handoff (drop-before-dispatch)"
                     );
+                    self.start_gamepads();
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -772,9 +802,12 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
             }
         }
         self.maybe_synthetic_engine_tap();
+        self.maybe_synthetic_touch();
 
         self.sync_web_view_window();
         let web_view_hidden = self.web_view_window == WebViewWindow::Hidden;
+        self.maybe_synthetic_gamepad(vm);
+        self.drive_gamepads(vm, web_view_hidden);
         if crate::webview::client::take_activation_request()
             && !crate::webview::client::pages_embedded()
         {
@@ -916,6 +949,12 @@ fn host_clipboard(window: &Window) -> Option<crate::clipboard::HostClipboard> {
             None
         }
     }
+}
+
+enum Gamepads {
+    AtHandoff,
+    Running(crate::gamepad::GamepadService),
+    Off,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1700,6 +1739,163 @@ impl GameWindow<'_> {
         }
     }
 
+    fn host_touch(&mut self, finger: u64, phase: winit::event::TouchPhase, (x, y): (f32, f32)) {
+        if !self.touch.is_active() {
+            self.touch_route = touch_route(
+                self.handed_off,
+                self.touch_mode,
+                self.web_view_window,
+                self.mouse_primary_held(),
+            );
+            if self.touch_route == TouchRoute::Withheld {
+                return;
+            }
+        }
+        for motion in self.touch.touch(finger, phase, x, y) {
+            self.touch_motion(motion);
+        }
+    }
+
+    fn mouse_primary_held(&self) -> bool {
+        if !self.handed_off {
+            return self.primary_press.is_some();
+        }
+        self.engine_tap_downtime.is_some() || self.engine_held.buttons.contains(&0)
+    }
+
+    fn touch_motion(&mut self, motion: crate::input::TouchMotion) {
+        match self.touch_route {
+            TouchRoute::EngineTouch => self.engine_touch_motion(&motion),
+            TouchRoute::EngineMouse => {
+                if let Some(primary) = motion.primary() {
+                    self.engine_finger_mouse(primary);
+                }
+            }
+            TouchRoute::LaunchWindow => {
+                if let Some(primary) = motion.primary() {
+                    self.launch_window_finger(primary);
+                }
+            }
+            TouchRoute::Withheld => {}
+        }
+    }
+
+    fn engine_touch_motion(&mut self, motion: &crate::input::TouchMotion) {
+        use crate::input::TouchAction;
+
+        let Some(vm) = self.vm else { return };
+        let down_time = match motion.action {
+            TouchAction::Down => None,
+            TouchAction::PointerDown(_)
+            | TouchAction::Move
+            | TouchAction::PointerUp(_)
+            | TouchAction::Up
+            | TouchAction::Cancel(_) => self.touch_down_time,
+        };
+        if let Some(pointer) = motion.pressed_pointer() {
+            crate::framework::prepare_text_field_pointer_press((pointer.x, pointer.y));
+        }
+        match crate::framework::engine_input::dispatch_touch_motion(vm, motion, down_time) {
+            Ok(Some(outcome)) => {
+                self.touch_down_time = Some(outcome.down_time_ms);
+                let action = motion.action;
+                let pointers = motion.pointers().len();
+                let consumed = outcome.consumed;
+                if action == TouchAction::Move {
+                    tracing::debug!(pointers, consumed, "engine touchscreen ACTION_MOVE");
+                } else {
+                    tracing::info!(
+                        ?action,
+                        pointers,
+                        consumed,
+                        "engine touchscreen pointer edge → RBXSurfaceView.onTouchEventInternal"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                action = ?motion.action,
+                %error,
+                "engine touchscreen dispatch failed (ignored)"
+            ),
+        }
+        if motion.ends_stream() {
+            self.touch_down_time = None;
+        }
+    }
+
+    fn engine_finger_mouse(&mut self, primary: crate::input::PrimaryTouch) {
+        use crate::input::PrimaryTouch;
+
+        match primary {
+            PrimaryTouch::Press { x, y } => {
+                self.cursor = Some((x, y));
+                self.engine_pointer_move(PointerMotion {
+                    position: (x, y),
+                    dx: 0.0,
+                    dy: 0.0,
+                });
+                self.engine_primary_press();
+            }
+            PrimaryTouch::Move { x, y } => {
+                if let Some(motion) = finger_cursor_motion(&mut self.cursor, (x, y)) {
+                    self.engine_pointer_move(motion);
+                }
+            }
+            PrimaryTouch::Release { x, y } => {
+                self.cursor = Some((x, y));
+                self.engine_primary_release();
+            }
+            PrimaryTouch::Cancel => self.engine_primary_release(),
+        }
+    }
+
+    fn launch_window_finger(&mut self, primary: crate::input::PrimaryTouch) {
+        use crate::input::PrimaryTouch;
+
+        match primary {
+            PrimaryTouch::Press { x, y } => {
+                self.cursor = Some((x, y));
+                self.handle_primary_press();
+            }
+            PrimaryTouch::Move { x, y } => self.cursor = Some((x, y)),
+            PrimaryTouch::Release { x, y } => {
+                self.cursor = Some((x, y));
+                self.handle_primary_release();
+            }
+            PrimaryTouch::Cancel => self.primary_press = None,
+        }
+    }
+
+    fn maybe_synthetic_touch(&mut self) {
+        if self.synthetic_touch_done
+            || self
+                .handoff_at
+                .is_none_or(|at| at.elapsed() < SYNTHETIC_INPUT_DELAY)
+        {
+            return;
+        }
+        self.synthetic_touch_done = true;
+        let Some((first, second)) =
+            std::env::var_os("ECLIPSE_SYNTHETIC_TOUCH").and_then(|spec| parse_two_xy(&spec))
+        else {
+            return;
+        };
+        tracing::info!(
+            ?first,
+            ?second,
+            "synthetic touch: a two-finger pinch through the touchscreen path"
+        );
+        for frame in synthetic_pinch(first, second) {
+            for (finger, phase, position) in frame {
+                self.host_touch(finger, phase, position);
+            }
+            if let Some(motion) = self.touch.flush() {
+                self.touch_motion(motion);
+            }
+        }
+    }
+
     fn queue_pointer_motion(&mut self, motion: PendingPointerMotion) {
         if let Some(merged) = self
             .pending_pointer_motion
@@ -1894,6 +2090,7 @@ impl GameWindow<'_> {
 
     fn release_engine_input_for_focus_loss(&mut self) {
         let held = std::mem::take(&mut self.engine_held);
+        self.wheel_steps = crate::input::WheelSteps::default();
         if let Some(vm) = self.vm {
             for key in held.keys {
                 pass_key_to_engine(vm, crate::framework::KeyAction::Up, key, false);
@@ -1904,11 +2101,82 @@ impl GameWindow<'_> {
                     tracing::warn!(error = %e, button, "engine focus-loss mouse-button release failed");
                 }
             }
+            let released = self.engine_gamepads.release_all();
+            if let Err(error) = crate::framework::engine_input::pass_gamepad_calls(vm, released) {
+                self.stop_gamepads(&error);
+            }
+        }
+        for motion in self.touch.cancel() {
+            self.touch_motion(motion);
         }
         if self.engine_tap_downtime.is_some() {
             self.engine_primary_release();
         }
         self.update_pointer_lock(PointerLockReasons::default());
+    }
+
+    fn start_gamepads(&mut self) {
+        let Gamepads::AtHandoff = self.gamepads else {
+            return;
+        };
+        self.gamepads = match crate::gamepad::start_service() {
+            Some(service) => {
+                service.set_focused(self.focused);
+                Gamepads::Running(service)
+            }
+            None => Gamepads::Off,
+        };
+    }
+
+    fn drive_gamepads(&mut self, vm: &crate::runtime::Vm, web_view_hidden: bool) {
+        let Gamepads::Running(service) = &self.gamepads else {
+            return;
+        };
+        let gate = if self.handed_off && web_view_hidden && self.focused {
+            crate::gamepad::GamepadGate::Open
+        } else {
+            crate::gamepad::GamepadGate::Closed
+        };
+        let calls = service.drain(&mut self.engine_gamepads, gate);
+        if let Err(error) = crate::framework::engine_input::pass_gamepad_calls(vm, calls) {
+            self.stop_gamepads(&error);
+        }
+    }
+
+    fn maybe_synthetic_gamepad(&mut self, vm: &crate::runtime::Vm) {
+        if self.synthetic_gamepad_done
+            || self
+                .handoff_at
+                .is_none_or(|at| at.elapsed() < SYNTHETIC_INPUT_DELAY)
+        {
+            return;
+        }
+        self.synthetic_gamepad_done = true;
+        if std::env::var_os("ECLIPSE_SYNTHETIC_GAMEPAD").is_none_or(|value| value != "1") {
+            return;
+        }
+        tracing::info!("synthetic gamepad: a scripted Xbox pad bypasses SDL and focus");
+        let (mut inbox, steps) = crate::gamepad::synthetic_pad();
+        for step in steps {
+            for &update in step {
+                inbox.apply(update);
+            }
+            let calls = self
+                .engine_gamepads
+                .drain(&mut inbox, crate::gamepad::GamepadGate::Open);
+            if let Err(error) = crate::framework::engine_input::pass_gamepad_calls(vm, calls) {
+                self.stop_gamepads(&error);
+                return;
+            }
+        }
+    }
+
+    fn stop_gamepads(&mut self, error: &crate::framework::engine_input::GamepadPathError) {
+        tracing::warn!(
+            %error,
+            "controllers turned off: the engine's gamepad input path is unavailable"
+        );
+        self.gamepads = Gamepads::Off;
     }
 
     fn sync_host_cursor(&mut self) {
@@ -1925,6 +2193,7 @@ impl GameWindow<'_> {
 
     fn engine_key(&mut self, event: &winit::event::KeyEvent) {
         use crate::input::{KeyEdge, TextFieldKey};
+        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement as _;
 
         let Some(vm) = self.vm else { return };
         let Some(scan_code) = engine_scan_code(event.physical_key) else {
@@ -1955,7 +2224,10 @@ impl GameWindow<'_> {
                 }
                 let key = EngineKey {
                     scan_code,
-                    key_code: winit_keycode(&event.logical_key).unwrap_or(0),
+                    key_code: crate::input::android_key_code(
+                        &event.key_without_modifiers(),
+                        event.physical_key,
+                    ),
                 };
                 if pass_key_to_engine(vm, crate::framework::KeyAction::Down, key, event.repeat) {
                     self.engine_held.press_key(key);
@@ -2379,7 +2651,7 @@ pub fn run_windowed(
     activation_token: Option<ActivationToken>,
     title: &str,
     vm: Option<&crate::runtime::Vm>,
-    touch_mode: eclipse_config::TouchMode,
+    config: &eclipse_config::Config,
     commands: Option<&std::sync::mpsc::Receiver<launch_window::WindowCommand>>,
     window_state: window_state::WindowStateFile,
 ) -> Result<(), GraphicsError> {
@@ -2392,7 +2664,7 @@ pub fn run_windowed(
         create_error: None,
         handoff_error: None,
         vm,
-        touch_mode,
+        touch_mode: config.touch_mode,
         cursor: None,
         primary_press: None,
         synthetic_tap_done: false,
@@ -2413,6 +2685,13 @@ pub fn run_windowed(
         engine_typed2_at: None,
         engine_synthetic_submit_done: false,
         engine_reflect_done: false,
+        synthetic_gamepad_done: false,
+        synthetic_touch_done: false,
+        gamepads: match vm {
+            Some(_) if config.allow_gamepad_permission => Gamepads::AtHandoff,
+            Some(_) | None => Gamepads::Off,
+        },
+        engine_gamepads: crate::gamepad::EngineGamepads::default(),
         web_view_window: WebViewWindow::Hidden,
         runtime_shutdown_started: false,
         last_activity: crate::framework::lifecycle::LastActivityCheck::default(),
@@ -2429,6 +2708,10 @@ pub fn run_windowed(
         pointer_lock_reasons: PointerLockReasons::default(),
         pointer_lock: PointerLock::Free,
         engine_held: EngineHeldInput::default(),
+        wheel_steps: crate::input::WheelSteps::default(),
+        touch: crate::input::TouchTracker::default(),
+        touch_route: TouchRoute::Withheld,
+        touch_down_time: None,
         relative_motion_units: RelativeMotionUnits::DeviceCounts,
         engine_center_query_failed: false,
         pending_pointer_motion: None,
@@ -2923,6 +3206,108 @@ fn should_complete_tap(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TouchRoute {
+    LaunchWindow,
+    EngineMouse,
+    EngineTouch,
+    Withheld,
+}
+
+fn touch_route(
+    handed_off: bool,
+    touch_mode: eclipse_config::TouchMode,
+    web_view_window: WebViewWindow,
+    mouse_primary_held: bool,
+) -> TouchRoute {
+    use eclipse_config::TouchMode;
+
+    match (handed_off, web_view_window, touch_mode) {
+        _ if mouse_primary_held => TouchRoute::Withheld,
+        (false, _, _) => TouchRoute::LaunchWindow,
+        (true, WebViewWindow::Shown | WebViewWindow::Embedded, _) => TouchRoute::Withheld,
+        (true, WebViewWindow::Hidden, TouchMode::Off) => TouchRoute::EngineMouse,
+        (true, WebViewWindow::Hidden, TouchMode::On | TouchMode::FakeOff) => {
+            TouchRoute::EngineTouch
+        }
+    }
+}
+
+fn host_cursor_motion(
+    cursor: &mut Option<(f32, f32)>,
+    position: (f32, f32),
+    fingers_down: bool,
+) -> Option<PointerMotion> {
+    if fingers_down {
+        return None;
+    }
+    let (dx, dy) = cursor
+        .replace(position)
+        .map_or((0.0, 0.0), |(old_x, old_y)| {
+            (position.0 - old_x, position.1 - old_y)
+        });
+    Some(PointerMotion { position, dx, dy })
+}
+
+fn finger_cursor_motion(
+    cursor: &mut Option<(f32, f32)>,
+    position: (f32, f32),
+) -> Option<PointerMotion> {
+    let (old_x, old_y) = cursor.replace(position)?;
+    ((old_x, old_y) != position).then_some(PointerMotion {
+        position,
+        dx: position.0 - old_x,
+        dy: position.1 - old_y,
+    })
+}
+
+type SyntheticFinger = (u64, winit::event::TouchPhase, (f32, f32));
+
+const SYNTHETIC_PINCH_STEPS: u8 = 3;
+
+const SYNTHETIC_PINCH_CLOSING: f32 = 40.0;
+
+fn synthetic_pinch(first: (f32, f32), second: (f32, f32)) -> Vec<Vec<SyntheticFinger>> {
+    use winit::event::TouchPhase;
+
+    const FIRST: u64 = u64::MAX - 1;
+    const SECOND: u64 = u64::MAX;
+    let (dx, dy) = (second.0 - first.0, second.1 - first.1);
+    let length = dx.hypot(dy);
+    let (ux, uy) = if length > 0.0 {
+        (dx / length, dy / length)
+    } else {
+        (0.0, 0.0)
+    };
+    let per_finger = SYNTHETIC_PINCH_CLOSING / 2.0 / f32::from(SYNTHETIC_PINCH_STEPS);
+    let at = |origin: (f32, f32), toward: f32, step: u8| {
+        let travel = toward * per_finger * f32::from(step);
+        (origin.0 + ux * travel, origin.1 + uy * travel)
+    };
+    let mut frames = vec![
+        vec![(FIRST, TouchPhase::Started, first)],
+        vec![(SECOND, TouchPhase::Started, second)],
+    ];
+    for step in 1..=SYNTHETIC_PINCH_STEPS {
+        frames.push(vec![
+            (FIRST, TouchPhase::Moved, at(first, 1.0, step)),
+            (SECOND, TouchPhase::Moved, at(second, -1.0, step)),
+        ]);
+    }
+    let last = SYNTHETIC_PINCH_STEPS;
+    frames.push(vec![(SECOND, TouchPhase::Ended, at(second, -1.0, last))]);
+    frames.push(vec![(FIRST, TouchPhase::Ended, at(first, 1.0, last))]);
+    frames
+}
+
+fn parse_two_xy(spec: &std::ffi::OsStr) -> Option<((f32, f32), (f32, f32))> {
+    let (first, second) = spec.to_str()?.split_once(';')?;
+    Some((
+        parse_xy(std::ffi::OsStr::new(first))?,
+        parse_xy(std::ffi::OsStr::new(second))?,
+    ))
+}
+
 fn parse_xy(spec: &std::ffi::OsStr) -> Option<(f32, f32)> {
     let s = spec.to_str()?;
     let (xs, ys) = s.split_once(',')?;
@@ -2949,42 +3334,6 @@ fn desktop_mouse_button(button: MouseButton) -> Option<i32> {
         MouseButton::Forward => Some(15),
         MouseButton::Other(_) => None,
     }
-}
-
-fn winit_keycode(key: &winit::keyboard::Key) -> Option<i32> {
-    use winit::keyboard::{Key, NamedKey};
-    Some(match key {
-        Key::Character(s) => {
-            let c = s.chars().next()?;
-            match c {
-                'a'..='z' => 29 + (c as i32 - 'a' as i32),
-                'A'..='Z' => 29 + (c as i32 - 'A' as i32),
-                '0'..='9' => 7 + (c as i32 - '0' as i32),
-                ' ' => 62,
-                '.' => 56,
-                ',' => 55,
-                '@' => 77,
-                '-' | '_' => 69,
-                '+' | '=' => 70,
-                '/' => 76,
-                _ => 0,
-            }
-        }
-        Key::Named(NamedKey::Space) => 62,
-        Key::Named(NamedKey::Backspace) => 67,
-        Key::Named(NamedKey::Enter) => 66,
-        Key::Named(NamedKey::Tab) => 61,
-        Key::Named(NamedKey::Escape) => 4,
-        Key::Named(NamedKey::Insert) => 124,
-        Key::Named(NamedKey::Delete) => 112,
-        Key::Named(NamedKey::ArrowLeft) => 21,
-        Key::Named(NamedKey::ArrowRight) => 22,
-        Key::Named(NamedKey::ArrowUp) => 19,
-        Key::Named(NamedKey::ArrowDown) => 20,
-        Key::Named(NamedKey::Home) => 122,
-        Key::Named(NamedKey::End) => 123,
-        _ => return None,
-    })
 }
 
 fn pixel_rect_to_quad(
@@ -6774,43 +7123,6 @@ mod tests {
         assert_eq!(chosen.format, vk::Format::R8G8B8A8_UNORM);
     }
 
-    #[test]
-    fn winit_keycode_maps_credential_keys_to_android_keycodes() {
-        use winit::keyboard::{Key, NamedKey};
-
-        assert_eq!(winit_keycode(&Key::Character("a".into())), Some(29));
-        assert_eq!(winit_keycode(&Key::Character("z".into())), Some(54));
-        assert_eq!(winit_keycode(&Key::Character("A".into())), Some(29));
-
-        assert_eq!(winit_keycode(&Key::Character("0".into())), Some(7));
-        assert_eq!(winit_keycode(&Key::Character("9".into())), Some(16));
-
-        assert_eq!(winit_keycode(&Key::Character("@".into())), Some(77));
-        assert_eq!(winit_keycode(&Key::Character(".".into())), Some(56));
-
-        assert_eq!(winit_keycode(&Key::Named(NamedKey::Backspace)), Some(67));
-        assert_eq!(winit_keycode(&Key::Named(NamedKey::Enter)), Some(66));
-        assert_eq!(winit_keycode(&Key::Named(NamedKey::Space)), Some(62));
-
-        assert_eq!(winit_keycode(&Key::Character("#".into())), Some(0));
-
-        assert_eq!(winit_keycode(&Key::Named(NamedKey::F1)), None);
-    }
-
-    #[test]
-    fn escape_maps_to_android_back_navigation() {
-        use winit::keyboard::{Key, NamedKey};
-
-        assert_eq!(winit_keycode(&Key::Named(NamedKey::Escape)), Some(4));
-    }
-
-    #[test]
-    fn insert_maps_to_android_insert_for_internal_menu_toggle() {
-        use winit::keyboard::{Key, NamedKey};
-
-        assert_eq!(winit_keycode(&Key::Named(NamedKey::Insert)), Some(124));
-    }
-
     const KEY_EDGES: [crate::input::KeyEdge; 3] = [
         crate::input::KeyEdge::Press,
         crate::input::KeyEdge::Repeat,
@@ -7201,6 +7513,163 @@ mod tests {
             primary_release(TouchMode::Off, &mut held, None),
             PrimaryRelease::Nothing
         );
+    }
+
+    #[test]
+    fn a_touch_stream_goes_where_the_window_and_touch_mode_send_it() {
+        use eclipse_config::TouchMode;
+
+        for mode in [TouchMode::On, TouchMode::FakeOff] {
+            assert_eq!(
+                touch_route(true, mode, WebViewWindow::Hidden, false),
+                TouchRoute::EngineTouch
+            );
+        }
+        assert_eq!(
+            touch_route(true, TouchMode::Off, WebViewWindow::Hidden, false),
+            TouchRoute::EngineMouse
+        );
+        for mode in [TouchMode::Off, TouchMode::On, TouchMode::FakeOff] {
+            assert_eq!(
+                touch_route(false, mode, WebViewWindow::Hidden, false),
+                TouchRoute::LaunchWindow
+            );
+            for window in [WebViewWindow::Shown, WebViewWindow::Embedded] {
+                assert_eq!(touch_route(true, mode, window, false), TouchRoute::Withheld);
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_mouse_primary_keeps_new_fingers_out() {
+        use eclipse_config::TouchMode;
+
+        for mode in [TouchMode::Off, TouchMode::On, TouchMode::FakeOff] {
+            for handed_off in [false, true] {
+                assert_eq!(
+                    touch_route(handed_off, mode, WebViewWindow::Hidden, true),
+                    TouchRoute::Withheld
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_finger_drag_moves_the_engine_mouse_after_the_x11_cursor_echo() {
+        use crate::input::{PrimaryTouch, TouchTracker};
+        use winit::event::TouchPhase;
+
+        let (pressed_at, dragged_to) = ((10.0, 5.0), (30.0, 8.0));
+        let mut touch = TouchTracker::default();
+        let mut cursor = Some((0.0, 0.0));
+        assert_eq!(
+            host_cursor_motion(&mut cursor, pressed_at, touch.is_active()),
+            Some(PointerMotion {
+                position: pressed_at,
+                dx: 10.0,
+                dy: 5.0,
+            })
+        );
+        let pressed: Vec<_> = touch
+            .touch(1, TouchPhase::Started, pressed_at.0, pressed_at.1)
+            .filter_map(|motion| motion.primary())
+            .collect();
+        assert_eq!(pressed, [PrimaryTouch::Press { x: 10.0, y: 5.0 }]);
+
+        let mut engine_moves = Vec::new();
+        engine_moves.extend(host_cursor_motion(
+            &mut cursor,
+            dragged_to,
+            touch.is_active(),
+        ));
+        assert_eq!(
+            touch
+                .touch(1, TouchPhase::Moved, dragged_to.0, dragged_to.1)
+                .count(),
+            0
+        );
+        assert_eq!(
+            touch.flush().and_then(|motion| motion.primary()),
+            Some(PrimaryTouch::Move { x: 30.0, y: 8.0 })
+        );
+        engine_moves.extend(finger_cursor_motion(&mut cursor, dragged_to));
+        assert_eq!(
+            engine_moves,
+            [PointerMotion {
+                position: dragged_to,
+                dx: 20.0,
+                dy: 3.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn off_mode_presses_the_primary_button_with_the_first_finger_only() {
+        use crate::input::{PrimaryTouch, TouchTracker};
+        use eclipse_config::TouchMode;
+        use winit::event::TouchPhase;
+
+        assert_eq!(
+            touch_route(true, TouchMode::Off, WebViewWindow::Hidden, false),
+            TouchRoute::EngineMouse
+        );
+        let mut touch = TouchTracker::default();
+        let mut primary = Vec::new();
+        for (finger, phase, x) in [
+            (1, TouchPhase::Started, 10.0),
+            (2, TouchPhase::Started, 50.0),
+            (2, TouchPhase::Ended, 50.0),
+            (1, TouchPhase::Ended, 12.0),
+        ] {
+            primary.extend(
+                touch
+                    .touch(finger, phase, x, 5.0)
+                    .filter_map(|motion| motion.primary()),
+            );
+        }
+        assert_eq!(
+            primary,
+            [
+                PrimaryTouch::Press { x: 10.0, y: 5.0 },
+                PrimaryTouch::Release { x: 12.0, y: 5.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_synthetic_pinch_closes_two_fingers_by_forty_pixels() {
+        use crate::input::{TouchAction, TouchTracker};
+
+        let mut touch = TouchTracker::default();
+        let mut motions = Vec::new();
+        for frame in synthetic_pinch((100.0, 300.0), (500.0, 300.0)) {
+            for (finger, phase, (x, y)) in frame {
+                motions.extend(touch.touch(finger, phase, x, y));
+            }
+            motions.extend(touch.flush());
+        }
+        let actions: Vec<_> = motions.iter().map(|motion| motion.action).collect();
+        assert_eq!(
+            actions,
+            [
+                TouchAction::Down,
+                TouchAction::PointerDown(1),
+                TouchAction::Move,
+                TouchAction::Move,
+                TouchAction::Move,
+                TouchAction::PointerUp(1),
+                TouchAction::Up,
+            ]
+        );
+        let closed = motions[4].pointers();
+        assert!((closed[1].x - closed[0].x - 360.0).abs() < 1e-3);
+        assert_eq!(closed[0].y, 300.0);
+        assert!(!touch.is_active());
+        assert_eq!(
+            parse_two_xy(std::ffi::OsStr::new("100,300;500, 300")),
+            Some(((100.0, 300.0), (500.0, 300.0)))
+        );
+        assert_eq!(parse_two_xy(std::ffi::OsStr::new("100,300")), None);
     }
 
     #[test]

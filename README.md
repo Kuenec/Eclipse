@@ -29,7 +29,7 @@ You need an x86-64 Linux desktop (Wayland or X11) and a Vulkan driver. Eclipse t
 
 - **No setup.** Eclipse downloads and updates Roblox by itself, with no account needed.
 - **Official and unmodified.** Only files signed by Roblox run, and the game is never patched.
-- **Plays like the desktop client.** Mouse lock, clipboard, input methods and F11 or Alt+Enter fullscreen.
+- **Plays like the desktop client.** Mouse lock, clipboard, input methods, controllers and F11 or Alt+Enter fullscreen.
 - **Uncapped frame rate.** Roblox's own frame rate menu, up to 240 FPS on any monitor.
 - **Browser Play button.** `roblox://` and `roblox-player:` links open in Eclipse, which closes when you leave that experience.
 - **Sandboxed** in Flatpak, with no telemetry.
