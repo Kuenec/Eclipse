@@ -418,6 +418,27 @@ fn display_refresh_profile(window: &Window) -> Option<DisplayRefreshProfile> {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowRoute {
+    Game,
+    Dialog,
+    Closed,
+}
+
+fn window_route(
+    id: WindowId,
+    game: Option<WindowId>,
+    dialog_owns: impl Fn(WindowId) -> bool,
+) -> WindowRoute {
+    if game == Some(id) {
+        WindowRoute::Game
+    } else if dialog_owns(id) {
+        WindowRoute::Dialog
+    } else {
+        WindowRoute::Closed
+    }
+}
+
 impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let mut attrs = self.window_state.window_attributes(
@@ -524,11 +545,17 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
         use crate::loader::native_provider::{classify_winit_event, host_input_should_wake};
 
         self.sync_web_view_window();
-        if self.dialogs.owns(id) {
-            if let Some(vm) = self.vm {
-                self.dialogs.window_event(vm, id, event);
+        match window_route(id, self.window.as_ref().map(Window::id), |id| {
+            self.dialogs.owns(id)
+        }) {
+            WindowRoute::Game => {}
+            WindowRoute::Dialog => {
+                if let Some(vm) = self.vm {
+                    self.dialogs.window_event(vm, id, event);
+                }
+                return;
             }
-            return;
+            WindowRoute::Closed => return,
         }
 
         let input = classify_winit_event(&event);
@@ -4304,10 +4331,65 @@ struct SwapchainTarget<'a> {
     render_pass: vk::RenderPass,
 }
 
-struct VulkanRenderer {
-    _entry: ash::Entry,
+struct HostVulkan {
+    display_server: std::mem::Discriminant<RawDisplayHandle>,
+    entry: ash::Entry,
     instance: ash::Instance,
     surface_loader: khr::surface::Instance,
+}
+
+static HOST_VULKAN: std::sync::Mutex<Option<&'static HostVulkan>> = std::sync::Mutex::new(None);
+
+impl HostVulkan {
+    fn shared(display_handle: RawDisplayHandle) -> Result<&'static Self, GraphicsError> {
+        let mut shared = HOST_VULKAN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let host = match *shared {
+            Some(host) => host,
+            None => *shared.insert(Box::leak(Box::new(Self::create(display_handle)?))),
+        };
+        if host.display_server != std::mem::discriminant(&display_handle) {
+            return Err(GraphicsError::Vulkan(format!(
+                "Eclipse's Vulkan instance serves another display server than {display_handle:?}"
+            )));
+        }
+        Ok(host)
+    }
+
+    fn create(display_handle: RawDisplayHandle) -> Result<Self, GraphicsError> {
+        let entry = unsafe { ash::Entry::load() }.map_err(|e| {
+            GraphicsError::Vulkan(format!("no Vulkan loader (libvulkan) available: {e}"))
+        })?;
+
+        let surface_extensions = ash_window::enumerate_required_extensions(display_handle)
+            .map_err(|e| {
+                GraphicsError::Vulkan(format!(
+                    "no Vulkan surface extension for this display server: {e}"
+                ))
+            })?;
+
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(c"Eclipse")
+            .api_version(vk::API_VERSION_1_0);
+        let instance_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(surface_extensions);
+
+        let instance = unsafe { entry.create_instance(&instance_info, None) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateInstance failed: {e}")))?;
+        let surface_loader = khr::surface::Instance::new(&entry, &instance);
+        Ok(Self {
+            display_server: std::mem::discriminant(&display_handle),
+            entry,
+            instance,
+            surface_loader,
+        })
+    }
+}
+
+struct VulkanRenderer {
+    host: &'static HostVulkan,
     surface: vk::SurfaceKHR,
     physical_device: vk::PhysicalDevice,
 
@@ -4361,67 +4443,25 @@ impl VulkanRenderer {
         window_handle: RawWindowHandle,
         size: winit::dpi::PhysicalSize<u32>,
     ) -> Result<Self, GraphicsError> {
-        let entry = unsafe { ash::Entry::load() }.map_err(|e| {
-            GraphicsError::Vulkan(format!("no Vulkan loader (libvulkan) available: {e}"))
-        })?;
+        let host = HostVulkan::shared(display_handle)?;
 
-        let surface_extensions = ash_window::enumerate_required_extensions(display_handle)
-            .map_err(|e| {
-                GraphicsError::Vulkan(format!(
-                    "no Vulkan surface extension for this display server: {e}"
-                ))
-            })?;
-
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(c"Eclipse")
-            .api_version(vk::API_VERSION_1_0);
-        let instance_info = vk::InstanceCreateInfo::default()
-            .application_info(&app_info)
-            .enabled_extension_names(surface_extensions);
-
-        let instance = unsafe { entry.create_instance(&instance_info, None) }
-            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateInstance failed: {e}")))?;
-
-        match Self::build(&entry, instance, display_handle, window_handle, size) {
-            Ok(renderer) => Ok(renderer),
-            Err(boxed) => {
-                let (e, instance) = *boxed;
-
-                unsafe {
-                    instance.destroy_instance(None);
-                }
-                Err(e)
-            }
+        let surface = unsafe {
+            ash_window::create_surface(
+                &host.entry,
+                &host.instance,
+                display_handle,
+                window_handle,
+                None,
+            )
         }
-    }
-
-    fn build(
-        entry: &ash::Entry,
-        instance: ash::Instance,
-        display_handle: RawDisplayHandle,
-        window_handle: RawWindowHandle,
-        size: winit::dpi::PhysicalSize<u32>,
-    ) -> Result<Self, Box<(GraphicsError, ash::Instance)>> {
-        let surface_loader = khr::surface::Instance::new(entry, &instance);
-
-        let surface = match unsafe {
-            ash_window::create_surface(entry, &instance, display_handle, window_handle, None)
-        } {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(Box::new((
-                    GraphicsError::Vulkan(format!("vkCreate*SurfaceKHR failed: {e}")),
-                    instance,
-                )));
-            }
-        };
+        .map_err(|e| GraphicsError::Vulkan(format!("vkCreate*SurfaceKHR failed: {e}")))?;
 
         let (physical_device, queue_family_index) =
-            match Self::pick_device(&instance, &surface_loader, surface) {
+            match Self::pick_device(&host.instance, &host.surface_loader, surface) {
                 Ok(v) => v,
                 Err(e) => {
-                    unsafe { surface_loader.destroy_surface(surface, None) };
-                    return Err(Box::new((e, instance)));
+                    unsafe { host.surface_loader.destroy_surface(surface, None) };
+                    return Err(e);
                 }
             };
 
@@ -4434,20 +4474,20 @@ impl VulkanRenderer {
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_extensions);
 
-        let device = match unsafe { instance.create_device(physical_device, &device_info, None) } {
+        let device = match unsafe {
+            host.instance
+                .create_device(physical_device, &device_info, None)
+        } {
             Ok(d) => d,
             Err(e) => {
-                unsafe { surface_loader.destroy_surface(surface, None) };
-                return Err(Box::new((
-                    GraphicsError::Vulkan(format!("vkCreateDevice failed: {e}")),
-                    instance,
-                )));
+                unsafe { host.surface_loader.destroy_surface(surface, None) };
+                return Err(GraphicsError::Vulkan(format!("vkCreateDevice failed: {e}")));
             }
         };
 
         match Self::build_device_objects(
-            &instance,
-            &surface_loader,
+            &host.instance,
+            &host.surface_loader,
             surface,
             physical_device,
             queue_family_index,
@@ -4455,9 +4495,7 @@ impl VulkanRenderer {
             size,
         ) {
             Ok(objects) => Ok(Self {
-                _entry: entry.clone(),
-                instance,
-                surface_loader,
+                host,
                 surface,
                 physical_device,
                 device,
@@ -4486,9 +4524,9 @@ impl VulkanRenderer {
             Err(e) => {
                 unsafe {
                     device.destroy_device(None);
-                    surface_loader.destroy_surface(surface, None);
+                    host.surface_loader.destroy_surface(surface, None);
                 }
-                Err(Box::new((e, instance)))
+                Err(e)
             }
         }
     }
@@ -4991,7 +5029,7 @@ impl VulkanRenderer {
             color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
         };
         let target = SwapchainTarget {
-            surface_loader: &self.surface_loader,
+            surface_loader: &self.host.surface_loader,
             swapchain_loader: &self.swapchain_loader,
             device: &self.device,
             physical_device: self.physical_device,
@@ -6433,8 +6471,7 @@ impl Drop for VulkanRenderer {
             self.swapchain.destroy(&self.device, &self.swapchain_loader);
             self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_device(None);
-            self.surface_loader.destroy_surface(self.surface, None);
-            self.instance.destroy_instance(None);
+            self.host.surface_loader.destroy_surface(self.surface, None);
         }
     }
 }
@@ -6582,6 +6619,32 @@ impl std::error::Error for GraphicsError {
 mod tests {
     use super::*;
     use crate::framework::view_registry::WRAP_CONTENT;
+    use crate::loader::vulkan_wsi::unmapped_xlib::UnmappedXlibWindow;
+
+    #[test]
+    fn events_of_a_closed_window_never_reach_the_game_window() {
+        let game = WindowId::from(1);
+        let dialog = WindowId::from(2);
+        let closed_dialog = WindowId::from(3);
+        let open_dialogs = |id| id == dialog;
+        assert_eq!(
+            window_route(game, Some(game), open_dialogs),
+            WindowRoute::Game
+        );
+        assert_eq!(
+            window_route(dialog, Some(game), open_dialogs),
+            WindowRoute::Dialog
+        );
+        assert_eq!(
+            window_route(closed_dialog, Some(game), open_dialogs),
+            WindowRoute::Closed
+        );
+        assert_eq!(
+            window_route(game, None, open_dialogs),
+            WindowRoute::Closed,
+            "a dropped game window's queued events"
+        );
+    }
 
     fn headless_gpu() -> Option<headless_vulkan::HeadlessGpu> {
         match headless_vulkan::HeadlessGpu::new() {
@@ -6933,15 +6996,14 @@ mod tests {
     const LOADER_LIFETIME_CHILD: &str = "ECLIPSE_TEST_VULKAN_LOADER_LIFETIME_CHILD";
 
     #[test]
-    fn renderer_init_failure_destroys_its_instance_while_the_loader_stays_loaded() {
+    fn a_failed_renderer_init_leaves_the_shared_instance_usable() {
         if std::env::var_os(LOADER_LIFETIME_CHILD).is_none() {
             let output = std::process::Command::new(
                 std::env::current_exe().expect("the test harness executable must have a path"),
             )
             .args([
                 "--exact",
-                "graphics::tests::\
-                 renderer_init_failure_destroys_its_instance_while_the_loader_stays_loaded",
+                "graphics::tests::a_failed_renderer_init_leaves_the_shared_instance_usable",
                 "--test-threads=1",
             ])
             .env(LOADER_LIFETIME_CHILD, "1")
@@ -6950,25 +7012,103 @@ mod tests {
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
                 output.status.success() && stdout.contains("1 passed"),
-                "a failed renderer init must not call into an unloaded Vulkan loader: \
+                "a failed renderer init must leave the shared Vulkan instance usable: \
                  status={:?}, stdout={stdout}, stderr={}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
             return;
         }
+        let display = RawDisplayHandle::Wayland(raw_window_handle::WaylandDisplayHandle::new(
+            std::ptr::NonNull::dangling(),
+        ));
         let result = VulkanRenderer::create(
-            RawDisplayHandle::Wayland(raw_window_handle::WaylandDisplayHandle::new(
-                std::ptr::NonNull::dangling(),
-            )),
+            display,
             RawWindowHandle::Web(raw_window_handle::WebWindowHandle::new(1)),
             winit::dpi::PhysicalSize::new(64, 64),
         );
         match result {
             Ok(_) => panic!("a web window handle cannot back a Linux Vulkan surface"),
             Err(GraphicsError::Vulkan(message)) if message.contains("vkCreate*SurfaceKHR") => {}
-            Err(e) => eprintln!("SKIP: no Vulkan instance with Wayland surface support ({e})"),
+            Err(e) => {
+                eprintln!("SKIP: no Vulkan instance with Wayland surface support ({e})");
+                return;
+            }
         }
+        let host = HostVulkan::shared(display).expect("the shared Vulkan instance");
+        unsafe { host.instance.enumerate_physical_devices() }
+            .expect("the shared instance outlives a failed renderer init");
+    }
+
+    const SHARED_INSTANCE_CHILD: &str = "ECLIPSE_TEST_SHARED_VULKAN_INSTANCE_CHILD";
+
+    const SHARED_INSTANCE_CHILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    #[test]
+    fn window_renderers_share_one_vulkan_instance_that_outlives_them() {
+        if std::env::var_os(SHARED_INSTANCE_CHILD).is_none() {
+            if std::env::var_os("DISPLAY").is_none() {
+                eprintln!("SKIP: no X11 display (DISPLAY unset)");
+                return;
+            }
+            let output = crate::bounded_child::output(
+                std::process::Command::new(
+                    std::env::current_exe().expect("the test harness executable must have a path"),
+                )
+                .args([
+                    "--exact",
+                    "graphics::tests::window_renderers_share_one_vulkan_instance_that_outlives_them",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(SHARED_INSTANCE_CHILD, "1"),
+                SHARED_INSTANCE_CHILD_LIMIT,
+            );
+            let report = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && report.contains("1 passed"),
+                "status={:?}, stdout={report}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let windows = match (UnmappedXlibWindow::open(), UnmappedXlibWindow::open()) {
+            (Ok(first), Ok(second)) => [first, second],
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("SKIP: no usable X11 display ({e})");
+                return;
+            }
+        };
+        let display_of = |window: &UnmappedXlibWindow| {
+            RawDisplayHandle::Xlib(raw_window_handle::XlibDisplayHandle::new(
+                std::ptr::NonNull::new(window.display),
+                0,
+            ))
+        };
+        let renderer_on = |window: &UnmappedXlibWindow| {
+            VulkanRenderer::create(
+                display_of(window),
+                RawWindowHandle::Xlib(raw_window_handle::XlibWindowHandle::new(window.window)),
+                winit::dpi::PhysicalSize::new(64, 64),
+            )
+        };
+        let first = match renderer_on(&windows[0]) {
+            Ok(renderer) => renderer,
+            Err(e) => {
+                eprintln!("SKIP: no Vulkan device presents to X11 ({e})");
+                return;
+            }
+        };
+        let second = renderer_on(&windows[1]).expect("a second window's renderer");
+        let instance = first.host.instance.handle();
+        assert_eq!(second.host.instance.handle(), instance);
+        drop(first);
+        drop(second);
+        let host = HostVulkan::shared(display_of(&windows[0])).expect("the shared instance");
+        assert_eq!(host.instance.handle(), instance);
+        unsafe { host.instance.enumerate_physical_devices() }
+            .expect("closing every window keeps the shared instance");
     }
 
     fn caps(min: u32, max: u32, cur_w: u32, cur_h: u32) -> vk::SurfaceCapabilitiesKHR {
