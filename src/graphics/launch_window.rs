@@ -353,17 +353,15 @@ impl StatusScreen {
 
     fn give(&mut self, answer: Answer) {
         if self.content.error.is_some() {
-            self.close_window();
-            self.session = Session::Dismissed;
+            self.dismiss();
         } else if self.awaiting_answer() {
             self.answer = Some(answer);
         }
     }
 
-    fn dismiss(&mut self, event_loop: &ActiveEventLoop) {
+    fn dismiss(&mut self) {
         self.close_window();
         self.session = Session::Dismissed;
-        event_loop.exit();
     }
 
     fn wait_without_window(&mut self, timeout: Duration) {
@@ -378,13 +376,13 @@ impl StatusScreen {
         }
     }
 
-    fn run_commands(&mut self, event_loop: &ActiveEventLoop) {
+    fn run_commands(&mut self) {
         while let Ok(command) = self.commands.try_recv() {
             match command {
                 WindowCommand::Raise { token, done } => {
                     raise(self.window.as_ref(), token.as_ref(), done);
                 }
-                WindowCommand::Close => self.dismiss(event_loop),
+                WindowCommand::Close => self.dismiss(),
             }
         }
     }
@@ -408,6 +406,10 @@ impl StatusScreen {
             window.set_title(&format!("{} — {}", self.title, self.content.summary()));
         }
         window.request_redraw();
+    }
+
+    fn shows(&self, id: WindowId) -> bool {
+        self.window.as_ref().map(Window::id) == Some(id)
     }
 
     fn draws_text(&self) -> bool {
@@ -506,6 +508,51 @@ impl StatusScreen {
             tracing::warn!(%error, "drawing the launch status failed");
         }
     }
+
+    fn handle_window_event(&mut self, id: WindowId, event: WindowEvent) {
+        if !self.shows(id) {
+            return;
+        }
+        let target_at = |point| {
+            let renderer = self.renderer.as_ref()?;
+            let text = renderer.text.as_ref()?;
+            self.content
+                .answer_at(&text.atlas, renderer.swapchain_extent, self.scale, point)
+        };
+        if let Some(answer) = self.clicks.window_event(&event, target_at) {
+            self.give(answer);
+        }
+        match event {
+            WindowEvent::CloseRequested => {
+                self.give(Answer::Cancel);
+                self.dismiss();
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat =>
+            {
+                if let Some(answer) = key_answer(&event.logical_key) {
+                    self.give(answer);
+                }
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.mark_resized(size.width, size.height);
+                }
+                self.content_changed();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.rescale(scale_factor);
+                self.content_changed();
+            }
+            WindowEvent::ActivationTokenDone { serial, token } => {
+                if self.activation == Activation::Pending(serial) {
+                    self.activation = Activation::Granted(token);
+                }
+            }
+            WindowEvent::RedrawRequested => self.draw(),
+            _ => {}
+        }
+    }
 }
 
 impl ApplicationHandler<HostWake> for StatusScreen {
@@ -545,51 +592,13 @@ impl ApplicationHandler<HostWake> for StatusScreen {
         self.content_changed();
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let target_at = |point| {
-            let renderer = self.renderer.as_ref()?;
-            let text = renderer.text.as_ref()?;
-            self.content
-                .answer_at(&text.atlas, renderer.swapchain_extent, self.scale, point)
-        };
-        if let Some(answer) = self.clicks.window_event(&event, target_at) {
-            self.give(answer);
-        }
-        match event {
-            WindowEvent::CloseRequested => {
-                self.give(Answer::Cancel);
-                self.dismiss(event_loop);
-            }
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed && !event.repeat =>
-            {
-                if let Some(answer) = key_answer(&event.logical_key) {
-                    self.give(answer);
-                }
-            }
-            WindowEvent::Resized(size) => {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.mark_resized(size.width, size.height);
-                }
-                self.content_changed();
-            }
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.rescale(scale_factor);
-                self.content_changed();
-            }
-            WindowEvent::ActivationTokenDone { serial, token } => {
-                if self.activation == Activation::Pending(serial) {
-                    self.activation = Activation::Granted(token);
-                }
-            }
-            WindowEvent::RedrawRequested => self.draw(),
-            _ => {}
-        }
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        self.handle_window_event(id, event);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.session == Session::Showing {
-            self.run_commands(event_loop);
+            self.run_commands();
         }
         if self.session != Session::Showing {
             event_loop.exit();
@@ -1591,6 +1600,14 @@ mod tests {
         commands.send(WindowCommand::Close).unwrap();
         screen.wait_without_window(Duration::from_secs(5));
         assert_eq!(screen.session, Session::Dismissed);
+    }
+
+    #[test]
+    fn a_status_screen_ignores_the_events_of_other_windows() {
+        let mut screen = asking_screen();
+        screen.handle_window_event(WindowId::from(7), WindowEvent::CloseRequested);
+        assert_eq!(screen.answer, None);
+        assert_eq!(screen.session, Session::Showing);
     }
 
     #[test]
