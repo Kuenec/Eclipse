@@ -215,6 +215,7 @@ fn installs_and_updates_are_refused_while_roblox_runs() {
     );
     let store_touched = store.exists();
     let assets_extracted = app_data.join("files").exists();
+    client.unlock().unwrap();
     drop(client);
     let after_exit = eclipse(
         &root,
@@ -296,6 +297,7 @@ fn pruning_waits_while_another_process_holds_the_client_lock() {
     client.lock().unwrap();
     let while_running = eclipse(&root, &app_data, &install);
     let kept_while_running = unkept.exists();
+    client.unlock().unwrap();
     drop(client);
     let after_exit = eclipse(&root, &app_data, &install);
     let kept_after_exit = unkept.exists();

@@ -1868,7 +1868,7 @@ fn report_failure(launch: &Launch, error: &str) {
 }
 
 struct LockedRun {
-    lock: std::fs::File,
+    lock: instance_control::HeldLock,
     log: eclipse::diagnostics::RunLog,
 }
 
@@ -1955,7 +1955,7 @@ fn stage_client_settings(
     Ok(())
 }
 
-fn lock_out_clients() -> Result<std::fs::File, String> {
+fn lock_out_clients() -> Result<instance_control::HeldLock, String> {
     let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
     match instance_control::lock_client(&app_data_dir.join(RUNTIME_DIR))? {
         ClientLock::Acquired(lock) => Ok(lock),
@@ -3663,17 +3663,11 @@ mod tests {
             "a refused launch starts no run log"
         );
         drop(first);
-        let concurrent_spawns_released_it = (0..100).find_map(|_| {
-            match super::instance_control::lock_client(&root.join(super::RUNTIME_DIR)).unwrap() {
-                ClientLock::Acquired(lock) => Some(lock),
-                ClientLock::Held(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    None
-                }
-            }
-        });
         assert!(
-            concurrent_spawns_released_it.is_some(),
+            matches!(
+                super::instance_control::lock_client(&root.join(super::RUNTIME_DIR)).unwrap(),
+                ClientLock::Acquired(_)
+            ),
             "a client starts once the first one exits"
         );
         std::fs::remove_dir_all(&root).ok();
