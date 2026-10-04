@@ -76,6 +76,10 @@ impl SwapchainCopies {
     }
 }
 
+pub(crate) fn engine_present_count() -> u64 {
+    PRESENT_COUNT.load(Ordering::Relaxed)
+}
+
 pub(crate) fn set_instance(instance: vk::Instance) {
     INSTANCE.store(instance.as_raw(), Ordering::Relaxed);
 }
@@ -1952,6 +1956,7 @@ unsafe extern "system" fn eclipse_vk_queue_present_khr(
     queue: vk::Queue,
     p_present_info: *const vk::PresentInfoKHR<'_>,
 ) -> vk::Result {
+    super::present_pacing::wait_for_turn();
     unsafe { present_engine_frame(frame_log::armed(), queue, p_present_info) }
 }
 

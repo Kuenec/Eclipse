@@ -37,6 +37,10 @@ Roblox for Android sells Robux and Premium only through Google Play, so buying t
 
 Controllers need Flatpak 1.16 or newer. On older Flatpak, run `flatpak override --user --device=all io.github.kuenec.Eclipse`. A controller SDL does not recognize needs an [SDL mapping](https://wiki.libsdl.org/SDL3/SDL_HINT_GAMECONTROLLERCONFIG): `flatpak override --user --env=SDL_GAMECONTROLLERCONFIG="<mapping>" io.github.kuenec.Eclipse`. Eclipse can read input devices for controllers, which includes keyboards if your user is in the `input` group. To remove that access, run `flatpak override --user --nodevice=input io.github.kuenec.Eclipse`; to only turn controllers off, set `allow_gamepad_permission` to `false`.
 
+## Variable refresh rate
+
+On Wayland, Eclipse marks its game window as a game, which compositors such as Hyprland (`misc:vrr = 3`) use to turn on variable refresh rate in fullscreen.
+
 ## Settings
 
 | Key | Default | Effect |
@@ -53,6 +57,7 @@ Controllers need Flatpak 1.16 or newer. On older Flatpak, run `flatpak override 
 | `server_location_indicator_enabled` | `false` | Shows where the Roblox server is in the window title and a notification. ipinfo.io receives the server's address and sees your IP address |
 | `vulkan_device` | `null` | The GPU Roblox and Eclipse render on, as `"vendor:device"` from `lspci -nn`, such as `"10de:2f04"`; `null` prefers a discrete GPU |
 | `use_opengl` | `false` | `true` makes Roblox draw with OpenGL ES instead of Vulkan, which Eclipse also does when it finds no usable Vulkan GPU; on X11, OpenGL ES is capped at the monitor's refresh rate |
+| `unfocused_fps_limit` | `null` | Caps Roblox at 1 to 240 frames per second while another window has focus; while its window is hidden or minimized, Roblox draws at most 5. Neither applies with OpenGL ES |
 
 The settings window, `config set KEY VALUE` and `config unset KEY` change one key and keep every other key and value as written.
 

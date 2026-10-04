@@ -319,7 +319,7 @@ mod tests {
 
     use super::*;
     use crate::audio::{AudioDevice, DeviceName};
-    use crate::{CloseOnLeave, GraphicsOptimizationMode, PciId, TouchMode};
+    use crate::{CloseOnLeave, FrameRateLimit, GraphicsOptimizationMode, PciId, TouchMode};
 
     const FLATPAK_ID: &str = "io.github.kuenec.Eclipse";
 
@@ -832,6 +832,7 @@ mod tests {
                         .expect("a device name"),
                 ),
                 audio_input_device: AudioDevice::SystemDefault,
+                unfocused_fps_limit: FrameRateLimit::new(30),
                 fflags: BTreeMap::from([("DFIntExample".to_owned(), 42.into())]),
                 webview_helper_path: Some(PathBuf::from("/opt/eclipse-webview")),
             },
@@ -995,6 +996,34 @@ mod tests {
                 "{}:1:18: vulkan_device: expected `null` or a PCI ID \"vendor:device\" in hex, \
                  as `lspci -nn` shows it, such as `\"10de:2f04\"`; Eclipse uses the default \
                  (null)",
+                path.display()
+            )]
+        );
+    }
+
+    #[test]
+    fn unfocused_fps_limit_reads_a_frame_rate() {
+        let (_, loaded) = load_bytes("unfocused-limit", br#"{"unfocused_fps_limit": 30}"#);
+        assert_eq!(loaded.problems, []);
+        assert!(loaded.unused_keys.is_empty(), "{:?}", loaded.unused_keys);
+        assert_eq!(loaded.config.unfocused_fps_limit, FrameRateLimit::new(30));
+        let (_, loaded) = load_bytes("unfocused-limit-absent", b"{}");
+        assert_eq!(loaded.config.unfocused_fps_limit, None);
+    }
+
+    #[test]
+    fn a_zero_unfocused_fps_limit_is_named_and_ignored() {
+        let (path, loaded) = load_bytes("unfocused-limit-zero", br#"{"unfocused_fps_limit": 0}"#);
+        assert_eq!(loaded.config.unfocused_fps_limit, None);
+        assert_eq!(
+            loaded
+                .problems
+                .iter()
+                .map(Problem::to_string)
+                .collect::<Vec<_>>(),
+            [format!(
+                "{}:1:25: unfocused_fps_limit: expected `null` or a whole number of frames per \
+                 second from 1 to 240; Eclipse uses the default (null)",
                 path.display()
             )]
         );

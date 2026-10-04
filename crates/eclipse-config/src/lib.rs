@@ -1,6 +1,7 @@
 pub mod audio;
 mod document;
 pub mod edit;
+mod frame_rate_limit;
 mod load;
 mod pci_id;
 pub mod shell;
@@ -15,6 +16,7 @@ use serde::{Serialize, Serializer};
 use crate::audio::{AudioDevice, Direction};
 
 pub use document::Position;
+pub use frame_rate_limit::FrameRateLimit;
 pub use load::{config_path, load, load_from, Loaded, Problem};
 pub use pci_id::PciId;
 
@@ -152,6 +154,8 @@ pub struct Config {
 
     pub audio_input_device: AudioDevice,
 
+    pub unfocused_fps_limit: Option<FrameRateLimit>,
+
     pub fflags: BTreeMap<String, serde_json::Value>,
 
     pub webview_helper_path: Option<PathBuf>,
@@ -171,6 +175,7 @@ impl Default for Config {
             use_opengl: false,
             audio_output_device: AudioDevice::SystemDefault,
             audio_input_device: AudioDevice::SystemDefault,
+            unfocused_fps_limit: None,
             fflags: BTreeMap::new(),
             webview_helper_path: None,
         }
@@ -203,6 +208,7 @@ impl Config {
                 Setting::UseOpengl(enabled) => self.use_opengl = enabled,
                 Setting::AudioOutputDevice(device) => self.audio_output_device = device,
                 Setting::AudioInputDevice(device) => self.audio_input_device = device,
+                Setting::UnfocusedFpsLimit(limit) => self.unfocused_fps_limit = limit,
             },
             Key::FileOnly(FileOnlyKey::Fflags) => {
                 self.fflags = serde_json::from_value(value).map_err(reason)?;
@@ -231,6 +237,7 @@ pub enum Setting {
     UseOpengl(bool),
     AudioOutputDevice(AudioDevice),
     AudioInputDevice(AudioDevice),
+    UnfocusedFpsLimit(Option<FrameRateLimit>),
 }
 
 impl Setting {
@@ -256,6 +263,7 @@ impl Setting {
             Self::UseOpengl(_) => SettingKey::UseOpengl,
             Self::AudioOutputDevice(_) => SettingKey::AudioOutputDevice,
             Self::AudioInputDevice(_) => SettingKey::AudioInputDevice,
+            Self::UnfocusedFpsLimit(_) => SettingKey::UnfocusedFpsLimit,
         }
     }
 }
@@ -273,10 +281,11 @@ pub enum SettingKey {
     UseOpengl,
     AudioOutputDevice,
     AudioInputDevice,
+    UnfocusedFpsLimit,
 }
 
 impl SettingKey {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::TouchMode,
         Self::GraphicsOptimizationMode,
         Self::EnableGamemode,
@@ -288,6 +297,7 @@ impl SettingKey {
         Self::UseOpengl,
         Self::AudioOutputDevice,
         Self::AudioInputDevice,
+        Self::UnfocusedFpsLimit,
     ];
 
     #[must_use]
@@ -312,6 +322,7 @@ impl SettingKey {
             Self::UseOpengl => "use_opengl",
             Self::AudioOutputDevice => "audio_output_device",
             Self::AudioInputDevice => "audio_input_device",
+            Self::UnfocusedFpsLimit => "unfocused_fps_limit",
         }
     }
 
@@ -353,6 +364,9 @@ impl SettingKey {
                 AudioDevice::from_json(value).map(Setting::AudioOutputDevice)
             }
             Self::AudioInputDevice => AudioDevice::from_json(value).map(Setting::AudioInputDevice),
+            Self::UnfocusedFpsLimit => {
+                FrameRateLimit::from_json(value).map(Setting::UnfocusedFpsLimit)
+            }
         };
         setting.ok_or_else(|| format!("expected {}", self.accepted_values()))
     }
@@ -373,6 +387,7 @@ impl SettingKey {
             Self::AudioOutputDevice | Self::AudioInputDevice => {
                 return AUDIO_DEVICE_VALUES.to_owned();
             }
+            Self::UnfocusedFpsLimit => return FrameRateLimit::ACCEPTED.to_owned(),
         };
         let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
         format!("one of {}", quoted.join(", "))
@@ -498,7 +513,7 @@ mod tests {
              `graphics_optimization_mode`, `enable_gamemode`, `roblox_auto_update`, \
              `close_on_leave`, `server_location_indicator_enabled`, \
              `allow_gamepad_permission`, `vulkan_device`, `use_opengl`, `audio_output_device`, \
-             `audio_input_device`"
+             `audio_input_device`, `unfocused_fps_limit`"
         );
     }
 
@@ -694,6 +709,45 @@ mod tests {
     }
 
     #[test]
+    fn unfocused_fps_limit_takes_null_or_1_to_240() {
+        let key = SettingKey::UnfocusedFpsLimit;
+        for json in [
+            serde_json::json!(null),
+            serde_json::json!(1),
+            serde_json::json!(240),
+        ] {
+            let setting = key
+                .parse(json.clone())
+                .expect("an unfocused_fps_limit value");
+            assert_eq!(
+                setting,
+                Setting::UnfocusedFpsLimit(json.as_u64().map(|per_second| {
+                    FrameRateLimit::new(u8::try_from(per_second).expect("a u8")).expect("a limit")
+                }))
+            );
+            assert_eq!(setting.key(), key);
+            assert_eq!(serde_json::to_value(setting).expect("serialize"), json);
+        }
+        for json in [
+            serde_json::json!(0),
+            serde_json::json!(241),
+            serde_json::json!(-1),
+            serde_json::json!(30.5),
+        ] {
+            assert_eq!(
+                key.parse(json.clone()),
+                Err(SettingError::Invalid {
+                    key,
+                    message: "expected `null` or a whole number of frames per second from 1 \
+                              to 240"
+                        .to_owned(),
+                }),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
     fn close_on_leave_takes_sober_booleans_and_browser() {
         for (json, policy) in [
             (serde_json::json!(false), CloseOnLeave::Never),
@@ -823,6 +877,7 @@ mod tests {
         assert_eq!(default_json("use_opengl"), "false");
         assert_eq!(default_json("audio_output_device"), r#""default""#);
         assert_eq!(default_json("audio_input_device"), r#""default""#);
+        assert_eq!(default_json("unfocused_fps_limit"), "null");
         assert_eq!(default_json("fflags"), "{}");
         assert_eq!(default_json("webview_helper_path"), "null");
         for key in SettingKey::ALL {
