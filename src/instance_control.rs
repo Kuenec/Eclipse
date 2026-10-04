@@ -45,8 +45,18 @@ const UNEXPECTED_ANSWER: &str =
     "Roblox in Eclipse gave an answer this Eclipse does not understand; close it and try again";
 
 pub(crate) enum ClientLock {
-    Acquired(File),
+    Acquired(HeldLock),
     Held(PathBuf),
+}
+
+pub(crate) struct HeldLock(File);
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "cannot release a lock before closing it");
+        }
+    }
 }
 
 pub(crate) fn lock_client(runtime_dir: &Path) -> Result<ClientLock, String> {
@@ -59,11 +69,11 @@ pub(crate) fn lock_client(runtime_dir: &Path) -> Result<ClientLock, String> {
     })
 }
 
-pub(crate) fn lock_prompt(socket: &Path) -> Result<Option<File>, String> {
+pub(crate) fn lock_prompt(socket: &Path) -> Result<Option<HeldLock>, String> {
     try_lock(&socket.with_extension(PROMPT_LOCK_EXTENSION))
 }
 
-fn try_lock(path: &Path) -> Result<Option<File>, String> {
+fn try_lock(path: &Path) -> Result<Option<HeldLock>, String> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -71,7 +81,7 @@ fn try_lock(path: &Path) -> Result<Option<File>, String> {
         .open(path)
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     match lock.try_lock() {
-        Ok(()) => Ok(Some(lock)),
+        Ok(()) => Ok(Some(HeldLock(lock))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(error)) => {
             Err(format!("cannot lock {}: {error}", path.display()))
@@ -378,9 +388,11 @@ fn read_within(stream: &mut UnixStream, limit: usize, deadline: Instant) -> io::
             .ok_or(ErrorKind::TimedOut)?;
         stream.set_read_timeout(Some(left))?;
         let wanted = chunk.len().min(limit - message.len());
-        match stream.read(&mut chunk[..wanted])? {
-            0 => break,
-            read => message.extend_from_slice(&chunk[..read]),
+        match stream.read(&mut chunk[..wanted]) {
+            Ok(0) => break,
+            Ok(read) => message.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(message)
@@ -629,12 +641,11 @@ mod tests {
         }
     }
 
-    fn acquired(runtime_dir: &Path) -> File {
-        once_spawned_children_let_go(|| match lock_client(runtime_dir).unwrap() {
-            ClientLock::Acquired(lock) => Some(lock),
-            ClientLock::Held(_) => None,
-        })
-        .unwrap_or_else(|| panic!("{} stays held", runtime_dir.display()))
+    fn acquired(runtime_dir: &Path) -> HeldLock {
+        match lock_client(runtime_dir).unwrap() {
+            ClientLock::Acquired(lock) => lock,
+            ClientLock::Held(lock) => panic!("{} is held", lock.display()),
+        }
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -650,7 +661,7 @@ mod tests {
     fn serve_fake(
         socket: &Path,
         slot: Arc<LaunchSlot>,
-        mut lock: Option<File>,
+        mut lock: Option<HeldLock>,
         experience: Experience,
     ) -> mpsc::Receiver<Seen> {
         let listener = listen(socket).unwrap();
@@ -991,6 +1002,44 @@ mod tests {
         assert!(waited < REQUEST_TIMEOUT, "{waited:?}");
     }
 
+    extern "C" fn ignore_signal(_: libc::c_int) {}
+
+    fn asleep(task: &Path) -> bool {
+        std::fs::read_to_string(task.join("stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, fields)| fields.starts_with('S'))
+        })
+    }
+
+    #[test]
+    fn a_signal_while_waiting_for_an_answer_does_not_end_the_wait() {
+        use std::os::unix::thread::JoinHandleExt as _;
+
+        let handler: extern "C" fn(libc::c_int) = ignore_signal;
+        unsafe { libc::signal(libc::SIGURG, handler as libc::sighandler_t) };
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        let (task, waiting) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            task.send(std::fs::canonicalize("/proc/thread-self").unwrap())
+                .unwrap();
+            read_within(&mut ours, MESSAGE_LIMIT, Instant::now() + ANSWER_TIMEOUT)
+        });
+        let task = waiting.recv().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !asleep(&task) {
+            assert!(Instant::now() < deadline, "the reader never waited");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let signalled = unsafe { libc::pthread_kill(reader.as_pthread_t(), libc::SIGURG) };
+        std::thread::sleep(Duration::from_millis(50));
+        let answered = theirs.write_all(br#""accepted""#);
+        drop(theirs);
+        assert_eq!(signalled, 0);
+        assert_eq!(reader.join().unwrap().unwrap(), br#""accepted""#);
+        answered.unwrap();
+    }
+
     #[test]
     fn a_stale_socket_with_a_free_lock_boots_and_the_next_holder_rebinds() {
         let root = socket_test_root("stale");
@@ -1034,7 +1083,7 @@ mod tests {
         let waited = started.elapsed();
         assert_eq!(error, already_running(&runtime.join(CLIENT_LOCK_FILE)));
         assert!(
-            (1800..=2200).contains(&waited.as_millis()),
+            (LOCK_RETRY..LOCK_RETRY * 2).contains(&waited),
             "gave up after {waited:?}"
         );
         std::fs::remove_dir_all(&root).ok();
@@ -1196,8 +1245,46 @@ mod tests {
         assert!(root.join("control-0123456789abcdef.prompt").exists());
         assert!(lock_prompt(&socket).unwrap().is_none());
         drop(asking);
-        assert!(once_spawned_children_let_go(|| lock_prompt(&socket).unwrap()).is_some());
+        assert!(lock_prompt(&socket).unwrap().is_some());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_released_lock_is_free_while_a_child_forked_meanwhile_has_not_started() {
+        use std::os::fd::BorrowedFd;
+        use std::os::unix::process::CommandExt as _;
+
+        let root = socket_test_root("inherited");
+        let runtime = root.join("runtime");
+        let lock = acquired(&runtime);
+        let (mut forked, forked_writer) = std::io::pipe().unwrap();
+        let (go_reader, mut go) = std::io::pipe().unwrap();
+        let (forked_fd, go_fd) = (forked_writer.as_raw_fd(), go_reader.as_raw_fd());
+        let mut child = Command::new("true");
+        unsafe {
+            child.pre_exec(move || {
+                rustix::io::write(BorrowedFd::borrow_raw(forked_fd), b"f")?;
+                rustix::io::read(BorrowedFd::borrow_raw(go_fd), &mut [0_u8])?;
+                Ok(())
+            });
+        }
+        let started = std::thread::spawn(move || {
+            let status = child.status();
+            drop((forked_writer, go_reader));
+            status
+        });
+        forked.read_exact(&mut [0]).unwrap();
+
+        drop(lock);
+        let free = matches!(lock_client(&runtime).unwrap(), ClientLock::Acquired(_));
+        go.write_all(b"g").unwrap();
+        let status = started.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        assert!(status.success(), "{status}");
+        assert!(
+            free,
+            "a child that has not started its program yet keeps the released lock"
+        );
     }
 
     struct ControlChild(Child);
@@ -1266,6 +1353,8 @@ mod tests {
                     "--exact",
                     "instance_control::tests::a_running_client_takes_links_until_it_plays_and_exits_when_asked",
                     "--nocapture",
+                    "--test-threads=1",
+                    "--quiet",
                 ])
                 .env(CONTROL_CHILD, &root)
                 .stdin(Stdio::null())

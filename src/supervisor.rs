@@ -22,6 +22,7 @@ use rustix::process::{Pid, WaitId, WaitIdOptions};
 use tracing::Level;
 
 use crate::desktop_integration::Packaging;
+use crate::instance_control::HeldLock;
 
 const FDS_ENV: &str = "ECLIPSE_SUPERVISOR_FDS";
 const PIPE_BYTES: usize = 1024 * 1024;
@@ -469,7 +470,7 @@ pub(crate) struct Output<O, E> {
 
 pub(crate) fn run<O: Write, E: Write>(
     mut command: Command,
-    lock: File,
+    lock: HeldLock,
     runtime_dir: &Path,
     log: RunLog,
     output: Output<O, E>,
@@ -1095,6 +1096,7 @@ fn oom_kill_count(memory_events: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instance_control::{lock_client, ClientLock};
     use eclipse::diagnostics::LogSink;
     use eclipse::framework::lifecycle::finish_android_process;
     use std::sync::atomic::{AtomicI32, Ordering};
@@ -1127,17 +1129,28 @@ mod tests {
         dir
     }
 
-    fn child_command(test: &str) -> Command {
+    fn test_command(test: &str) -> Command {
         let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args(["--exact", &format!("supervisor::tests::{test}")])
-            .env(CHILD, "1")
-            .env_remove(PARENT);
+        command.args([
+            "--exact",
+            &format!("supervisor::tests::{test}"),
+            "--test-threads=1",
+            "--quiet",
+        ]);
         command
     }
 
-    fn lock_in(dir: &Path) -> File {
-        File::create(dir.join("client.lock")).unwrap()
+    fn child_command(test: &str) -> Command {
+        let mut command = test_command(test);
+        command.env(CHILD, "1").env_remove(PARENT);
+        command
+    }
+
+    fn lock_in(dir: &Path) -> HeldLock {
+        match lock_client(dir).unwrap() {
+            ClientLock::Acquired(lock) => lock,
+            ClientLock::Held(lock) => panic!("{} is held", lock.display()),
+        }
     }
 
     fn supervise(test: &str) -> Supervised {
@@ -1674,8 +1687,7 @@ mod tests {
         }
 
         let dir = temp_dir("parent-death");
-        let mut parent = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &format!("supervisor::tests::{TEST}")])
+        let mut parent = test_command(TEST)
             .env(PARENT, &dir)
             .env_remove(CHILD)
             .stdout(Stdio::piped())
