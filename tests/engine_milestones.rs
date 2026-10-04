@@ -1254,6 +1254,27 @@ fn platform_test_obtains_a_second_finger_motion_event_under_check_jni() {
 }
 
 #[test]
+fn platform_test_constructs_the_clients_webrtc_audio_manager_under_check_jni() {
+    if !platform_test_can_boot() {
+        return;
+    }
+
+    let root = PlatformTestRoot::create("webrtc-voice");
+    let text = root.run_with_vm_options("-Xcheck:jni");
+
+    assert_lines(
+        &text,
+        &[
+            "__platform-test: WebRtcAudioManager cached 48000 Hz, 1 output and 1 input channel \
+             for native manager 0x5eeda0d1, hardware AEC false, AGC false, NS false, low-latency \
+             output true and input true, pro audio false, AAudio false, 512 output and 512 input \
+             frames per buffer; init returned true, OpenSL ES blacklisted false"
+                .to_owned(),
+        ],
+    );
+}
+
+#[test]
 fn input_test_delivers_ident_then_looper_wake() {
     let out = run_eclipse("__input-test", &[], DIAGNOSTIC_LIMIT);
     let text = combined(&out);

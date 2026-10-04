@@ -1,15 +1,20 @@
+use std::ffi::c_void;
 use std::fmt;
 use std::panic::AssertUnwindSafe;
+use std::sync::{Mutex, PoisonError};
 
+use jni::errors::LogErrorAndDefault;
 use jni::objects::JObject;
+use jni::strings::JNIStr;
+use jni::sys::{jboolean, jint, jlong};
 use jni::vm::JavaVM;
-use jni::{jni_sig, jni_str, Env, JValue};
+use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
 use super::engine_input::{probe_second_finger, TouchEventReadback};
 use super::{
     checked, external_intents, jstring_object_to_string, keep_screen_on, notifications,
     register_framework_natives, take_pending_host_clipboard_text, FrameworkError, ACTIVITY_CLASS,
-    CONTEXT_CLASS, ENVIRONMENT_CLASS, WINDOW_CLASS,
+    ATL_LOADED_APP_CLASS, CONTEXT_CLASS, ENVIRONMENT_CLASS, WINDOW_CLASS,
 };
 use crate::apk::signature::SigningCertificateHistory;
 use crate::runtime::Vm;
@@ -26,6 +31,81 @@ const OPENED_LINK: &str = "https://example.org/x";
 const REFUSED_LINK: &str = "roblox://placeId=1";
 const SHARED_TEXT: &str = "hi https://www.roblox.com/share?code=X";
 const NO_SHARED_FILE: i32 = -1;
+
+const CONTEXT_UTILS_CLASS: &JNIStr = jni_str!("org/webrtc/ContextUtils");
+const WEBRTC_AUDIO_MANAGER_CLASS: &JNIStr = jni_str!("org/webrtc/voiceengine/WebRtcAudioManager");
+const CACHE_AUDIO_PARAMETERS_NAME: &JNIStr = jni_str!("nativeCacheAudioParameters");
+const CACHE_AUDIO_PARAMETERS_SIG: &JNIStr = jni_str!("(IIIZZZZZZZIIJ)V");
+const NATIVE_AUDIO_MANAGER: jlong = 0x5eed_a0d1;
+
+static CACHED_AUDIO_PARAMETERS: Mutex<Option<CachedAudioParameters>> = Mutex::new(None);
+
+struct CachedAudioParameters {
+    sample_rate: jint,
+    output_channels: jint,
+    input_channels: jint,
+    hardware_aec: bool,
+    hardware_agc: bool,
+    hardware_ns: bool,
+    low_latency_output: bool,
+    low_latency_input: bool,
+    pro_audio: bool,
+    aaudio: bool,
+    output_buffer_frames: jint,
+    input_buffer_frames: jint,
+    native_audio_manager: jlong,
+}
+
+impl fmt::Display for CachedAudioParameters {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cached {} Hz, {} output and {} input channel for native manager {:#x}, hardware AEC \
+             {}, AGC {}, NS {}, low-latency output {} and input {}, pro audio {}, AAudio {}, {} \
+             output and {} input frames per buffer",
+            self.sample_rate,
+            self.output_channels,
+            self.input_channels,
+            self.native_audio_manager,
+            self.hardware_aec,
+            self.hardware_agc,
+            self.hardware_ns,
+            self.low_latency_output,
+            self.low_latency_input,
+            self.pro_audio,
+            self.aaudio,
+            self.output_buffer_frames,
+            self.input_buffer_frames
+        )
+    }
+}
+
+struct WebRtcVoiceReadback {
+    parameters: Option<CachedAudioParameters>,
+    initialized: bool,
+    communication_mode: bool,
+    open_sl_es_blacklisted: bool,
+}
+
+impl fmt::Display for WebRtcVoiceReadback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WebRtcAudioManager ")?;
+        match &self.parameters {
+            Some(parameters) => write!(f, "{parameters}")?,
+            None => f.write_str("never cached its audio parameters")?,
+        }
+        writeln!(
+            f,
+            "; init returned {}, OpenSL ES blacklisted {}",
+            self.initialized, self.open_sl_es_blacklisted
+        )?;
+        write!(
+            f,
+            "WebRtcAudioManager communication mode enabled {}",
+            self.communication_mode
+        )
+    }
+}
 
 enum NativeOutcome {
     Returned,
@@ -81,6 +161,7 @@ pub struct PlatformProbeReport {
     shared_text: NativeOutcome,
     host_clipboard: Option<String>,
     second_finger: TouchEventReadback,
+    webrtc_voice: WebRtcVoiceReadback,
 }
 
 impl fmt::Display for PlatformProbeReport {
@@ -123,6 +204,7 @@ impl fmt::Display for PlatformProbeReport {
             self.shared_text
         )?;
         writeln!(f, "{}", self.second_finger)?;
+        writeln!(f, "{}", self.webrtc_voice)?;
         match &self.host_clipboard {
             Some(text) => write!(f, "host clipboard slot holds {text:?}"),
             None => f.write_str("host clipboard slot is empty"),
@@ -170,6 +252,7 @@ fn probe(
     let refused_link = open_uri(env, REFUSED_LINK)?;
     let shared_text = share_text(env, SHARED_TEXT)?;
     let second_finger = probe_second_finger(env)?;
+    let webrtc_voice = webrtc_voice(env)?;
     Ok(PlatformProbeReport {
         pictures,
         movies,
@@ -181,7 +264,138 @@ fn probe(
         shared_text,
         host_clipboard: take_pending_host_clipboard_text(),
         second_finger,
+        webrtc_voice,
     })
+}
+
+fn webrtc_voice(env: &mut Env) -> Result<WebRtcVoiceReadback, FrameworkError> {
+    let context = checked(env, "ATLLoadedApp primary Context", |env| {
+        let loaded_app = env
+            .call_static_method(
+                ATL_LOADED_APP_CLASS,
+                jni_str!("getPrimaryApplication"),
+                jni_sig!("()Landroid/atl/ATLLoadedApp;"),
+                &[],
+            )?
+            .l()?;
+        env.call_method(
+            &loaded_app,
+            jni_str!("createContext"),
+            jni_sig!(
+                "(Landroid/util/DisplayMetrics;Landroid/content/res/Configuration;I)Landroid/app/ContextImpl;"
+            ),
+            &[
+                JValue::Object(&JObject::null()),
+                JValue::Object(&JObject::null()),
+                JValue::Int(0),
+            ],
+        )?
+        .l()
+    })?;
+    checked(env, "ContextUtils.initialize", |env| {
+        env.call_static_method(
+            CONTEXT_UTILS_CLASS,
+            jni_str!("initialize"),
+            jni_sig!("(Landroid/content/Context;)V"),
+            &[JValue::Object(&context)],
+        )?
+        .v()
+    })?;
+    checked(
+        env,
+        "RegisterNatives WebRtcAudioManager.nativeCacheAudioParameters",
+        |env| {
+            let class = env.find_class(WEBRTC_AUDIO_MANAGER_CLASS)?;
+            let methods = [unsafe {
+                NativeMethod::from_raw_parts(
+                    CACHE_AUDIO_PARAMETERS_NAME,
+                    CACHE_AUDIO_PARAMETERS_SIG,
+                    native_cache_audio_parameters as *mut c_void,
+                )
+            }];
+            unsafe { env.register_native_methods(&class, &methods) }
+        },
+    )?;
+    let manager = checked(env, "NewObject WebRtcAudioManager(J)V", |env| {
+        env.new_object(
+            WEBRTC_AUDIO_MANAGER_CLASS,
+            jni_sig!("(J)V"),
+            &[JValue::Long(NATIVE_AUDIO_MANAGER)],
+        )
+    })?;
+    let parameters = CACHED_AUDIO_PARAMETERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    let mut boolean = |name: &'static JNIStr| {
+        checked(env, "WebRtcAudioManager boolean method", |env| {
+            env.call_method(&manager, name, jni_sig!("()Z"), &[])?.z()
+        })
+    };
+    let initialized = boolean(jni_str!("init"))?;
+    let communication_mode = boolean(jni_str!("isCommunicationModeEnabled"))?;
+    let open_sl_es_blacklisted = boolean(jni_str!("isDeviceBlacklistedForOpenSLESUsage"))?;
+    for mute in [true, false] {
+        checked(env, "WebRtcAudioManager.setMicrophoneMute", |env| {
+            env.call_method(
+                &manager,
+                jni_str!("setMicrophoneMute"),
+                jni_sig!("(Z)V"),
+                &[JValue::Bool(mute)],
+            )?
+            .v()
+        })?;
+    }
+    checked(env, "WebRtcAudioManager.dispose", |env| {
+        env.call_method(&manager, jni_str!("dispose"), jni_sig!("()V"), &[])?
+            .v()
+    })?;
+    Ok(WebRtcVoiceReadback {
+        parameters,
+        initialized,
+        communication_mode,
+        open_sl_es_blacklisted,
+    })
+}
+
+extern "system" fn native_cache_audio_parameters<'local>(
+    mut env: EnvUnowned<'local>,
+    _manager: JObject<'local>,
+    sample_rate: jint,
+    output_channels: jint,
+    input_channels: jint,
+    hardware_aec: jboolean,
+    hardware_agc: jboolean,
+    hardware_ns: jboolean,
+    low_latency_output: jboolean,
+    low_latency_input: jboolean,
+    pro_audio: jboolean,
+    aaudio: jboolean,
+    output_buffer_frames: jint,
+    input_buffer_frames: jint,
+    native_audio_manager: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        *CACHED_AUDIO_PARAMETERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(CachedAudioParameters {
+            sample_rate,
+            output_channels,
+            input_channels,
+            hardware_aec,
+            hardware_agc,
+            hardware_ns,
+            low_latency_output,
+            low_latency_input,
+            pro_audio,
+            aaudio,
+            output_buffer_frames,
+            input_buffer_frames,
+            native_audio_manager,
+        });
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
 }
 
 fn open_uri(env: &mut Env, link: &str) -> Result<NativeOutcome, FrameworkError> {

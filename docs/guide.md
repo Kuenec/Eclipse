@@ -29,6 +29,10 @@ xdg-mime default io.github.kuenec.Eclipse.UrlHandler.desktop x-scheme-handler/ro
 
 Voice chat uses your system's default microphone. Choose it in your desktop's sound settings.
 
+## Robux
+
+Roblox for Android sells Robux and Premium only through Google Play, so buying them in Eclipse shows Roblox's "Please setup Google Play Store" message. Buy them at [roblox.com](https://www.roblox.com/upgrades/robux) in a browser.
+
 ## Controllers
 
 Controllers need Flatpak 1.16 or newer. On older Flatpak, run `flatpak override --user --device=all io.github.kuenec.Eclipse`. A controller SDL does not recognize needs an [SDL mapping](https://wiki.libsdl.org/SDL3/SDL_HINT_GAMECONTROLLERCONFIG): `flatpak override --user --env=SDL_GAMECONTROLLERCONFIG="<mapping>" io.github.kuenec.Eclipse`. Eclipse can read input devices for controllers, which includes keyboards if your user is in the `input` group. To remove that access, run `flatpak override --user --nodevice=input io.github.kuenec.Eclipse`; to only turn controllers off, set `allow_gamepad_permission` to `false`.

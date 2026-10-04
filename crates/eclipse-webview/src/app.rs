@@ -1,6 +1,6 @@
 use crate::cookies;
 use crate::logging::{self, Redacted};
-use crate::view::{self, Route, Unparented, View};
+use crate::view::{self, Frame, Route, Unparented, View};
 use crate::wire::{Inbound, Wire};
 use eclipse_webview::proto::{
     ClearScope, ConsumerMsg, CookiePair, HelperMsg, ParentSize, ParentWindow, ProtoError,
@@ -21,6 +21,8 @@ use webkit6::soup;
 const SNAPSHOT_DELAY: Duration = Duration::from_millis(500);
 
 const MAX_PENDING: usize = 256;
+
+const FETCH_DESTINATION_HEADER: &str = "Sec-Fetch-Dest";
 
 pub(crate) const EXIT_REQUESTED: u8 = 0;
 
@@ -563,12 +565,17 @@ impl App {
         let Some(view) = self.view(id) else {
             return false;
         };
-        let Some((request, redirect, user_gesture)) = decision
+        let Some((request, redirect, user_gesture, kind)) = decision
             .downcast_ref::<webkit6::NavigationPolicyDecision>()
             .and_then(webkit6::NavigationPolicyDecision::navigation_action)
             .and_then(|action| {
                 let request = action.request()?;
-                Some((request, action.is_redirect(), action.is_user_gesture()))
+                Some((
+                    request,
+                    action.is_redirect(),
+                    action.is_user_gesture(),
+                    action.navigation_type(),
+                ))
             })
         else {
             return false;
@@ -576,8 +583,25 @@ impl App {
         let url = request.uri().map(String::from).unwrap_or_default();
         let method = request.http_method();
         let app_initiated = !redirect && view.take_app_load(&url);
-        if view::navigation_route(&url, method.as_deref(), redirect, app_initiated) == Route::Engine
-        {
+        let (navigated_frame, user_gesture) = if redirect {
+            let destination = request
+                .http_headers()
+                .and_then(|headers| headers.one(FETCH_DESTINATION_HEADER));
+            (view::redirect_frame(destination.as_deref()), user_gesture)
+        } else {
+            match view.take_intent(&url, kind) {
+                Some(intent) => (Frame::Main, user_gesture || intent.activation),
+                None => (Frame::Unknown, user_gesture),
+            }
+        };
+        let route = view::navigation_route(
+            &url,
+            method.as_deref(),
+            redirect,
+            app_initiated,
+            navigated_frame,
+        );
+        if route == Route::Engine {
             return false;
         }
         if self.policies.borrow().len() >= MAX_PENDING {
@@ -875,10 +899,14 @@ impl ImportTally {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::intent;
     use crate::wire::Wire;
     use eclipse_webview::proto::{self, LoadEvent, GLOBAL_FRAME_CAP};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
     use std::time::Instant;
 
     fn storage(tag: &str) -> (PathBuf, Storage) {
@@ -981,7 +1009,7 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
-    fn pump_until(what: &str, done: impl Fn() -> bool) {
+    fn pump_until(what: &str, mut done: impl FnMut() -> bool) {
         let context = glib::MainContext::default();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !done() {
@@ -1043,11 +1071,342 @@ mod tests {
         );
     }
 
+    const SITE_PAGE: &str = "<!doctype html><title>page</title>\
+                             <iframe id=frame src=/frame-1></iframe>\
+                             <a id=jump href=#here>jump</a><a id=link href=/linked>link</a>\
+                             <form id=search action=/search><input name=q value=a></form>";
+
+    fn site_response(target: &str) -> String {
+        let path = target.split(['?', '#']).next().unwrap_or(target);
+        let (status, location, body) = match path {
+            "/main" | "/buy" | "/linked" | "/search" | "/landed" => ("200 OK", "", SITE_PAGE),
+            "/frame-1" | "/frame-2" | "/frame-3" | "/frame-4" => {
+                ("200 OK", "", "<!doctype html>frame")
+            }
+            "/hop" => ("302 Found", "Location: /landed\r\n", ""),
+            "/frame-hop" => ("302 Found", "Location: /frame-4\r\n", ""),
+            _ => ("404 Not Found", "", ""),
+        };
+        format!(
+            "HTTP/1.1 {status}\r\n{location}Content-Type: text/html; charset=utf-8\r\n\
+             Cache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    struct Site {
+        origin: String,
+        requests: mpsc::Receiver<String>,
+        served: RefCell<Vec<String>>,
+    }
+
+    impl Site {
+        fn start() -> Site {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind the test site");
+            let port = listener.local_addr().expect("the test site address").port();
+            let (sender, requests) = mpsc::channel();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { return };
+                    let mut reader = BufReader::new(&stream);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let mut header = String::new();
+                    while reader.read_line(&mut header).is_ok_and(|read| read > 2) {
+                        header.clear();
+                    }
+                    let target = request_line.split(' ').nth(1).unwrap_or("/").to_string();
+                    if (&stream)
+                        .write_all(site_response(&target).as_bytes())
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    if sender.send(target).is_err() {
+                        return;
+                    }
+                }
+            });
+            Site {
+                origin: format!("http://127.0.0.1:{port}"),
+                requests,
+                served: RefCell::default(),
+            }
+        }
+
+        fn url(&self, target: &str) -> String {
+            format!("{}{target}", self.origin)
+        }
+
+        fn served(&self, target: &str) -> usize {
+            self.served.borrow_mut().extend(self.requests.try_iter());
+            self.served
+                .borrow()
+                .iter()
+                .filter(|served| *served == target)
+                .count()
+        }
+    }
+
+    struct Host {
+        received: mpsc::Receiver<HelperMsg>,
+        recent: RefCell<Vec<HelperMsg>>,
+        policies: RefCell<Vec<(String, bool, String)>>,
+    }
+
+    impl Host {
+        fn listen(stream: UnixStream) -> Host {
+            stream.set_read_timeout(None).expect("block on host reads");
+            let (sender, received) = mpsc::channel();
+            std::thread::spawn(move || {
+                while let Ok(msg) = proto::read_helper_msg(&mut &stream) {
+                    if sender.send(msg).is_err() {
+                        return;
+                    }
+                }
+            });
+            Host {
+                received,
+                recent: RefCell::default(),
+                policies: RefCell::default(),
+            }
+        }
+
+        fn drain(&self) {
+            for msg in self.received.try_iter() {
+                if let HelperMsg::PolicyRequest {
+                    url,
+                    redirect,
+                    method,
+                    ..
+                } = &msg
+                {
+                    self.policies
+                        .borrow_mut()
+                        .push((url.clone(), *redirect, method.clone()));
+                }
+                self.recent.borrow_mut().push(msg);
+            }
+        }
+
+        fn take_policy(&self, url: &str) -> Option<(u32, bool)> {
+            self.drain();
+            let mut recent = self.recent.borrow_mut();
+            let index = recent.iter().position(
+                |msg| matches!(msg, HelperMsg::PolicyRequest { url: asked, .. } if asked == url),
+            )?;
+            match recent.remove(index) {
+                HelperMsg::PolicyRequest {
+                    policy_id,
+                    redirect,
+                    ..
+                } => Some((policy_id, redirect)),
+                _ => None,
+            }
+        }
+
+        fn take_finished(&self, url: &str) -> bool {
+            self.drain();
+            let mut recent = self.recent.borrow_mut();
+            let load_event = |event: LoadEvent| {
+                move |msg: &HelperMsg| {
+                    matches!(
+                        msg,
+                        HelperMsg::LoadChanged { event: seen, url: loaded, .. }
+                            if *seen == event && loaded == url
+                    )
+                }
+            };
+            let Some(committed) = recent.iter().position(load_event(LoadEvent::Committed)) else {
+                return false;
+            };
+            let Some(finished) = recent[committed..]
+                .iter()
+                .position(load_event(LoadEvent::Finished))
+            else {
+                return false;
+            };
+            recent.drain(..=committed + finished);
+            true
+        }
+
+        fn take_result(&self, request_id: u32) -> Option<String> {
+            self.drain();
+            let mut recent = self.recent.borrow_mut();
+            let index = recent.iter().position(|msg| {
+                matches!(msg, HelperMsg::EvaluateJsResult { request_id: id, .. } if *id == request_id)
+            })?;
+            match recent.remove(index) {
+                HelperMsg::EvaluateJsResult { value_json, .. } => Some(value_json),
+                _ => None,
+            }
+        }
+    }
+
+    fn main_frame_navigations_reach_the_app_and_frame_navigations_do_not() {
+        if gtk::init().is_err() {
+            eprintln!("SKIP: no display for a WebKit view (WAYLAND_DISPLAY or DISPLAY)");
+            return;
+        }
+        let site = Site::start();
+        let (root, app, host) = app_with_host("navigation");
+        let host = Host::listen(host);
+        let view = 1;
+        let evaluations = Cell::new(0);
+        let evaluate = |script: &str| {
+            let request_id = evaluations.get() + 1;
+            evaluations.set(request_id);
+            app.handle(ConsumerMsg::EvaluateJs {
+                view,
+                request_id,
+                script: script.to_string(),
+            });
+            let mut result = None;
+            pump_until("run a page script", || {
+                result = host.take_result(request_id);
+                result.is_some()
+            });
+            result.expect("pump_until waited for the result")
+        };
+        let load = |target: &str| {
+            app.handle(ConsumerMsg::LoadUrl {
+                view,
+                url: site.url(target),
+            });
+        };
+        let finish = |target: &str| {
+            pump_until("finish loading the page", || {
+                host.take_finished(&site.url(target))
+            });
+        };
+        let answer = |target: &str, redirect: bool, override_load: bool| {
+            let mut asked = None;
+            pump_until("ask the app about a main-frame navigation", || {
+                asked = host.take_policy(&site.url(target));
+                asked.is_some()
+            });
+            let (policy_id, asked_redirect) = asked.expect("pump_until waited for the request");
+            assert_eq!(asked_redirect, redirect, "{target}");
+            app.handle(ConsumerMsg::PolicyReply {
+                policy_id,
+                override_load,
+            });
+        };
+        let served = |target: &str| {
+            pump_until("fetch a frame document", || site.served(target) > 0);
+        };
+
+        app.handle(ConsumerMsg::CreateView { view });
+        load("/main");
+        finish("/main");
+        served("/frame-1");
+        evaluate("document.getElementById('frame').src='/frame-2'");
+        served("/frame-2");
+        evaluate("document.getElementById('frame').contentWindow.location.href='/frame-3'");
+        served("/frame-3");
+        evaluate("document.getElementById('frame').src='/frame-hop'");
+        served("/frame-4");
+        evaluate(
+            "var l=document.getElementById('link');\
+             l.addEventListener('click',function(e){\
+             e.preventDefault();document.getElementById('frame').src=l.href;});l.click()",
+        );
+        served("/linked");
+        evaluate(
+            "var f=document.getElementById('search');\
+             f.addEventListener('submit',function(e){\
+             e.preventDefault();document.getElementById('frame').src='/search?q=frame';});\
+             f.requestSubmit()",
+        );
+        served("/search?q=frame");
+        evaluate("document.getElementById('jump').click()");
+        assert_eq!(evaluate("location.hash"), "\"#here\"");
+
+        evaluate("location.href='/buy?id=com.roblox.robloxmobile.premium80robux'");
+        answer(
+            "/buy?id=com.roblox.robloxmobile.premium80robux",
+            false,
+            true,
+        );
+        load("/buy?id=com.roblox.robloxmobile.premium80robux");
+        finish("/buy?id=com.roblox.robloxmobile.premium80robux");
+        assert_eq!(
+            site.served("/buy?id=com.roblox.robloxmobile.premium80robux"),
+            1,
+            "the app took the page's navigation, so only its own load fetched the page"
+        );
+
+        evaluate("document.getElementById('link').click()");
+        answer("/linked", false, false);
+        finish("/linked");
+        evaluate("document.getElementById('search').requestSubmit()");
+        answer("/search?q=a", false, false);
+        finish("/search?q=a");
+        evaluate("location.href='/hop'");
+        answer("/hop", false, false);
+        answer("/landed", true, false);
+        finish("/landed");
+
+        load("/hop");
+        answer("/landed", true, true);
+        load("/landed");
+        finish("/landed");
+
+        let posted = Rc::new(Cell::new(false));
+        let noted = Rc::clone(&posted);
+        app.view(view)
+            .expect("the view")
+            .web_view
+            .evaluate_javascript(
+                &format!(
+                    "window.webkit.messageHandlers.{}.postMessage(\
+                     {{kind:'page',url:'{}',activation:true}});true",
+                    intent::MESSAGE_HANDLER,
+                    site.url("/main?again")
+                ),
+                Some(intent::SCRIPT_WORLD),
+                None,
+                None::<&gio::Cancellable>,
+                move |result| noted.set(result.is_ok()),
+            );
+        pump_until("post a navigation intent", || posted.get());
+        load("/main?again");
+        finish("/main?again");
+        evaluate(
+            "var link=document.getElementById('link');\
+             link.addEventListener('click',function(e){\
+             e.preventDefault();history.pushState(null,'','/linked');});link.click()",
+        );
+        evaluate("location.reload()");
+        finish("/linked");
+
+        host.drain();
+        let get = |target: &str, redirect: bool| (site.url(target), redirect, "GET".to_string());
+        assert_eq!(
+            *host.policies.borrow(),
+            vec![
+                get("/buy?id=com.roblox.robloxmobile.premium80robux", false),
+                get("/linked", false),
+                get("/search?q=a", false),
+                get("/hop", false),
+                get("/landed", true),
+                get("/landed", true),
+            ],
+            "only main-frame page navigations and main-frame redirects reach the app"
+        );
+        app.handle(ConsumerMsg::CloseView { view });
+        drop(app);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
     #[test]
     fn webkit_backed_checks_run_on_the_one_thread_that_starts_webkit() {
         an_engine_tears_down_without_touching_a_finalized_session();
         a_page_message_too_large_to_send_is_dropped_without_ending_the_helper();
         a_reply_too_large_to_send_reaches_the_host_as_a_failure();
         webkit_keeps_cookies_in_memory_and_hands_them_to_the_host();
+        main_frame_navigations_reach_the_app_and_frame_navigations_do_not();
     }
 }

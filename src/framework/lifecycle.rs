@@ -61,10 +61,14 @@ pub fn finish_android_process(end: ClientEnd) -> ! {
             eprintln!("eclipse: cannot tell Eclipse's supervisor how Roblox ended: {error}");
         }
     }
+    exit_without_vm_teardown(end.status())
+}
+
+pub fn exit_without_vm_teardown(status: i32) -> ! {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 
-    unsafe { libc::_exit(end.status()) }
+    unsafe { libc::_exit(status) }
 }
 
 fn write_exit_record(mut pipe: File, end: ClientEnd) -> std::io::Result<()> {

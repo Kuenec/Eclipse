@@ -1,0 +1,11 @@
+--- a/art/runtime/native_stack_dump.cc
++++ b/art/runtime/native_stack_dump.cc
+@@ -65,7 +65,7 @@
+ 
+ using android::base::StringPrintf;
+ 
+-static constexpr bool kUseAddr2line = !kIsTargetBuild;
++static constexpr bool kUseAddr2line = false;
+ 
+ std::string FindAddr2line() {
+   if (!kIsTargetBuild) {

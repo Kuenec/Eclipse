@@ -145,6 +145,8 @@ modules:
         path: patches/art_standalone-class-loader-context.patch
       - type: patch
         path: patches/art_standalone-host-isa-baseline.patch
+      - type: patch
+        path: patches/art_standalone-no-addr2line-in-crash-dumps.patch
 
   - name: android-translation-layer
     buildsystem: meson

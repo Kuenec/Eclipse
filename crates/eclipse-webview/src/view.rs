@@ -1,5 +1,7 @@
 use crate::app::App;
 use crate::bridge;
+use crate::intent::{self, Intent};
+use crate::logging;
 use eclipse_webview::proto::{HelperMsg, LoadError, LoadEvent, ParentSize, ParentWindow, SizeUnit};
 use gtk4 as gtk;
 use gtk4::prelude::*;
@@ -28,20 +30,22 @@ const BACK_BUTTON: u32 = 8;
 
 const RESOURCE_EVENT_INTERVAL: Duration = Duration::from_millis(250);
 
-const ENGINE_SCHEMES: [&str; 7] = [
-    "http",
-    "https",
-    "about",
-    "data",
-    "blob",
-    "javascript",
-    "file",
-];
+const WEB_SCHEMES: [&str; 2] = ["http", "https"];
+
+const LOCAL_SCHEMES: [&str; 5] = ["about", "data", "blob", "javascript", "file"];
+
+const DOCUMENT_DESTINATION: &str = "document";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Route {
     Engine,
     App,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Frame {
+    Main,
+    Unknown,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -67,6 +71,7 @@ pub(crate) struct View {
     progress: Cell<Option<u8>>,
     resources: ResourceThrottle,
     app_load: RefCell<Option<String>>,
+    intent: RefCell<Option<Intent>>,
     failed_url: RefCell<Option<String>>,
     composing: Cell<bool>,
     escape_held: Cell<bool>,
@@ -148,11 +153,21 @@ fn effective_user_agent(requested: &str) -> &str {
     }
 }
 
-fn engine_handles_scheme(url: &str) -> bool {
+fn has_scheme(url: &str, schemes: &[&str]) -> bool {
     let scheme = url.split_once(':').map_or("", |(scheme, _)| scheme);
-    ENGINE_SCHEMES
+    schemes
         .iter()
-        .any(|handled| handled.eq_ignore_ascii_case(scheme))
+        .any(|listed| listed.eq_ignore_ascii_case(scheme))
+}
+
+pub(crate) fn redirect_frame(fetch_destination: Option<&str>) -> Frame {
+    if fetch_destination
+        .is_some_and(|destination| destination.eq_ignore_ascii_case(DOCUMENT_DESTINATION))
+    {
+        Frame::Main
+    } else {
+        Frame::Unknown
+    }
 }
 
 pub(crate) fn navigation_route(
@@ -160,17 +175,21 @@ pub(crate) fn navigation_route(
     method: Option<&str>,
     redirect: bool,
     app_initiated: bool,
+    frame: Frame,
 ) -> Route {
-    if engine_handles_scheme(url) {
-        return Route::Engine;
-    }
     if method.is_some_and(|method| !method.eq_ignore_ascii_case("GET")) {
         return Route::Engine;
     }
     if app_initiated && !redirect {
         return Route::Engine;
     }
-    Route::App
+    if has_scheme(url, &LOCAL_SCHEMES) {
+        return Route::Engine;
+    }
+    match frame {
+        Frame::Unknown if has_scheme(url, &WEB_SCHEMES) => Route::Engine,
+        Frame::Main | Frame::Unknown => Route::App,
+    }
 }
 
 pub(crate) fn key_response(key: gdk::Key, target: EscapeTarget, escape_held: bool) -> KeyResponse {
@@ -373,6 +392,16 @@ impl View {
     pub(crate) fn create(app: &Rc<App>, id: i64) -> Rc<View> {
         let content = webkit6::UserContentManager::new();
         content.register_script_message_handler_with_reply(bridge::MESSAGE_HANDLER, None);
+        content
+            .register_script_message_handler(intent::MESSAGE_HANDLER, Some(intent::SCRIPT_WORLD));
+        content.add_script(&webkit6::UserScript::for_world(
+            &intent::script(),
+            webkit6::UserContentInjectedFrames::TopFrame,
+            webkit6::UserScriptInjectionTime::Start,
+            intent::SCRIPT_WORLD,
+            &[],
+            &[],
+        ));
         let web_view = webkit6::WebView::builder()
             .network_session(app.session())
             .user_content_manager(&content)
@@ -398,6 +427,7 @@ impl View {
             progress: Cell::default(),
             resources: ResourceThrottle::default(),
             app_load: RefCell::default(),
+            intent: RefCell::default(),
             failed_url: RefCell::default(),
             composing: Cell::new(false),
             escape_held: Cell::new(false),
@@ -476,7 +506,7 @@ impl View {
     }
 
     pub(crate) fn load_url(&self, url: &str) {
-        *self.app_load.borrow_mut() = (!engine_handles_scheme(url)).then(|| url.to_string());
+        *self.app_load.borrow_mut() = Some(url.to_string());
         self.web_view.load_uri(url);
     }
 
@@ -489,6 +519,12 @@ impl View {
         matched
     }
 
+    pub(crate) fn take_intent(&self, url: &str, kind: webkit6::NavigationType) -> Option<Intent> {
+        let intent = self.intent.take()?;
+        let current = self.web_view.uri().unwrap_or_default();
+        intent.applies_to(url, kind, &current).then_some(intent)
+    }
+
     fn connect(&self, app: Weak<App>, id: i64) {
         let weak = app.clone();
         self.content.connect_script_message_with_reply_received(
@@ -498,6 +534,22 @@ impl View {
                     app.bridge_message(id, value, reply);
                 }
                 true
+            },
+        );
+
+        let weak = app.clone();
+        self.content.connect_script_message_received(
+            Some(intent::MESSAGE_HANDLER),
+            move |_, message| {
+                let Some(view) = weak.upgrade().and_then(|app| app.view(id)) else {
+                    return;
+                };
+                match Intent::from_message(message) {
+                    Some(intent) => *view.intent.borrow_mut() = Some(intent),
+                    None => logging::warn(format_args!(
+                        "dropping a malformed navigation message in view {id}"
+                    )),
+                }
             },
         );
 
@@ -608,6 +660,7 @@ impl View {
             let failed_url = match event {
                 LoadEvent::Started => {
                     view.failed_url.take();
+                    view.intent.take();
                     None
                 }
                 LoadEvent::Finished => view.failed_url.take(),
@@ -919,27 +972,66 @@ mod tests {
         assert_eq!(effective_user_agent(" "), " ");
     }
 
+    const BUY_80_ROBUX: &str = "https://www.roblox.com/mobile-app-upgrades/buy?\
+                                id=com.roblox.robloxmobile.premium80robux";
+
     #[test]
-    fn schemes_the_engine_loads_never_reach_the_app() {
+    fn main_frame_page_navigations_over_http_ask_the_app() {
         for url in [
-            "https://www.roblox.com/login",
+            BUY_80_ROBUX,
             "HTTP://host/",
+            "https://www.roblox.com/games/1",
+        ] {
+            assert_eq!(
+                navigation_route(url, Some("GET"), false, false, Frame::Main),
+                Route::App,
+                "{url}"
+            );
+            assert_eq!(
+                navigation_route(url, None, true, false, Frame::Main),
+                Route::App,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn subframe_and_unclassified_http_navigations_stay_with_the_engine() {
+        for url in [BUY_80_ROBUX, "https://www.roblox.com/login", "HTTP://host/"] {
+            assert_eq!(
+                navigation_route(url, Some("GET"), false, false, Frame::Unknown),
+                Route::Engine,
+                "{url}"
+            );
+            assert_eq!(
+                navigation_route(url, None, true, false, Frame::Unknown),
+                Route::Engine,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_schemes_never_reach_the_app_from_any_frame() {
+        for url in [
             "about:blank",
             "data:text/html,x",
             "blob:https://host/id",
             "javascript:void(0)",
             "file:///etc/passwd",
         ] {
-            assert_eq!(
-                navigation_route(url, Some("GET"), false, false),
-                Route::Engine,
-                "{url}"
-            );
-            assert_eq!(
-                navigation_route(url, None, true, false),
-                Route::Engine,
-                "{url}"
-            );
+            for frame in [Frame::Main, Frame::Unknown] {
+                assert_eq!(
+                    navigation_route(url, Some("GET"), false, false, frame),
+                    Route::Engine,
+                    "{url}"
+                );
+                assert_eq!(
+                    navigation_route(url, None, true, false, frame),
+                    Route::Engine,
+                    "{url}"
+                );
+            }
         }
     }
 
@@ -952,35 +1044,63 @@ mod tests {
             "tel:123",
             "intent://x#Intent;end",
         ] {
-            assert_eq!(
-                navigation_route(url, None, false, false),
-                Route::App,
-                "{url}"
-            );
-            assert_eq!(
-                navigation_route(url, Some("GET"), true, false),
-                Route::App,
-                "{url}"
-            );
+            for frame in [Frame::Main, Frame::Unknown] {
+                assert_eq!(
+                    navigation_route(url, None, false, false, frame),
+                    Route::App,
+                    "{url}"
+                );
+                assert_eq!(
+                    navigation_route(url, Some("GET"), true, false, frame),
+                    Route::App,
+                    "{url}"
+                );
+            }
         }
-        assert_eq!(navigation_route("nourl", None, false, false), Route::App);
+        assert_eq!(
+            navigation_route("nourl", None, false, false, Frame::Unknown),
+            Route::App
+        );
     }
 
     #[test]
     fn app_loads_and_non_get_requests_stay_with_the_engine_but_app_load_redirects_ask() {
-        assert_eq!(
-            navigation_route("roblox://x", None, false, true),
-            Route::Engine
-        );
-        assert_eq!(navigation_route("roblox://x", None, true, true), Route::App);
-        assert_eq!(
-            navigation_route("roblox://x", Some("POST"), false, false),
-            Route::Engine
-        );
-        assert_eq!(
-            navigation_route("roblox://x", Some("get"), false, false),
-            Route::App
-        );
+        for (url, frame) in [("roblox://x", Frame::Unknown), (BUY_80_ROBUX, Frame::Main)] {
+            assert_eq!(
+                navigation_route(url, None, false, true, frame),
+                Route::Engine,
+                "{url}"
+            );
+            assert_eq!(
+                navigation_route(url, None, true, true, frame),
+                Route::App,
+                "{url}"
+            );
+            assert_eq!(
+                navigation_route(url, Some("POST"), false, false, frame),
+                Route::Engine,
+                "{url}"
+            );
+            assert_eq!(
+                navigation_route(url, Some("POST"), true, false, frame),
+                Route::Engine,
+                "{url}"
+            );
+            assert_eq!(
+                navigation_route(url, Some("get"), false, false, frame),
+                Route::App,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_document_fetch_makes_a_redirect_a_main_frame_one() {
+        assert_eq!(redirect_frame(Some("document")), Frame::Main);
+        assert_eq!(redirect_frame(Some("Document")), Frame::Main);
+        for other in [Some("iframe"), Some("frame"), Some("empty"), Some(""), None] {
+            assert_eq!(redirect_frame(other), Frame::Unknown, "{other:?}");
+        }
     }
 
     #[test]
