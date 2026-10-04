@@ -1,5 +1,7 @@
 #[path = "../src/bounded_child.rs"]
 mod bounded_child;
+#[path = "support/stub_script.rs"]
+mod stub_script;
 
 use std::fs::{self, Permissions};
 use std::os::unix::fs::{symlink, PermissionsExt as _};
@@ -278,13 +280,10 @@ fn a_config_managed_outside_eclipse_is_refused_and_left_alone() {
 fn settings_becomes_the_settings_app_installed_next_to_eclipse() {
     let sandbox = Sandbox::create("settings");
     let eclipse = sandbox.install_eclipse();
-    let settings = sandbox.settings_app();
-    fs::write(
-        &settings,
+    stub_script::write(
+        &sandbox.settings_app(),
         "#!/bin/sh\necho \"$PPID $#\" > \"${0%/*}/opened\"\n",
-    )
-    .expect("write the settings stub");
-    fs::set_permissions(&settings, Permissions::from_mode(0o755)).expect("make it executable");
+    );
 
     let output = sandbox.eclipse(&eclipse, &["settings"]);
 

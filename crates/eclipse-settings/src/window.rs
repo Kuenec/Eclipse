@@ -1009,6 +1009,7 @@ mod tests {
 
     use super::*;
     use crate::headless;
+    use crate::stub_script;
 
     const FIXTURE: &str = r#"{
   "zeta_unknown": 1,
@@ -1360,10 +1361,7 @@ mod tests {
             return;
         }
         let root = headless::root("install");
-        let eclipse = headless::eclipse_path(&root);
-        fs::create_dir_all(eclipse.parent().expect("a bin directory")).expect("mkdir");
-        fs::write(&eclipse, FAILING_INSTALL).expect("write the stub");
-        fs::set_permissions(&eclipse, Permissions::from_mode(0o755)).expect("chmod");
+        stub(&root, FAILING_INSTALL);
 
         headless::run_child(
             "window::tests::a_failed_install_shows_its_output_and_frees_the_row",
@@ -1404,17 +1402,13 @@ mod tests {
             return;
         }
         let root = headless::root("controller-access");
-        let eclipse = headless::eclipse_path(&root);
-        fs::create_dir_all(eclipse.parent().expect("a bin directory")).expect("mkdir");
-        fs::write(
-            &eclipse,
-            format!(
+        stub(
+            &root,
+            &format!(
                 "#!/bin/sh\n[ \"$1\" = __controller-access ] || exit 2\n\
                  echo '{NO_INPUT_DEVICES}'\nexit 1\n"
             ),
-        )
-        .expect("write the stub");
-        fs::set_permissions(&eclipse, Permissions::from_mode(0o755)).expect("chmod");
+        );
 
         headless::run_child(
             "window::tests::the_controllers_row_says_why_controllers_cannot_work",
@@ -1470,8 +1464,7 @@ mod tests {
     fn stub(root: &Path, script: &str) {
         let eclipse = headless::eclipse_path(root);
         fs::create_dir_all(eclipse.parent().expect("a bin directory")).expect("mkdir");
-        fs::write(&eclipse, script).expect("write the stub");
-        fs::set_permissions(&eclipse, Permissions::from_mode(0o755)).expect("chmod");
+        stub_script::write(&eclipse, script);
     }
 
     #[test]
@@ -1688,18 +1681,14 @@ mod tests {
             return;
         }
         let root = headless::root("bug-report");
-        let eclipse = headless::eclipse_path(&root);
-        fs::create_dir_all(eclipse.parent().expect("a bin directory")).expect("mkdir");
-        fs::write(
-            &eclipse,
-            format!(
+        stub(
+            &root,
+            &format!(
                 "#!/bin/sh\ncase \"$1\" in __controller-access | __audio-devices) exit 0 ;; esac\n\
                  printf '%s\\n' \"$@\" > \"${{0%/*}}/arguments\"\nprintf '{}'\n",
                 REPORT.replace('\n', "\\n")
             ),
-        )
-        .expect("write the stub");
-        fs::set_permissions(&eclipse, Permissions::from_mode(0o755)).expect("chmod");
+        );
 
         headless::run_child(
             "window::tests::copy_bug_report_puts_what_doctor_prints_on_the_clipboard",
@@ -1717,8 +1706,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).expect("create the stub directory");
         let eclipse = dir.join("eclipse");
-        fs::write(&eclipse, script).expect("write the stub");
-        fs::set_permissions(&eclipse, Permissions::from_mode(0o755)).expect("chmod");
+        stub_script::write(&eclipse, script);
         let answer = glib::MainContext::new().block_on(ask(&eclipse));
         fs::remove_dir_all(&dir).ok();
         (eclipse, answer)

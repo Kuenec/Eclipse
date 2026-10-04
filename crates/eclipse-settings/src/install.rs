@@ -69,18 +69,17 @@ fn ending(process: &gio::Subprocess) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, Permissions};
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
 
     use super::*;
+    use crate::stub_script;
 
     fn stub(tag: &str, script: &str) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!("eclipse-settings-install-{tag}"));
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).expect("create the stub directory");
         let eclipse = dir.join("eclipse");
-        fs::write(&eclipse, script).expect("write the stub");
-        fs::set_permissions(&eclipse, Permissions::from_mode(0o755)).expect("make it executable");
+        stub_script::write(&eclipse, script);
         (dir, eclipse)
     }
 

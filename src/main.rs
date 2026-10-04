@@ -33,6 +33,9 @@ mod bug_report;
 mod desktop_integration;
 mod doctor;
 mod instance_control;
+#[cfg(test)]
+#[path = "../tests/support/stub_script.rs"]
+mod stub_script;
 mod supervisor;
 
 use desktop_integration::Packaging;
