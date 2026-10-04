@@ -46,14 +46,16 @@ Start **Eclipse** from your app menu. From a terminal, use `flatpak run io.githu
 | `update` | Check for a newer Roblox now |
 | `rollback` | Go back to the Roblox version before the current one, if Eclipse still keeps it |
 | `install <files>` | Install Roblox from your own `base.apk` + `split_config.x86_64.apk`, or an `.apks`/`.xapk` bundle |
-| `config` | Show the settings file path, the values in effect and any problems in the file |
+| `settings` | Open the settings window, which is also in Eclipse's right-click menu |
+| `config` | Show the settings file path, the values in effect and any problems; `config set KEY VALUE` changes one |
 | `storage` | Show the disk space Eclipse uses; `storage --clean` empties the caches and old logs |
+| `doctor` | Check the setup and say how to fix what is wrong; `doctor --report` prints a paste for a bug report |
 
 Sign-in and other Roblox web pages open inside the game window on Wayland and as a window of their own on X11.
 
 ## Settings
 
-Settings live in `~/.var/app/io.github.kuenec.Eclipse/config/eclipse/config.json`:
+Right-click Eclipse in your app menu and choose **Settings**, or edit `~/.var/app/io.github.kuenec.Eclipse/config/eclipse/config.json`:
 
 ```json
 {
@@ -93,7 +95,7 @@ flowchart LR
 - **Logged out after updating from 0.1.4 or older?** Eclipse carries your login over from the old web engine once. If it could not, the log says why; sign in again.
 - **Uninstall everything:** `flatpak uninstall --user --delete-data io.github.kuenec.Eclipse`
 
-When reporting a bug, include your distro, desktop, GPU and driver, and the log. Never attach APKs, cookies or account data.
+When reporting a bug, paste the report from **Copy Report** in the window Eclipse shows when a launch fails, **Copy Bug Report** in Settings, or the output of `flatpak run io.github.kuenec.Eclipse doctor --report`. All three leave out your home path, tokens, cookies and account ids. Never attach APKs, cookies or account data.
 
 ## More
 

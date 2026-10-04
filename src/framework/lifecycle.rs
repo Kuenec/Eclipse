@@ -28,22 +28,40 @@ const LAST_ACTIVITY_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const LAST_ACTIVITY_GRACE: Duration = Duration::from_secs(1);
 const THREAD_NAME_PATH: &str = "/proc/thread-self/comm";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientEnd {
     Played,
     WindowClosed,
     ClosedForAnotherLaunch,
     FailureShown,
+    FailureToShow { message: String, stage: Stage },
     ClientExited { status: i32 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    Starting,
+    Running,
+}
+
+impl Stage {
+    pub fn now() -> Self {
+        if crate::first_frame::shown() {
+            Self::Running
+        } else {
+            Self::Starting
+        }
+    }
+}
+
 impl ClientEnd {
-    fn status(self) -> i32 {
+    fn status(&self) -> i32 {
         match self {
             Self::Played | Self::ClosedForAnotherLaunch => 0,
-            Self::WindowClosed | Self::FailureShown => 1,
-            Self::ClientExited { status } => status,
+            Self::WindowClosed | Self::FailureShown | Self::FailureToShow { .. } => 1,
+            Self::ClientExited { status } => *status,
         }
     }
 }
@@ -57,7 +75,7 @@ pub fn report_exit_to(pipe: File) {
 pub fn finish_android_process(end: ClientEnd) -> ! {
     let mut record = EXIT_RECORD.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(pipe) = record.take() {
-        if let Err(error) = write_exit_record(pipe, end) {
+        if let Err(error) = write_exit_record(pipe, &end) {
             eprintln!("eclipse: cannot tell Eclipse's supervisor how Roblox ended: {error}");
         }
     }
@@ -71,8 +89,8 @@ pub fn exit_without_vm_teardown(status: i32) -> ! {
     unsafe { libc::_exit(status) }
 }
 
-fn write_exit_record(mut pipe: File, end: ClientEnd) -> std::io::Result<()> {
-    let mut record = serde_json::to_vec(&end)?;
+fn write_exit_record(mut pipe: File, end: &ClientEnd) -> std::io::Result<()> {
+    let mut record = serde_json::to_vec(end)?;
     record.push(b'\n');
     pipe.write_all(&record)
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 
 use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
@@ -67,6 +68,13 @@ impl<'a> Document<'a> {
     pub(crate) fn position(&self, value: &RawValue) -> Position {
         let offset = value.get().as_ptr().addr() - self.text.as_ptr().addr();
         Position::of_offset(self.text.as_bytes(), offset)
+    }
+
+    pub(crate) fn repeats(&self) -> impl Iterator<Item = &(String, &'a RawValue)> {
+        let mut seen = HashSet::new();
+        self.entries
+            .iter()
+            .filter(move |(key, _)| !seen.insert(key.as_str()))
     }
 }
 

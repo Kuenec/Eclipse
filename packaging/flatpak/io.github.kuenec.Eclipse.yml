@@ -240,16 +240,20 @@ modules:
           - vendor
           - repo
           - crates/eclipse-webview/target
+          - crates/eclipse-settings/target
           - crates/libm-shim/target
       - cargo-sources.json
     build-commands:
       - cargo build --release --locked
       - cargo build --release --locked --manifest-path crates/eclipse-webview/Cargo.toml
+      - cargo build --release --locked --manifest-path crates/eclipse-settings/Cargo.toml
       - install -Dm755 target/release/eclipse /app/lib/eclipse/eclipse
       - install -Dm755 crates/eclipse-webview/target/release/eclipse-webview /app/lib/eclipse/eclipse-webview
+      - install -Dm755 crates/eclipse-settings/target/release/eclipse-settings /app/lib/eclipse/eclipse-settings
       - install -d /app/bin
       - ln -s ../lib/eclipse/eclipse /app/bin/eclipse
       - install -Dm644 packaging/flatpak/io.github.kuenec.Eclipse.desktop /app/share/applications/io.github.kuenec.Eclipse.desktop
       - install -Dm644 packaging/flatpak/io.github.kuenec.Eclipse.UrlHandler.desktop /app/share/applications/io.github.kuenec.Eclipse.UrlHandler.desktop
+      - install -Dm644 packaging/flatpak/io.github.kuenec.Eclipse.Settings.desktop /app/share/applications/io.github.kuenec.Eclipse.Settings.desktop
       - install -Dm644 packaging/flatpak/io.github.kuenec.Eclipse.metainfo.xml /app/share/metainfo/io.github.kuenec.Eclipse.metainfo.xml
       - install -Dm644 packaging/flatpak/io.github.kuenec.Eclipse.svg /app/share/icons/hicolor/scalable/apps/io.github.kuenec.Eclipse.svg

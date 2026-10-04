@@ -12,3 +12,8 @@ SingleMainWindow=true
 X-GNOME-UsesNotifications=true
 Categories=Game;
 Keywords=roblox;android;game;
+Actions=settings;
+
+[Desktop Action settings]
+Name=Settings
+Exec=eclipse settings

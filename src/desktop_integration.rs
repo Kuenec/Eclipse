@@ -1,4 +1,5 @@
 use directories::BaseDirs;
+use eclipse::flatpak;
 use eclipse_config::temp_file::TempFile;
 use std::ffi::OsStr;
 use std::io::{self, ErrorKind};
@@ -10,7 +11,6 @@ const DESKTOP_FILE_ID: &str = "dev.eclipse.RobloxPlayer.desktop";
 const URL_HANDLER_MIMES: [&str; 2] = ["x-scheme-handler/roblox-player", "x-scheme-handler/roblox"];
 pub(super) const BROWSER_HANDLER_COMMAND: &str = "__handle-roblox-player-url";
 
-const FLATPAK_INFO: &str = "/.flatpak-info";
 const FLATPAK_APPLICATIONS_DIR: &str = "/app/share/applications";
 const FLATPAK_URL_HANDLER_SUFFIX: &str = ".UrlHandler.desktop";
 
@@ -74,24 +74,56 @@ pub(super) fn install_url_handler() -> Result<UrlHandlerInstall, Box<dyn std::er
     }
 }
 
-pub(super) fn sandbox_app_id() -> io::Result<Option<String>> {
-    let info = match std::fs::read_to_string(FLATPAK_INFO) {
-        Ok(info) => info,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(io::Error::new(
-                error.kind(),
-                format!("cannot read {FLATPAK_INFO} to detect the Flatpak sandbox: {error}"),
-            ))
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Packaging {
+    Flatpak { app_id: String },
+    Host,
+}
+
+impl Packaging {
+    pub(super) fn detect() -> io::Result<Self> {
+        Ok(match sandbox_app_id()? {
+            Some(app_id) => Self::Flatpak { app_id },
+            None => Self::Host,
+        })
+    }
+
+    pub(super) fn command(&self, arguments: &str) -> String {
+        match self {
+            Self::Flatpak { app_id } => format!("flatpak run {app_id} {arguments}"),
+            Self::Host => format!("eclipse {arguments}"),
         }
+    }
+}
+
+pub(super) fn sandbox_app_id() -> io::Result<Option<String>> {
+    let Some(info) = flatpak_info()? else {
+        return Ok(None);
     };
-    let app_id = flatpak_app_id(&info).ok_or_else(|| {
+    Ok(Some(flatpak_app_id(&info)?.to_owned()))
+}
+
+pub(super) fn flatpak_info() -> io::Result<Option<String>> {
+    match std::fs::read_to_string(flatpak::INFO_PATH) {
+        Ok(info) => Ok(Some(info)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "cannot read {} to detect the Flatpak sandbox: {error}",
+                flatpak::INFO_PATH
+            ),
+        )),
+    }
+}
+
+pub(super) fn flatpak_app_id(info: &str) -> io::Result<&str> {
+    flatpak::info_value(info, "Application", "name").ok_or_else(|| {
         io::Error::new(
             ErrorKind::InvalidData,
-            format!("{FLATPAK_INFO} names no [Application] id"),
+            format!("{} names no [Application] id", flatpak::INFO_PATH),
         )
-    })?;
-    Ok(Some(app_id.to_owned()))
+    })
 }
 
 fn flatpak_exported_handler(
@@ -114,35 +146,28 @@ fn flatpak_exported_handler(
     })
 }
 
-fn flatpak_app_id(info: &str) -> Option<&str> {
-    let mut in_application = false;
-    for line in info.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_application = line == "[Application]";
-        } else if in_application {
-            if let Some(("name", value)) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
-                return Some(value).filter(|value| !value.is_empty());
-            }
-        }
-    }
-    None
-}
-
-fn flatpak_url_handler_path(app_id: &str) -> PathBuf {
+pub(super) fn flatpak_url_handler_path(app_id: &str) -> PathBuf {
     Path::new(FLATPAK_APPLICATIONS_DIR).join(format!("{app_id}{FLATPAK_URL_HANDLER_SUFFIX}"))
 }
 
 pub(super) fn flatpak_handler_notice(app_id: &str, desktop_path: &Path) -> String {
+    format!(
+        "Eclipse is running inside the {app_id} Flatpak, which installed its own {} handler ({}) \
+         together with the app, so nothing was written to the sandbox's private data directory. If \
+         another app is the default handler, run this on the host: {}",
+        URL_HANDLER_MIMES.join(" and "),
+        desktop_path.display(),
+        make_default_handler_command(desktop_path)
+    )
+}
+
+pub(super) fn make_default_handler_command(desktop_path: &Path) -> String {
     let desktop_id = desktop_path
         .file_name()
         .map(OsStr::to_string_lossy)
         .unwrap_or_default();
     format!(
-        "Eclipse is running inside the {app_id} Flatpak, which installed its own {} handler ({}) \
-         together with the app, so nothing was written to the sandbox's private data directory. If \
-         another app is the default handler, run this on the host: xdg-mime default {desktop_id} {}",
-        URL_HANDLER_MIMES.join(" and "),
-        desktop_path.display(),
+        "xdg-mime default {desktop_id} {}",
         URL_HANDLER_MIMES.join(" ")
     )
 }
@@ -219,23 +244,7 @@ fn install_host_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
     }
 
     for mime in URL_HANDLER_MIMES {
-        let query = Command::new(&xdg_mime)
-            .arg("query")
-            .arg("default")
-            .arg(mime)
-            .output()
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "cannot run {} to query the {mime} handler: {error}",
-                        xdg_mime.display()
-                    ),
-                )
-            })?;
-        if !query.status.success()
-            || String::from_utf8_lossy(&query.stdout).trim() != DESKTOP_FILE_ID
-        {
+        if default_handler(&xdg_mime, mime)?.as_deref() != Some(DESKTOP_FILE_ID) {
             return Err(io::Error::other(format!(
                 "the desktop environment did not retain Eclipse as the {mime} handler"
             ))
@@ -244,6 +253,53 @@ fn install_host_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
     }
 
     Ok(desktop_path)
+}
+
+#[derive(Debug)]
+pub(super) enum HostHandler {
+    Eclipse,
+    Other(String),
+    Nothing,
+}
+
+pub(super) fn host_url_handler() -> io::Result<HostHandler> {
+    let xdg_mime = find_on_path("xdg-mime").ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::NotFound,
+            "xdg-mime is not installed, so the handler of Roblox links is unknown",
+        )
+    })?;
+    Ok(match default_handler(&xdg_mime, URL_HANDLER_MIMES[0])? {
+        Some(desktop_id) if desktop_id == DESKTOP_FILE_ID => HostHandler::Eclipse,
+        Some(desktop_id) => HostHandler::Other(desktop_id),
+        None => HostHandler::Nothing,
+    })
+}
+
+fn default_handler(xdg_mime: &Path, mime: &str) -> io::Result<Option<String>> {
+    let query = Command::new(xdg_mime)
+        .arg("query")
+        .arg("default")
+        .arg(mime)
+        .output()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot run {} to query the {mime} handler: {error}",
+                    xdg_mime.display()
+                ),
+            )
+        })?;
+    if !query.status.success() {
+        return Err(io::Error::other(format!(
+            "{} query default {mime} failed: {}",
+            xdg_mime.display(),
+            query.status
+        )));
+    }
+    let desktop_id = String::from_utf8_lossy(&query.stdout).trim().to_owned();
+    Ok(Some(desktop_id).filter(|desktop_id| !desktop_id.is_empty()))
 }
 
 fn write_desktop_file(
@@ -555,19 +611,28 @@ mod tests {
     }
 
     #[test]
-    fn flatpak_app_id_is_read_from_the_application_group_only() {
+    fn the_flatpak_app_id_is_the_application_name() {
         let info = "[Application]\n\
                     name=io.github.kuenec.Eclipse\n\
-                    runtime=runtime/org.gnome.Platform/x86_64/51\n\
                     \n\
                     [Instance]\n\
-                    instance-id=1234\n\
-                    app-path=/var/lib/flatpak/app/io.github.kuenec.Eclipse/x86_64/stable/abc/files\n";
-        assert_eq!(flatpak_app_id(info), Some("io.github.kuenec.Eclipse"));
-
+                    name=other\n";
+        assert_eq!(flatpak_app_id(info).ok(), Some("io.github.kuenec.Eclipse"));
         let runtime_only = "[Runtime]\nname=org.gnome.Platform\n\n[Instance]\nname=other\n";
-        assert_eq!(flatpak_app_id(runtime_only), None);
-        assert_eq!(flatpak_app_id("[Application]\nname=\n"), None);
+        assert!(flatpak_app_id(runtime_only).is_err());
+        assert!(flatpak_app_id("[Application]\nname=\n").is_err());
+    }
+
+    #[test]
+    fn commands_are_named_the_way_this_install_runs_eclipse() {
+        let flatpak = Packaging::Flatpak {
+            app_id: "io.github.kuenec.Eclipse".to_owned(),
+        };
+        assert_eq!(
+            flatpak.command("doctor --report"),
+            "flatpak run io.github.kuenec.Eclipse doctor --report"
+        );
+        assert_eq!(Packaging::Host.command("update"), "eclipse update");
     }
 
     #[test]

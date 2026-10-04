@@ -10,9 +10,11 @@ use eclipse::apk::store::{
 };
 use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode};
 use eclipse::framework::lifecycle::{
-    exit_without_vm_teardown, finish_android_process, record_normal_close_at_client_exit, ClientEnd,
+    exit_without_vm_teardown, finish_android_process, record_normal_close_at_client_exit,
+    ClientEnd, Stage,
 };
 use eclipse::framework::ActivityStart;
+use eclipse::gamepad::DeviceAccess;
 use eclipse::graphics::activation::Token;
 use eclipse::graphics::launch_window::{
     Answer, Answered, FailureHeading, LaunchWindow, Prompt, WindowClosed,
@@ -23,12 +25,17 @@ use eclipse::runtime::{ClientCacheDir, NativeLibRoot};
 use eclipse::session::LaunchOrigin;
 use eclipse::status::{StatusSink, StatusUpdate};
 use eclipse::storage::{StorageLayout, Trim};
+use eclipse_config::edit::{Applied, Change};
+use eclipse_config::{SettingError, SettingKey};
 
+mod bug_report;
 mod desktop_integration;
+mod doctor;
 mod instance_control;
 mod supervisor;
 
-use instance_control::{ClientLock, HandOff, LaunchSlot, Request};
+use desktop_integration::Packaging;
+use instance_control::{ClientLock, HandOff, LaunchSlot, Request, RUNTIME_DIR};
 use supervisor::Supervision;
 
 const CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV: &str = "ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE";
@@ -58,6 +65,8 @@ const UNSUPERVISED: &str = "the Android client must be started by Eclipse's supe
      Eclipse without ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE in its environment";
 const BROWSER_LAUNCH_CONTEXT: &str = "eclipse browser launch";
 const LAUNCH_CHECK_BUDGET: Duration = Duration::from_secs(3);
+const BUG_REPORT_LIMIT: Duration = Duration::from_secs(10);
+const SETTINGS_APP: &str = "eclipse-settings";
 
 const HELP: &str = "\
 eclipse — run the Android Roblox build on Linux (open-source, Rust)
@@ -99,7 +108,17 @@ COMMANDS:
                 Show the disk space Roblox and Eclipse use, and where. --json prints it as JSON.
                 --clean empties Roblox's cache and the WebView cache, removes older logs and the
                 Roblox versions Eclipse no longer keeps; Roblox must be closed.
-    config      Show effective configuration and its path
+    config [set KEY VALUE | unset KEY]
+                Show the settings file's path, the settings in effect and any problems in the
+                file, and exit with status 1 if it has one. `set` changes one setting, as in
+                `config set touch_mode on`, and `unset` returns one to its default; both keep
+                every other key and value as written. Changes apply the next time Roblox
+                starts.
+    settings    Open the settings window
+    doctor [--report [RUN_LOG]]
+                Check Eclipse's setup and say how to fix what is wrong. --report prints one paste
+                for a bug report: the check, how the newest launch (or RUN_LOG) ended and an
+                excerpt of its log, without your home path, tokens, cookies or account ids.
     help        Show this help
     --version   Show version
 
@@ -187,7 +206,12 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("config") => show_config(),
+        Some("config") => config_command(&args[1..]),
+        Some("doctor") => doctor_command(&args[1..]),
+        Some("settings") => {
+            eprintln!("eclipse settings: {}", open_settings(&args[1..]));
+            ExitCode::FAILURE
+        }
         Some("storage") => match storage_command(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -195,6 +219,8 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("__controller-access") => controller_access_command(),
+        Some("__log-dir") => log_dir_command(),
 
         Some("__run-libroblox-init") => {
             let outcome = parse_libroblox_init_lib_dir(&args[1..]).and_then(|lib_dir| {
@@ -718,15 +744,40 @@ fn echo_client_records() -> bool {
 }
 
 fn present_failure(launch: &LaunchCommand, target: &Launch, finished: &supervisor::Finished) {
-    let Some(failure) = finished.failure() else {
+    let presentation = if launch.launches_in_window() {
+        supervisor::Presentation::Window {
+            failure_window: installed_failure_window(),
+        }
+    } else {
+        supervisor::Presentation::Terminal
+    };
+    let Some(plan) = supervisor::presentation_plan(finished, presentation) else {
         return;
     };
-    eprintln!("{}: {failure}", target.context());
-    if launch.launches_in_window() {
-        show_error_window(FailureHeading::Stopped, &failure, Some(&finished.log));
-    } else {
-        eprintln!("Details are in {}", finished.log.display());
+    eprintln!("{}: {}", target.context(), plan.failure());
+    supervisor::present(
+        plan,
+        || write_bug_report(finished),
+        |heading, failure, details| show_error_window(heading, failure, Some(details)),
+    );
+}
+
+fn installed_failure_window() -> Option<PathBuf> {
+    match settings_app_path() {
+        Ok(app) => app.is_file().then_some(app),
+        Err(error) => {
+            eprintln!("eclipse: cannot look for the failure window next to Eclipse: {error}");
+            None
+        }
     }
+}
+
+fn write_bug_report(finished: &supervisor::Finished) -> Result<(), String> {
+    let eclipse = std::env::current_exe()
+        .map_err(|error| format!("cannot find Eclipse to write the bug report: {error}"))?;
+    let packaging =
+        Packaging::detect().map_err(|error| format!("cannot write the bug report: {error}"))?;
+    supervisor::write_report(&eclipse, &packaging, finished, BUG_REPORT_LIMIT)
 }
 
 struct ClientSettingsBridge {
@@ -736,8 +787,6 @@ struct ClientSettingsBridge {
 
 impl ClientSettingsBridge {
     fn locate() -> Result<Self, String> {
-        use std::os::unix::ffi::OsStrExt as _;
-
         let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
         let runtime_dir = app_data_dir.join(RUNTIME_DIR);
         std::fs::create_dir_all(&runtime_dir)
@@ -745,18 +794,10 @@ impl ClientSettingsBridge {
         let runtime_dir = runtime_dir
             .canonicalize()
             .map_err(|error| format!("cannot resolve {}: {error}", runtime_dir.display()))?;
-        if runtime_dir
-            .as_os_str()
-            .as_bytes()
-            .iter()
-            .any(|byte| matches!(byte, b':' | b';'))
+        if let Some(problem) =
+            doctor::runtime_dir_problem(&runtime_dir).map_err(|error| error.to_string())?
         {
-            return Err(format!(
-                "the Android client-settings bridge directory {} contains a colon or semicolon, \
-                 which LD_LIBRARY_PATH cannot carry; set ECLIPSE_APP_DATA_DIR to a directory \
-                 without colons or semicolons",
-                runtime_dir.display()
-            ));
+            return Err(problem.to_string());
         }
         Ok(Self {
             app_data_dir,
@@ -797,40 +838,50 @@ impl ClientSettingsBridge {
 
 fn run_client(launch: LaunchCommand, supervision: Option<Supervision>) -> ExitCode {
     if let Err(error) = client_settings_path() {
-        report_setup_failure(&launch, SETTINGS_CONTEXT, &error);
-        return match supervision {
-            Some(_) => finish_android_process(ClientEnd::FailureShown),
-            None => ExitCode::FAILURE,
-        };
+        if supervision.is_none() {
+            report_setup_failure(&launch, SETTINGS_CONTEXT, &error);
+            return ExitCode::FAILURE;
+        }
+        finish_android_process(client_setup_failure(&launch, SETTINGS_CONTEXT, error));
     }
-    let Some(Supervision { records, run_log }) = supervision else {
+    let Some(Supervision { records }) = supervision else {
         report_setup_failure(&launch, launch.launch().context(), UNSUPERVISED);
         return ExitCode::FAILURE;
     };
     if let Err(error) = eclipse::loader::frame_log::arm_from_env() {
-        report_setup_failure(&launch, FRAME_LOG_CONTEXT, &error.to_string());
-        finish_android_process(ClientEnd::FailureShown);
+        finish_android_process(client_setup_failure(
+            &launch,
+            FRAME_LOG_CONTEXT,
+            error.to_string(),
+        ));
     }
     eclipse::diagnostics::init(eclipse::diagnostics::LogSink::Supervisor(records));
     tracing::debug!(version = eclipse::VERSION, "eclipse client starting");
     let loaded = eclipse_config::load();
     let auto_update = loaded.config.roblox_auto_update;
     let end = match launch {
-        LaunchCommand::Run(run) => launch_in_window(
-            &Launch::Installed,
-            run.check(auto_update),
-            &loaded,
-            &run_log,
-        ),
+        LaunchCommand::Run(run) => {
+            launch_in_window(&Launch::Installed, run.check(auto_update), &loaded)
+        }
         LaunchCommand::RunFile(path) => run_file(&path, &loaded),
         LaunchCommand::Link(target) => launch_in_window(
             &Launch::Link(target),
             RunCheck::Configured.check(auto_update),
             &loaded,
-            &run_log,
         ),
     };
     finish_android_process(end)
+}
+
+fn client_setup_failure(launch: &LaunchCommand, context: &str, error: String) -> ClientEnd {
+    if launch.launches_in_window() {
+        return ClientEnd::FailureToShow {
+            message: error,
+            stage: Stage::Starting,
+        };
+    }
+    eprintln!("{context}: {error}");
+    ClientEnd::FailureShown
 }
 
 fn prepend_search_list_entry(
@@ -897,6 +948,224 @@ fn report_config(loaded: &eclipse_config::Loaded, status: &StatusSink) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigAction {
+    Show,
+    Edit(Result<Change, SettingError>),
+}
+
+fn parse_config_action(arguments: &[OsString]) -> Result<ConfigAction, &'static str> {
+    let key = |name: &OsString| SettingKey::from_name(&name.to_string_lossy());
+    match arguments {
+        [] => Ok(ConfigAction::Show),
+        [command, name, value] if command == "set" => {
+            let value = setting_value(&value.to_string_lossy());
+            let setting = key(name).and_then(|key| key.parse(value));
+            Ok(ConfigAction::Edit(setting.map(Change::Set)))
+        }
+        [command, name] if command == "unset" => {
+            Ok(ConfigAction::Edit(key(name).map(Change::Unset)))
+        }
+        _ => Err(CONFIG_USAGE),
+    }
+}
+
+fn setting_value(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::from(text))
+}
+
+fn config_command(arguments: &[OsString]) -> ExitCode {
+    let edited = match parse_config_action(arguments) {
+        Ok(ConfigAction::Show) => return show_config(),
+        Ok(ConfigAction::Edit(change)) => edit_config(change),
+        Err(usage) => Err(usage.to_owned()),
+    };
+    match edited {
+        Ok(outcome) => {
+            println!("{outcome}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("eclipse config: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn edit_config(change: Result<Change, SettingError>) -> Result<String, String> {
+    let path = eclipse_config::config_path().ok_or(NO_CONFIG_DIR)?;
+    let change = change.map_err(|error| match error {
+        SettingError::FileOnly(key) => {
+            format!("`{key}` is edited by hand in {}", path.display())
+        }
+        SettingError::UnknownKey(_) | SettingError::Invalid { .. } => error.to_string(),
+    })?;
+    let applied = eclipse_config::edit::apply(&path, change).map_err(|error| error.to_string())?;
+    Ok(edit_outcome(change, applied, &path))
+}
+
+fn edit_outcome(change: Change, applied: Applied, path: &Path) -> String {
+    let name = change.key().name();
+    let path = path.display();
+    let json = |setting| serde_json::to_string(&setting).expect("a setting has a JSON form");
+    match (change, applied) {
+        (Change::Set(setting), Applied::Written) => {
+            format!("{name} is now {} in {path}", json(setting))
+        }
+        (Change::Set(setting), Applied::Unchanged) => {
+            format!("{name} is already {} in {path}", json(setting))
+        }
+        (Change::Unset(key), Applied::Written) => format!(
+            "{name} is removed from {path}; Eclipse uses the default ({})",
+            key.default_json()
+        ),
+        (Change::Unset(key), Applied::Unchanged) => format!(
+            "{name} is not set in {path}; Eclipse uses the default ({})",
+            key.default_json()
+        ),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DoctorAction {
+    Check,
+    Report(Option<PathBuf>),
+}
+
+fn parse_doctor_action(arguments: &[OsString]) -> Result<DoctorAction, &'static str> {
+    match arguments {
+        [] => Ok(DoctorAction::Check),
+        [flag] if flag == "--report" => Ok(DoctorAction::Report(None)),
+        [flag, run_log] if flag == "--report" => {
+            Ok(DoctorAction::Report(Some(PathBuf::from(run_log))))
+        }
+        _ => Err(DOCTOR_USAGE),
+    }
+}
+
+fn doctor_command(arguments: &[OsString]) -> ExitCode {
+    use std::io::Write as _;
+
+    let text = match parse_doctor_action(arguments) {
+        Ok(DoctorAction::Check) => Ok(doctor::Doctor::examine().to_string()),
+        Ok(DoctorAction::Report(run_log)) => {
+            bug_report::report(&doctor::Doctor::examine(), run_log.as_deref())
+        }
+        Err(usage) => Err(usage.to_owned()),
+    };
+    let written = text.and_then(|text| {
+        std::io::stdout()
+            .lock()
+            .write_all(text.as_bytes())
+            .map_err(|error| format!("cannot write to standard output: {error}"))
+    });
+    match written {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("eclipse doctor: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn controller_access_command() -> ExitCode {
+    let access = eclipse::gamepad::device_access();
+    println!("{access}");
+    match access {
+        DeviceAccess::Visible => ExitCode::SUCCESS,
+        DeviceAccess::MissingInFlatpak(_) | DeviceAccess::MissingOnHost => ExitCode::FAILURE,
+    }
+}
+
+fn log_dir_command() -> ExitCode {
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let Some(app_data_dir) = eclipse::framework::app_data_dir() else {
+        eprintln!("eclipse __log-dir: {NO_APP_DATA_DIR}");
+        return ExitCode::FAILURE;
+    };
+    let mut line = eclipse::diagnostics::log_dir(&app_data_dir)
+        .into_os_string()
+        .into_vec();
+    line.push(b'\n');
+    match std::io::stdout().lock().write_all(&line) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("eclipse __log-dir: cannot write to standard output: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn open_settings(arguments: &[OsString]) -> String {
+    use std::os::unix::process::CommandExt as _;
+
+    if !arguments.is_empty() {
+        return "usage: eclipse settings".to_owned();
+    }
+    let settings = match settings_app_path() {
+        Ok(settings) => settings,
+        Err(error) => return format!("cannot find Eclipse's own executable: {error}"),
+    };
+    let error = std::process::Command::new(&settings).exec();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return format!(
+            "the settings app is not installed at {}; it ships with the Flatpak",
+            settings.display()
+        );
+    }
+    format!("cannot start {}: {error}", settings.display())
+}
+
+fn settings_app_path() -> std::io::Result<PathBuf> {
+    Ok(std::env::current_exe()?.with_file_name(SETTINGS_APP))
+}
+
+fn installed_settings_app() -> std::io::Result<Option<Packaging>> {
+    if !settings_app_path()?.is_file() {
+        return Ok(None);
+    }
+    Packaging::detect().map(Some)
+}
+
+fn first_run_note(
+    installed: Option<&InstalledVersion>,
+    settings: Option<&Packaging>,
+) -> Option<String> {
+    if installed.is_some() {
+        return None;
+    }
+    let settings = settings?;
+    let command = settings.command("settings");
+    let opening = match settings {
+        Packaging::Flatpak { .. } => {
+            format!("right-click Eclipse in your app menu, or run `{command}`")
+        }
+        Packaging::Host => format!("run `{command}`"),
+    };
+    Some(format!("{FIRST_RUN} Settings: {opening}."))
+}
+
+fn note_first_run(store: &Store, status: &StatusSink) {
+    let Ok(installed) = store.current() else {
+        return;
+    };
+    let settings = match installed_settings_app() {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "cannot tell whether the settings app is installed; the first-run note is not shown"
+            );
+            return;
+        }
+    };
+    if let Some(note) = first_run_note(installed.as_ref(), settings.as_ref()) {
+        status.note(note);
+    }
+}
+
 fn show_config() -> ExitCode {
     let loaded = eclipse_config::load();
     if let Some(path) = &loaded.path {
@@ -910,7 +1179,10 @@ fn show_config() -> ExitCode {
         }
     }
     for problem in &loaded.problems {
-        eprintln!("eclipse config: {problem}");
+        eprintln!("{problem}");
+    }
+    if let Some(message) = loaded.unused_keys_message() {
+        eprintln!("{message}");
     }
     if loaded.problems.is_empty() {
         ExitCode::SUCCESS
@@ -922,15 +1194,23 @@ fn show_config() -> ExitCode {
 const NOT_INSTALLED: &str = "Roblox is not installed; run `eclipse update` to download it, or \
      install the APKs with `eclipse install <PATH>`";
 
+const FIRST_RUN: &str = "First run: Eclipse is downloading Roblox's official release and \
+     installs it only if Roblox's signature checks out.";
+
 const NOTHING_KEPT: &str = "Eclipse keeps no other Roblox version to go back to; it keeps the \
      previous one only until the current one has been played and closed once";
 
 const NO_APP_DATA_DIR: &str = "cannot resolve Eclipse's app-data directory; set HOME, \
      XDG_DATA_HOME, or ECLIPSE_APP_DATA_DIR";
 
-const VERIFYING_SIGNATURE: &str = "Verifying the Roblox client's signature…";
+const NO_CONFIG_DIR: &str =
+    "cannot resolve Eclipse's config directory; set HOME or XDG_CONFIG_HOME";
 
-const RUNTIME_DIR: &str = "runtime";
+const CONFIG_USAGE: &str = "usage: eclipse config [set KEY VALUE | unset KEY]";
+
+const DOCTOR_USAGE: &str = "usage: eclipse doctor [--report [RUN_LOG]]";
+
+const VERIFYING_SIGNATURE: &str = "Verifying the Roblox client's signature…";
 
 const CLIENT_SETTINGS_FILE: &str = "ClientAppSettings.json";
 
@@ -1219,6 +1499,7 @@ fn installed_apk_set(
     status: &StatusSink,
 ) -> Result<InstalledClient, Box<dyn std::error::Error>> {
     let store = Store::open()?;
+    note_first_run(&store, status);
     match store.settle_launch() {
         Ok(Some(both_failed)) => status.warning(both_failed.to_string()),
         Ok(None) => {}
@@ -1512,15 +1793,10 @@ fn window_title() -> String {
 }
 
 fn show_error_window(heading: FailureHeading, message: &str, log: Option<&Path>) {
-    if let Some(mut window) = open_error_window() {
-        window.show_error(heading, message, log);
+    match LaunchWindow::open(&window_title()) {
+        Ok(mut window) => window.show_error(heading, message, log),
+        Err(error) => eprintln!("eclipse: cannot open a window to show this error: {error}"),
     }
-}
-
-fn open_error_window() -> Option<LaunchWindow> {
-    LaunchWindow::open(&window_title())
-        .inspect_err(|error| eprintln!("eclipse: cannot open a window to show this error: {error}"))
-        .ok()
 }
 
 fn report_failure(launch: &Launch, error: &str) {
@@ -1585,50 +1861,22 @@ fn lock_run_in(
     Ok(RunStart::Locked(LockedRun { lock, log }))
 }
 
-struct SetupFailure {
-    error: String,
-    listener: Option<std::os::unix::net::UnixListener>,
-}
-
-impl From<String> for SetupFailure {
-    fn from(error: String) -> Self {
-        Self {
-            error,
-            listener: None,
-        }
-    }
-}
-
 fn start_client_run(
     launch: &Launch,
     fflags: &BTreeMap<String, serde_json::Value>,
-) -> Result<Option<std::os::unix::net::UnixListener>, SetupFailure> {
-    let control = match launch.control_request(None) {
+) -> Result<Option<std::os::unix::net::UnixListener>, String> {
+    let listener = match launch.control_request(None) {
         Some(_) => {
-            let app_data_dir =
-                eclipse::framework::app_data_dir().ok_or_else(|| NO_APP_DATA_DIR.to_owned())?;
-            Some(instance_control::control_socket(&app_data_dir)?)
+            let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
+            let control = instance_control::control_socket(&app_data_dir)?;
+            Some(instance_control::listen(&control)?)
         }
         None => None,
     };
-    start_client_run_in(control.as_deref(), client_settings_path(), fflags)
-}
-
-fn start_client_run_in(
-    control: Option<&Path>,
-    client_settings: Result<PathBuf, String>,
-    fflags: &BTreeMap<String, serde_json::Value>,
-) -> Result<Option<std::os::unix::net::UnixListener>, SetupFailure> {
-    let listener = control.map(instance_control::listen).transpose()?;
-    let prepared = client_settings
-        .and_then(|path| stage_client_settings(&path, fflags))
-        .and_then(|()| {
-            eclipse::runtime::prepare_art_boot_environment().map_err(|error| error.to_string())
-        });
-    match prepared {
-        Ok(()) => Ok(listener),
-        Err(error) => Err(SetupFailure { error, listener }),
-    }
+    let settings = client_settings_path()?;
+    stage_client_settings(&settings, fflags)?;
+    eclipse::runtime::prepare_art_boot_environment().map_err(|error| error.to_string())?;
+    Ok(listener)
 }
 
 fn stage_client_settings(
@@ -1701,21 +1949,19 @@ fn launch_in_window(
     launch: &Launch,
     check: LaunchCheck,
     loaded: &eclipse_config::Loaded,
-    log: &Path,
 ) -> ClientEnd {
     let (sender, updates) = std::sync::mpsc::channel();
     let status = StatusSink::with_window(sender.clone());
     report_config(loaded, &status);
     let listener = match start_client_run(launch, &loaded.config.fflags) {
         Ok(listener) => listener,
-        Err(failure) => return show_setup_failure(launch, failure, log),
+        Err(error) => return failure_to_show(error),
     };
     let preparation = prepare_in_background(check, sender);
     let mut window = match LaunchWindow::open(&window_title()) {
         Ok(window) => window,
         Err(error) => {
-            report_failure(launch, &format!("cannot open the Eclipse window: {error}"));
-            return ClientEnd::FailureShown;
+            return failure_to_show(format!("cannot open the Eclipse window: {error}"));
         }
     };
     let slot = std::sync::Arc::new(LaunchSlot::new(launch.target().cloned()));
@@ -1726,10 +1972,9 @@ fn launch_in_window(
             window.control(),
         );
         if let Err(error) = serving {
-            let error = format!("cannot take launches from other Eclipse processes: {error}");
-            report_failure(launch, &error);
-            window.show_error(FailureHeading::CouldNotStart, &error, Some(log));
-            return ClientEnd::FailureShown;
+            return failure_to_show(format!(
+                "cannot take launches from other Eclipse processes: {error}"
+            ));
         }
     }
     let played = preparation.map_err(Into::into).and_then(|worker| {
@@ -1751,47 +1996,18 @@ fn launch_in_window(
         return ClientEnd::ClosedForAnotherLaunch;
     }
     slot.end();
-    let text = error.to_string();
-    report_failure(launch, &text);
-    window.show_error(
-        FailureHeading::CouldNotStart,
-        &text,
-        Some(&eclipse::diagnostics::newest_run_part(log)),
-    );
-    if slot.closing() {
-        ClientEnd::ClosedForAnotherLaunch
-    } else if error.is::<WindowClosed>() {
-        ClientEnd::WindowClosed
-    } else {
-        ClientEnd::FailureShown
+    if error.is::<WindowClosed>() {
+        report_failure(launch, &error.to_string());
+        return ClientEnd::WindowClosed;
     }
+    failure_to_show(error.to_string())
 }
 
-fn show_setup_failure(launch: &Launch, failure: SetupFailure, log: &Path) -> ClientEnd {
-    report_failure(launch, &failure.error);
-    let Some(mut window) = open_error_window() else {
-        return ClientEnd::FailureShown;
-    };
-    let slot = std::sync::Arc::new(LaunchSlot::new(None));
-    slot.end();
-    if let Some(listener) = failure.listener {
-        let serving = instance_control::serve_in_background(
-            listener,
-            std::sync::Arc::clone(&slot),
-            window.control(),
-        );
-        if let Err(error) = serving {
-            tracing::warn!(
-                %error,
-                "later Eclipse launches cannot close this error and will report Roblox as running"
-            );
-        }
-    }
-    window.show_error(FailureHeading::CouldNotStart, &failure.error, Some(log));
-    if slot.closing() {
-        ClientEnd::ClosedForAnotherLaunch
-    } else {
-        ClientEnd::FailureShown
+fn failure_to_show(message: String) -> ClientEnd {
+    eclipse::diagnostics::record_status(tracing::Level::ERROR, &message);
+    ClientEnd::FailureToShow {
+        message,
+        stage: Stage::now(),
     }
 }
 
@@ -2763,11 +2979,12 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_storage, finish_update, installed_client_note, installed_or_updated_set, lock_run_in,
-        native_lib_dir, parse_libroblox_init_lib_dir, parse_storage_action, parse_update_source,
-        record_normal_end, remove_other_native_lib_versions, remove_other_version_oats,
-        update_if_due, url_handler_message, window_title, ClientLock, Launch, LaunchCheck,
-        LaunchCommand, LaunchCommandError, Proving, Request, RunCheck, RunStart, StorageAction,
+        clean_storage, finish_update, first_run_note, installed_client_note,
+        installed_or_updated_set, lock_run_in, native_lib_dir, parse_libroblox_init_lib_dir,
+        parse_storage_action, parse_update_source, record_normal_end,
+        remove_other_native_lib_versions, remove_other_version_oats, update_if_due,
+        url_handler_message, window_title, ClientLock, Launch, LaunchCheck, LaunchCommand,
+        LaunchCommandError, Packaging, Proving, Request, RunCheck, RunStart, StorageAction,
         StorageLayout, Token, UpdateSource, HELP, LAUNCH_CHECK_BUDGET, LAUNCH_LINK_COMMAND,
         LAUNCH_LINK_ENV, NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE,
     };
@@ -2952,6 +3169,88 @@ mod tests {
                 Err("usage: eclipse storage [--json | --clean]".to_owned()),
                 "{refused:?}"
             );
+        }
+    }
+
+    #[test]
+    fn doctor_takes_a_report_flag_with_an_optional_run_log() {
+        use super::{parse_doctor_action, DoctorAction, DOCTOR_USAGE};
+
+        let action = |arguments: &[&str]| {
+            let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+            parse_doctor_action(&arguments)
+        };
+        assert_eq!(action(&[]), Ok(DoctorAction::Check));
+        assert_eq!(action(&["--report"]), Ok(DoctorAction::Report(None)));
+        assert_eq!(
+            action(&["--report", "eclipse.log"]),
+            Ok(DoctorAction::Report(Some(std::path::PathBuf::from(
+                "eclipse.log"
+            ))))
+        );
+        for refused in [&["report"][..], &["eclipse.log"], &["--report", "a", "b"]] {
+            assert_eq!(action(refused), Err(DOCTOR_USAGE), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn config_sets_a_setting_from_json_or_text_and_unsets_one() {
+        use super::{parse_config_action, ConfigAction, CONFIG_USAGE};
+        use eclipse_config::edit::Change;
+        use eclipse_config::{CloseOnLeave, Setting, SettingError, SettingKey, TouchMode};
+
+        let action = |arguments: &[&str]| {
+            let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+            parse_config_action(&arguments)
+        };
+        let set = |setting| Ok(ConfigAction::Edit(Ok(Change::Set(setting))));
+        assert_eq!(action(&[]), Ok(ConfigAction::Show));
+        assert_eq!(
+            action(&["set", "touch_mode", "on"]),
+            set(Setting::TouchMode(TouchMode::On))
+        );
+        assert_eq!(
+            action(&["set", "enable_gamemode", "false"]),
+            set(Setting::EnableGamemode(false))
+        );
+        for browser in ["browser", r#""browser""#] {
+            assert_eq!(
+                action(&["set", "close_on_leave", browser]),
+                set(Setting::CloseOnLeave(CloseOnLeave::LinkLaunches))
+            );
+        }
+        assert_eq!(
+            action(&["unset", "touch_mode"]),
+            Ok(ConfigAction::Edit(Ok(Change::Unset(SettingKey::TouchMode))))
+        );
+
+        let refused = |arguments: &[&str]| match action(arguments) {
+            Ok(ConfigAction::Edit(Err(error))) => error,
+            other => panic!("{arguments:?}: expected a refused edit, got {other:?}"),
+        };
+        assert!(matches!(
+            refused(&["set", "enable_gamemode", r#""false""#]),
+            SettingError::Invalid {
+                key: SettingKey::EnableGamemode,
+                ..
+            }
+        ));
+        assert_eq!(
+            refused(&["set", "fflags", "{}"]),
+            SettingError::FileOnly("fflags")
+        );
+        assert_eq!(
+            refused(&["unset", "use_opengl"]),
+            SettingError::UnknownKey("use_opengl".to_owned())
+        );
+        for usage in [
+            &["set", "touch_mode"][..],
+            &["set", "touch_mode", "on", "off"],
+            &["unset"],
+            &["unset", "touch_mode", "on"],
+            &["show"],
+        ] {
+            assert_eq!(action(usage), Err(CONFIG_USAGE), "{usage:?}");
         }
     }
 
@@ -3336,25 +3635,6 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_that_fails_its_setup_keeps_answering_later_launches() {
-        let root = super::instance_control::socket_test_root("setup-failure");
-        let socket = root.join("c.sock");
-        let failure = super::start_client_run_in(
-            Some(&socket),
-            Err("the client-settings bridge did not load".to_owned()),
-            &BTreeMap::new(),
-        )
-        .expect_err("setup fails without the client-settings bridge");
-        assert_eq!(failure.error, "the client-settings bridge did not load");
-        let listener = failure
-            .listener
-            .expect("the control socket is bound before any setup step can fail");
-        let _later_launch = std::os::unix::net::UnixStream::connect(&socket).unwrap();
-        listener.accept().unwrap();
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
     fn every_launch_but_a_file_run_shows_setup_failures_in_a_window() {
         let place = "roblox://placeId=1818";
         for (arguments, launch_link) in [
@@ -3604,6 +3884,34 @@ mod tests {
         std::fs::write(root.join("current.json"), b"{\"version_code\": 3170}").unwrap();
         assert_eq!(installed_client_note(&store), None);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_first_run_note_names_how_to_open_settings_where_eclipse_runs() {
+        let in_flatpak = Packaging::Flatpak {
+            app_id: "io.github.kuenec.Eclipse".to_owned(),
+        };
+        assert_eq!(
+            first_run_note(None, Some(&in_flatpak)).as_deref(),
+            Some(
+                "First run: Eclipse is downloading Roblox's official release and installs it \
+                 only if Roblox's signature checks out. Settings: right-click Eclipse in your app \
+                 menu, or run `flatpak run io.github.kuenec.Eclipse settings`."
+            )
+        );
+        assert_eq!(
+            first_run_note(None, Some(&Packaging::Host)).as_deref(),
+            Some(
+                "First run: Eclipse is downloading Roblox's official release and installs it \
+                 only if Roblox's signature checks out. Settings: run `eclipse settings`."
+            )
+        );
+        let installed = InstalledVersion {
+            version_code: VersionCode(3170),
+            version_name: None,
+        };
+        assert_eq!(first_run_note(Some(&installed), Some(&in_flatpak)), None);
+        assert_eq!(first_run_note(None, None), None);
     }
 
     #[test]

@@ -44,6 +44,17 @@ updates:
       webview-dependencies:
         patterns: ["*"]
 
+  - package-ecosystem: cargo
+    directory: /crates/eclipse-settings
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:40"
+      timezone: Europe/Paris
+    groups:
+      settings-dependencies:
+        patterns: ["*"]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

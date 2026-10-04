@@ -1,12 +1,14 @@
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher, RandomState};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const SUFFIX: &str = ".tmp";
 const NAME_ATTEMPTS: usize = 16;
 const ABANDONED_AGE: Duration = Duration::from_secs(60 * 60);
+const DEFAULT_MODE: u32 = 0o666;
 
 pub struct TempFile {
     path: PathBuf,
@@ -16,10 +18,19 @@ pub struct TempFile {
 
 impl TempFile {
     pub fn create(dir: &Path, name: &str) -> io::Result<Self> {
+        Self::create_with_mode(dir, name, DEFAULT_MODE)
+    }
+
+    pub fn create_with_mode(dir: &Path, name: &str, mode: u32) -> io::Result<Self> {
         let mut attempts = 1;
         loop {
             let path = dir.join(unique_name(name));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            let opened = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&path);
+            match opened {
                 Ok(file) => {
                     return Ok(Self {
                         path,
@@ -43,6 +54,10 @@ impl TempFile {
 
     pub fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.file.write_all(bytes)
+    }
+
+    pub fn set_permissions(&self, permissions: fs::Permissions) -> io::Result<()> {
+        self.file.set_permissions(permissions)
     }
 
     pub fn sync(&self) -> io::Result<()> {

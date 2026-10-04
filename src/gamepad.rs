@@ -1,8 +1,10 @@
 use std::path::Path;
 
+use crate::flatpak;
+
 mod sdl;
 
-pub use sdl::GamepadService;
+pub use sdl::{sdl_version, GamepadService, SdlVersion};
 
 const MAX_PADS: usize = 8;
 
@@ -73,15 +75,17 @@ const SDL_GAMEPAD_TYPE_PS3: i32 = 4;
 const SDL_GAMEPAD_TYPE_PS4: i32 = 5;
 const SDL_GAMEPAD_TYPE_PS5: i32 = 6;
 
+const INPUT_DEVICE_GRANT: flatpak::Version = flatpak::Version::new(1, 16, 0);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceAccess {
     Visible,
-    MissingInFlatpak,
+    MissingInFlatpak(Option<flatpak::Version>),
     MissingOnHost,
 }
 
 pub fn device_access() -> DeviceAccess {
-    device_access_at(Path::new("/dev/input"), Path::new("/.flatpak-info"))
+    device_access_at(Path::new("/dev/input"), Path::new(flatpak::INFO_PATH))
 }
 
 fn device_access_at(input_dir: &Path, flatpak_info: &Path) -> DeviceAccess {
@@ -93,9 +97,42 @@ fn device_access_at(input_dir: &Path, flatpak_info: &Path) -> DeviceAccess {
     if event_node_visible {
         DeviceAccess::Visible
     } else if flatpak_info.exists() {
-        DeviceAccess::MissingInFlatpak
+        let version = std::fs::read_to_string(flatpak_info)
+            .ok()
+            .and_then(|info| flatpak::Version::of_instance(&info));
+        DeviceAccess::MissingInFlatpak(version)
     } else {
         DeviceAccess::MissingOnHost
+    }
+}
+
+impl std::fmt::Display for DeviceAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let app_id = crate::APP_ID;
+        match self {
+            Self::Visible => f.write_str("input devices are visible"),
+            Self::MissingInFlatpak(Some(version)) if *version >= INPUT_DEVICE_GRANT => write!(
+                f,
+                "/dev/input is not visible in the sandbox because an override removed it; to \
+                 allow controllers, run `flatpak override --user --device=input {app_id}`"
+            ),
+            Self::MissingInFlatpak(Some(version)) => write!(
+                f,
+                "/dev/input is not visible in the sandbox because Flatpak {version} is older \
+                 than {INPUT_DEVICE_GRANT}, which cannot grant input devices alone; to allow \
+                 controllers, run `flatpak override --user --device=all {app_id}`"
+            ),
+            Self::MissingInFlatpak(None) => write!(
+                f,
+                "/dev/input is not visible in the sandbox (Flatpak older than \
+                 {INPUT_DEVICE_GRANT}, or an override removed it); to allow controllers, run \
+                 `flatpak override --user --device=all {app_id}`"
+            ),
+            Self::MissingOnHost => f.write_str(
+                "no /dev/input/event* devices are visible; check that your user can read input \
+                 devices",
+            ),
+        }
     }
 }
 
@@ -111,18 +148,8 @@ pub(crate) fn start_service() -> Option<GamepadService> {
                 None
             }
         },
-        DeviceAccess::MissingInFlatpak => {
-            tracing::info!(
-                "controllers unavailable: /dev/input is not visible in the sandbox (Flatpak older \
-                 than 1.16, or an override removed it); see the guide's Controllers section"
-            );
-            None
-        }
-        DeviceAccess::MissingOnHost => {
-            tracing::info!(
-                "controllers unavailable: no /dev/input/event* devices are visible; check that \
-                 your user can read input devices"
-            );
+        access @ (DeviceAccess::MissingInFlatpak(_) | DeviceAccess::MissingOnHost) => {
+            tracing::info!("controllers unavailable: {access}");
             None
         }
     }
@@ -1437,12 +1464,14 @@ mod tests {
         std::fs::write(&flatpak_info, "[Application]\n").expect("write the Flatpak marker");
         assert_eq!(
             device_access_at(&input, &flatpak_info),
-            DeviceAccess::MissingInFlatpak
+            DeviceAccess::MissingInFlatpak(None)
         );
+        std::fs::write(&flatpak_info, "[Instance]\nflatpak-version=1.16.1\n")
+            .expect("write the Flatpak marker");
         std::fs::create_dir_all(input.join("by-id")).expect("create /dev/input");
         assert_eq!(
             device_access_at(&input, &flatpak_info),
-            DeviceAccess::MissingInFlatpak
+            DeviceAccess::MissingInFlatpak(Some(flatpak::Version::new(1, 16, 1)))
         );
         std::fs::write(input.join("event3"), "").expect("create an event node");
         assert_eq!(
@@ -1450,5 +1479,45 @@ mod tests {
             DeviceAccess::Visible
         );
         std::fs::remove_dir_all(&root).expect("remove the fixture");
+    }
+
+    #[test]
+    fn missing_input_devices_ask_for_the_narrowest_grant_the_flatpak_supports() {
+        let grant = |access: DeviceAccess| {
+            let text = access.to_string();
+            text.split_once("run `")
+                .and_then(|(_, command)| command.strip_suffix('`'))
+                .unwrap_or_else(|| panic!("no command in {text}"))
+                .to_owned()
+        };
+        for (version, command) in [
+            (
+                Some(flatpak::Version::new(1, 16, 0)),
+                "flatpak override --user --device=input io.github.kuenec.Eclipse",
+            ),
+            (
+                Some(flatpak::Version::new(1, 18, 2)),
+                "flatpak override --user --device=input io.github.kuenec.Eclipse",
+            ),
+            (
+                Some(flatpak::Version::new(1, 14, 10)),
+                "flatpak override --user --device=all io.github.kuenec.Eclipse",
+            ),
+            (
+                None,
+                "flatpak override --user --device=all io.github.kuenec.Eclipse",
+            ),
+        ] {
+            assert_eq!(
+                grant(DeviceAccess::MissingInFlatpak(version)),
+                command,
+                "{version:?}"
+            );
+        }
+        assert!(
+            DeviceAccess::MissingInFlatpak(Some(flatpak::Version::new(1, 14, 10)))
+                .to_string()
+                .contains("Flatpak 1.14.10 is older than 1.16.0"),
+        );
     }
 }

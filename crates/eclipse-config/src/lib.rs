@@ -1,16 +1,17 @@
 mod document;
+pub mod edit;
 mod load;
 pub mod shell;
 pub mod temp_file;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Serialize, Serializer};
 
 pub use document::Position;
-pub use load::{load, load_from, Loaded, Problem};
+pub use load::{config_path, load, load_from, Loaded, Problem};
 
 const SOBER_FAKE_OFF: &str = "fake_off";
 
@@ -56,7 +57,7 @@ pub enum TouchMode {
 }
 
 impl TouchMode {
-    const ALL: [Self; 3] = [Self::Off, Self::On, Self::FakeOff];
+    pub const ALL: [Self; 3] = [Self::Off, Self::On, Self::FakeOff];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -90,7 +91,7 @@ pub enum CloseOnLeave {
 }
 
 impl CloseOnLeave {
-    const ALL: [Self; 3] = [Self::Never, Self::LinkLaunches, Self::Always];
+    pub const ALL: [Self; 3] = [Self::Never, Self::LinkLaunches, Self::Always];
 
     const fn json_form(self) -> &'static str {
         match self {
@@ -255,6 +256,11 @@ impl SettingKey {
         }
     }
 
+    #[must_use]
+    pub fn default_json(self) -> String {
+        Key::Setting(self).default_json()
+    }
+
     pub fn parse(self, value: serde_json::Value) -> Result<Setting, SettingError> {
         self.setting(&value)
             .map_err(|message| SettingError::Invalid { key: self, message })
@@ -366,6 +372,12 @@ impl fmt::Display for SettingError {
 }
 
 impl std::error::Error for SettingError {}
+
+fn containing_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
 
 #[cfg(test)]
 mod tests {
@@ -643,5 +655,8 @@ mod tests {
         assert_eq!(default_json("allow_gamepad_permission"), "true");
         assert_eq!(default_json("fflags"), "{}");
         assert_eq!(default_json("webview_helper_path"), "null");
+        for key in SettingKey::ALL {
+            assert_eq!(key.default_json(), default_json(key.name()));
+        }
     }
 }

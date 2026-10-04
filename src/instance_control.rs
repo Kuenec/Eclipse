@@ -18,6 +18,7 @@ use rustix::process::Uid;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+pub(crate) const RUNTIME_DIR: &str = "runtime";
 const CLIENT_LOCK_FILE: &str = "client.lock";
 const PROMPT_LOCK_EXTENSION: &str = "prompt";
 const HOST_SOCKET_DIR: &str = "eclipse";

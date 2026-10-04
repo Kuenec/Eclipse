@@ -60,6 +60,12 @@ impl Token {
             command.env(name, &self.0);
         }
     }
+
+    pub fn withhold_from(command: &mut Command) {
+        for name in LAUNCH_TOKEN_VARIABLES {
+            command.env_remove(name);
+        }
+    }
 }
 
 impl TryFrom<String> for Token {
@@ -203,6 +209,23 @@ mod tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_withheld_token_reaches_the_command_under_neither_startup_variable() {
+        use std::collections::BTreeMap;
+        use std::ffi::OsStr;
+
+        let mut command = Command::new("eclipse-settings");
+        Token::withhold_from(&mut command);
+        let withheld: BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            withheld,
+            BTreeMap::from([
+                (OsStr::new("DESKTOP_STARTUP_ID"), None),
+                (OsStr::new("XDG_ACTIVATION_TOKEN"), None)
+            ])
+        );
     }
 
     #[test]

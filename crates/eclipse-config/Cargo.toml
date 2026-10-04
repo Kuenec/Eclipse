@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.95"
 license = "MIT"
 publish = false
-description = "Eclipse's settings schema, config.json loading, atomic file replacement and shell quoting"
+description = "Eclipse's settings schema, config.json loading and editing, atomic file replacement and shell quoting"
 
 [dependencies]
 directories = "6"

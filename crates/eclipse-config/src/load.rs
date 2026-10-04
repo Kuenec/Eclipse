@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use directories::ProjectDirs;
 
 use crate::document::{self, Document, Malformed, Position};
-use crate::{shell, Config, Key};
+use crate::{containing_directory, shell, Config, Key};
 
 const NIX_STORE: &str = "/nix/store";
 
@@ -86,7 +86,7 @@ pub enum Problem {
 }
 
 impl Problem {
-    fn malformed(path: &Path, malformed: Malformed) -> Self {
+    pub(crate) fn malformed(path: &Path, malformed: Malformed) -> Self {
         let path = path.to_owned();
         match malformed {
             Malformed::NotUtf8(at) => Self::NotUtf8 { path, at },
@@ -187,7 +187,8 @@ fn sandbox_share(target: &Path) -> &Path {
     target.parent().unwrap_or(target)
 }
 
-fn config_path() -> Option<PathBuf> {
+#[must_use]
+pub fn config_path() -> Option<PathBuf> {
     ProjectDirs::from("", "", "eclipse").map(|dirs| dirs.config_dir().join("config.json"))
 }
 
@@ -253,11 +254,7 @@ fn dangling_link(path: &Path) -> Option<(PathBuf, PathBuf)> {
         if !metadata.is_symlink() || !matches!(candidate.try_exists(), Ok(false)) {
             return None;
         }
-        let directory = candidate
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let target = directory
+        let target = containing_directory(candidate)
             .canonicalize()
             .ok()?
             .join(fs::read_link(candidate).ok()?);
@@ -283,14 +280,8 @@ fn without_dot_components(path: &Path) -> PathBuf {
 }
 
 fn read_entries(document: &Document<'_>, path: &Path, loaded: &mut Loaded) {
+    let repeated: HashSet<&str> = document.repeats().map(|(key, _)| key.as_str()).collect();
     let mut seen = HashSet::new();
-    let repeated: HashSet<&str> = document
-        .entries
-        .iter()
-        .map(|(key, _)| key.as_str())
-        .filter(|key| !seen.insert(*key))
-        .collect();
-    seen.clear();
     for (key, value) in &document.entries {
         if !seen.insert(key.as_str()) {
             loaded.problems.push(Problem::DuplicateKey {

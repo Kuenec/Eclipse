@@ -39,6 +39,8 @@ pub enum StatusUpdate {
 
     Progress(Progress),
 
+    Note(String),
+
     Warning(String),
 }
 
@@ -69,6 +71,13 @@ impl StatusSink {
         println!("{text}");
         record_status(Level::INFO, &text);
         self.show(StatusUpdate::Step(text));
+    }
+
+    pub fn note(&self, text: impl Into<String>) {
+        let text = text.into();
+        println!("# {text}");
+        record_status(Level::INFO, &text);
+        self.show(StatusUpdate::Note(text));
     }
 
     pub fn warning(&self, text: impl Into<String>) {
@@ -168,6 +177,7 @@ mod tests {
         status.step("Checking APKCombo");
         status.transfer(5, Some(10));
         status.extraction(3, 9);
+        status.note("First run");
         status.warning("could not update Roblox");
         status.outcome("Roblox 2.740.931 is up to date");
         assert_eq!(
@@ -179,6 +189,7 @@ mod tests {
                     total: Some(10)
                 }),
                 StatusUpdate::Progress(Progress::Extraction { done: 3, total: 9 }),
+                StatusUpdate::Note("First run".to_owned()),
                 StatusUpdate::Warning("could not update Roblox".to_owned()),
                 StatusUpdate::Step("Roblox 2.740.931 is up to date".to_owned()),
             ]

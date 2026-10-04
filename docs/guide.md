@@ -8,7 +8,7 @@ Commands are run as `flatpak run io.github.kuenec.Eclipse <command>`.
 flatpak run io.github.kuenec.Eclipse install ~/Downloads/base.apk ~/Downloads/split_config.x86_64.apk
 ```
 
-This accepts the two APKs, a folder holding them, or an `.apks`, `.xapk` or `.apkm` bundle. Eclipse can read your Downloads folder.
+This accepts the two APKs, a folder holding them, or an `.apks`, `.xapk` or `.apkm` bundle. Eclipse can read your Downloads folder. **Install from files** in Settings does the same without a terminal.
 
 ## Download from Google Play
 
@@ -50,6 +50,8 @@ Controllers need Flatpak 1.16 or newer. On older Flatpak, run `flatpak override 
 | `close_on_leave` | `"browser"` | Closes Eclipse when you leave an experience that a link started; `true` closes it after any experience, `false` never |
 | `server_location_indicator_enabled` | `false` | Shows where the Roblox server is in the window title and a notification. ipinfo.io receives the server's address and sees your IP address |
 
+The settings window, `config set KEY VALUE` and `config unset KEY` change one key and keep every other key and value as written.
+
 ## Files
 
 Eclipse keeps its files in `~/.var/app/io.github.kuenec.Eclipse/`:
@@ -58,7 +60,8 @@ Eclipse keeps its files in `~/.var/app/io.github.kuenec.Eclipse/`:
 |---|---|
 | Settings | `config/eclipse/config.json` |
 | Roblox | `data/eclipse/roblox/` |
-| Game data and logs | `data/eclipse/app-data/` |
+| Game data | `data/eclipse/app-data/` |
+| Logs of the last five launches and their bug reports | `data/eclipse/app-data/logs/` |
 | Roblox's cache, trimmed above 512 MiB | `cache/eclipse/client-cache/` |
 | The experience you are in, for stream tools | `data/eclipse/app-data/runtime/session.json`, removed when you leave |
 | Captures | `~/Pictures/Roblox/`, or `data/eclipse/app-data/Pictures/` until `xdg-user-dirs-update` sets your Pictures folder |

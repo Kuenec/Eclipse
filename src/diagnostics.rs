@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write as _};
+use std::io::{self, BufRead as _, BufReader, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::UNIX_EPOCH;
@@ -23,6 +23,7 @@ const RUN_PREFIX: &str = "eclipse-";
 const HEAD_SUFFIX: &str = ".log";
 const TAIL_SUFFIX: &str = ".tail.log";
 const PREVIOUS_TAIL_SUFFIX: &str = ".tail.log.1";
+const REPORT_SUFFIX: &str = ".report.txt";
 const RUN_STAMP_SHAPE: &str = "00000000T000000.000Z";
 const RECORD_STAMP_SHAPE: &str = "0000-00-00T00:00:00.000000Z";
 pub const RAW_LINE_BYTES: usize = 64 * 1024;
@@ -34,6 +35,7 @@ const RUN_LOG_LIMITS: RunLogLimits = RunLogLimits {
     total: 64 * MIB,
 };
 pub const STATUS_TARGET: &str = "eclipse::status";
+pub const SUPERVISOR_TARGET: &str = "eclipse::supervisor";
 const SECONDS_PER_DAY: u64 = 86_400;
 const DAYS_FROM_MARCH_OF_YEAR_ZERO_TO_EPOCH: u64 = 719_468;
 const DAYS_PER_400_YEARS: u64 = 146_097;
@@ -203,18 +205,65 @@ impl RunLogLimits {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RunStamp(String);
 
-impl RunStamp {
+struct UtcTime {
+    year: u64,
+    month: u64,
+    day: u64,
+    second_of_day: u64,
+    millis: u32,
+}
+
+impl UtcTime {
     fn at(time: std::time::SystemTime) -> Self {
         let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
         let seconds = since_epoch.as_secs();
-        let second_of_day = seconds % SECONDS_PER_DAY;
         let (year, month, day) = civil_from_days(seconds / SECONDS_PER_DAY);
+        Self {
+            year,
+            month,
+            day,
+            second_of_day: seconds % SECONDS_PER_DAY,
+            millis: since_epoch.subsec_millis(),
+        }
+    }
+
+    fn hour(&self) -> u64 {
+        self.second_of_day / 3_600
+    }
+
+    fn minute(&self) -> u64 {
+        self.second_of_day / 60 % 60
+    }
+
+    fn second(&self) -> u64 {
+        self.second_of_day % 60
+    }
+}
+
+pub fn utc_text(time: std::time::SystemTime) -> String {
+    let utc = UtcTime::at(time);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+        utc.year,
+        utc.month,
+        utc.day,
+        utc.hour(),
+        utc.minute()
+    )
+}
+
+impl RunStamp {
+    fn at(time: std::time::SystemTime) -> Self {
+        let utc = UtcTime::at(time);
         Self(format!(
-            "{year:04}{month:02}{day:02}T{:02}{:02}{:02}.{:03}Z",
-            second_of_day / 3_600,
-            second_of_day / 60 % 60,
-            second_of_day % 60,
-            since_epoch.subsec_millis()
+            "{:04}{:02}{:02}T{:02}{:02}{:02}.{:03}Z",
+            utc.year,
+            utc.month,
+            utc.day,
+            utc.hour(),
+            utc.minute(),
+            utc.second(),
+            utc.millis
         ))
     }
 
@@ -255,10 +304,10 @@ fn run_stamp_of(file_name: &str) -> Option<RunStamp> {
     RunStamp::parse(stamp)
 }
 
-#[derive(Default)]
-struct RunFiles {
+pub struct RunFiles {
+    pub head: PathBuf,
     paths: Vec<PathBuf>,
-    bytes: u64,
+    pub bytes: u64,
 }
 
 fn run_logs(dir: &Path) -> io::Result<Vec<RunFiles>> {
@@ -272,7 +321,12 @@ fn run_logs(dir: &Path) -> io::Result<Vec<RunFiles>> {
         if !metadata.is_file() {
             continue;
         }
-        let run = runs.entry(stamp).or_default();
+        let head = dir.join(stamp.file_name(HEAD_SUFFIX));
+        let run = runs.entry(stamp).or_insert_with(|| RunFiles {
+            head,
+            paths: Vec::new(),
+            bytes: 0,
+        });
         run.paths.push(entry.path());
         run.bytes += metadata.len();
     }
@@ -283,13 +337,26 @@ pub fn log_dir(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join(LOG_DIR)
 }
 
+pub fn kept_runs(dir: &Path) -> io::Result<Vec<RunFiles>> {
+    match run_logs(dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        runs => runs,
+    }
+}
+
 pub fn older_run_logs(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let runs = match run_logs(dir) {
-        Ok(runs) => runs,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    Ok(runs.into_iter().skip(1).flat_map(|run| run.paths).collect())
+    Ok(kept_runs(dir)?
+        .into_iter()
+        .skip(1)
+        .flat_map(|run| run.paths)
+        .collect())
+}
+
+pub fn run_head_in(dir: &Path, file: &Path) -> Option<PathBuf> {
+    let file = file.canonicalize().ok()?;
+    let stamp = run_stamp_of(file.file_name()?.to_str()?)?;
+    let dir = dir.canonicalize().ok()?;
+    (file.parent()? == dir).then(|| dir.join(stamp.file_name(HEAD_SUFFIX)))
 }
 
 fn open_run(
@@ -403,6 +470,10 @@ impl RunLog {
         self.path(HEAD_SUFFIX)
     }
 
+    pub fn report_path(&self) -> PathBuf {
+        self.path(REPORT_SUFFIX)
+    }
+
     fn path(&self, suffix: &str) -> PathBuf {
         self.dir.join(self.stamp.file_name(suffix))
     }
@@ -480,16 +551,76 @@ impl RunLog {
     }
 }
 
-pub fn newest_run_part(head: &Path) -> PathBuf {
-    let tail = head
+pub fn run_parts(head: &Path) -> Vec<PathBuf> {
+    let Some(stamp) = head
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(run_stamp_of)
-        .map(|stamp| head.with_file_name(stamp.file_name(TAIL_SUFFIX)));
-    match tail {
-        Some(tail) if tail.is_file() => tail,
-        _ => head.to_owned(),
+    else {
+        return vec![head.to_owned()];
+    };
+    [HEAD_SUFFIX, PREVIOUS_TAIL_SUFFIX, TAIL_SUFFIX]
+        .into_iter()
+        .map(|suffix| head.with_file_name(stamp.file_name(suffix)))
+        .filter(|part| part.is_file())
+        .collect()
+}
+
+pub fn newest_run_part(head: &Path) -> PathBuf {
+    run_parts(head).pop().unwrap_or_else(|| head.to_owned())
+}
+
+pub fn read_records(parts: &[PathBuf], mut each: impl FnMut(&str)) -> io::Result<()> {
+    let mut record = String::new();
+    let mut line = Vec::new();
+    for part in parts {
+        let mut reader = BufReader::new(File::open(part).map_err(failed("open", part))?);
+        loop {
+            line.clear();
+            if reader
+                .read_until(b'\n', &mut line)
+                .map_err(failed("read", part))?
+                == 0
+            {
+                break;
+            }
+            let text = String::from_utf8_lossy(&line);
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            if !record.is_empty() {
+                if record_head(text).is_some() {
+                    each(&record);
+                    record.clear();
+                } else {
+                    record.push('\n');
+                }
+            }
+            record.push_str(text);
+        }
     }
+    if !record.is_empty() {
+        each(&record);
+    }
+    Ok(())
+}
+
+pub fn run_outcome(head: &Path) -> io::Result<Option<String>> {
+    let mut last = String::new();
+    read_records(&[newest_run_part(head)], |record| {
+        last.clear();
+        last.push_str(record);
+    })?;
+    let (first_line, detail) = match last.split_once('\n') {
+        Some((first_line, detail)) => (first_line, Some(detail)),
+        None => (last.as_str(), None),
+    };
+    let Some(footer) = record_head(first_line).filter(|head| head.target == SUPERVISOR_TARGET)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(match detail {
+        Some(detail) => format!("{}\n{detail}", footer.message),
+        None => footer.message.to_owned(),
+    }))
 }
 
 fn continuation_line(stamp: &RunStamp) -> String {
@@ -591,13 +722,13 @@ mod tests {
         for second in 0..7 {
             let mut log = open_run(&dir, at(1_800_000_000 + second, 0), TEST_LIMITS).unwrap();
             log.append(b"one record\n").unwrap();
-            fs::write(log.path(".report.txt"), b"report").unwrap();
+            fs::write(log.report_path(), b"report").unwrap();
             stamps.push(log.stamp.clone());
         }
 
         let kept = stamps[2..]
             .iter()
-            .flat_map(|stamp| [HEAD_SUFFIX, ".report.txt"].map(|suffix| stamp.file_name(suffix)));
+            .flat_map(|stamp| [HEAD_SUFFIX, REPORT_SUFFIX].map(|suffix| stamp.file_name(suffix)));
         let expected = sorted(
             kept.chain([LATEST_LOG.to_owned(), "notes.txt".to_owned()])
                 .collect(),
@@ -638,7 +769,7 @@ mod tests {
         for second in 0..3 {
             let mut log = open_run(&dir, at(1_800_000_000 + second, 0), TEST_LIMITS).unwrap();
             fill(&mut log, 4);
-            fs::write(log.path(".report.txt"), b"report").unwrap();
+            fs::write(log.report_path(), b"report").unwrap();
             stamps.push(log.stamp.clone());
         }
 
@@ -649,7 +780,7 @@ mod tests {
             .collect();
         let expected = stamps[..2]
             .iter()
-            .flat_map(|stamp| [HEAD_SUFFIX, ".report.txt"].map(|suffix| stamp.file_name(suffix)));
+            .flat_map(|stamp| [HEAD_SUFFIX, REPORT_SUFFIX].map(|suffix| stamp.file_name(suffix)));
         assert_eq!(sorted(older), sorted(expected.collect()));
         fs::remove_dir_all(&dir).ok();
     }
@@ -765,6 +896,127 @@ mod tests {
             "the newest part holds the last record"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn utc_text_names_the_minute() {
+        assert_eq!(utc_text(at(1_800_000_000, 692)), "2027-01-15 08:00 UTC");
+        assert_eq!(utc_text(at(951_782_399, 0)), "2000-02-28 23:59 UTC");
+    }
+
+    #[test]
+    fn a_run_ends_with_the_supervisor_footer_when_it_has_one() {
+        let dir = temp_dir("outcome");
+        let mut log = open_run(&dir, at(1_800_000_000, 692), TEST_LIMITS).unwrap();
+        let head = log.head_path();
+        log.record(Level::INFO, STATUS_TARGET, "Starting Roblox")
+            .unwrap();
+        log.flush().unwrap();
+        let running = run_outcome(&head).unwrap();
+
+        log.record(
+            Level::ERROR,
+            SUPERVISOR_TARGET,
+            "Roblox crashed (signal 11)\nLast error: the engine stopped",
+        )
+        .unwrap();
+        log.flush().unwrap();
+        let crashed = run_outcome(&head).unwrap();
+
+        fill(&mut log, 20);
+        log.record(Level::INFO, SUPERVISOR_TARGET, "Roblox closed itself")
+            .unwrap();
+        log.flush().unwrap();
+        let closed = run_outcome(&head).unwrap();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(running, None);
+        assert_eq!(
+            crashed.as_deref(),
+            Some("Roblox crashed (signal 11)\nLast error: the engine stopped")
+        );
+        assert_eq!(closed.as_deref(), Some("Roblox closed itself"));
+    }
+
+    #[test]
+    fn records_keep_their_continuation_lines() {
+        let dir = temp_dir("records");
+        let mut log = open_run(&dir, at(1_800_000_000, 0), RUN_LOG_LIMITS).unwrap();
+        log.append_raw(RawStream::Stderr, b"before any record")
+            .unwrap();
+        log.record(
+            Level::ERROR,
+            "liblog",
+            "java.lang.RuntimeException: boom\n    at a.b",
+        )
+        .unwrap();
+        log.record(Level::INFO, STATUS_TARGET, "next").unwrap();
+        log.flush().unwrap();
+        let mut records = Vec::new();
+        let read = read_records(&run_parts(&log.head_path()), |record| {
+            records.push(record.to_owned())
+        });
+        fs::remove_dir_all(&dir).ok();
+        read.unwrap();
+
+        let heads: Vec<&str> = records
+            .iter()
+            .map(|record| {
+                record_head(record.split('\n').next().unwrap())
+                    .unwrap()
+                    .message
+            })
+            .collect();
+        assert_eq!(
+            heads,
+            [
+                "before any record",
+                "java.lang.RuntimeException: boom",
+                "next"
+            ]
+        );
+        assert!(records[1].ends_with(": java.lang.RuntimeException: boom\n    at a.b"));
+    }
+
+    #[test]
+    fn only_run_files_inside_the_log_directory_name_a_run() {
+        let dir = temp_dir("run-head");
+        let logs = dir.join(LOG_DIR);
+        fs::create_dir_all(&logs).unwrap();
+        let mut log = open_run(&logs, at(1_800_000_000, 692), TEST_LIMITS).unwrap();
+        fill(&mut log, 40);
+        log.flush().unwrap();
+        let head = fs::canonicalize(log.head_path()).unwrap();
+        let outside = dir.join(head.file_name().unwrap());
+        fs::write(&outside, b"copied elsewhere").unwrap();
+        fs::write(logs.join("notes.log"), b"not a run").unwrap();
+
+        let named = [
+            run_head_in(&logs, &log.head_path()),
+            run_head_in(&logs, &log.path(TAIL_SUFFIX)),
+            run_head_in(&logs, &logs.join(LATEST_LOG)),
+            run_head_in(&logs, &outside),
+            run_head_in(&logs, &logs.join("notes.log")),
+            run_head_in(&logs, &logs.join("eclipse-20270115T080000.693Z.log")),
+        ];
+        let runs = kept_runs(&logs).unwrap();
+        let missing = kept_runs(&dir.join("missing")).unwrap();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            named,
+            [
+                Some(head.clone()),
+                Some(head.clone()),
+                Some(head.clone()),
+                None,
+                None,
+                None
+            ]
+        );
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].head, log.head_path());
+        assert!(missing.is_empty());
     }
 
     #[test]
