@@ -1,11 +1,9 @@
 use std::collections::BTreeMap;
-use std::ffi::CStr;
 use std::fmt;
 use std::io;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
-use ash::vk;
 use eclipse::apk::store::{
     CheckOutcome, InstalledVersion, LeftBecause, Store, StoreError, StoredVersion, UpdateCheck,
 };
@@ -24,10 +22,7 @@ const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 const GIB: u64 = 1024 * MIB;
 const LOW_SPACE: u64 = GIB;
-const NVIDIA_VENDOR: u32 = 0x10de;
 const SHORT_COMMIT: usize = 12;
-const NVIDIA_MODULE: &str = "/proc/driver/nvidia/version";
-const NVIDIA_VERSION_LINE: &str = "NVRM version:";
 const OS_RELEASES: [&str; 2] = ["/run/host/os-release", "/etc/os-release"];
 const KERNEL_RELEASE: &str = "/proc/sys/kernel/osrelease";
 const CPU_INFO: &str = "/proc/cpuinfo";
@@ -46,8 +41,7 @@ pub(crate) struct Doctor {
     system: System,
     cpu: Cpu,
     memory: Fact<Memory>,
-    vulkan: Result<Vulkan, VulkanError>,
-    nvidia_module: Fact<Option<String>>,
+    graphics: Graphics,
     storage: Storage,
     roblox: Roblox,
     config: ConfigFile,
@@ -187,188 +181,9 @@ fn parse_os_release(text: &str) -> Option<String> {
     Some(value.replace("\\\"", "\"")).filter(|value| !value.is_empty())
 }
 
-fn parse_nvidia_module(text: &str) -> Option<&str> {
-    text.lines()
-        .find_map(|line| line.strip_prefix(NVIDIA_VERSION_LINE))?
-        .split_whitespace()
-        .find(|token| {
-            token.contains('.')
-                && token
-                    .split('.')
-                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-        })
-}
-
-enum VulkanError {
-    NoLoader(String),
-    Failed(String),
-}
-
-impl fmt::Display for VulkanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoLoader(error) => write!(f, "no Vulkan loader: {error}"),
-            Self::Failed(error) => f.write_str(error),
-        }
-    }
-}
-
-struct Vulkan {
-    instance_version: u32,
-    devices: Vec<VulkanDevice>,
-}
-
-struct VulkanDevice {
-    name: String,
-    kind: DeviceKind,
-    vendor_id: u32,
-    api_version: u32,
-    driver_version: u32,
-    driver: Option<Driver>,
-}
-
-impl VulkanDevice {
-    fn is_nvidia(&self) -> bool {
-        self.vendor_id == NVIDIA_VENDOR
-    }
-
-    fn driver_text(&self) -> String {
-        match &self.driver {
-            Some(driver) => format!("{} {}", driver.name, driver.info),
-            None => format!("version {}", self.driver_version_text()),
-        }
-    }
-
-    fn driver_version_text(&self) -> String {
-        match &self.driver {
-            Some(driver) if self.is_nvidia() && !driver.info.is_empty() => driver.info.clone(),
-            _ if self.is_nvidia() => {
-                let version = self.driver_version;
-                format!(
-                    "{}.{}.{:02}",
-                    version >> 22,
-                    (version >> 14) & 0xff,
-                    (version >> 6) & 0xff
-                )
-            }
-            _ => version_text(self.driver_version),
-        }
-    }
-}
-
-struct Driver {
-    name: String,
-    info: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeviceKind {
-    Discrete,
-    Integrated,
-    Virtual,
-    Cpu,
-    Other,
-}
-
-impl DeviceKind {
-    fn of(kind: vk::PhysicalDeviceType) -> Self {
-        match kind {
-            vk::PhysicalDeviceType::DISCRETE_GPU => Self::Discrete,
-            vk::PhysicalDeviceType::INTEGRATED_GPU => Self::Integrated,
-            vk::PhysicalDeviceType::VIRTUAL_GPU => Self::Virtual,
-            vk::PhysicalDeviceType::CPU => Self::Cpu,
-            _ => Self::Other,
-        }
-    }
-}
-
-impl fmt::Display for DeviceKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Discrete => "discrete GPU",
-            Self::Integrated => "integrated GPU",
-            Self::Virtual => "virtual GPU",
-            Self::Cpu => "CPU renderer",
-            Self::Other => "other device",
-        })
-    }
-}
-
-fn version_text(version: u32) -> String {
-    format!(
-        "{}.{}.{}",
-        vk::api_version_major(version),
-        vk::api_version_minor(version),
-        vk::api_version_patch(version)
-    )
-}
-
-fn probe_vulkan() -> Result<Vulkan, VulkanError> {
-    let entry =
-        unsafe { ash::Entry::load() }.map_err(|error| VulkanError::NoLoader(error.to_string()))?;
-    let instance_version = unsafe { entry.try_enumerate_instance_version() }
-        .map_err(|error| {
-            VulkanError::Failed(format!("vkEnumerateInstanceVersion failed: {error}"))
-        })?
-        .unwrap_or(vk::API_VERSION_1_0);
-    let api_version = if instance_version >= vk::API_VERSION_1_1 {
-        vk::API_VERSION_1_3
-    } else {
-        vk::API_VERSION_1_0
-    };
-    let application = vk::ApplicationInfo::default()
-        .application_name(c"Eclipse doctor")
-        .api_version(api_version);
-    let create = vk::InstanceCreateInfo::default().application_info(&application);
-    let instance = unsafe { entry.create_instance(&create, None) }
-        .map_err(|error| VulkanError::Failed(format!("vkCreateInstance failed: {error}")))?;
-    let devices = list_devices(&instance, api_version);
-    unsafe { instance.destroy_instance(None) };
-    Ok(Vulkan {
-        instance_version,
-        devices: devices?,
-    })
-}
-
-fn list_devices(
-    instance: &ash::Instance,
-    api_version: u32,
-) -> Result<Vec<VulkanDevice>, VulkanError> {
-    let handles = unsafe { instance.enumerate_physical_devices() }.map_err(|error| {
-        VulkanError::Failed(format!("vkEnumeratePhysicalDevices failed: {error}"))
-    })?;
-    Ok(handles
-        .into_iter()
-        .map(|handle| {
-            let properties = unsafe { instance.get_physical_device_properties(handle) };
-            let driver = (api_version >= vk::API_VERSION_1_2
-                && properties.api_version >= vk::API_VERSION_1_2)
-                .then(|| driver_properties(instance, handle));
-            VulkanDevice {
-                name: c_text(properties.device_name_as_c_str()),
-                kind: DeviceKind::of(properties.device_type),
-                vendor_id: properties.vendor_id,
-                api_version: properties.api_version,
-                driver_version: properties.driver_version,
-                driver,
-            }
-        })
-        .collect())
-}
-
-fn driver_properties(instance: &ash::Instance, handle: vk::PhysicalDevice) -> Driver {
-    let mut driver = vk::PhysicalDeviceDriverProperties::default();
-    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
-    unsafe { instance.get_physical_device_properties2(handle, &mut properties) };
-    Driver {
-        name: c_text(driver.driver_name_as_c_str()),
-        info: c_text(driver.driver_info_as_c_str()),
-    }
-}
-
-fn c_text<E>(text: Result<&CStr, E>) -> String {
-    text.map(|text| text.to_string_lossy().into_owned())
-        .unwrap_or_default()
+struct Graphics {
+    section: String,
+    problems: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,18 +359,7 @@ struct NewestRun {
 #[derive(Debug, PartialEq, Eq)]
 enum Problem {
     CpuBelowBaseline(&'static str),
-    NoVulkanLoader,
-    NoVulkanDevice,
-    SoftwareRendering,
-    NvidiaDriverMissing {
-        module: String,
-        packaging: Packaging,
-    },
-    NvidiaVersionMismatch {
-        module: String,
-        vulkan: String,
-        packaging: Packaging,
-    },
+    Graphics(String),
     RuntimeDir(RuntimeDirProblem),
     LowSpace {
         path: PathBuf,
@@ -581,54 +385,7 @@ impl fmt::Display for Problem {
                 "This CPU lacks {feature}. Roblox's Android x86-64 client needs SSSE3, SSE4.1, \
                  SSE4.2 and POPCNT, so it cannot run on this computer."
             ),
-            Self::NoVulkanLoader => f.write_str(
-                "No Vulkan loader was found. Install your distribution's Vulkan loader \
-                 (libvulkan.so.1) and the Vulkan driver for your GPU.",
-            ),
-            Self::NoVulkanDevice => f.write_str(
-                "Vulkan finds no GPU. Install the Vulkan driver for your GPU: Mesa for AMD and \
-                 Intel, NVIDIA's driver for NVIDIA.",
-            ),
-            Self::SoftwareRendering => f.write_str(
-                "Vulkan offers only a CPU renderer, so Roblox would draw slowly on the CPU. \
-                 Install the Vulkan driver for your GPU.",
-            ),
-            Self::NvidiaDriverMissing {
-                module,
-                packaging: Packaging::Flatpak { .. },
-            } => write!(
-                f,
-                "The NVIDIA kernel module {module} is loaded, but Vulkan finds no NVIDIA GPU. \
-                 Run `flatpak update` to install the matching Flatpak NVIDIA driver \
-                 (org.freedesktop.Platform.GL.nvidia-{}).",
-                module.replace('.', "-")
-            ),
-            Self::NvidiaDriverMissing {
-                module,
-                packaging: Packaging::Host,
-            } => write!(
-                f,
-                "The NVIDIA kernel module {module} is loaded, but Vulkan finds no NVIDIA GPU. \
-                 Install the Vulkan part of NVIDIA's driver {module}."
-            ),
-            Self::NvidiaVersionMismatch {
-                module,
-                vulkan,
-                packaging,
-            } => {
-                write!(
-                    f,
-                    "The NVIDIA kernel module is {module}, but the NVIDIA Vulkan driver is \
-                     {vulkan}. "
-                )?;
-                f.write_str(match packaging {
-                    Packaging::Flatpak { .. } => {
-                        "Run `flatpak update` so the Flatpak NVIDIA driver matches, and restart \
-                         after a driver update."
-                    }
-                    Packaging::Host => "Restart after a driver update so both match.",
-                })
-            }
+            Self::Graphics(problem) => f.write_str(problem),
             Self::RuntimeDir(problem) => {
                 let text = problem.to_string();
                 let mut characters = text.chars();
@@ -714,6 +471,7 @@ impl Doctor {
         let app_data = eclipse::framework::app_data_dir().ok_or_else(|| NO_APP_DATA_DIR.to_owned());
         let store = Store::open().map_err(|error| error.to_string());
         let loaded = eclipse_config::load();
+        let graphics = eclipse::gpu::diagnosis::diagnose(&loaded.config);
         let config_repair = ConfigRepair::of(loaded.path.as_deref());
         let url_handler = match &install {
             Ok(Install::Flatpak(flatpak)) => {
@@ -755,8 +513,10 @@ impl Doctor {
             memory: read_fact(MEM_INFO).and_then(|text| {
                 parse_mem_info(&text).ok_or_else(|| format!("{MEM_INFO} names no MemTotal"))
             }),
-            vulkan: probe_vulkan(),
-            nvidia_module: examine_nvidia_module(),
+            graphics: Graphics {
+                section: graphics.to_string(),
+                problems: graphics.problems(),
+            },
             storage: examine_storage(app_data.clone(), &store),
             roblox: examine_roblox(&store),
             config: ConfigFile {
@@ -796,7 +556,13 @@ impl Doctor {
         if let Err(RuntimeError::CpuLacksFeature(feature)) = self.cpu.baseline {
             problems.push(Problem::CpuBelowBaseline(feature));
         }
-        problems.extend(self.vulkan_problems());
+        problems.extend(
+            self.graphics
+                .problems
+                .iter()
+                .cloned()
+                .map(Problem::Graphics),
+        );
         if let Ok(Some(problem)) = &self.storage.runtime_dir {
             problems.push(Problem::RuntimeDir(problem.clone()));
         }
@@ -833,38 +599,6 @@ impl Doctor {
         }
         problems
     }
-
-    fn vulkan_problems(&self) -> Vec<Problem> {
-        let devices = match &self.vulkan {
-            Err(VulkanError::NoLoader(_)) => return vec![Problem::NoVulkanLoader],
-            Err(VulkanError::Failed(_)) => return vec![Problem::NoVulkanDevice],
-            Ok(vulkan) if vulkan.devices.is_empty() => return vec![Problem::NoVulkanDevice],
-            Ok(vulkan) => &vulkan.devices,
-        };
-        let mut problems = Vec::new();
-        if devices.iter().all(|device| device.kind == DeviceKind::Cpu) {
-            problems.push(Problem::SoftwareRendering);
-        }
-        let Ok(Some(module)) = &self.nvidia_module else {
-            return problems;
-        };
-        let packaging = self.packaging();
-        match devices.iter().find(|device| device.is_nvidia()) {
-            None => problems.push(Problem::NvidiaDriverMissing {
-                module: module.clone(),
-                packaging,
-            }),
-            Some(device) if device.driver_version_text() != *module => {
-                problems.push(Problem::NvidiaVersionMismatch {
-                    module: module.clone(),
-                    vulkan: device.driver_version_text(),
-                    packaging,
-                });
-            }
-            Some(_) => {}
-        }
-        problems
-    }
 }
 
 fn examine_install() -> Fact<Install> {
@@ -875,16 +609,6 @@ fn examine_install() -> Fact<Install> {
         None => std::env::current_exe()
             .map(|executable| Install::Host { executable })
             .map_err(|error| format!("cannot locate the Eclipse executable: {error}")),
-    }
-}
-
-fn examine_nvidia_module() -> Fact<Option<String>> {
-    match std::fs::read_to_string(NVIDIA_MODULE) {
-        Ok(text) => parse_nvidia_module(&text)
-            .map(|version| Some(version.to_owned()))
-            .ok_or_else(|| format!("{NVIDIA_MODULE} names no version")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot read {NVIDIA_MODULE}: {error}")),
     }
 }
 
@@ -983,7 +707,8 @@ impl fmt::Display for Doctor {
         self.write_eclipse(f)?;
         self.write_system(f)?;
         self.write_cpu(f)?;
-        self.write_vulkan(f)?;
+        writeln!(f, "Graphics")?;
+        f.write_str(&self.graphics.section)?;
         self.write_storage(f)?;
         self.write_roblox(f)?;
         self.write_config(f)?;
@@ -1063,39 +788,6 @@ impl Doctor {
         match &self.cpu.baseline {
             Ok(()) => writeln!(f, "  Android x86-64 baseline: met"),
             Err(error) => writeln!(f, "  Android x86-64 baseline: {error}"),
-        }
-    }
-
-    fn write_vulkan(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Vulkan")?;
-        match &self.vulkan {
-            Ok(vulkan) => {
-                writeln!(
-                    f,
-                    "  Instance: Vulkan {}",
-                    version_text(vulkan.instance_version)
-                )?;
-                if vulkan.devices.is_empty() {
-                    writeln!(f, "  Devices: none")?;
-                }
-                for (index, device) in vulkan.devices.iter().enumerate() {
-                    writeln!(
-                        f,
-                        "  Device {index}: {} ({}, vendor {:#06x}, Vulkan {}), driver {}",
-                        device.name,
-                        device.kind,
-                        device.vendor_id,
-                        version_text(device.api_version),
-                        device.driver_text()
-                    )?;
-                }
-            }
-            Err(error) => writeln!(f, "  Instance: {error}")?,
-        }
-        match &self.nvidia_module {
-            Ok(Some(module)) => writeln!(f, "  NVIDIA kernel module: {module}"),
-            Ok(None) => Ok(()),
-            Err(error) => writeln!(f, "  NVIDIA kernel module: {error}"),
         }
     }
 
@@ -1274,28 +966,16 @@ mod tests {
 
     const ALL_FEATURES: &str = "ssse3,sse4.1,sse4.2,avx,avx2,popcnt";
 
+    const RX_6800: &str = "  Device 0: AMD Radeon RX 6800 (RADV NAVI21) [1002:73bf], discrete, \
+                           Vulkan 1.4.312, driver radv Mesa 25.2.4";
+
+    const DRAWS_WITH_VULKAN: &str = "  Roblox draws with: Vulkan\n";
+
+    const ON_LLVMPIPE: &str = "Roblox is rendering on the CPU (llvmpipe), which is slow.";
+
     fn flatpak() -> Packaging {
         Packaging::Flatpak {
             app_id: "io.github.kuenec.Eclipse".to_owned(),
-        }
-    }
-
-    fn device(
-        name: &str,
-        kind: DeviceKind,
-        vendor_id: u32,
-        driver: Option<(&str, &str)>,
-    ) -> VulkanDevice {
-        VulkanDevice {
-            name: name.to_owned(),
-            kind,
-            vendor_id,
-            api_version: vk::make_api_version(0, 1, 4, 312),
-            driver_version: vk::make_api_version(0, 25, 2, 4),
-            driver: driver.map(|(name, info)| Driver {
-                name: name.to_owned(),
-                info: info.to_owned(),
-            }),
         }
     }
 
@@ -1332,16 +1012,10 @@ mod tests {
                 total: 32 * GIB,
                 available: Some(20 * GIB + 512 * MIB),
             }),
-            vulkan: Ok(Vulkan {
-                instance_version: vk::make_api_version(0, 1, 4, 321),
-                devices: vec![device(
-                    "AMD Radeon RX 6800 (RADV NAVI21)",
-                    DeviceKind::Discrete,
-                    0x1002,
-                    Some(("radv", "Mesa 25.2.4")),
-                )],
-            }),
-            nvidia_module: Ok(None),
+            graphics: Graphics {
+                section: format!("{RX_6800}\n{DRAWS_WITH_VULKAN}"),
+                problems: Vec::new(),
+            },
             storage: Storage {
                 runtime_dir: Ok(None),
                 places: vec![
@@ -1427,96 +1101,26 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_vulkan_loader_or_device_is_named() {
+    fn graphics_problems_follow_the_cpu_and_precede_the_storage() {
         let mut doctor = healthy();
-        doctor.vulkan = Err(VulkanError::NoLoader(
-            "libvulkan.so.1: not found".to_owned(),
-        ));
-        assert_eq!(doctor.problems(), [Problem::NoVulkanLoader]);
-
-        doctor.vulkan = Ok(Vulkan {
-            instance_version: vk::API_VERSION_1_3,
-            devices: Vec::new(),
-        });
-        assert_eq!(doctor.problems(), [Problem::NoVulkanDevice]);
-
-        doctor.vulkan = Err(VulkanError::Failed(
-            "vkCreateInstance failed: ERROR_INCOMPATIBLE_DRIVER".to_owned(),
-        ));
-        assert_eq!(doctor.problems(), [Problem::NoVulkanDevice]);
-    }
-
-    #[test]
-    fn a_cpu_renderer_alone_is_software_rendering() {
-        let mut doctor = healthy();
-        doctor.vulkan = Ok(Vulkan {
-            instance_version: vk::API_VERSION_1_3,
-            devices: vec![device(
-                "llvmpipe (LLVM 20.1.8, 256 bits)",
-                DeviceKind::Cpu,
-                0x10005,
-                Some(("llvmpipe", "Mesa 25.2.4 (LLVM 20.1.8)")),
-            )],
-        });
-        assert_eq!(doctor.problems(), [Problem::SoftwareRendering]);
-    }
-
-    #[test]
-    fn an_nvidia_module_without_an_nvidia_vulkan_device_asks_for_the_flatpak_driver() {
-        let mut doctor = healthy();
-        doctor.nvidia_module = Ok(Some("580.95.05".to_owned()));
-        let problems = doctor.problems();
-        assert_eq!(
-            problems,
-            [Problem::NvidiaDriverMissing {
-                module: "580.95.05".to_owned(),
-                packaging: flatpak(),
-            }]
-        );
-        assert!(
-            problems[0]
-                .to_string()
-                .contains("org.freedesktop.Platform.GL.nvidia-580-95-05"),
-            "{}",
-            problems[0]
-        );
-    }
-
-    #[test]
-    fn nvidia_kernel_and_vulkan_driver_versions_must_match() {
-        let mut doctor = healthy();
-        doctor.nvidia_module = Ok(Some("580.95.05".to_owned()));
-        let mut nvidia = device(
-            "NVIDIA GeForce RTX 3070",
-            DeviceKind::Discrete,
-            NVIDIA_VENDOR,
-            Some(("NVIDIA", "580.82.09")),
-        );
-        doctor.vulkan = Ok(Vulkan {
-            instance_version: vk::API_VERSION_1_3,
-            devices: vec![nvidia],
-        });
+        doctor.cpu.baseline = Err(RuntimeError::CpuLacksFeature("SSE4.1"));
+        doctor.graphics.problems = vec![ON_LLVMPIPE.to_owned()];
+        let noexec = RuntimeDirProblem::NoExec(PathBuf::from("/media/games/eclipse/runtime"));
+        doctor.storage.runtime_dir = Ok(Some(noexec.clone()));
         assert_eq!(
             doctor.problems(),
-            [Problem::NvidiaVersionMismatch {
-                module: "580.95.05".to_owned(),
-                vulkan: "580.82.09".to_owned(),
-                packaging: flatpak(),
-            }]
+            [
+                Problem::CpuBelowBaseline("SSE4.1"),
+                Problem::Graphics(ON_LLVMPIPE.to_owned()),
+                Problem::RuntimeDir(noexec),
+            ]
         );
-
-        nvidia = device(
-            "NVIDIA GeForce RTX 3070",
-            DeviceKind::Discrete,
-            NVIDIA_VENDOR,
-            None,
+        assert!(
+            doctor
+                .to_string()
+                .contains(&format!("\n  - {ON_LLVMPIPE}\n")),
+            "{doctor}"
         );
-        nvidia.driver_version = (580 << 22) | (95 << 14) | (5 << 6);
-        doctor.vulkan = Ok(Vulkan {
-            instance_version: vk::API_VERSION_1_1,
-            devices: vec![nvidia],
-        });
-        assert_eq!(doctor.problems(), []);
     }
 
     #[test]
@@ -1706,10 +1310,10 @@ CPU
   Model: AMD Ryzen 7 5800X 8-Core Processor, 16 logical CPUs
   Features for ART: ssse3,sse4.1,sse4.2,avx,avx2,popcnt
   Android x86-64 baseline: met
-Vulkan
-  Instance: Vulkan 1.4.321
-  Device 0: AMD Radeon RX 6800 (RADV NAVI21) (discrete GPU, vendor 0x1002, Vulkan 1.4.312), \
-driver radv Mesa 25.2.4
+Graphics
+  Device 0: AMD Radeon RX 6800 (RADV NAVI21) [1002:73bf], discrete, Vulkan 1.4.312, driver radv \
+Mesa 25.2.4
+  Roblox draws with: Vulkan
 Storage
   App data: /data/eclipse/app-data (100.0 GiB free)
   Roblox store: /data/eclipse/roblox (100.0 GiB free)
@@ -1734,6 +1338,8 @@ Config
     roblox_auto_update: true
     server_location_indicator_enabled: false
     touch_mode: \"off\"
+    use_opengl: false
+    vulkan_device: null
     webview_helper_path: null
 Roblox links
   Handler: Eclipse cannot see which app opens them from inside Flatpak; to make Eclipse open \
@@ -1756,10 +1362,6 @@ io.github.kuenec.Eclipse update`.
     fn a_report_without_facts_names_each_failure() {
         let mut doctor = healthy();
         doctor.install = Err("cannot read /.flatpak-info: permission denied".to_owned());
-        doctor.vulkan = Err(VulkanError::NoLoader(
-            "libvulkan.so.1: not found".to_owned(),
-        ));
-        doctor.nvidia_module = Err("/proc/driver/nvidia/version names no version".to_owned());
         doctor.logs = Err(NO_APP_DATA_DIR.to_owned());
         doctor.config.problems = vec!["config.json:1:2: invalid JSON".to_owned()];
         doctor.system.sdl = Err("libSDL3.so.0 could not be loaded: not found".to_owned());
@@ -1767,11 +1369,8 @@ io.github.kuenec.Eclipse update`.
         for line in [
             "  Installation: cannot read /.flatpak-info: permission denied\n",
             "  SDL: libSDL3.so.0 could not be loaded: not found\n",
-            "  Instance: no Vulkan loader: libvulkan.so.1: not found\n",
-            "  NVIDIA kernel module: /proc/driver/nvidia/version names no version\n",
             "  Problem: config.json:1:2: invalid JSON\n",
             "Logs\n  Directory: cannot resolve Eclipse's app-data directory",
-            "  - No Vulkan loader was found.",
             "  - The settings file has problems",
         ] {
             assert!(text.contains(line), "{line:?} in {text}");
@@ -1859,19 +1458,6 @@ io.github.kuenec.Eclipse update`.
                 model: Some("Intel(R) Core(TM)2 Duo CPU     E8400  @ 3.00GHz".to_owned()),
                 logical: 2,
             }
-        );
-
-        assert_eq!(
-            parse_nvidia_module(&fixture("nvidia-version")),
-            Some("580.95.05")
-        );
-        assert_eq!(
-            parse_nvidia_module(&fixture("nvidia-version-470")),
-            Some("470.256.02")
-        );
-        assert_eq!(
-            parse_nvidia_module("GCC version:  gcc version 15.2.1\n"),
-            None
         );
     }
 }

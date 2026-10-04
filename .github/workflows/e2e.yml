@@ -67,6 +67,19 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: xvfb-run -a -s "-screen 0 1280x720x24" cargo test --locked --lib loader::vulkan_wsi::tests::x11_window_backs_the_engine_vulkan_and_egl_surfaces -- --nocapture
 
+      - name: Draw Eclipse's windows with OpenGL ES on an X11 window
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a -s "-screen 0 1280x720x24" cargo test --locked --lib graphics::gles_renderer::tests::x11_window_draws_views_text_and_canvases_with_opengl_es_only -- --nocapture
+
+      - name: Choose between Vulkan and OpenGL ES on an X11 window
+        run: xvfb-run -a -s "-screen 0 1280x720x24" cargo test --locked --lib graphics::gles_renderer::tests::automatic_choice_ -- --nocapture
+
+      - name: Draw focused text over Roblox's OpenGL ES frames on an X11 window
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a -s "-screen 0 1280x720x24" cargo test --locked --lib loader::egl_seam::tests::focused_text_ -- --nocapture
+
       - name: Exercise native input pipeline
         run: target/debug/eclipse __input-test
 

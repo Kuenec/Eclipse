@@ -8,7 +8,7 @@ use winit::window::{Window, WindowId};
 use super::launch_window::{
     action_at, displayable, node, scaled, wrap, ClickTracker, BUTTON_BACKGROUND,
 };
-use super::{GlyphAtlas, TextMeasure, VulkanRenderer};
+use super::{GlyphAtlas, TextMeasure, WindowRenderer};
 use crate::framework::dialogs::{dispatch_dialog_action, DialogAction};
 use crate::framework::view_registry::{self, LayoutParams, RenderNode, MATCH_PARENT, WRAP_CONTENT};
 use crate::framework::window_registry::{DialogView, WindowHandle};
@@ -210,14 +210,18 @@ impl Sheet {
 struct OpenDialog {
     handle: WindowHandle,
     content: DialogContent,
-    renderer: Option<VulkanRenderer>,
+    renderer: Option<WindowRenderer>,
     window: Window,
     scale: f64,
     clicks: ClickTracker<DialogAction>,
 }
 
 impl OpenDialog {
-    fn open(event_loop: &ActiveEventLoop, view: &DialogView) -> Option<Self> {
+    fn open(
+        event_loop: &ActiveEventLoop,
+        view: &DialogView,
+        graphics: crate::gpu::Graphics,
+    ) -> Option<Self> {
         let content = DialogContent::of(view);
         let attributes = Window::default_attributes()
             .with_title(content.window_title())
@@ -230,7 +234,7 @@ impl OpenDialog {
                 return None;
             }
         };
-        let renderer = match VulkanRenderer::new(&window) {
+        let renderer = match WindowRenderer::start(&window, None, graphics) {
             Ok(renderer) => Some(renderer),
             Err(error) => {
                 tracing::error!(%error, dialog = view.handle, "the dialog window cannot draw");
@@ -264,9 +268,8 @@ impl OpenDialog {
 
     fn nodes(&self) -> Option<Vec<RenderNode>> {
         let renderer = self.renderer.as_ref()?;
-        let text = renderer.text.as_ref()?;
-        let width = renderer.swapchain_extent.width;
-        let (nodes, _) = self.content.nodes(&text.atlas, width, self.scale);
+        let width = renderer.extent().width;
+        let (nodes, _) = self.content.nodes(renderer.atlas()?, width, self.scale);
         Some(nodes)
     }
 
@@ -284,9 +287,8 @@ impl OpenDialog {
     fn window_event(&mut self, vm: &Vm, event: WindowEvent) {
         let target_at = |point| {
             let renderer = self.renderer.as_ref()?;
-            let text = renderer.text.as_ref()?;
             self.content
-                .action_at(&text.atlas, renderer.swapchain_extent, self.scale, point)
+                .action_at(renderer.atlas()?, renderer.extent(), self.scale, point)
         };
         if let Some(action) = self.clicks.window_event(&event, target_at) {
             self.dispatch(vm, action);
@@ -327,7 +329,12 @@ pub(super) struct DialogWindows {
 }
 
 impl DialogWindows {
-    pub(super) fn sync(&mut self, event_loop: &ActiveEventLoop, showing: &[DialogView]) {
+    pub(super) fn sync(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        showing: &[DialogView],
+        graphics: crate::gpu::Graphics,
+    ) {
         self.open
             .retain(|dialog| showing.iter().any(|view| view.handle == dialog.handle));
         for view in showing {
@@ -344,7 +351,9 @@ impl DialogWindows {
                         dialog.window.request_redraw();
                     }
                 }
-                None => self.open.extend(OpenDialog::open(event_loop, view)),
+                None => self
+                    .open
+                    .extend(OpenDialog::open(event_loop, view, graphics)),
             }
         }
     }

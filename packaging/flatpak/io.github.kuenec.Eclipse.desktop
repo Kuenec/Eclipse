@@ -11,9 +11,13 @@ StartupNotify=true
 SingleMainWindow=true
 X-GNOME-UsesNotifications=true
 Categories=Game;
-Keywords=roblox;android;game;
-Actions=settings;
+Keywords=roblox;player;android;game;
+Actions=settings;check-update;
 
 [Desktop Action settings]
 Name=Settings
 Exec=eclipse settings
+
+[Desktop Action check-update]
+Name=Check for Roblox Update
+Exec=eclipse run --check-update

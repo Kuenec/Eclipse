@@ -214,6 +214,19 @@ class ClientOutputTest(unittest.TestCase):
         self.assertFalse(output.update_check)
         self.assertFalse(output.fatal)
 
+    def test_the_opengl_es_seam_marks_the_first_frame_and_its_extent(self):
+        output = client_output(
+            [
+                (
+                    5.5,
+                    "2026-10-04T05:15:37.236360Z  INFO eclipse::loader::egl_seam: egl seam "
+                    "armed (engine eglSwapBuffers interposed) width=1280 height=720",
+                )
+            ]
+        )
+        self.assertEqual(output.markers, {Marker.FIRST_FRAME: 5.5})
+        self.assertEqual(output.extent, (1280, 720))
+
     def test_update_checks_and_fatal_lines_are_flagged(self):
         output = client_output(
             [

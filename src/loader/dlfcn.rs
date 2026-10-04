@@ -1,9 +1,71 @@
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::cell::RefCell;
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::OnceLock;
 
 use super::native_provider::{last_dl_error, EclipseNativeProvider};
 use super::resolve::SymbolProvider;
 use super::vulkan_wsi;
+use crate::gpu::{client_graphics, Graphics};
+
+const VULKAN_LOADERS: [&[u8]; 2] = [b"libvulkan.so", b"libvulkan.so.1"];
+
+thread_local! {
+    static REFUSAL: RefCell<Refusal> = const {
+        RefCell::new(Refusal {
+            pending: None,
+            reported: None,
+        })
+    };
+}
+
+struct Refusal {
+    pending: Option<CString>,
+    reported: Option<CString>,
+}
+
+fn file_name(path: &CStr) -> &[u8] {
+    path.to_bytes()
+        .rsplit(|&b| b == b'/')
+        .next()
+        .unwrap_or_default()
+}
+
+fn hides_library(path: &CStr, graphics: Graphics) -> bool {
+    graphics.hides_vulkan() && VULKAN_LOADERS.contains(&file_name(path))
+}
+
+fn hides_symbol(name: &CStr, graphics: Graphics) -> bool {
+    graphics.hides_vulkan() && name.to_bytes().starts_with(b"vk")
+}
+
+fn refuse(name: &CStr, reason: &str) {
+    tracing::debug!(
+        target: "dlfcn",
+        ?name,
+        reason,
+        "Vulkan is hidden from Roblox, which uses OpenGL ES"
+    );
+    unsafe { libc::dlerror() };
+    let mut message = name.to_bytes().to_vec();
+    message.extend_from_slice(b": ");
+    message.extend_from_slice(reason.as_bytes());
+    let message = CString::new(message).expect("a C string name and a reason hold no NUL");
+    if REFUSAL
+        .try_with(|refusal| refusal.borrow_mut().pending = Some(message))
+        .is_err()
+    {
+        tracing::debug!(
+            target: "dlfcn",
+            ?name,
+            "the refusal outlived this thread's dlerror state"
+        );
+    }
+}
+
+fn forget_refusal() {
+    let _nothing_is_pending_after_thread_teardown =
+        REFUSAL.try_with(|refusal| refusal.borrow_mut().pending = None);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlatformLibrary {
@@ -16,8 +78,7 @@ static PLATFORM_LIBRARIES: [PlatformLibrary; 2] =
 
 impl PlatformLibrary {
     fn from_path(path: &CStr) -> Option<Self> {
-        let file_name = path.to_bytes().rsplit(|&b| b == b'/').next()?;
-        match file_name {
+        match file_name(path) {
             b"libOpenSLES.so" => Some(Self::OpenSles),
             b"libaaudio.so" => Some(Self::AAudio),
             _ => None,
@@ -64,6 +125,14 @@ pub(crate) unsafe extern "C" fn eclipse_dlopen(
     flags: c_int,
 ) -> *mut c_void {
     let name = (!filename.is_null()).then(|| unsafe { CStr::from_ptr(filename) });
+    if let Some(name) = name.filter(|name| hides_library(name, client_graphics())) {
+        refuse(
+            name,
+            "cannot open shared object file: No such file or directory",
+        );
+        return std::ptr::null_mut();
+    }
+    forget_refusal();
     if let Some(library) = name.and_then(PlatformLibrary::from_path) {
         return library.handle();
     }
@@ -86,10 +155,23 @@ unsafe fn log_failure_and_rearm_dlerror(name: Option<&CStr>, flags: c_int) -> *m
 }
 
 pub(crate) unsafe extern "C" fn eclipse_dlclose(handle: *mut c_void) -> c_int {
+    forget_refusal();
     if PlatformLibrary::from_handle(handle).is_some() {
         return 0;
     }
     unsafe { libc::dlclose(handle) }
+}
+
+pub(crate) unsafe extern "C" fn eclipse_dlerror() -> *mut c_char {
+    let refused = REFUSAL.try_with(|refusal| {
+        let mut refusal = refusal.borrow_mut();
+        let message = refusal.pending.take()?;
+        Some(refusal.reported.insert(message).as_ptr().cast_mut())
+    });
+    match refused {
+        Ok(Some(message)) => message,
+        Ok(None) | Err(_) => unsafe { libc::dlerror() },
+    }
 }
 
 pub(crate) unsafe extern "C" fn eclipse_dlsym(
@@ -97,9 +179,15 @@ pub(crate) unsafe extern "C" fn eclipse_dlsym(
     symbol: *const c_char,
 ) -> *mut c_void {
     if symbol.is_null() {
+        forget_refusal();
         return unsafe { libc::dlsym(handle, symbol) };
     }
     let name = unsafe { CStr::from_ptr(symbol) };
+    if hides_symbol(name, client_graphics()) {
+        refuse(name, "undefined symbol");
+        return std::ptr::null_mut();
+    }
+    forget_refusal();
     if let Some(library) = PlatformLibrary::from_handle(handle) {
         return library.symbol(name);
     }
@@ -109,6 +197,10 @@ pub(crate) unsafe extern "C" fn eclipse_dlsym(
         vulkan_wsi::eclipse_vk_create_instance as *const () as *mut c_void
     } else if name == c"vkCreateAndroidSurfaceKHR" {
         vulkan_wsi::eclipse_vk_create_android_surface_khr as *const () as *mut c_void
+    } else if name == c"vkEnumeratePhysicalDevices" {
+        vulkan_wsi::eclipse_vk_enumerate_physical_devices as *const () as *mut c_void
+    } else if name == c"vkEnumeratePhysicalDeviceGroups" {
+        vulkan_wsi::eclipse_vk_enumerate_physical_device_groups as *const () as *mut c_void
     } else {
         unsafe { libc::dlsym(handle, symbol) }
     }
@@ -116,11 +208,19 @@ pub(crate) unsafe extern "C" fn eclipse_dlsym(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use ash::vk;
+
     use super::*;
+    use crate::gpu::GlesReason;
 
     type DlopenFn = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
     type DlsymFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
     type DlcloseFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+    type DlerrorFn = unsafe extern "C" fn() -> *mut c_char;
+
+    const HIDDEN_VULKAN_CHILD: &str = "ECLIPSE_TEST_HIDDEN_VULKAN_CHILD";
 
     const OPENSLES_NAMES: [&CStr; 6] = [
         c"slCreateEngine",
@@ -278,6 +378,21 @@ mod tests {
             vulkan_wsi::eclipse_vk_create_instance as *const () as *mut c_void,
             "Vulkan entry points stay routed through Eclipse's WSI"
         );
+        assert_eq!(
+            unsafe { (dl.sym)(libc_handle, c"vkEnumeratePhysicalDevices".as_ptr()) },
+            vulkan_wsi::eclipse_vk_enumerate_physical_devices as *const () as *mut c_void,
+            "the client's device list goes through the chosen-GPU filter"
+        );
+        assert_eq!(
+            unsafe { (dl.sym)(libc_handle, c"vkEnumeratePhysicalDeviceGroups".as_ptr()) },
+            vulkan_wsi::eclipse_vk_enumerate_physical_device_groups as *const () as *mut c_void,
+            "the client's device groups go through the chosen-GPU filter"
+        );
+        assert!(
+            unsafe { (dl.sym)(libc_handle, c"vkEnumeratePhysicalDeviceGroupsKHR".as_ptr()) }
+                .is_null(),
+            "no Vulkan loader exports the KHR alias, so dlsym finds none"
+        );
         assert_eq!(unsafe { (dl.close)(libc_handle) }, 0);
     }
 
@@ -305,6 +420,139 @@ mod tests {
             caller_reason.contains("libeclipse_absent_media_3b9e.so")
                 && caller_reason.contains("cannot open shared object"),
             "the caller's dlerror() must still report the failure after logging: {caller_reason}"
+        );
+    }
+
+    #[test]
+    fn opengl_es_hides_only_the_vulkan_loader_and_vulkan_symbols() {
+        let gles = Graphics::Gles(GlesReason::Configured);
+        for loader in [
+            c"libvulkan.so",
+            c"/system/lib64/libvulkan.so",
+            c"libvulkan.so.1",
+        ] {
+            assert!(hides_library(loader, gles), "{loader:?}");
+            assert!(
+                hides_library(loader, Graphics::Gles(GlesReason::NoUsableVulkan)),
+                "{loader:?}"
+            );
+            assert!(!hides_library(loader, Graphics::Vulkan), "{loader:?}");
+        }
+        for other in [c"libvulkan_foo.so", c"libEGL.so", c"libGLESv3.so"] {
+            assert!(!hides_library(other, gles), "{other:?}");
+        }
+        for vulkan in [c"vkCreateInstance", c"vkGetInstanceProcAddr"] {
+            assert!(hides_symbol(vulkan, gles), "{vulkan:?}");
+            assert!(!hides_symbol(vulkan, Graphics::Vulkan), "{vulkan:?}");
+        }
+        for other in [
+            c"eglSwapBuffers",
+            c"glDrawArrays",
+            c"AAudio_createStreamBuilder",
+        ] {
+            assert!(!hides_symbol(other, gles), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn opengl_es_closes_every_native_route_to_vulkan() {
+        if std::env::var_os(HIDDEN_VULKAN_CHILD).is_none() {
+            let output = crate::bounded_child::output(
+                std::process::Command::new(
+                    std::env::current_exe().expect("the test harness executable must have a path"),
+                )
+                .args([
+                    "--exact",
+                    "loader::dlfcn::tests::opengl_es_closes_every_native_route_to_vulkan",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(HIDDEN_VULKAN_CHILD, "1"),
+                Duration::from_secs(60),
+            );
+            let report = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && report.contains("1 passed"),
+                "status={:?}, stdout={report}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::gpu::give_client(Graphics::Gles(GlesReason::Configured));
+        let dl = dl_through_provider();
+        let error = unsafe {
+            std::mem::transmute::<*mut c_void, DlerrorFn>(provider_addr(&dl, c"dlerror"))
+        };
+
+        assert!(unsafe { (dl.open)(c"libvulkan.so.1".as_ptr(), libc::RTLD_NOW) }.is_null());
+        let refusal = unsafe { error() };
+        assert!(
+            !refusal.is_null(),
+            "a refused dlopen leaves a dlerror message"
+        );
+        let refusal = unsafe { CStr::from_ptr(refusal) }
+            .to_string_lossy()
+            .into_owned();
+        assert!(refusal.contains("libvulkan.so.1"), "{refusal}");
+        assert!(
+            unsafe { error() }.is_null(),
+            "dlerror reports the refusal once"
+        );
+
+        let libc_handle = unsafe { (dl.open)(c"libc.so.6".as_ptr(), libc::RTLD_NOW) };
+        assert!(!libc_handle.is_null());
+        assert!(unsafe { (dl.sym)(libc_handle, c"vkCreateInstance".as_ptr()) }.is_null());
+        assert_eq!(
+            unsafe { (dl.sym)(libc_handle, c"strlen".as_ptr()) },
+            unsafe { libc::dlsym(libc_handle, c"strlen".as_ptr()) },
+            "other symbols still come from the host"
+        );
+
+        let create_instance = unsafe {
+            std::mem::transmute::<*mut c_void, vk::PFN_vkCreateInstance>(provider_addr(
+                &dl,
+                c"vkCreateInstance",
+            ))
+        };
+        let mut instance = vk::Instance::null();
+        let info = vk::InstanceCreateInfo::default();
+        assert_eq!(
+            unsafe { create_instance(&info, std::ptr::null(), &mut instance) },
+            vk::Result::ERROR_INCOMPATIBLE_DRIVER
+        );
+        let get_instance_proc_addr = unsafe {
+            std::mem::transmute::<*mut c_void, vk::PFN_vkGetInstanceProcAddr>(provider_addr(
+                &dl,
+                c"vkGetInstanceProcAddr",
+            ))
+        };
+        assert!(
+            unsafe { get_instance_proc_addr(instance, c"vkCreateInstance".as_ptr()) }.is_none()
+        );
+        let create_surface = unsafe {
+            std::mem::transmute::<*mut c_void, vk::PFN_vkCreateAndroidSurfaceKHR>(provider_addr(
+                &dl,
+                c"vkCreateAndroidSurfaceKHR",
+            ))
+        };
+        let mut surface = vk::SurfaceKHR::null();
+        assert_eq!(
+            unsafe {
+                create_surface(
+                    instance,
+                    &vk::AndroidSurfaceCreateInfoKHR::default(),
+                    std::ptr::null(),
+                    &mut surface,
+                )
+            },
+            vk::Result::ERROR_INITIALIZATION_FAILED
+        );
+
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("/proc/self/maps");
+        assert!(
+            !maps.contains("libvulkan"),
+            "hiding Vulkan loaded the Vulkan loader"
         );
     }
 }

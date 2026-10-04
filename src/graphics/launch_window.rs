@@ -21,9 +21,10 @@ use winit::platform::wayland::{ActiveEventLoopExtWayland as _, WindowAttributesE
 use winit::window::{ActivationToken, Window, WindowId};
 
 use super::activation::Token;
-use super::{layout_views, GlyphAtlas, GraphicsError, HostEventLoop, TextMeasure, VulkanRenderer};
+use super::{layout_views, GlyphAtlas, GraphicsError, HostEventLoop, TextMeasure, WindowRenderer};
 use crate::framework::view_registry::{LayoutParams, RenderNode, MATCH_PARENT, WRAP_CONTENT};
 use crate::framework::HostWake;
+use crate::gpu::Requested;
 use crate::input::{PrimaryTouch, TouchTracker};
 use crate::status::{Progress, StatusUpdate};
 
@@ -144,11 +145,11 @@ pub struct LaunchWindow {
 }
 
 impl LaunchWindow {
-    pub fn open(title: &str) -> Result<Self, GraphicsError> {
+    pub fn open(title: &str, graphics: Requested) -> Result<Self, GraphicsError> {
         let (commands, received) = mpsc::channel();
         let mut launch = Self {
             event_loop: super::host_event_loop()?,
-            screen: StatusScreen::new(title, received),
+            screen: StatusScreen::new(title, graphics, received),
             commands,
             pumping: false,
         };
@@ -318,7 +319,8 @@ enum Activation {
 
 struct StatusScreen {
     title: String,
-    renderer: Option<VulkanRenderer>,
+    graphics: Requested,
+    renderer: Option<WindowRenderer>,
     window: Option<Window>,
     create_error: Option<OsError>,
     content: Content,
@@ -331,9 +333,10 @@ struct StatusScreen {
 }
 
 impl StatusScreen {
-    fn new(title: &str, commands: Receiver<WindowCommand>) -> Self {
+    fn new(title: &str, graphics: Requested, commands: Receiver<WindowCommand>) -> Self {
         Self {
             title: title.to_owned(),
+            graphics,
             renderer: None,
             window: None,
             create_error: None,
@@ -415,7 +418,7 @@ impl StatusScreen {
     fn draws_text(&self) -> bool {
         self.renderer
             .as_ref()
-            .is_some_and(|renderer| renderer.text.is_some())
+            .is_some_and(|renderer| renderer.atlas().is_some())
     }
 
     fn request_activation(&mut self) -> bool {
@@ -500,8 +503,8 @@ impl StatusScreen {
                 return;
             }
         };
-        let nodes = match renderer.text.as_ref() {
-            Some(text) => self.content.nodes(&text.atlas, extent, self.scale),
+        let nodes = match renderer.atlas() {
+            Some(atlas) => self.content.nodes(atlas, extent, self.scale),
             None => Vec::new(),
         };
         if let Err(error) = renderer.draw_nodes(window, &nodes) {
@@ -515,9 +518,8 @@ impl StatusScreen {
         }
         let target_at = |point| {
             let renderer = self.renderer.as_ref()?;
-            let text = renderer.text.as_ref()?;
             self.content
-                .answer_at(&text.atlas, renderer.swapchain_extent, self.scale, point)
+                .answer_at(renderer.atlas()?, renderer.extent(), self.scale, point)
         };
         if let Some(answer) = self.clicks.window_event(&event, target_at) {
             self.give(answer);
@@ -577,7 +579,7 @@ impl ApplicationHandler<HostWake> for StatusScreen {
                 return;
             }
         };
-        match VulkanRenderer::new(&window) {
+        match WindowRenderer::for_status_window(&window, self.graphics) {
             Ok(renderer) => self.renderer = Some(renderer),
             Err(error) => self.renderer_unavailable(&error, WindowMapping::of(event_loop)),
         }
@@ -660,7 +662,7 @@ impl Content {
                 prompt.question, prompt.confirm, prompt.cancel
             );
         }
-        match &self.error {
+        let status = match &self.error {
             Some(Failure {
                 heading,
                 message,
@@ -682,6 +684,10 @@ impl Content {
                     None => step.to_owned(),
                 }
             }
+        };
+        match self.warnings.back() {
+            Some(warning) => format!("{status} — {warning}"),
+            None => status,
         }
     }
 
@@ -1297,7 +1303,7 @@ mod tests {
     }
 
     fn asking_screen() -> StatusScreen {
-        let mut screen = StatusScreen::new("Eclipse", mpsc::channel().1);
+        let mut screen = StatusScreen::new("Eclipse", Requested::Automatic, mpsc::channel().1);
         screen.content.prompt = Some(prompt());
         screen
     }
@@ -1409,7 +1415,7 @@ mod tests {
         closed.give(Answer::Cancel);
         assert_eq!(closed.answer, Some(Answer::Cancel));
 
-        let mut status = StatusScreen::new("Eclipse", mpsc::channel().1);
+        let mut status = StatusScreen::new("Eclipse", Requested::Automatic, mpsc::channel().1);
         status.give(Answer::Confirm);
         assert_eq!(status.answer, None, "only a prompt takes answers");
     }
@@ -1549,7 +1555,7 @@ mod tests {
     #[test]
     fn escape_enter_or_the_close_button_dismiss_a_shown_failure() {
         for answer in [Answer::Cancel, Answer::Confirm] {
-            let mut screen = StatusScreen::new("Eclipse", mpsc::channel().1);
+            let mut screen = StatusScreen::new("Eclipse", Requested::Automatic, mpsc::channel().1);
             screen.content.error = Some(failure());
             screen.give(answer);
             assert_eq!(screen.session, Session::Dismissed, "{answer:?}");
@@ -1572,11 +1578,11 @@ mod tests {
     #[test]
     fn a_window_that_cannot_map_without_drawing_ends_instead_of_waiting_for_a_close() {
         let error = GraphicsError::Vulkan("no physical device".to_owned());
-        let mut screen = StatusScreen::new("Eclipse", mpsc::channel().1);
+        let mut screen = StatusScreen::new("Eclipse", Requested::Automatic, mpsc::channel().1);
         screen.renderer_unavailable(&error, WindowMapping::OnFirstFrame);
         assert_eq!(screen.session, Session::Ending);
 
-        let mut screen = StatusScreen::new("Eclipse", mpsc::channel().1);
+        let mut screen = StatusScreen::new("Eclipse", Requested::Automatic, mpsc::channel().1);
         screen.renderer_unavailable(&error, WindowMapping::OnCreate);
         assert_eq!(screen.session, Session::Showing);
     }
@@ -1584,7 +1590,7 @@ mod tests {
     #[test]
     fn a_launch_without_a_window_still_answers_raises_and_closes() {
         let (commands, received) = mpsc::channel();
-        let mut screen = StatusScreen::new("Eclipse", received);
+        let mut screen = StatusScreen::new("Eclipse", Requested::Automatic, received);
         screen.end();
         let (done, raised) = mpsc::channel();
         commands
@@ -1618,7 +1624,7 @@ mod tests {
             log: Some(PathBuf::from("/data/logs/eclipse.log")),
         };
 
-        let mut unmapped = StatusScreen::new("Eclipse", mpsc::channel().1);
+        let mut unmapped = StatusScreen::new("Eclipse", Requested::Automatic, mpsc::channel().1);
         unmapped.content.error = Some(failure.clone());
         unmapped.renderer_unavailable(
             &GraphicsError::Vulkan("no physical device".to_owned()),
@@ -1629,7 +1635,7 @@ mod tests {
             Some(Path::new("/data/logs/eclipse.log"))
         );
 
-        let mut closed = StatusScreen::new("Eclipse", mpsc::channel().1);
+        let mut closed = StatusScreen::new("Eclipse", Requested::Automatic, mpsc::channel().1);
         closed.content.error = Some(failure);
         closed.session = Session::Dismissed;
         assert_eq!(closed.log_of_unseen_failure(), None);
@@ -1657,6 +1663,26 @@ mod tests {
             content.summary(),
             "Roblox could not start: APKCombo is unreachable (Details are in \
              /data/logs/eclipse.log)"
+        );
+    }
+
+    #[test]
+    fn the_title_ends_with_the_newest_warning_when_text_cannot_be_drawn() {
+        let mut content = Content::default();
+        let missing_driver = "NVIDIA driver 615.71.09 has no matching Flatpak driver.";
+        content.apply(StatusUpdate::Warning(missing_driver.to_owned()));
+        assert_eq!(content.summary(), format!("{STARTING} — {missing_driver}"));
+
+        let cpu = "Vulkan offers only llvmpipe, which runs on the CPU.";
+        content.apply(StatusUpdate::Warning(cpu.to_owned()));
+        content.error = Some(Failure {
+            heading: FailureHeading::CouldNotStart,
+            message: "Roblox closed".to_owned(),
+            log: None,
+        });
+        assert_eq!(
+            content.summary(),
+            format!("Roblox could not start: Roblox closed — {cpu}")
         );
     }
 }

@@ -15,6 +15,7 @@ use eclipse::framework::lifecycle::{
 };
 use eclipse::framework::ActivityStart;
 use eclipse::gamepad::DeviceAccess;
+use eclipse::gpu::Requested;
 use eclipse::graphics::activation::Token;
 use eclipse::graphics::launch_window::{
     Answer, Answered, FailureHeading, LaunchWindow, Prompt, WindowClosed,
@@ -567,7 +568,8 @@ fn ask_to_leave(launch: &LaunchCommand) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut window = match LaunchWindow::open(&window_title()) {
+    let graphics = window_graphics(&eclipse_config::load());
+    let mut window = match LaunchWindow::open(&window_title(), graphics) {
         Ok(window) => window,
         Err(error) => {
             eprintln!(
@@ -858,6 +860,7 @@ fn run_client(launch: LaunchCommand, supervision: Option<Supervision>) -> ExitCo
     eclipse::diagnostics::init(eclipse::diagnostics::LogSink::Supervisor(records));
     tracing::debug!(version = eclipse::VERSION, "eclipse client starting");
     let loaded = eclipse_config::load();
+    eclipse::gpu::configure(loaded.config.vulkan_device);
     let auto_update = loaded.config.roblox_auto_update;
     let end = match launch {
         LaunchCommand::Run(run) => {
@@ -1793,10 +1796,18 @@ fn window_title() -> String {
 }
 
 fn show_error_window(heading: FailureHeading, message: &str, log: Option<&Path>) {
-    match LaunchWindow::open(&window_title()) {
+    let graphics = window_graphics(&eclipse_config::load());
+    match LaunchWindow::open(&window_title(), graphics) {
         Ok(mut window) => window.show_error(heading, message, log),
         Err(error) => eprintln!("eclipse: cannot open a window to show this error: {error}"),
     }
+}
+
+fn window_graphics(loaded: &eclipse_config::Loaded) -> Requested {
+    for problem in &loaded.problems {
+        eprintln!("eclipse: {problem}");
+    }
+    Requested::of(&loaded.config)
 }
 
 fn report_failure(launch: &Launch, error: &str) {
@@ -1926,6 +1937,7 @@ fn play_file(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let status = StatusSink::terminal();
     report_config(loaded, &status);
+    eclipse::gpu::report(&status);
     let paths = ApkSetPaths::locate(path)?;
     eclipse::runtime::prepare_art_boot_environment()?;
     status.step(VERIFYING_SIGNATURE);
@@ -1953,17 +1965,19 @@ fn launch_in_window(
     let (sender, updates) = std::sync::mpsc::channel();
     let status = StatusSink::with_window(sender.clone());
     report_config(loaded, &status);
+    let graphics = Requested::of(&loaded.config);
     let listener = match start_client_run(launch, &loaded.config.fflags) {
         Ok(listener) => listener,
         Err(error) => return failure_to_show(error),
     };
     let preparation = prepare_in_background(check, sender);
-    let mut window = match LaunchWindow::open(&window_title()) {
+    let mut window = match LaunchWindow::open(&window_title(), graphics) {
         Ok(window) => window,
         Err(error) => {
             return failure_to_show(format!("cannot open the Eclipse window: {error}"));
         }
     };
+    eclipse::gpu::report(&status);
     let slot = std::sync::Arc::new(LaunchSlot::new(launch.target().cloned()));
     if let Some(listener) = listener {
         let serving = instance_control::serve_in_background(
@@ -2288,6 +2302,8 @@ fn boot_and_play(
     eclipse::performance::configure_engine_cpu_affinity(config.graphics_optimization_mode);
     request_game_mode(config);
     let plan = eclipse::runtime::BootPlan::new(&manifest, config, client_cache);
+    let graphics = eclipse::gpu::graphics(Requested::of(config));
+    eclipse::gpu::give_client(graphics);
     let runtime_dir = eclipse::framework::app_data_dir()
         .ok_or(NO_APP_DATA_DIR)?
         .join(RUNTIME_DIR);
@@ -2332,6 +2348,7 @@ fn boot_and_play(
         plan.heap_mib, plan.disable_hspace_compact
     );
     println!("instruction_set:    {}", plan.instruction_set_features);
+    println!("graphics:           {graphics}");
 
     println!("\n# VM options (-> JNI_CreateJavaVM):");
     for opt in plan.vm_options() {
@@ -2983,10 +3000,10 @@ mod tests {
         installed_or_updated_set, lock_run_in, native_lib_dir, parse_libroblox_init_lib_dir,
         parse_storage_action, parse_update_source, record_normal_end,
         remove_other_native_lib_versions, remove_other_version_oats, update_if_due,
-        url_handler_message, window_title, ClientLock, Launch, LaunchCheck, LaunchCommand,
-        LaunchCommandError, Packaging, Proving, Request, RunCheck, RunStart, StorageAction,
-        StorageLayout, Token, UpdateSource, HELP, LAUNCH_CHECK_BUDGET, LAUNCH_LINK_COMMAND,
-        LAUNCH_LINK_ENV, NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE,
+        url_handler_message, window_graphics, window_title, ClientLock, Launch, LaunchCheck,
+        LaunchCommand, LaunchCommandError, Packaging, Proving, Request, RunCheck, RunStart,
+        StorageAction, StorageLayout, Token, UpdateSource, HELP, LAUNCH_CHECK_BUDGET,
+        LAUNCH_LINK_COMMAND, LAUNCH_LINK_ENV, NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE,
     };
     use crate::desktop_integration::BROWSER_HANDLER_COMMAND;
     use eclipse::apk::store::{
@@ -3008,6 +3025,27 @@ mod tests {
         ));
         std::fs::remove_dir_all(&root).ok();
         root
+    }
+
+    #[test]
+    fn windows_shown_outside_the_client_follow_use_opengl() {
+        let root = temp_root("window-graphics");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.json");
+        std::fs::write(&config, r#"{"use_opengl": true}"#).unwrap();
+        let configured = window_graphics(&eclipse_config::load_from(&config));
+        std::fs::write(&config, r#"{"use_opengl": "yes"}"#).unwrap();
+        let invalid = eclipse_config::load_from(&config);
+        let fallback = window_graphics(&invalid);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(configured, eclipse::gpu::Requested::OpenGlEs);
+        assert!(
+            invalid.problems[0].to_string().contains("use_opengl"),
+            "{:?}",
+            invalid.problems
+        );
+        assert_eq!(fallback, eclipse::gpu::Requested::Automatic);
     }
 
     fn launch_command(
@@ -3240,8 +3278,8 @@ mod tests {
             SettingError::FileOnly("fflags")
         );
         assert_eq!(
-            refused(&["unset", "use_opengl"]),
-            SettingError::UnknownKey("use_opengl".to_owned())
+            refused(&["unset", "use_console_experience"]),
+            SettingError::UnknownKey("use_console_experience".to_owned())
         );
         for usage in [
             &["set", "touch_mode"][..],

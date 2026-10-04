@@ -234,6 +234,10 @@ impl EclipseNativeProvider {
         );
 
         p.register("eglGetDisplay", eclipse_egl_get_display as *const () as u64);
+        p.register(
+            "eglSwapBuffers",
+            super::egl_seam::eclipse_egl_swap_buffers as *const () as u64,
+        );
 
         p.register(
             "vkGetInstanceProcAddr",
@@ -251,6 +255,7 @@ impl EclipseNativeProvider {
         p.register("dlopen", super::dlfcn::eclipse_dlopen as *const () as u64);
         p.register("dlsym", super::dlfcn::eclipse_dlsym as *const () as u64);
         p.register("dlclose", super::dlfcn::eclipse_dlclose as *const () as u64);
+        p.register("dlerror", super::dlfcn::eclipse_dlerror as *const () as u64);
 
         p.register(
             "ANativeWindow_fromSurface",
@@ -2825,7 +2830,7 @@ pub(crate) fn last_dl_error() -> String {
         .into_owned()
 }
 
-fn host_library_symbol(soname: &str, symbol: &std::ffi::CStr) -> Result<usize, String> {
+pub(super) fn host_library_symbol(soname: &str, symbol: &std::ffi::CStr) -> Result<usize, String> {
     let cname = std::ffi::CString::new(soname).map_err(|e| format!("dlopen({soname}): {e}"))?;
     let handle = unsafe { libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if handle.is_null() {
@@ -3044,15 +3049,15 @@ mod tests {
 
         assert_eq!(
             p.len(),
-            106 + super::super::mediacodec::MEDIA_NDK_NATIVE_COUNT
+            108 + super::super::mediacodec::MEDIA_NDK_NATIVE_COUNT
                 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT
                 + super::super::bionic_locale::LOCALE_NATIVE_COUNT
                 + super::super::aaudio::AAUDIO_NATIVE_COUNT,
             "6 liblog + 18 bionic-libc + 25 bionic-stdio + 8 bionic-signal + 2 link-map \
-             introspection + 4 netdb resolver-ABI + 1 EGL display interception + 3 Vulkan WSI \
-             interception + 3 dlfcn + 28 ndk-android + 33 media-ndk + 8 OpenSL ES + 26 AAudio + \
-             53 pthread + 6 sysconf system-query + 1 locale natives registered"
+             introspection + 4 netdb resolver-ABI + 2 EGL display and swap interception + 3 \
+             Vulkan WSI interception + 4 dlfcn + 28 ndk-android + 33 media-ndk + 8 OpenSL ES + \
+             26 AAudio + 53 pthread + 6 sysconf system-query + 1 locale natives registered"
         );
         for name in [
             "__android_log_write",
@@ -3119,12 +3124,14 @@ mod tests {
             "gai_strerror",
             "getnameinfo",
             "eglGetDisplay",
+            "eglSwapBuffers",
             "vkGetInstanceProcAddr",
             "vkCreateInstance",
             "vkCreateAndroidSurfaceKHR",
             "dlopen",
             "dlsym",
             "dlclose",
+            "dlerror",
             "AAssetManager_fromJava",
             "AAssetManager_open",
             "AAsset_close",
