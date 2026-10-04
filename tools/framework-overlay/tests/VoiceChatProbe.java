@@ -1,6 +1,7 @@
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.UUID;
 
 public final class VoiceChatProbe {
     private static final int PERMISSION_GRANTED = 0;
@@ -10,6 +11,9 @@ public final class VoiceChatProbe {
     private static final int USAGE_VOICE_COMMUNICATION = 2;
     private static final int CONTENT_TYPE_SPEECH = 1;
     private static final String ROBLOX_PACKAGE = "com.roblox.client";
+    private static final String AOSP_EFFECT_TYPE_AEC = "7b491460-8d4d-11e0-bd61-0002a5d5c51b";
+    private static final String AOSP_EFFECT_TYPE_NS = "58b4b260-8e06-11e0-aa8e-0002a5d5c51b";
+    private static final int VOICE_AUDIO_SESSION = 1;
 
     private static void require(boolean condition, String message) {
         if (!condition) {
@@ -105,9 +109,50 @@ public final class VoiceChatProbe {
                 "the stream volume is not fixed");
     }
 
+    private static void requireEffectType(Class<?> audioEffectClass, String name, String aospUuid)
+            throws ReflectiveOperationException {
+        Object type = audioEffectClass.getField(name).get(null);
+        require(UUID.fromString(aospUuid).equals(type),
+                name + " is " + type + ", expected the AOSP value " + aospUuid);
+    }
+
+    private static void requireAbsentHardwareEffect(String className)
+            throws ReflectiveOperationException {
+        Class<?> effectClass = Class.forName(className);
+        require(!(Boolean) effectClass.getMethod("isAvailable").invoke(null),
+                className + ".isAvailable() reports a hardware effect this device lacks");
+        Object created =
+                effectClass.getMethod("create", int.class).invoke(null, VOICE_AUDIO_SESSION);
+        require(created == null, className + ".create returned an effect this device lacks");
+    }
+
+    private static void requireNoHardwareVoiceEffects() throws ReflectiveOperationException {
+        Class<?> audioEffectClass = Class.forName("android.media.audiofx.AudioEffect");
+        requireEffectType(audioEffectClass, "EFFECT_TYPE_AEC", AOSP_EFFECT_TYPE_AEC);
+        requireEffectType(audioEffectClass, "EFFECT_TYPE_NS", AOSP_EFFECT_TYPE_NS);
+        Object[] effects = (Object[]) audioEffectClass.getMethod("queryEffects").invoke(null);
+        require(effects != null && effects.length == 0,
+                "queryEffects() must list no hardware effects");
+
+        Class<?> descriptorClass = Class.forName("android.media.audiofx.AudioEffect$Descriptor");
+        for (String field : new String[] {"type", "uuid"}) {
+            require(descriptorClass.getField(field).getType() == UUID.class,
+                    "AudioEffect.Descriptor." + field + " must be a public UUID");
+        }
+
+        requireAbsentHardwareEffect("android.media.audiofx.AcousticEchoCanceler");
+        requireAbsentHardwareEffect("android.media.audiofx.NoiseSuppressor");
+
+        Object equalizer = Class.forName("android.media.audiofx.Equalizer")
+                .getConstructor(int.class, int.class).newInstance(0, VOICE_AUDIO_SESSION);
+        require(!(Boolean) audioEffectClass.getMethod("getEnabled").invoke(equalizer),
+                "ATL's Equalizer must start disabled through Eclipse's AudioEffect");
+    }
+
     public static void main(String[] arguments) throws ReflectiveOperationException {
         requireMicrophonePermission();
         requireVoiceCallAudioManager();
+        requireNoHardwareVoiceEffects();
         System.out.println("voice-chat-ok");
         Runtime.getRuntime().halt(0);
     }

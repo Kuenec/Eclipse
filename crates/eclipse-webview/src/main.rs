@@ -1,6 +1,7 @@
 mod app;
 mod bridge;
 mod cookies;
+mod intent;
 mod logging;
 mod view;
 mod wire;

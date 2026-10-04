@@ -10,11 +10,13 @@ use eclipse::apk::store::{
 };
 use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode};
 use eclipse::framework::lifecycle::{
-    finish_android_process, record_normal_close_at_client_exit, ClientEnd,
+    exit_without_vm_teardown, finish_android_process, record_normal_close_at_client_exit, ClientEnd,
 };
 use eclipse::framework::ActivityStart;
 use eclipse::graphics::activation::Token;
-use eclipse::graphics::launch_window::{Answer, Answered, LaunchWindow, Prompt, WindowClosed};
+use eclipse::graphics::launch_window::{
+    Answer, Answered, FailureHeading, LaunchWindow, Prompt, WindowClosed,
+};
 use eclipse::graphics::window_state::WindowStateFile;
 use eclipse::links::LaunchTarget;
 use eclipse::runtime::{ClientCacheDir, NativeLibRoot};
@@ -246,11 +248,11 @@ fn main() -> ExitCode {
         Some("__webview-test") => match run_webview_test() {
             Ok(report) => {
                 println!("__webview-test: {report}");
-                ExitCode::SUCCESS
+                exit_without_vm_teardown(libc::EXIT_SUCCESS)
             }
             Err(e) => {
                 eprintln!("__webview-test: {e}");
-                ExitCode::FAILURE
+                exit_without_vm_teardown(libc::EXIT_FAILURE)
             }
         },
 
@@ -259,11 +261,11 @@ fn main() -> ExitCode {
                 for line in report.to_string().lines() {
                     println!("__platform-test: {line}");
                 }
-                ExitCode::SUCCESS
+                exit_without_vm_teardown(libc::EXIT_SUCCESS)
             }
             Err(e) => {
                 eprintln!("__platform-test: {e}");
-                ExitCode::FAILURE
+                exit_without_vm_teardown(libc::EXIT_FAILURE)
             }
         },
 
@@ -440,7 +442,7 @@ impl LaunchCommandError {
             }
             Self::Link { context, message } => {
                 eprintln!("{context}: {message}");
-                show_error_window(message, None);
+                show_error_window(FailureHeading::CouldNotStart, message, None);
             }
         }
     }
@@ -574,7 +576,7 @@ fn ask_to_leave(launch: &LaunchCommand) -> ExitCode {
             }
             Err(error) => {
                 eprintln!("{HAND_OFF_CONTEXT}: {error}");
-                window.show_error(&error, None);
+                window.show_error(FailureHeading::CouldNotStart, &error, None);
                 ExitCode::FAILURE
             }
         },
@@ -614,7 +616,7 @@ fn leave_and_join(
         Err(error) => error,
     };
     eprintln!("{HAND_OFF_CONTEXT}: {error}");
-    window.show_error(&error, None);
+    window.show_error(FailureHeading::CouldNotStart, &error, None);
     ExitCode::FAILURE
 }
 
@@ -636,7 +638,7 @@ fn hand_off(
 fn report_setup_failure(launch: &LaunchCommand, context: &str, error: &str) {
     eprintln!("{context}: {error}");
     if launch.launches_in_window() {
-        show_error_window(error, None);
+        show_error_window(FailureHeading::CouldNotStart, error, None);
     }
 }
 
@@ -721,7 +723,7 @@ fn present_failure(launch: &LaunchCommand, target: &Launch, finished: &superviso
     };
     eprintln!("{}: {failure}", target.context());
     if launch.launches_in_window() {
-        show_error_window(&failure, Some(&finished.log));
+        show_error_window(FailureHeading::Stopped, &failure, Some(&finished.log));
     } else {
         eprintln!("Details are in {}", finished.log.display());
     }
@@ -1509,9 +1511,9 @@ fn window_title() -> String {
     eclipse::window_title("Roblox")
 }
 
-fn show_error_window(message: &str, log: Option<&Path>) {
+fn show_error_window(heading: FailureHeading, message: &str, log: Option<&Path>) {
     if let Some(mut window) = open_error_window() {
-        window.show_error(message, log);
+        window.show_error(heading, message, log);
     }
 }
 
@@ -1726,7 +1728,7 @@ fn launch_in_window(
         if let Err(error) = serving {
             let error = format!("cannot take launches from other Eclipse processes: {error}");
             report_failure(launch, &error);
-            window.show_error(&error, Some(log));
+            window.show_error(FailureHeading::CouldNotStart, &error, Some(log));
             return ClientEnd::FailureShown;
         }
     }
@@ -1751,7 +1753,11 @@ fn launch_in_window(
     slot.end();
     let text = error.to_string();
     report_failure(launch, &text);
-    window.show_error(&text, Some(&eclipse::diagnostics::newest_run_part(log)));
+    window.show_error(
+        FailureHeading::CouldNotStart,
+        &text,
+        Some(&eclipse::diagnostics::newest_run_part(log)),
+    );
     if slot.closing() {
         ClientEnd::ClosedForAnotherLaunch
     } else if error.is::<WindowClosed>() {
@@ -1781,7 +1787,7 @@ fn show_setup_failure(launch: &Launch, failure: SetupFailure, log: &Path) -> Cli
             );
         }
     }
-    window.show_error(&failure.error, Some(log));
+    window.show_error(FailureHeading::CouldNotStart, &failure.error, Some(log));
     if slot.closing() {
         ClientEnd::ClosedForAnotherLaunch
     } else {

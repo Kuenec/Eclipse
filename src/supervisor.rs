@@ -14,7 +14,7 @@ use eclipse::framework::lifecycle::{report_exit_to, ClientEnd};
 use eclipse::links::redact_join_secrets;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::{Errno, FdFlags};
-use rustix::process::Pid;
+use rustix::process::{Pid, WaitId, WaitIdOptions};
 use tracing::Level;
 
 const FDS_ENV: &str = "ECLIPSE_SUPERVISOR_FDS";
@@ -25,7 +25,12 @@ const READ_CHUNK: usize = 64 * 1024;
 const EXIT_CHECK: Duration = Duration::from_secs(5);
 const LATE_OUTPUT: Duration = Duration::from_secs(1);
 const UNCAUGHT_EXCEPTION_WINDOW: Duration = Duration::from_secs(5);
-const UNCAUGHT_EXCEPTION_HEADER: &[u8] = b"Exception in thread \"";
+const UNCAUGHT_EXCEPTION_HEADER: &str = "Exception in thread \"";
+const CAUSE_HEADER: &str = "Caused by: ";
+const ART_FATAL_SIGNAL: &[u8] = b"Fatal signal ";
+const NO_SUCH_FIELD: &str = "java.lang.NoSuchFieldError: ";
+const NO_SUCH_METHOD: &str = "java.lang.NoSuchMethodError: ";
+const NO_CLASS_DEF: &str = "java.lang.NoClassDefFoundError: Failed resolution of: ";
 const FACT_BYTES: usize = 400;
 const EXIT_RECORD_BYTES: usize = 4096;
 const SIGNAL_EXIT_BASE: i32 = 128;
@@ -189,6 +194,7 @@ pub(crate) fn classify(
     record: Option<ClientEnd>,
     status: ExitStatus,
     uncaught_exception_recent: bool,
+    art_fatal_signal: Option<Signal>,
     oom_kills: Option<u64>,
 ) -> RunEnd {
     if let Some(end) = record {
@@ -209,6 +215,9 @@ pub(crate) fn classify(
             _ => RunEnd::Crashed(Signal(signal)),
         };
     }
+    if let Some(signal) = art_fatal_signal {
+        return RunEnd::Crashed(signal);
+    }
     match status.code() {
         Some(code) => exit_status_end(code, uncaught_exception_recent),
         None => RunEnd::ExitedUnexpectedly {
@@ -228,6 +237,7 @@ fn exit_status_end(status: i32, uncaught_exception_recent: bool) -> RunEnd {
 pub(crate) struct Finished {
     pub(crate) end: RunEnd,
     status_error: Option<String>,
+    missing_android_api: Option<String>,
     status: ExitStatus,
     pub(crate) log: PathBuf,
 }
@@ -238,10 +248,18 @@ impl Finished {
     }
 
     fn outcome(&self) -> String {
-        match &self.status_error {
-            Some(error) => format!("{}\nLast error: {error}", self.end),
-            None => self.end.to_string(),
-        }
+        let mut lines = vec![self.end.to_string()];
+        lines.extend(
+            self.status_error
+                .iter()
+                .map(|error| format!("Last error: {error}")),
+        );
+        lines.extend(
+            self.missing_android_api
+                .iter()
+                .map(|api| format!("Missing Android API: {api}")),
+        );
+        lines.join("\n")
     }
 
     pub(crate) fn exit_code(&self) -> ExitCode {
@@ -316,14 +334,26 @@ pub(crate) fn run<O: Write, E: Write>(
     let oom_kills = oom_kills_before
         .zip(oom_kills())
         .map(|(before, after)| after.saturating_sub(before));
-    let end = classify(record, status, uncaught_exception_recent, oom_kills);
+    let art_fatal_signal = sink.facts.art_fatal_signal.map(|(signal, _)| signal);
+    let end = classify(
+        record,
+        status,
+        uncaught_exception_recent,
+        art_fatal_signal,
+        oom_kills,
+    );
     let status_error = end
         .failed()
         .then(|| sink.facts.last_status_error.take())
         .flatten();
+    let missing_android_api = end
+        .failed()
+        .then(|| sink.facts.missing_android_api_before_the_end(gone_at))
+        .flatten();
     let mut finished = Finished {
         end,
         status_error,
+        missing_android_api,
         status,
         log: log_path,
     };
@@ -351,7 +381,8 @@ fn spawn<O: Write, E: Write>(
         .env(RUN_LOG_ENV, &sink.log_path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     unsafe {
         command.pre_exec(move || inherit_supervision(parent, inherited));
     }
@@ -483,6 +514,102 @@ impl Lines {
 struct Facts {
     last_status_error: Option<String>,
     uncaught_exception_at: Option<Instant>,
+    art_fatal_signal: Option<(Signal, Instant)>,
+    missing_android_api: Option<(String, Instant)>,
+}
+
+impl Facts {
+    fn note_stderr(&mut self, line: &[u8], at: Instant) {
+        if line.starts_with(UNCAUGHT_EXCEPTION_HEADER.as_bytes()) {
+            self.uncaught_exception_at = Some(at);
+        }
+        if self.art_fatal_signal.is_some() {
+            return;
+        }
+        if let Some(signal) = art_fatal_signal(line) {
+            self.art_fatal_signal = Some((signal, at));
+        } else if let Some(api) = missing_android_api(line) {
+            self.missing_android_api = Some((api, at));
+        }
+    }
+
+    fn missing_android_api_before_the_end(&mut self, gone_at: Instant) -> Option<String> {
+        let end = self.art_fatal_signal.map_or(gone_at, |(_, at)| at);
+        let (api, at) = self.missing_android_api.take()?;
+        (end.saturating_duration_since(at) <= UNCAUGHT_EXCEPTION_WINDOW).then_some(api)
+    }
+}
+
+fn art_fatal_signal(line: &[u8]) -> Option<Signal> {
+    let report = line.strip_prefix(ART_FATAL_SIGNAL)?;
+    let digits = report
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    let number = std::str::from_utf8(&report[..digits]).ok()?.parse().ok()?;
+    report[digits..]
+        .starts_with(b" (")
+        .then_some(Signal(number))
+}
+
+fn missing_android_api(line: &[u8]) -> Option<String> {
+    let line = std::str::from_utf8(line).ok()?;
+    let error = match line.strip_prefix(CAUSE_HEADER) {
+        Some(cause) => cause,
+        None => uncaught_exception(line).unwrap_or(line),
+    };
+    if let Some(message) = error.strip_prefix(NO_SUCH_FIELD) {
+        return missing_field(message);
+    }
+    if let Some(message) = error.strip_prefix(NO_SUCH_METHOD) {
+        return missing_method(message);
+    }
+    android_class(error.strip_prefix(NO_CLASS_DEF)?)
+}
+
+fn missing_field(message: &str) -> Option<String> {
+    if let Some(linked) = message.strip_prefix("No ") {
+        let (_, field) = linked.split_once("field ")?;
+        let (name, declared) = field.split_once(" of type ")?;
+        let (_, class) = declared.split_once(" in class ")?;
+        return android_member(class, name);
+    }
+    if let Some(field_type) = message.strip_prefix("no type \"") {
+        return android_class(field_type);
+    }
+    let (_, looked_up) = message.strip_prefix("no \"")?.split_once("\" field \"")?;
+    let (name, class) = looked_up.split_once("\" in class \"")?;
+    android_member(class, name)
+}
+
+fn missing_method(message: &str) -> Option<String> {
+    if let Some(linked) = message.strip_prefix("No ") {
+        let (_, method) = linked.split_once(" method ")?;
+        let (name, class) = method.split_once(" in class ")?;
+        return android_member(class, name);
+    }
+    let (_, looked_up) = message.strip_prefix("no ")?.split_once(" method \"")?;
+    let (_, method) = looked_up.split_once(";.")?;
+    let (name, _) = method.split_once('"')?;
+    android_member(looked_up, name)
+}
+
+fn uncaught_exception(line: &str) -> Option<&str> {
+    let (_, error) = line
+        .strip_prefix(UNCAUGHT_EXCEPTION_HEADER)?
+        .split_once("\" ")?;
+    Some(error)
+}
+
+fn android_member(class: &str, member: &str) -> Option<String> {
+    Some(format!("{}.{member}", android_class(class)?))
+}
+
+fn android_class(descriptor: &str) -> Option<String> {
+    let (class, _) = descriptor.strip_prefix('L')?.split_once(';')?;
+    class
+        .starts_with("android/")
+        .then(|| class.replace('/', "."))
 }
 
 fn without_leading_nul(line: &[u8]) -> &[u8] {
@@ -566,9 +693,9 @@ impl<O: Write, E: Write> Sink<O, E> {
     }
 
     fn raw(&mut self, stream: RawStream, line: &[u8]) {
-        let text = without_leading_nul(line);
-        if matches!(stream, RawStream::Stderr) && text.starts_with(UNCAUGHT_EXCEPTION_HEADER) {
-            self.facts.uncaught_exception_at = Some(Instant::now());
+        if matches!(stream, RawStream::Stderr) {
+            self.facts
+                .note_stderr(without_leading_nul(line), Instant::now());
         }
         self.write_log(|log| log.append_raw(stream, line));
     }
@@ -617,14 +744,13 @@ struct Drain<O, E> {
 
 impl<O: Write, E: Write> Drain<O, E> {
     fn until_exit(&mut self, child: &mut Child) -> io::Result<(ExitStatus, Instant)> {
+        let client = Pid::from_child(child);
         let mut buffer = vec![0; READ_CHUNK];
-        let mut exited = None;
         let mut next_check = Instant::now() + EXIT_CHECK;
         while self.streams.is_open(Source::Exit) {
             let now = Instant::now();
             if now >= next_check {
-                exited = child.try_wait()?;
-                if exited.is_some() {
+                if exited(client, WaitIdOptions::NOHANG)? {
                     break;
                 }
                 next_check = now + EXIT_CHECK;
@@ -634,7 +760,9 @@ impl<O: Write, E: Write> Drain<O, E> {
             }
         }
         let gone_at = Instant::now();
-        let late = gone_at + LATE_OUTPUT;
+        exited(client, WaitIdOptions::empty())?;
+        self.end_leftovers(client);
+        let late = Instant::now() + LATE_OUTPUT;
         while self.streams.any_open() {
             let Some(left) = late
                 .checked_duration_since(Instant::now())
@@ -647,11 +775,21 @@ impl<O: Write, E: Write> Drain<O, E> {
             }
         }
         self.finish_lines();
-        let status = match exited {
-            Some(status) => status,
-            None => child.wait()?,
-        };
-        Ok((status, gone_at))
+        Ok((child.wait()?, gone_at))
+    }
+
+    fn end_leftovers(&mut self, client: Pid) {
+        if let Err(error) =
+            rustix::process::kill_process_group(client, rustix::process::Signal::KILL)
+        {
+            self.sink.note(
+                Level::WARN,
+                &format!(
+                    "processes Roblox's process {client} started may outlive it, because ending \
+                     its process group failed: {error}"
+                ),
+            );
+        }
     }
 
     fn drain_ready(&mut self, buffer: &mut [u8], timeout: Duration) -> bool {
@@ -727,6 +865,19 @@ impl<O: Write, E: Write> Drain<O, E> {
                 self.sink.note(Level::WARN, &text);
                 None
             }
+        }
+    }
+}
+
+fn exited(client: Pid, options: WaitIdOptions) -> io::Result<bool> {
+    loop {
+        match rustix::process::waitid(
+            WaitId::Pid(client),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | options,
+        ) {
+            Ok(status) => return Ok(status.is_some()),
+            Err(Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -1020,6 +1171,47 @@ mod tests {
                  memory"
             )
         );
+    }
+
+    fn ended(pid: libc::pid_t) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, fields)| fields.starts_with('Z'))
+        })
+    }
+
+    #[test]
+    fn processes_a_crashed_client_leaves_behind_end_with_it() {
+        const TEST: &str = "processes_a_crashed_client_leaves_behind_end_with_it";
+        if supervised_child() {
+            let leftover = unsafe { libc::fork() };
+            if leftover == 0 {
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+            write_raw(
+                RawStream::Stdout,
+                format!("leftover {leftover}\n").as_bytes(),
+            );
+            die_by(libc::SIGABRT);
+        }
+
+        let run = supervise(TEST);
+        let leftover: libc::pid_t = String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("leftover ")?.parse().ok())
+            .expect("the client names the process it left behind");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ended(leftover) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let gone = ended(leftover);
+        if !gone {
+            unsafe { libc::kill(leftover, libc::SIGKILL) };
+        }
+        assert_eq!(run.finished.end, RunEnd::Crashed(Signal(libc::SIGABRT)));
+        assert!(gone, "a process the crashed client left behind outlived it");
     }
 
     #[test]
@@ -1486,11 +1678,158 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                classify(record, status, uncaught, oom_kills),
+                classify(record, status, uncaught, None, oom_kills),
                 end,
                 "{record:?} {status:?} {uncaught}"
             );
         }
+    }
+
+    #[test]
+    fn an_art_fatal_signal_report_turns_only_a_plain_exit_into_a_crash() {
+        let abort = Some(Signal(libc::SIGABRT));
+        for (record, status, end) in [
+            (None, exited(1), RunEnd::Crashed(Signal(libc::SIGABRT))),
+            (
+                None,
+                exit_status(libc::SIGSEGV),
+                RunEnd::Crashed(Signal(libc::SIGSEGV)),
+            ),
+            (
+                Some(ClientEnd::FailureShown),
+                exited(1),
+                RunEnd::FailureShown,
+            ),
+        ] {
+            assert_eq!(
+                classify(record, status, false, abort, None),
+                end,
+                "{record:?} {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linkage_errors_name_only_missing_android_apis() {
+        for (line, api) in [
+            (
+                "java.lang.NoSuchFieldError: No field EFFECT_TYPE_AEC of type Ljava/util/UUID; in \
+                 class Landroid/media/audiofx/AudioEffect; or its superclasses (declaration of \
+                 'android.media.audiofx.AudioEffect' appears in \
+                 /app/lib/eclipse/framework/api-impl.jar!classes3.dex)",
+                Some("android.media.audiofx.AudioEffect.EFFECT_TYPE_AEC"),
+            ),
+            (
+                "Exception in thread \"Thread-17\" java.lang.NoSuchMethodError: No virtual method \
+                 isDeviceSecure()Z in class Landroid/app/KeyguardManager; or its super classes",
+                Some("android.app.KeyguardManager.isDeviceSecure()Z"),
+            ),
+            (
+                "Caused by: java.lang.NoClassDefFoundError: Failed resolution of: \
+                 Landroid/media/MediaExtractor;",
+                Some("android.media.MediaExtractor"),
+            ),
+            (
+                "java.lang.NoSuchMethodError: no static method \
+                 \"Landroid/os/Build;.getSerial()Ljava/lang/String;\"",
+                Some("android.os.Build.getSerial()Ljava/lang/String;"),
+            ),
+            (
+                "Exception in thread \"main\" java.lang.NoSuchFieldError: no \
+                 \"Ljava/lang/String;\" field \"SOC_MODEL\" in class \"Landroid/os/Build;\" or \
+                 its superclasses",
+                Some("android.os.Build.SOC_MODEL"),
+            ),
+            (
+                "java.lang.NoSuchFieldError: no type \"Landroid/media/AudioDeviceInfo;\" found and \
+                 so no field \"device\" could be found in class \"Lcom/roblox/b;\" or its \
+                 superclasses",
+                Some("android.media.AudioDeviceInfo"),
+            ),
+            (
+                "java.lang.NoSuchFieldError: No static field a of type I in class Lcom/roblox/b; \
+                 or its superclasses",
+                None,
+            ),
+            (
+                "java.lang.NoSuchMethodError: no non-static method \"Lcom/roblox/b;.a()V\"",
+                None,
+            ),
+            (
+                "java.lang.NoSuchFieldError: no \"I\" field \"a\" in class \"Lcom/roblox/b;\" or \
+                 its superclasses",
+                None,
+            ),
+            (
+                "java.lang.NoSuchFieldException: EFFECT_TYPE_AEC in \
+                 Landroid/media/audiofx/AudioEffect;",
+                None,
+            ),
+            (
+                "\tat org.webrtc.voiceengine.WebRtcAudioManager.<init>(Unknown Source:81)",
+                None,
+            ),
+        ] {
+            assert_eq!(
+                missing_android_api(line.as_bytes()).as_deref(),
+                api,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_art_fatal_signal_before_a_status_exit_is_a_crash_naming_the_missing_android_api() {
+        if supervised_child() {
+            write_raw(
+                RawStream::Stderr,
+                b"java.lang.NoSuchFieldError: No field EFFECT_TYPE_AEC of type Ljava/util/UUID; \
+                  in class Landroid/media/audiofx/AudioEffect; or its superclasses (declaration \
+                  of 'android.media.audiofx.AudioEffect' appears in \
+                  /app/lib/eclipse/framework/api-impl.jar!classes3.dex)\n\
+                  \tat org.webrtc.voiceengine.WebRtcAudioManager.<init>(Unknown Source:81)\n\
+                  # Check failed: !jni_->ExceptionCheck()\n\
+                  *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***\n\
+                  Fatal signal 6 (SIGABRT), code -6 (SI_TKILL)\n\
+                  A/art     (    3): art/runtime/runtime_common.cc:458] HandleUnexpectedSignal \
+                  reenter\n",
+            );
+            unsafe { libc::_exit(1) }
+        }
+
+        let run = supervise(
+            "an_art_fatal_signal_before_a_status_exit_is_a_crash_naming_the_missing_android_api",
+        );
+        assert_eq!(run.finished.end, RunEnd::Crashed(Signal(libc::SIGABRT)));
+        assert_eq!(run.finished.exit_code(), ExitCode::FAILURE);
+        assert_eq!(
+            run.finished.failure().as_deref(),
+            Some(
+                "Roblox crashed (signal 6, SIGABRT: Roblox aborted)\nMissing Android API: \
+                 android.media.audiofx.AudioEffect.EFFECT_TYPE_AEC"
+            )
+        );
+        assert_eq!(footer(&run.log).len(), 2, "{}", run.log);
+    }
+
+    #[test]
+    fn a_linkage_error_after_the_fatal_signal_report_is_not_the_crash_detail() {
+        if supervised_child() {
+            write_raw(
+                RawStream::Stderr,
+                b"Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR)\n\
+                  java.lang.NoClassDefFoundError: Failed resolution of: \
+                  Landroid/media/MediaExtractor;\n",
+            );
+            unsafe { libc::_exit(1) }
+        }
+
+        let run =
+            supervise("a_linkage_error_after_the_fatal_signal_report_is_not_the_crash_detail");
+        assert_eq!(
+            run.finished.failure().as_deref(),
+            Some("Roblox crashed (signal 11, SIGSEGV: invalid memory access)")
+        );
     }
 
     #[test]

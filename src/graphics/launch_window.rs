@@ -44,9 +44,23 @@ const LINEAR_LAYOUT: &str = "android.widget.LinearLayout";
 const FRAME_LAYOUT: &str = "android.widget.FrameLayout";
 const TEXT_VIEW: &str = "android.widget.TextView";
 const STARTING: &str = "Starting Roblox…";
-const ERROR_HEADING: &str = "Roblox could not start:";
 const LOG_HINT: &str = "Details are in";
-const CLOSE_HINT: &str = "Close this window to exit.";
+const CLOSE: &str = "Close (Esc)";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureHeading {
+    CouldNotStart,
+    Stopped,
+}
+
+impl FailureHeading {
+    fn text(self) -> &'static str {
+        match self {
+            Self::CouldNotStart => "Roblox could not start:",
+            Self::Stopped => "Roblox stopped:",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowClosed;
@@ -239,8 +253,9 @@ impl LaunchWindow {
         self.screen.take_activation_token()
     }
 
-    pub fn show_error(&mut self, message: &str, log: Option<&Path>) {
+    pub fn show_error(&mut self, heading: FailureHeading, message: &str, log: Option<&Path>) {
         self.screen.content.error = Some(Failure {
+            heading,
             message: message.to_owned(),
             log: log.map(Path::to_path_buf),
         });
@@ -256,7 +271,7 @@ impl LaunchWindow {
         }
         self.screen.session = Session::Showing;
         if let Err(error) = self.event_loop.run_app_on_demand(&mut self.screen) {
-            tracing::warn!(%error, "the window that shows why Roblox could not start failed");
+            tracing::warn!(%error, "the window that shows why Roblox failed could not run");
         }
         if let Some(log) = self.screen.log_of_unseen_failure() {
             eprintln!("{LOG_HINT} {}", log.display());
@@ -337,7 +352,10 @@ impl StatusScreen {
     }
 
     fn give(&mut self, answer: Answer) {
-        if self.awaiting_answer() {
+        if self.content.error.is_some() {
+            self.close_window();
+            self.session = Session::Dismissed;
+        } else if self.awaiting_answer() {
             self.answer = Some(answer);
         }
     }
@@ -581,6 +599,7 @@ impl ApplicationHandler<HostWake> for StatusScreen {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Failure {
+    heading: FailureHeading,
     message: String,
     log: Option<PathBuf>,
 }
@@ -632,10 +651,19 @@ impl Content {
         }
         match &self.error {
             Some(Failure {
+                heading,
                 message,
                 log: Some(log),
-            }) => format!("{ERROR_HEADING} {message} ({LOG_HINT} {})", log.display()),
-            Some(Failure { message, log: None }) => format!("{ERROR_HEADING} {message}"),
+            }) => format!(
+                "{} {message} ({LOG_HINT} {})",
+                heading.text(),
+                log.display()
+            ),
+            Some(Failure {
+                heading,
+                message,
+                log: None,
+            }) => format!("{} {message}", heading.text()),
             None => {
                 let step = self.step.as_deref().unwrap_or(STARTING);
                 match self.progress {
@@ -647,8 +675,23 @@ impl Content {
     }
 
     fn nodes(&self, atlas: &GlyphAtlas, extent: vk::Extent2D, scale: f64) -> Vec<RenderNode> {
+        self.screen(atlas, extent, scale).nodes
+    }
+
+    fn answer_at(
+        &self,
+        atlas: &GlyphAtlas,
+        extent: vk::Extent2D,
+        scale: f64,
+        point: (f32, f32),
+    ) -> Option<Answer> {
+        let screen = self.screen(atlas, extent, scale);
+        action_at(&screen.nodes, &screen.answers, atlas, extent, point)
+    }
+
+    fn screen(&self, atlas: &GlyphAtlas, extent: vk::Extent2D, scale: f64) -> Screen {
         if let Some(prompt) = self.showing_prompt() {
-            return Screen::asking(prompt, atlas, extent, scale).nodes;
+            return Screen::asking(prompt, atlas, extent, scale);
         }
         let mut screen = Screen::new(scale);
         let width = extent.width as i32 - 2 * screen.px(PADDING);
@@ -656,13 +699,12 @@ impl Content {
         let measure = TextMeasure { atlas };
         match &self.error {
             Some(failure) => {
-                screen.paragraph(ERROR_HEADING, measure, width, ERROR_BACKGROUND, 0);
+                screen.paragraph(failure.heading.text(), measure, width, ERROR_BACKGROUND, 0);
                 screen.paragraph(&failure.message, measure, width, ERROR_BACKGROUND, 0);
                 if let Some(log) = &failure.log {
                     let hint = format!("{LOG_HINT} {}", log.display());
                     screen.paragraph(&hint, measure, width, BACKGROUND, gap);
                 }
-                screen.paragraph(CLOSE_HINT, measure, width, BACKGROUND, gap);
             }
             None => {
                 let step = self.step.as_deref().unwrap_or(STARTING);
@@ -678,19 +720,10 @@ impl Content {
         for warning in &self.warnings {
             screen.paragraph(warning, measure, width, WARNING_BACKGROUND, gap);
         }
-        screen.nodes
-    }
-
-    fn answer_at(
-        &self,
-        atlas: &GlyphAtlas,
-        extent: vk::Extent2D,
-        scale: f64,
-        point: (f32, f32),
-    ) -> Option<Answer> {
-        let prompt = self.showing_prompt()?;
-        let screen = Screen::asking(prompt, atlas, extent, scale);
-        action_at(&screen.nodes, &screen.answers, atlas, extent, point)
+        if self.error.is_some() {
+            screen.button(CLOSE, Answer::Cancel, measure, width);
+        }
+        screen
     }
 }
 
@@ -1128,24 +1161,44 @@ mod tests {
         );
 
         content.error = Some(Failure {
+            heading: FailureHeading::CouldNotStart,
             message: "Roblox is not installed".to_owned(),
             log: None,
         });
         assert_eq!(
-            texts(&content.nodes(&atlas, extent, 1.0))[..3],
-            [ERROR_HEADING, "Roblox is not installed", CLOSE_HINT]
+            texts(&content.nodes(&atlas, extent, 1.0)),
+            [
+                "Roblox could not start:",
+                "Roblox is not installed",
+                "warning 1",
+                "warning 2",
+                "warning 3",
+                CLOSE
+            ]
         );
         content.error = Some(Failure {
+            heading: FailureHeading::CouldNotStart,
             message: "Roblox is not installed".to_owned(),
             log: Some(PathBuf::from("/data/logs/eclipse.log")),
         });
         assert_eq!(
-            texts(&content.nodes(&atlas, extent, 1.0))[..4],
+            texts(&content.nodes(&atlas, extent, 1.0))[..3],
             [
-                ERROR_HEADING,
+                "Roblox could not start:",
                 "Roblox is not installed",
-                "Details are in /data/logs/eclipse.log",
-                CLOSE_HINT
+                "Details are in /data/logs/eclipse.log"
+            ]
+        );
+        content.error = Some(Failure {
+            heading: FailureHeading::Stopped,
+            message: "Roblox crashed (signal 6, SIGABRT: Roblox aborted)".to_owned(),
+            log: Some(PathBuf::from("/data/logs/eclipse.log")),
+        });
+        assert_eq!(
+            texts(&content.nodes(&atlas, extent, 1.0))[..2],
+            [
+                "Roblox stopped:",
+                "Roblox crashed (signal 6, SIGABRT: Roblox aborted)"
             ]
         );
     }
@@ -1264,12 +1317,13 @@ mod tests {
             .all(|button| button.layout.width == MATCH_PARENT));
 
         content.error = Some(Failure {
+            heading: FailureHeading::CouldNotStart,
             message: "Roblox did not close".to_owned(),
             log: None,
         });
         assert_eq!(
             texts(&content.nodes(&atlas, PROMPT_EXTENT, 1.0))[..2],
-            [ERROR_HEADING, "Roblox did not close"]
+            ["Roblox could not start:", "Roblox did not close"]
         );
     }
 
@@ -1404,6 +1458,44 @@ mod tests {
         }
     }
 
+    fn failure() -> Failure {
+        Failure {
+            heading: FailureHeading::Stopped,
+            message: "Roblox exited unexpectedly with status 1".to_owned(),
+            log: Some(PathBuf::from("/data/logs/eclipse.log")),
+        }
+    }
+
+    #[test]
+    fn a_failure_offers_a_close_button() {
+        let atlas = monospace_atlas();
+        let content = Content {
+            error: Some(failure()),
+            prompt: Some(prompt()),
+            ..Content::default()
+        };
+        let nodes = content.nodes(&atlas, PROMPT_EXTENT, 1.0);
+        let close = nodes
+            .iter()
+            .find(|node| node.text.as_deref() == Some(CLOSE))
+            .expect("a close button");
+        assert_eq!(close.background_color, Some(BUTTON_BACKGROUND));
+        let at = |point| content.answer_at(&atlas, PROMPT_EXTENT, 1.0, point);
+        assert_eq!(at(center_of(&content, &atlas, CLOSE)), Some(Answer::Cancel));
+        assert_eq!(at(center_of(&content, &atlas, "Roblox stopped:")), None);
+    }
+
+    #[test]
+    fn escape_enter_or_the_close_button_dismiss_a_shown_failure() {
+        for answer in [Answer::Cancel, Answer::Confirm] {
+            let mut screen = StatusScreen::new("Eclipse", mpsc::channel().1);
+            screen.content.error = Some(failure());
+            screen.give(answer);
+            assert_eq!(screen.session, Session::Dismissed, "{answer:?}");
+            assert_eq!(screen.answer, None, "{answer:?}");
+        }
+    }
+
     #[test]
     fn the_title_carries_the_question_and_both_keys_when_text_cannot_be_drawn() {
         let content = Content {
@@ -1452,6 +1544,7 @@ mod tests {
     #[test]
     fn a_failure_no_window_showed_names_its_log_for_the_terminal() {
         let failure = Failure {
+            heading: FailureHeading::CouldNotStart,
             message: "Roblox is not installed".to_owned(),
             log: Some(PathBuf::from("/data/logs/eclipse.log")),
         };
@@ -1487,6 +1580,7 @@ mod tests {
             "Downloading Roblox… Downloaded 50.0 of 100.0 MiB (50%)"
         );
         content.error = Some(Failure {
+            heading: FailureHeading::CouldNotStart,
             message: "APKCombo is unreachable".to_owned(),
             log: Some(PathBuf::from("/data/logs/eclipse.log")),
         });

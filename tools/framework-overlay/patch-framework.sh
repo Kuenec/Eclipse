@@ -122,6 +122,27 @@ kg_src="$here/src/android/app/KeyguardManager.java"
 [ -f "$kg_src" ] || fail "patched KeyguardManager.java missing at $kg_src"
 grep -qF 'public boolean isDeviceSecure()' "$kg_src" || fail "patched KeyguardManager.java no longer declares isDeviceSecure() — the NoSuchMethodError fix regressed"
 
+audiofx_src="$here/src/android/media/audiofx"
+atl_audiofx_src="$ATL_SRC/android/media/audiofx"
+ATL_AUDIO_EFFECT_SHA256='f3a60ffddb628d31a17e19cf0620b459e2480385955ea4c1d90c8a27279ecc79'
+atl_audio_effect_sha256="$(sha256sum "$atl_audiofx_src/AudioEffect.java" | awk '{print $1}')"
+[ "$atl_audio_effect_sha256" = "$ATL_AUDIO_EFFECT_SHA256" ] || fail "ATL's AudioEffect.java changed (sha256 $atl_audio_effect_sha256) — Eclipse's copy at $audiofx_src/AudioEffect.java shadows it; merge ATL's new members into it, then update ATL_AUDIO_EFFECT_SHA256"
+grep -qE 'class[[:space:]]+Equalizer[[:space:]]+extends[[:space:]]+AudioEffect' "$atl_audiofx_src/Equalizer.java" || fail "ATL's Equalizer no longer extends AudioEffect — re-check that it links against Eclipse's AudioEffect"
+for atl_effect in AcousticEchoCanceler NoiseSuppressor; do
+    [ ! -e "$atl_audiofx_src/$atl_effect.java" ] || fail "ATL now ships $atl_effect.java — drop Eclipse's copy at $audiofx_src"
+done
+for audiofx_needle in \
+    'EFFECT_TYPE_AEC =' \
+    '"7b491460-8d4d-11e0-bd61-0002a5d5c51b"' \
+    'EFFECT_TYPE_NS =' \
+    '"58b4b260-8e06-11e0-aa8e-0002a5d5c51b"' \
+    'public UUID type;' \
+    'public UUID uuid;' \
+    'public void release()'
+do
+    grep -qF "$audiofx_needle" "$audiofx_src/AudioEffect.java" || fail "AudioEffect.java lost '$audiofx_needle' — WebRTC voice chat would abort Roblox when it joins a voice server"
+done
+
 kgps_src="$here/src/android/security/keystore/KeyGenParameterSpec.java"
 [ -f "$kgps_src" ] || fail "KeyGenParameterSpec compatibility surface missing at $kgps_src"
 for kgps_needle in \
@@ -214,6 +235,9 @@ grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+th
     "$wre_src" \
     "$wrr_src" \
     "$here/src/android/app/KeyguardManager.java" \
+    "$audiofx_src/AudioEffect.java" \
+    "$audiofx_src/AcousticEchoCanceler.java" \
+    "$audiofx_src/NoiseSuppressor.java" \
     "$kgps_src" \
     "$pc_src" \
     "$si_src" \
@@ -221,7 +245,7 @@ grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+th
     "$pl_src" \
     "$r_src"
 
-for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/webkit/WebResourceError*.class' 'android/webkit/EclipseWebResourceRequest*.class' 'android/app/KeyguardManager*.class' 'android/security/keystore/KeyGenParameterSpec*.class' 'android/content/pm/SigningInfo*.class' 'android/content/pm/SigningCertificates*.class' 'android/os/PreloadedLibrary*.class'; do
+for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/webkit/WebResourceError*.class' 'android/webkit/EclipseWebResourceRequest*.class' 'android/app/KeyguardManager*.class' 'android/media/audiofx/AudioEffect*.class' 'android/media/audiofx/AcousticEchoCanceler*.class' 'android/media/audiofx/NoiseSuppressor*.class' 'android/security/keystore/KeyGenParameterSpec*.class' 'android/content/pm/SigningInfo*.class' 'android/content/pm/SigningCertificates*.class' 'android/os/PreloadedLibrary*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     mapfile -t class_files < <(compgen -G "$work/classes/$pattern")
