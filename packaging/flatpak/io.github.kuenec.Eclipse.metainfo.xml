@@ -24,7 +24,7 @@
   <screenshots>
     <screenshot type="default">
       <caption>The launch window downloading the official Roblox client</caption>
-      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.8/packaging/flatpak/screenshots/first-launch.png</image>
+      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.9/packaging/flatpak/screenshots/first-launch.png</image>
     </screenshot>
   </screenshots>
   <url type="homepage">https://github.com/Kuenec/Eclipse</url>
@@ -57,6 +57,24 @@
     <color type="primary" scheme_preference="dark">#9e391b</color>
   </branding>
   <releases>
+    <release version="0.1.9" date="2026-10-04">
+      <description>
+        <ul>
+          <li>
+            Controllers work through SDL3, touchscreens send real multi-finger touches, and
+            touchpad scrolling no longer depends on your display scale.
+          </li>
+          <li>
+            Eclipse remembers its window size and fullscreen state, closes cleanly when Roblox
+            exits, and can show the server's location or close when you leave a game.
+          </li>
+          <li>
+            Roblox is ready about twice as fast after an update. eclipse rollback returns to the
+            previous version, and eclipse storage shows and cleans what Eclipse keeps on disk.
+          </li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.8" date="2026-10-03">
       <description>
         <ul>
