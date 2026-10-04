@@ -25,6 +25,9 @@ unused = { level = "warn", priority = -1 }
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 lto = true
