@@ -90,7 +90,7 @@ struct SdlApi {
     _library: libloading::Library,
 }
 
-struct SdlVersion(c_int);
+pub struct SdlVersion(c_int);
 
 impl fmt::Display for SdlVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -160,6 +160,14 @@ impl SdlApi {
         Ok(API.get_or_init(|| api))
     }
 
+    fn supported_version(&self) -> Result<SdlVersion, SdlUnavailable> {
+        let version = unsafe { (self.get_version)() };
+        if version < MINIMUM_VERSION {
+            return Err(SdlUnavailable::TooOld { version });
+        }
+        Ok(SdlVersion(version))
+    }
+
     fn error(&self) -> String {
         let message = unsafe { (self.get_error)() };
         if message.is_null() {
@@ -169,6 +177,12 @@ impl SdlApi {
             .to_string_lossy()
             .into_owned()
     }
+}
+
+pub fn sdl_version() -> Result<SdlVersion, String> {
+    SdlApi::loaded()
+        .and_then(SdlApi::supported_version)
+        .map_err(|error| error.to_string())
 }
 
 fn symbol<T: Copy>(library: &libloading::Library, name: &'static str) -> Result<T, SdlUnavailable> {
@@ -185,17 +199,14 @@ struct SdlSession {
 impl SdlSession {
     fn start() -> Result<Self, SdlUnavailable> {
         let api = SdlApi::loaded()?;
-        let version = unsafe { (api.get_version)() };
-        if version < MINIMUM_VERSION {
-            return Err(SdlUnavailable::TooOld { version });
-        }
+        let version = api.supported_version()?;
         if !unsafe { (api.set_hint)(c"SDL_NO_SIGNAL_HANDLERS".as_ptr(), c"1".as_ptr()) } {
             return Err(SdlUnavailable::Init(api.error()));
         }
         if !unsafe { (api.init)(SDL_INIT_GAMEPAD) } {
             return Err(SdlUnavailable::Init(api.error()));
         }
-        tracing::info!(version = %SdlVersion(version), "controller support started");
+        tracing::info!(%version, "controller support started");
         Ok(Self {
             api,
             pads: Vec::new(),

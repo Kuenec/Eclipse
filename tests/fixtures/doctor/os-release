@@ -1,0 +1,7 @@
+NAME="Fedora Linux"
+VERSION="42 (Workstation Edition)"
+ID=fedora
+VERSION_ID=42
+PRETTY_NAME="Fedora Linux 42 (Workstation Edition)"
+ANSI_COLOR="0;38;2;60;110;180"
+HOME_URL="https://fedoraproject.org/"

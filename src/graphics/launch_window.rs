@@ -616,6 +616,7 @@ fn key_answer(key: &Key) -> Option<Answer> {
 struct Content {
     step: Option<String>,
     progress: Option<Progress>,
+    note: Option<String>,
     warnings: VecDeque<String>,
     error: Option<Failure>,
     prompt: Option<Prompt>,
@@ -629,6 +630,7 @@ impl Content {
                 self.progress = None;
             }
             StatusUpdate::Progress(progress) => self.progress = Some(progress),
+            StatusUpdate::Note(text) => self.note = Some(text),
             StatusUpdate::Warning(text) => {
                 if self.warnings.len() == MAX_WARNINGS {
                     self.warnings.pop_front();
@@ -714,6 +716,9 @@ impl Content {
                         screen.bar(done, total, width);
                     }
                     screen.paragraph(&progress.text(), measure, width, BACKGROUND, 0);
+                }
+                if let Some(note) = &self.note {
+                    screen.paragraph(note, measure, width, BACKGROUND, gap);
                 }
             }
         }
@@ -1201,6 +1206,53 @@ mod tests {
                 "Roblox crashed (signal 6, SIGABRT: Roblox aborted)"
             ]
         );
+    }
+
+    #[test]
+    fn the_latest_note_follows_the_status_above_the_warnings_until_an_error() {
+        let atlas = monospace_atlas();
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        let mut content = Content::default();
+        content.apply(StatusUpdate::Step("Checking APKCombo".to_owned()));
+        content.apply(StatusUpdate::Note("First run".to_owned()));
+        content.apply(StatusUpdate::Warning("could not update Roblox".to_owned()));
+        let nodes = content.nodes(&atlas, extent, 1.0);
+        assert_eq!(
+            texts(&nodes),
+            ["Checking APKCombo", "First run", "could not update Roblox"]
+        );
+        let note = nodes
+            .iter()
+            .find(|node| node.text.as_deref() == Some("First run"))
+            .expect("the note");
+        assert_eq!(note.background_color, Some(BACKGROUND));
+        assert_eq!(note.layout.margins[1], SECTION_GAP);
+
+        content.apply(StatusUpdate::Note("Settings".to_owned()));
+        content.apply(StatusUpdate::Step("Downloading Roblox".to_owned()));
+        content.apply(StatusUpdate::Progress(Progress::Transfer {
+            done: 50 * 1024 * 1024,
+            total: Some(100 * 1024 * 1024),
+        }));
+        assert_eq!(
+            texts(&content.nodes(&atlas, extent, 1.0)),
+            [
+                "Downloading Roblox",
+                "Downloaded 50.0 of 100.0 MiB (50%)",
+                "Settings",
+                "could not update Roblox"
+            ]
+        );
+
+        content.error = Some(Failure {
+            heading: FailureHeading::CouldNotStart,
+            message: "APKCombo is unreachable".to_owned(),
+            log: None,
+        });
+        assert!(!texts(&content.nodes(&atlas, extent, 1.0)).contains(&"Settings"));
     }
 
     #[test]

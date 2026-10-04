@@ -1,14 +1,15 @@
 # Contributing
 
-Bug reports and focused pull requests are welcome. For a bug, include your distro, desktop, GPU and driver, and the log. Never attach APKs, cookies or account data.
+Bug reports and focused pull requests are welcome. For a bug, paste the output of `eclipse doctor --report`. Never attach APKs, cookies or account data.
 
 ## Build
 
-Requirements: Rust 1.95+, a C/C++ toolchain, `pkg-config`, and the ALSA, D-Bus, Fontconfig and FreeType headers. The tests also need `dbus-daemon`. The WebView helper also needs the GTK 4.10+ and WebKitGTK 6.0 (2.42+) headers.
+Requirements: Rust 1.95+, a C/C++ toolchain, `pkg-config`, and the ALSA, D-Bus, Fontconfig and FreeType headers. The tests also need `dbus-daemon`. The WebView helper also needs the GTK 4.10+ and WebKitGTK 6.0 (2.42+) headers, and the settings window needs GTK 4.10+ and libadwaita 1.5+.
 
 ```bash
 cargo build --release --locked
 cargo build --release --locked --manifest-path crates/eclipse-webview/Cargo.toml
+cargo build --release --locked --manifest-path crates/eclipse-settings/Cargo.toml
 ```
 
 A source build also needs the Android runtime the Flatpak bundles (art_standalone, bionic_translation and Android Translation Layer, pinned in the manifest) and the patched framework from `tools/framework-overlay/patch-framework.sh`. Point Eclipse at them with `ECLIPSE_LIBART` and `ECLIPSE_ANDROID_FRAMEWORK_DIR`. The simplest route is to build the Flatpak:
@@ -47,6 +48,7 @@ To record frame times, run `flatpak run --filesystem=xdg-run/eclipse-perf:create
 | `src/graphics.rs` | Window, presentation and input |
 | `src/webview/`, `crates/eclipse-webview/` | WebView helper and its protocol |
 | `crates/eclipse-config/` | Settings schema and config.json loading |
+| `crates/eclipse-settings/` | Settings window |
 | `tools/framework-overlay/` | Android framework patches and probes |
 | `tools/perf/` | Performance measurement harness |
 | `packaging/flatpak/` | Flatpak manifest and metadata |

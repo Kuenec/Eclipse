@@ -103,16 +103,14 @@ struct TestSupervisor {
 }
 
 impl TestSupervisor {
-    fn attach(command: &mut Command, run_log: &Path) -> Self {
+    fn attach(command: &mut Command) -> Self {
         let (records, records_end) = std::io::pipe().expect("create the record pipe");
         let (exit, exit_end) = std::io::pipe().expect("create the exit pipe");
         let inherited = [records_end.as_raw_fd(), exit_end.as_raw_fd()];
-        command
-            .env(
-                "ECLIPSE_SUPERVISOR_FDS",
-                format!("{},{}", inherited[0], inherited[1]),
-            )
-            .env("ECLIPSE_SUPERVISOR_RUN_LOG", run_log);
+        command.env(
+            "ECLIPSE_SUPERVISOR_FDS",
+            format!("{},{}", inherited[0], inherited[1]),
+        );
         unsafe {
             command.pre_exec(move || {
                 for fd in inherited {
@@ -156,7 +154,7 @@ fn a_restarted_run_without_the_preloaded_bridge_stops_and_tells_its_supervisor_w
             "ECLIPSE_CLIENT_APP_SETTINGS_PATH",
             runtime.join("ClientAppSettings.json"),
         );
-    let supervisor = TestSupervisor::attach(&mut command, &root.join("eclipse.log"));
+    let supervisor = TestSupervisor::attach(&mut command);
     let output = bounded_child::output(&mut command, RUN_LIMIT);
     let (records, exit) = supervisor.collect();
     std::fs::remove_dir_all(&root).ok();

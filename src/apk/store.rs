@@ -170,6 +170,14 @@ pub struct Rejections {
     files: Vec<DeclaredFile>,
 }
 
+impl Rejections {
+    pub fn skipped_versions(&self) -> impl Iterator<Item = (VersionCode, LeftBecause)> + '_ {
+        self.left
+            .iter()
+            .map(|(&version, &because)| (version, because))
+    }
+}
+
 pub fn plan(
     candidate: Candidate,
     verified: Option<&InstalledVersion>,
@@ -2559,9 +2567,14 @@ mod tests {
                 because: LeftBecause::FailedToStart,
             }]
         );
+        let rejections = store.rejections(crate::VERSION).unwrap();
         assert_eq!(
-            store.rejections(crate::VERSION).unwrap().left,
+            rejections.left,
             BTreeMap::from([(VersionCode(3212), LeftBecause::FailedToStart)])
+        );
+        assert_eq!(
+            rejections.skipped_versions().collect::<Vec<_>>(),
+            [(VersionCode(3212), LeftBecause::FailedToStart)]
         );
         assert!(root.join("3212").join(BASE_APK).is_file());
         assert!(!root.join(ATTEMPT_FILE).exists());

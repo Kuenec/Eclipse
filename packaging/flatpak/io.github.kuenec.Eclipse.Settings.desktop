@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=Eclipse Settings
+Exec=eclipse settings
+Icon=io.github.kuenec.Eclipse
+Terminal=false
+NoDisplay=true
+StartupNotify=true

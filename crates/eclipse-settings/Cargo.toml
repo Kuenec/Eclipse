@@ -1,0 +1,31 @@
+[package]
+name = "eclipse-settings"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+description = "Eclipse's settings window, kept out of the game process"
+repository = "https://github.com/Kuenec/Eclipse"
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+eclipse-config = { path = "../eclipse-config" }
+gtk4 = { version = "0.11", features = ["v4_10"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+unused = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]

@@ -435,3 +435,188 @@ fn a_launch_while_roblox_runs_is_handed_to_it_with_no_link_in_its_arguments() {
     assert_eq!(staged_after, staged);
     assert!(!shim_staged, "a handed-off launch never restarts itself");
 }
+
+const FAILURE_WINDOW_STUB: &str = "#!/bin/sh\n\
+    dir=${0%/*}\n\
+    {\n\
+    printf '%s\\n' \"$@\"\n\
+    printf 'GSK_RENDERER=%s\\n' \"${GSK_RENDERER-unset}\"\n\
+    printf 'XDG_ACTIVATION_TOKEN=%s\\n' \"${XDG_ACTIVATION_TOKEN-unset}\"\n\
+    printf 'DESKTOP_STARTUP_ID=%s\\n' \"${DESKTOP_STARTUP_ID-unset}\"\n\
+    } > \"$dir/window.tmp\"\n\
+    mv \"$dir/window.tmp\" \"$dir/window\"\n\
+    while [ ! -e \"$dir/close\" ]; do sleep 0.05; done\n";
+
+struct Launched {
+    eclipse: std::process::Child,
+    close: PathBuf,
+}
+
+impl Drop for Launched {
+    fn drop(&mut self) {
+        std::fs::write(&self.close, b"").ok();
+        if let Ok(None) = self.eclipse.try_wait() {
+            self.eclipse.kill().ok();
+            self.eclipse.wait().ok();
+        }
+    }
+}
+
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + RUN_LIMIT;
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting until {what}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_failed_window_launch_frees_roblox_and_opens_the_failure_window_on_its_saved_report() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = sandbox("failure-window");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let eclipse = bin.join("eclipse");
+    if std::fs::hard_link(env!("CARGO_BIN_EXE_eclipse"), &eclipse).is_err() {
+        std::fs::copy(env!("CARGO_BIN_EXE_eclipse"), &eclipse).unwrap();
+    }
+    let window = bin.join("eclipse-settings");
+    std::fs::write(&window, FAILURE_WINDOW_STUB).unwrap();
+    std::fs::set_permissions(&window, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let app_data = root.join("app-data");
+    let runtime = app_data.join("runtime");
+    std::fs::create_dir_all(runtime.join("ClientAppSettings.json")).unwrap();
+    let runtime_dir = Path::new(SHORT_RUNTIME_PARENT).join(format!("ec-{}-fw", std::process::id()));
+    std::fs::remove_dir_all(&runtime_dir).ok();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&runtime_dir)
+        .unwrap();
+
+    let eclipse = Command::new(&eclipse)
+        .arg("run")
+        .env("HOME", &root)
+        .env("USER", "eclipse-tester")
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("ECLIPSE_APP_DATA_DIR", &app_data)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("XDG_ACTIVATION_TOKEN", "eclipse-test-token")
+        .env_remove("DESKTOP_STARTUP_ID")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("WAYLAND_SOCKET")
+        .env_remove("DISPLAY")
+        .env_remove("LD_PRELOAD")
+        .env_remove("ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE")
+        .env_remove("ECLIPSE_CLIENT_APP_SETTINGS_PATH")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(root.join("stdout")).unwrap())
+        .stderr(std::fs::File::create(root.join("stderr")).unwrap())
+        .spawn()
+        .unwrap();
+    let mut launch = Launched {
+        eclipse,
+        close: bin.join("close"),
+    };
+    wait_for("the failure window opens", || bin.join("window").exists());
+    let lock = std::fs::File::create(runtime.join("client.lock")).unwrap();
+    let relaunch_possible = lock.try_lock().is_ok();
+    drop(lock);
+    let reports: Vec<PathBuf> = std::fs::read_dir(app_data.join("logs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.to_string_lossy().ends_with(".report.txt"))
+        .collect();
+    let report = std::fs::read_to_string(&reports[0]).unwrap();
+    std::fs::write(&launch.close, b"").unwrap();
+    let mut exited = None;
+    wait_for("Eclipse exits after the window closes", || {
+        exited = launch.eclipse.try_wait().unwrap();
+        exited.is_some()
+    });
+    drop(launch);
+    let opened = std::fs::read_to_string(bin.join("window")).unwrap();
+    let stderr = std::fs::read_to_string(root.join("stderr")).unwrap();
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&runtime_dir).ok();
+
+    assert_eq!(exited.unwrap().code(), Some(1), "{stderr}");
+    assert!(
+        relaunch_possible,
+        "Roblox's lock is free while the window is open"
+    );
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(
+        opened,
+        format!(
+            "--start-failure-report={}\nGSK_RENDERER=cairo\nXDG_ACTIVATION_TOKEN=unset\n\
+             DESKTOP_STARTUP_ID=unset\n",
+            reports[0].display()
+        )
+    );
+    assert!(
+        report.starts_with("Outcome: cannot write ~/app-data/runtime/ClientAppSettings.json"),
+        "{report}"
+    );
+    let (summary, rest) = report.split_once("\n\n").unwrap();
+    assert!(
+        summary.contains("\nProblem: Roblox is not installed. "),
+        "{summary}"
+    );
+    assert!(
+        summary
+            .lines()
+            .last()
+            .is_some_and(|line| line.starts_with("Log: ~/app-data/logs/eclipse-")),
+        "{summary}"
+    );
+    assert!(rest.starts_with("```text\nEclipse\n"), "{rest}");
+    assert!(report.len() <= 60_000, "{} bytes", report.len());
+    assert_eq!(
+        stderr.matches("eclipse run: cannot write ").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("cannot open a window"), "{stderr}");
+}
+
+#[test]
+fn the_log_directory_is_printed_for_the_settings_window() {
+    let root = sandbox("log-dir");
+    let app_data = root.join("app-data").join(OsStr::from_bytes(b"odd \xe9"));
+
+    let output = eclipse(&root, &app_data, &[OsStr::new("__log-dir")]);
+    let created = app_data.exists();
+    std::fs::remove_dir_all(&root).ok();
+
+    assert!(output.status.success(), "{output:?}");
+    let mut expected = app_data.join("logs").as_os_str().as_bytes().to_vec();
+    expected.push(b'\n');
+    assert_eq!(output.stdout, expected);
+    assert!(!created, "printing the directory creates nothing");
+}
+
+#[test]
+fn controller_access_is_one_line_and_fails_when_controllers_cannot_work() {
+    let root = sandbox("controller-access");
+
+    let output = eclipse(
+        &root,
+        &root.join("app-data"),
+        &[OsStr::new("__controller-access")],
+    );
+    std::fs::remove_dir_all(&root).ok();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert_eq!(
+        output.status.success(),
+        stdout == "input devices are visible\n",
+        "{stdout}"
+    );
+}

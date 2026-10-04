@@ -1,31 +1,74 @@
 #![forbid(unsafe_code)]
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 pub const NON_URL: &str = "<non-url>";
 
 const SCHEME_SEPARATOR: &str = "://";
 const REDACTED_SCHEMES: [&str; 2] = ["https", "http"];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Schemes {
+    Web,
+    Any,
+}
+
+impl Schemes {
+    fn start_in(self, before_separator: &str) -> Option<usize> {
+        match self {
+            Self::Web => web_scheme_start(before_separator),
+            Self::Any => any_scheme_start(before_separator),
+        }
+    }
+}
+
+pub struct UrlSpans<'a> {
+    text: &'a str,
+    schemes: Schemes,
+    cursor: usize,
+    floor: usize,
+}
+
+impl Iterator for UrlSpans<'_> {
+    type Item = Range<usize>;
+
+    fn next(&mut self) -> Option<Range<usize>> {
+        while let Some(offset) = self.text[self.cursor..].find(SCHEME_SEPARATOR) {
+            let separator = self.cursor + offset;
+            let authority = separator + SCHEME_SEPARATOR.len();
+            self.cursor = authority;
+            let Some(start) = self.schemes.start_in(&self.text[self.floor..separator]) else {
+                continue;
+            };
+            let start = self.floor + start;
+            let end = self.text[authority..]
+                .find(ends_url)
+                .map_or(self.text.len(), |length| authority + length);
+            self.floor = end;
+            self.cursor = end;
+            return Some(start..end);
+        }
+        None
+    }
+}
+
+pub fn url_spans(text: &str, schemes: Schemes) -> UrlSpans<'_> {
+    UrlSpans {
+        text,
+        schemes,
+        cursor: 0,
+        floor: 0,
+    }
+}
+
 pub fn redact_urls_for_log(text: &str) -> Cow<'_, str> {
     let mut redacted = String::new();
     let mut copied = 0;
-    let mut cursor = 0;
-    while let Some(offset) = text[cursor..].find(SCHEME_SEPARATOR) {
-        let separator = cursor + offset;
-        let authority = separator + SCHEME_SEPARATOR.len();
-        cursor = authority;
-        let Some(start) = redacted_scheme_start(&text[copied..separator]) else {
-            continue;
-        };
-        let start = copied + start;
-        let end = text[authority..]
-            .find(ends_url)
-            .map_or(text.len(), |length| authority + length);
-        redacted.push_str(&text[copied..start]);
-        redacted.push_str(&url_scheme_and_host_for_log(&text[start..end]));
-        copied = end;
-        cursor = end;
+    for span in url_spans(text, Schemes::Web) {
+        redacted.push_str(&text[copied..span.start]);
+        redacted.push_str(&url_scheme_and_host_for_log(&text[span.clone()]));
+        copied = span.end;
     }
     if copied == 0 {
         return Cow::Borrowed(text);
@@ -34,7 +77,7 @@ pub fn redact_urls_for_log(text: &str) -> Cow<'_, str> {
     Cow::Owned(redacted)
 }
 
-fn redacted_scheme_start(before_separator: &str) -> Option<usize> {
+fn web_scheme_start(before_separator: &str) -> Option<usize> {
     REDACTED_SCHEMES.iter().find_map(|scheme| {
         let start = before_separator.len().checked_sub(scheme.len())?;
         before_separator
@@ -42,6 +85,19 @@ fn redacted_scheme_start(before_separator: &str) -> Option<usize> {
             .eq_ignore_ascii_case(scheme)
             .then_some(start)
     })
+}
+
+fn any_scheme_start(before_separator: &str) -> Option<usize> {
+    let run = before_separator
+        .bytes()
+        .rev()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        .count();
+    let run_start = before_separator.len() - run;
+    before_separator[run_start..]
+        .bytes()
+        .position(|byte| byte.is_ascii_alphabetic())
+        .map(|offset| run_start + offset)
 }
 
 fn ends_url(c: char) -> bool {
@@ -163,6 +219,27 @@ mod tests {
             redact_urls_for_log("data:text/html,<a href=\"https://x?token=SECRET\">click</a>"),
             "data:text/html,<a href=\"https://x\">click</a>"
         );
+    }
+
+    #[test]
+    fn url_spans_of_any_scheme_cover_each_link_and_skip_non_schemes() {
+        let text = "open roblox://placeId=1818&accessCode=x, then rbxasset://textures/a.png \
+                    and 1https://a.example/?t=1 but not 3:// or 日本://語";
+        let spans: Vec<&str> = url_spans(text, Schemes::Any)
+            .map(|span| &text[span])
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                "roblox://placeId=1818&accessCode=x,",
+                "rbxasset://textures/a.png",
+                "https://a.example/?t=1",
+            ]
+        );
+        let web: Vec<&str> = url_spans(text, Schemes::Web)
+            .map(|span| &text[span])
+            .collect();
+        assert_eq!(web, ["https://a.example/?t=1"]);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read as _, Write};
@@ -9,17 +10,20 @@ use std::time::{Duration, Instant};
 
 use eclipse::diagnostics::{
     newest_run_part, record_head, RawStream, RecordHead, RunLog, RAW_LINE_BYTES, STATUS_TARGET,
+    SUPERVISOR_TARGET,
 };
-use eclipse::framework::lifecycle::{report_exit_to, ClientEnd};
+use eclipse::framework::lifecycle::{report_exit_to, ClientEnd, Stage};
+use eclipse::graphics::activation::Token;
+use eclipse::graphics::launch_window::FailureHeading;
 use eclipse::links::redact_join_secrets;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::{Errno, FdFlags};
 use rustix::process::{Pid, WaitId, WaitIdOptions};
 use tracing::Level;
 
+use crate::desktop_integration::Packaging;
+
 const FDS_ENV: &str = "ECLIPSE_SUPERVISOR_FDS";
-const RUN_LOG_ENV: &str = "ECLIPSE_SUPERVISOR_RUN_LOG";
-const TARGET: &str = "eclipse::supervisor";
 const PIPE_BYTES: usize = 1024 * 1024;
 const READ_CHUNK: usize = 64 * 1024;
 const EXIT_CHECK: Duration = Duration::from_secs(5);
@@ -32,25 +36,27 @@ const NO_SUCH_FIELD: &str = "java.lang.NoSuchFieldError: ";
 const NO_SUCH_METHOD: &str = "java.lang.NoSuchMethodError: ";
 const NO_CLASS_DEF: &str = "java.lang.NoClassDefFoundError: Failed resolution of: ";
 const FACT_BYTES: usize = 400;
-const EXIT_RECORD_BYTES: usize = 4096;
+const EXIT_RECORD_BYTES: usize = 64 * 1024;
 const SIGNAL_EXIT_BASE: i32 = 128;
 const PROC_CGROUP: &str = "/proc/self/cgroup";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const MEMORY_EVENTS: &str = "memory.events";
+const REPORT_POLL: Duration = Duration::from_millis(20);
+const FAILURE_REPORT_OPTION: &str = "--failure-report=";
+const START_FAILURE_REPORT_OPTION: &str = "--start-failure-report=";
+const RENDERER_VARIABLE: &str = "GSK_RENDERER";
+const SOFTWARE_RENDERER: &str = "cairo";
 
 pub(crate) struct Supervision {
     pub(crate) records: File,
-    pub(crate) run_log: PathBuf,
 }
 
 pub(crate) fn adopt() -> Result<Option<Supervision>, String> {
     let Some(fds) = std::env::var_os(FDS_ENV) else {
         return Ok(None);
     };
-    let run_log = std::env::var_os(RUN_LOG_ENV);
     unsafe {
         std::env::remove_var(FDS_ENV);
-        std::env::remove_var(RUN_LOG_ENV);
     }
     let malformed = || format!("{FDS_ENV} must name the supervisor's two pipes as RECORDS,EXIT");
     let (records, exit) = fds
@@ -62,13 +68,9 @@ pub(crate) fn adopt() -> Result<Option<Supervision>, String> {
     if records == exit {
         return Err(malformed());
     }
-    let run_log = run_log
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("{RUN_LOG_ENV} must name the run log"))?;
     let records = adopt_pipe(records)?;
     report_exit_to(adopt_pipe(exit)?);
-    Ok(Some(Supervision { records, run_log }))
+    Ok(Some(Supervision { records }))
 }
 
 fn adopt_pipe(fd: RawFd) -> Result<File, String> {
@@ -146,6 +148,7 @@ impl fmt::Display for Signal {
 pub(crate) enum RunEnd {
     Ended,
     FailureShown,
+    Failure { message: String, stage: Stage },
     Stopped(Signal),
     Killed { oom_kills: Option<u64> },
     Crashed(Signal),
@@ -156,13 +159,42 @@ pub(crate) enum RunEnd {
 impl RunEnd {
     fn shown(&self) -> bool {
         match self {
-            Self::Killed { .. } | Self::Crashed(_) | Self::ExitedUnexpectedly { .. } => true,
+            Self::Failure { .. }
+            | Self::Killed { .. }
+            | Self::Crashed(_)
+            | Self::ExitedUnexpectedly { .. } => true,
             Self::Ended | Self::FailureShown | Self::Stopped(_) | Self::ClosedItself => false,
         }
     }
 
-    fn failed(&self) -> bool {
-        self.shown() || *self == Self::FailureShown
+    fn takes_log_facts(&self) -> bool {
+        match self {
+            Self::FailureShown
+            | Self::Killed { .. }
+            | Self::Crashed(_)
+            | Self::ExitedUnexpectedly { .. } => true,
+            Self::Ended | Self::Failure { .. } | Self::Stopped(_) | Self::ClosedItself => false,
+        }
+    }
+
+    fn heading(&self) -> FailureHeading {
+        match self {
+            Self::Failure {
+                stage: Stage::Starting,
+                ..
+            } => FailureHeading::CouldNotStart,
+            Self::Failure {
+                stage: Stage::Running,
+                ..
+            }
+            | Self::Ended
+            | Self::FailureShown
+            | Self::Stopped(_)
+            | Self::Killed { .. }
+            | Self::Crashed(_)
+            | Self::ClosedItself
+            | Self::ExitedUnexpectedly { .. } => FailureHeading::Stopped,
+        }
     }
 }
 
@@ -171,6 +203,7 @@ impl fmt::Display for RunEnd {
         match self {
             Self::Ended => f.write_str("Roblox ended without an error"),
             Self::FailureShown => f.write_str("Roblox stopped after Eclipse reported why"),
+            Self::Failure { message, .. } => f.write_str(message),
             Self::Stopped(signal) => write!(f, "Roblox was stopped ({signal})"),
             Self::Killed {
                 oom_kills: Some(kills),
@@ -200,6 +233,7 @@ pub(crate) fn classify(
     if let Some(end) = record {
         return match end {
             ClientEnd::FailureShown => RunEnd::FailureShown,
+            ClientEnd::FailureToShow { message, stage } => RunEnd::Failure { message, stage },
             ClientEnd::Played | ClientEnd::WindowClosed | ClientEnd::ClosedForAnotherLaunch => {
                 RunEnd::Ended
             }
@@ -240,6 +274,7 @@ pub(crate) struct Finished {
     missing_android_api: Option<String>,
     status: ExitStatus,
     pub(crate) log: PathBuf,
+    report: PathBuf,
 }
 
 impl Finished {
@@ -272,6 +307,160 @@ impl Finished {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Presentation {
+    Terminal,
+    Window { failure_window: Option<PathBuf> },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Plan {
+    Print {
+        failure: String,
+        log: PathBuf,
+    },
+    Window {
+        failure: String,
+        heading: FailureHeading,
+        report: PathBuf,
+        log: PathBuf,
+        failure_window: Option<PathBuf>,
+    },
+}
+
+impl Plan {
+    pub(crate) fn failure(&self) -> &str {
+        match self {
+            Self::Print { failure, .. } | Self::Window { failure, .. } => failure,
+        }
+    }
+}
+
+pub(crate) fn presentation_plan(finished: &Finished, presentation: Presentation) -> Option<Plan> {
+    let failure = finished.failure()?;
+    let log = finished.log.clone();
+    Some(match presentation {
+        Presentation::Terminal => Plan::Print { failure, log },
+        Presentation::Window { failure_window } => Plan::Window {
+            failure,
+            heading: finished.end.heading(),
+            report: finished.report.clone(),
+            log,
+            failure_window,
+        },
+    })
+}
+
+pub(crate) fn present(
+    plan: Plan,
+    write_report: impl FnOnce() -> Result<(), String>,
+    error_screen: impl FnOnce(FailureHeading, &str, &Path),
+) {
+    let (failure, heading, report, log, failure_window) = match plan {
+        Plan::Print { log, .. } => {
+            eprintln!("Details are in {}", log.display());
+            return;
+        }
+        Plan::Window {
+            failure,
+            heading,
+            report,
+            log,
+            failure_window,
+        } => (failure, heading, report, log, failure_window),
+    };
+    if let Err(error) = write_report() {
+        eprintln!("eclipse: {error}");
+        error_screen(heading, &failure, &log);
+        return;
+    }
+    if let Some(app) = failure_window {
+        match show_failure_window(&app, &report, heading) {
+            Ok(()) => return,
+            Err(error) => eprintln!("eclipse: {error}"),
+        }
+    }
+    error_screen(heading, &failure, &report);
+}
+
+pub(crate) fn write_report(
+    eclipse: &Path,
+    packaging: &Packaging,
+    finished: &Finished,
+    limit: Duration,
+) -> Result<(), String> {
+    let report = &finished.report;
+    let cannot_write =
+        |error: io::Error| format!("cannot write the bug report {}: {error}", report.display());
+    let file = File::create(report).map_err(cannot_write)?;
+    let Err(reason) = check_setup(eclipse, &finished.log, file, limit) else {
+        return Ok(());
+    };
+    let text =
+        crate::bug_report::unfinished(&finished.outcome(), &finished.log, &reason, packaging);
+    std::fs::write(report, text).map_err(cannot_write)
+}
+
+fn check_setup(eclipse: &Path, log: &Path, report: File, limit: Duration) -> Result<(), String> {
+    let mut doctor = Command::new(eclipse)
+        .args(["doctor", "--report"])
+        .arg(log)
+        .stdin(Stdio::null())
+        .stdout(report)
+        .spawn()
+        .map_err(|error| format!("Eclipse's setup check could not start: {error}"))?;
+    let deadline = Instant::now() + limit;
+    loop {
+        let exited = doctor
+            .try_wait()
+            .map_err(|error| format!("Eclipse lost track of its setup check: {error}"))?;
+        match exited {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => return Err(format!("Eclipse's setup check failed ({status})")),
+            None if Instant::now() < deadline => std::thread::sleep(REPORT_POLL),
+            None => {
+                let stopped = doctor.kill().and_then(|()| doctor.wait());
+                return Err(match stopped {
+                    Ok(_) => format!("Eclipse's setup check did not finish within {limit:?}"),
+                    Err(error) => format!(
+                        "Eclipse's setup check did not finish within {limit:?} and could not be \
+                         stopped: {error}"
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn show_failure_window(app: &Path, report: &Path, heading: FailureHeading) -> Result<(), String> {
+    let status = failure_window_command(app, report, heading)
+        .status()
+        .map_err(|error| format!("cannot start the failure window {}: {error}", app.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the failure window {} ended with {status}",
+            app.display()
+        ))
+    }
+}
+
+fn failure_window_command(app: &Path, report: &Path, heading: FailureHeading) -> Command {
+    let mut argument = OsString::from(match heading {
+        FailureHeading::CouldNotStart => START_FAILURE_REPORT_OPTION,
+        FailureHeading::Stopped => FAILURE_REPORT_OPTION,
+    });
+    argument.push(report);
+    let mut command = Command::new(app);
+    command
+        .arg(argument)
+        .env(RENDERER_VARIABLE, SOFTWARE_RENDERER)
+        .stdin(Stdio::null());
+    Token::withhold_from(&mut command);
+    command
+}
+
 pub(crate) struct Output<O, E> {
     pub(crate) stdout: O,
     pub(crate) stderr: E,
@@ -286,6 +475,7 @@ pub(crate) fn run<O: Write, E: Write>(
     output: Output<O, E>,
 ) -> Result<Finished, String> {
     let log_path = log.head_path();
+    let report = log.report_path();
     let mut sink = Sink {
         log: Some(log),
         log_path: log_path.clone(),
@@ -343,11 +533,11 @@ pub(crate) fn run<O: Write, E: Write>(
         oom_kills,
     );
     let status_error = end
-        .failed()
+        .takes_log_facts()
         .then(|| sink.facts.last_status_error.take())
         .flatten();
     let missing_android_api = end
-        .failed()
+        .takes_log_facts()
         .then(|| sink.facts.missing_android_api_before_the_end(gone_at))
         .flatten();
     let mut finished = Finished {
@@ -356,6 +546,7 @@ pub(crate) fn run<O: Write, E: Write>(
         missing_android_api,
         status,
         log: log_path,
+        report,
     };
     let level = if finished.end.shown() {
         Level::ERROR
@@ -378,7 +569,6 @@ fn spawn<O: Write, E: Write>(
     let inherited = [records_end.as_raw_fd(), exit_end.as_raw_fd()];
     command
         .env(FDS_ENV, format!("{},{}", inherited[0], inherited[1]))
-        .env(RUN_LOG_ENV, &sink.log_path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -645,7 +835,7 @@ impl<O: Write, E: Write> Sink<O, E> {
     }
 
     fn note(&mut self, level: Level, text: &str) {
-        self.write_log(|log| log.record(level, TARGET, text));
+        self.write_log(|log| log.record(level, SUPERVISOR_TARGET, text));
     }
 
     fn footer(&mut self, level: Level, text: &str) {
@@ -1215,6 +1405,35 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_left_to_the_supervisor_is_shown_once_with_its_own_words() {
+        const MESSAGE: &str = "cannot download Roblox: APKCombo did not answer";
+        if supervised_child() {
+            eclipse::diagnostics::record_status(Level::ERROR, MESSAGE);
+            finish_android_process(ClientEnd::FailureToShow {
+                message: MESSAGE.to_owned(),
+                stage: Stage::Starting,
+            });
+        }
+
+        let run = supervise("a_failure_left_to_the_supervisor_is_shown_once_with_its_own_words");
+        assert_eq!(
+            run.finished.end,
+            RunEnd::Failure {
+                message: MESSAGE.to_owned(),
+                stage: Stage::Starting,
+            }
+        );
+        assert_eq!(run.finished.exit_code(), ExitCode::FAILURE);
+        assert_eq!(run.finished.failure().as_deref(), Some(MESSAGE));
+        let footer = footer(&run.log);
+        assert_eq!(footer.len(), 1, "{footer:?}");
+        assert!(
+            footer[0].ends_with(&format!(" ERROR eclipse::supervisor: {MESSAGE}")),
+            "{footer:?}"
+        );
+    }
+
+    #[test]
     fn a_quiet_exit_without_a_record_is_the_client_closing_itself() {
         if supervised_child() {
             unsafe { libc::_exit(0) }
@@ -1592,6 +1811,32 @@ mod tests {
                 RunEnd::FailureShown,
             ),
             (
+                Some(ClientEnd::FailureToShow {
+                    message: "cannot download Roblox".to_owned(),
+                    stage: Stage::Starting,
+                }),
+                exited(1),
+                true,
+                None,
+                RunEnd::Failure {
+                    message: "cannot download Roblox".to_owned(),
+                    stage: Stage::Starting,
+                },
+            ),
+            (
+                Some(ClientEnd::FailureToShow {
+                    message: "the engine stopped".to_owned(),
+                    stage: Stage::Running,
+                }),
+                exited(1),
+                false,
+                None,
+                RunEnd::Failure {
+                    message: "the engine stopped".to_owned(),
+                    stage: Stage::Running,
+                },
+            ),
+            (
                 Some(ClientEnd::ClientExited { status: 0 }),
                 exited(0),
                 false,
@@ -1678,7 +1923,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                classify(record, status, uncaught, None, oom_kills),
+                classify(record.clone(), status, uncaught, None, oom_kills),
                 end,
                 "{record:?} {status:?} {uncaught}"
             );
@@ -1702,7 +1947,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                classify(record, status, false, abort, None),
+                classify(record.clone(), status, false, abort, None),
                 end,
                 "{record:?} {status:?}"
             );
@@ -1842,6 +2087,14 @@ mod tests {
                 false,
             ),
             (
+                RunEnd::Failure {
+                    message: "cannot download Roblox: APKCombo did not answer".to_owned(),
+                    stage: Stage::Starting,
+                },
+                "cannot download Roblox: APKCombo did not answer",
+                true,
+            ),
+            (
                 RunEnd::Stopped(Signal(libc::SIGTERM)),
                 "Roblox was stopped (signal 15, SIGTERM)",
                 false,
@@ -1887,6 +2140,349 @@ mod tests {
             assert_eq!(end.to_string(), text);
             assert_eq!(end.shown(), shown, "{text}");
         }
+    }
+
+    const RUN: &str = "eclipse-20261003T091434.289Z";
+
+    fn finished_in(dir: &Path, end: RunEnd) -> Finished {
+        Finished {
+            end,
+            status_error: None,
+            missing_android_api: None,
+            status: exited(1),
+            log: dir.join(format!("{RUN}.tail.log")),
+            report: dir.join(format!("{RUN}.report.txt")),
+        }
+    }
+
+    #[test]
+    fn only_shown_ends_are_presented_and_a_missing_failure_window_falls_back() {
+        let dir = Path::new("/logs");
+        let app = PathBuf::from("/app/lib/eclipse/eclipse-settings");
+        let window = || Presentation::Window {
+            failure_window: Some(app.clone()),
+        };
+        let crash = "Roblox crashed (signal 11, SIGSEGV: invalid memory access)";
+        let crashed = finished_in(dir, RunEnd::Crashed(Signal(libc::SIGSEGV)));
+        let report = dir.join(format!("{RUN}.report.txt"));
+        let log = dir.join(format!("{RUN}.tail.log"));
+        assert_eq!(
+            presentation_plan(&crashed, window()),
+            Some(Plan::Window {
+                failure: crash.to_owned(),
+                heading: FailureHeading::Stopped,
+                report: report.clone(),
+                log: log.clone(),
+                failure_window: Some(app.clone()),
+            })
+        );
+        assert_eq!(
+            presentation_plan(
+                &crashed,
+                Presentation::Window {
+                    failure_window: None
+                }
+            ),
+            Some(Plan::Window {
+                failure: crash.to_owned(),
+                heading: FailureHeading::Stopped,
+                report: report.clone(),
+                log: log.clone(),
+                failure_window: None,
+            })
+        );
+        assert_eq!(
+            presentation_plan(&crashed, Presentation::Terminal),
+            Some(Plan::Print {
+                failure: crash.to_owned(),
+                log: log.clone(),
+            })
+        );
+        for (stage, heading) in [
+            (Stage::Starting, FailureHeading::CouldNotStart),
+            (Stage::Running, FailureHeading::Stopped),
+        ] {
+            let left = finished_in(
+                dir,
+                RunEnd::Failure {
+                    message: "cannot download Roblox".to_owned(),
+                    stage,
+                },
+            );
+            assert_eq!(
+                presentation_plan(&left, window()),
+                Some(Plan::Window {
+                    failure: "cannot download Roblox".to_owned(),
+                    heading,
+                    report: report.clone(),
+                    log: log.clone(),
+                    failure_window: Some(app.clone()),
+                })
+            );
+        }
+        for end in [
+            RunEnd::Ended,
+            RunEnd::FailureShown,
+            RunEnd::Stopped(Signal(libc::SIGTERM)),
+            RunEnd::ClosedItself,
+        ] {
+            let plan = presentation_plan(&finished_in(dir, end), window());
+            assert_eq!(plan, None);
+        }
+    }
+
+    fn stub(dir: &Path, name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = dir.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_report_is_what_eclipse_doctor_prints_for_the_run() {
+        let dir = temp_dir("report-written");
+        let eclipse = stub(
+            &dir,
+            "eclipse",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/*}/arguments\"\n\
+             printf 'Outcome: crashed\\n'\n",
+        );
+        let finished = finished_in(&dir, RunEnd::Crashed(Signal(libc::SIGSEGV)));
+
+        let written = write_report(
+            &eclipse,
+            &Packaging::Host,
+            &finished,
+            Duration::from_secs(60),
+        );
+
+        let report = std::fs::read_to_string(&finished.report);
+        let arguments = std::fs::read_to_string(dir.join("arguments"));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(written, Ok(()));
+        assert_eq!(report.unwrap(), "Outcome: crashed\n");
+        assert_eq!(
+            arguments.unwrap(),
+            format!("doctor\n--report\n{}\n", finished.log.display())
+        );
+    }
+
+    #[test]
+    fn a_setup_check_that_does_not_finish_is_stopped_and_the_report_keeps_the_outcome() {
+        let dir = temp_dir("report-unfinished");
+        let eclipse = stub(&dir, "eclipse", "#!/bin/sh\nexec sleep 60\n");
+        let finished = finished_in(&dir, RunEnd::Crashed(Signal(libc::SIGSEGV)));
+
+        let started = Instant::now();
+        let written = write_report(
+            &eclipse,
+            &Packaging::Host,
+            &finished,
+            Duration::from_millis(200),
+        );
+        let took = started.elapsed();
+
+        let report = std::fs::read_to_string(&finished.report);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(written, Ok(()));
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        let report = report.unwrap();
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(
+            lines[0], "Outcome: Roblox crashed (signal 11, SIGSEGV: invalid memory access)",
+            "{report}"
+        );
+        assert!(
+            lines[1].starts_with("Log: ") && lines[1].ends_with(&format!("/{RUN}.tail.log")),
+            "{report}"
+        );
+        assert_eq!(lines[2], "", "{report}");
+        assert!(
+            lines[3].starts_with("Eclipse's setup check did not finish within 200ms, so"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_setup_check_that_fails_or_cannot_start_leaves_a_short_report_saying_so() {
+        let dir = temp_dir("report-failed");
+        let failing = stub(&dir, "eclipse", "#!/bin/sh\nexit 3\n");
+        let finished = finished_in(&dir, RunEnd::ExitedUnexpectedly { status: 1 });
+
+        let report = |eclipse: &Path| {
+            write_report(
+                eclipse,
+                &Packaging::Host,
+                &finished,
+                Duration::from_secs(60),
+            )
+            .and_then(|()| {
+                std::fs::read_to_string(&finished.report).map_err(|error| error.to_string())
+            })
+        };
+        let failed = report(&failing);
+        let missing = report(&dir.join("missing"));
+
+        std::fs::remove_dir_all(&dir).ok();
+        let failed = failed.unwrap();
+        assert!(
+            failed.contains("\n\nEclipse's setup check failed (exit status: 3), so"),
+            "{failed}"
+        );
+        let missing = missing.unwrap();
+        assert!(
+            missing.contains("\n\nEclipse's setup check could not start: "),
+            "{missing}"
+        );
+        for report in [&failed, &missing] {
+            assert!(
+                report.starts_with("Outcome: Roblox exited unexpectedly with status 1\n"),
+                "{report}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_error_screen_names_the_report_only_when_it_was_written() {
+        let dir = temp_dir("error-screen");
+        let closed = stub(&dir, "closed", "#!/bin/sh\nexit 0\n");
+        let broken = stub(&dir, "broken", "#!/bin/sh\nexit 1\n");
+        let finished = finished_in(&dir, RunEnd::Crashed(Signal(libc::SIGSEGV)));
+        let unwritten = || Err("cannot write the bug report: disk full".to_owned());
+        let mut screens = Vec::new();
+
+        for (failure_window, written) in [
+            (Some(&closed), Ok(())),
+            (Some(&broken), Ok(())),
+            (Some(&closed), unwritten()),
+            (None, Ok(())),
+            (None, unwritten()),
+        ] {
+            let presentation = Presentation::Window {
+                failure_window: failure_window.cloned(),
+            };
+            let plan = presentation_plan(&finished, presentation).unwrap();
+            present(
+                plan,
+                || written,
+                |heading, failure, details| {
+                    screens.push((heading, failure.to_owned(), details.to_owned()));
+                },
+            );
+        }
+
+        let not_started = finished_in(
+            &dir,
+            RunEnd::Failure {
+                message: "cannot download Roblox".to_owned(),
+                stage: Stage::Starting,
+            },
+        );
+        let presentation = Presentation::Window {
+            failure_window: None,
+        };
+        present(
+            presentation_plan(&not_started, presentation).unwrap(),
+            || Ok(()),
+            |heading, failure, details| {
+                screens.push((heading, failure.to_owned(), details.to_owned()));
+            },
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        let screen = |details: &PathBuf| {
+            (
+                FailureHeading::Stopped,
+                finished.failure().unwrap(),
+                details.clone(),
+            )
+        };
+        assert_eq!(
+            screens,
+            [
+                screen(&finished.report),
+                screen(&finished.log),
+                screen(&finished.report),
+                screen(&finished.log),
+                (
+                    FailureHeading::CouldNotStart,
+                    "cannot download Roblox".to_owned(),
+                    not_started.report.clone(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_failure_window_draws_without_the_gpu_and_never_takes_the_launch_token() {
+        use std::collections::BTreeMap;
+        use std::ffi::OsStr;
+
+        let command = |heading| {
+            failure_window_command(
+                Path::new("/app/lib/eclipse/eclipse-settings"),
+                Path::new("/logs/eclipse-20261003T091434.289Z.report.txt"),
+                heading,
+            )
+        };
+        let stopped = command(FailureHeading::Stopped);
+        let not_started = command(FailureHeading::CouldNotStart);
+
+        let environment: BTreeMap<_, _> = stopped.get_envs().collect();
+        assert_eq!(
+            stopped.get_args().collect::<Vec<_>>(),
+            [OsStr::new(
+                "--failure-report=/logs/eclipse-20261003T091434.289Z.report.txt"
+            )]
+        );
+        assert_eq!(
+            not_started.get_args().collect::<Vec<_>>(),
+            [OsStr::new(
+                "--start-failure-report=/logs/eclipse-20261003T091434.289Z.report.txt"
+            )]
+        );
+        assert_eq!(
+            environment,
+            BTreeMap::from([
+                (OsStr::new("DESKTOP_STARTUP_ID"), None),
+                (OsStr::new("GSK_RENDERER"), Some(OsStr::new("cairo"))),
+                (OsStr::new("XDG_ACTIVATION_TOKEN"), None),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_failure_window_that_cannot_start_or_fails_is_an_error() {
+        let dir = temp_dir("failure-window");
+        let report = dir.join(format!("{RUN}.report.txt"));
+        let closed = stub(&dir, "closed", "#!/bin/sh\nexit 0\n");
+        let broken = stub(&dir, "broken", "#!/bin/sh\nexit 1\n");
+        let missing = dir.join("missing");
+
+        let outcomes = [&closed, &broken, &missing]
+            .map(|app| show_failure_window(app, &report, FailureHeading::Stopped));
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(outcomes[0], Ok(()));
+        assert_eq!(
+            outcomes[1],
+            Err(format!(
+                "the failure window {} ended with exit status: 1",
+                broken.display()
+            ))
+        );
+        let Err(error) = &outcomes[2] else {
+            panic!("a missing failure window is an error");
+        };
+        assert!(
+            error.starts_with(&format!(
+                "cannot start the failure window {}: ",
+                missing.display()
+            )),
+            "{error}"
+        );
     }
 
     #[test]

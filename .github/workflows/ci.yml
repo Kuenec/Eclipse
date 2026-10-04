@@ -48,6 +48,7 @@ jobs:
         run: |
           cargo fmt --manifest-path crates/libm-shim/Cargo.toml -- --check
           cargo fmt --manifest-path crates/eclipse-webview/Cargo.toml -- --check
+          cargo fmt --manifest-path crates/eclipse-settings/Cargo.toml -- --check
 
       - name: Lint Eclipse
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -123,7 +124,7 @@ jobs:
         run: cargo check --all-targets --locked
 
   webview:
-    name: WebView helper / GNOME 51 SDK
+    name: GTK apps / GNOME 51 SDK
     runs-on: ubuntu-latest
     timeout-minutes: 45
     container:
@@ -138,18 +139,23 @@ jobs:
           flatpak install --noninteractive flathub org.freedesktop.Sdk.Extension.rust-stable//26.08
           flatpak build-init "$RUNNER_TEMP/sdk" io.github.kuenec.Eclipse org.gnome.Sdk org.gnome.Platform 51
 
-      - name: Lint and test the WebView helper in the SDK
+      - name: Lint and test the WebView helper and the settings app in the SDK
         run: |
-          mkdir -p "$RUNNER_TEMP/cargo" "$GITHUB_WORKSPACE/crates/eclipse-webview/target"
+          mkdir -p "$RUNNER_TEMP/cargo" "$GITHUB_WORKSPACE/crates/eclipse-webview/target" \
+            "$GITHUB_WORKSPACE/crates/eclipse-settings/target"
           chmod -R a+rwX "$RUNNER_TEMP/cargo" "$GITHUB_WORKSPACE"
           in_sdk() {
+            crate="$1"
+            shift
             flatpak build --share=network --filesystem="$GITHUB_WORKSPACE" --filesystem="$RUNNER_TEMP" \
-              --build-dir="$GITHUB_WORKSPACE/crates/eclipse-webview" \
+              --build-dir="$GITHUB_WORKSPACE/crates/$crate" \
               --env=PATH=/usr/lib/sdk/rust-stable/bin:/usr/bin --env=CARGO_HOME="$RUNNER_TEMP/cargo" \
               "$RUNNER_TEMP/sdk" "$@"
           }
-          in_sdk cargo clippy --all-targets --locked -- -D warnings
-          in_sdk cargo test --all-targets --locked
+          for crate in eclipse-webview eclipse-settings; do
+            in_sdk "$crate" cargo clippy --all-targets --locked -- -D warnings
+            in_sdk "$crate" cargo test --all-targets --locked
+          done
 
   release-build:
     name: Release build
