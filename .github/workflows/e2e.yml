@@ -99,5 +99,13 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
 
+      - name: Require a writable uinput, input-group access and SDL3
+        run: |
+          test -w /dev/uinput || { echo "::error::/dev/uinput is not writable by $(id -un)"; exit 1; }
+          id -nG | tr ' ' '\n' | grep -qx input || { echo "::error::$(id -un) is not in the input group"; exit 1; }
+          python3 -c 'import ctypes; ctypes.CDLL("libSDL3.so.0")' || { echo "::error::libSDL3.so.0 does not load"; exit 1; }
+
       - name: Run the full provisioned-host milestone suite
+        env:
+          ECLIPSE_UINPUT_GAMEPAD_TEST: "1"
         run: cargo test --locked --test engine_milestones -- --nocapture

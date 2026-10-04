@@ -10,6 +10,7 @@ pub mod egl_engine;
 pub mod first_frame;
 mod font;
 pub mod framework;
+pub mod gamepad;
 pub mod graphics;
 mod host_fonts;
 mod host_locale;

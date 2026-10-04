@@ -1,3 +1,6 @@
 {
-  "io.github.kuenec.Eclipse": ["appstream-external-screenshot-url"]
+  "io.github.kuenec.Eclipse": [
+    "appstream-external-screenshot-url",
+    "finish-args-no-required-flatpak"
+  ]
 }

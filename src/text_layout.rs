@@ -1057,6 +1057,22 @@ mod tests {
     use super::*;
 
     const SIZE: f32 = 24.0;
+    const NOTO_SANS: &[u8] = include_bytes!("../tests/fixtures/fonts/NotoSans-subset.ttf");
+    const NOTO_SANS_HEBREW: &[u8] =
+        include_bytes!("../tests/fixtures/fonts/NotoSansHebrew-subset.ttf");
+    const NOTO_SANS_ARABIC: &[u8] =
+        include_bytes!("../tests/fixtures/fonts/NotoSansArabic-subset.ttf");
+
+    fn with_fixture_chain(test: impl FnOnce(FaceChain<'_>)) {
+        let [primary, hebrew, arabic] = [NOTO_SANS, NOTO_SANS_HEBREW, NOTO_SANS_ARABIC]
+            .map(|font| RasterFont::open(font.into(), 0).expect("a fixture font opens"));
+        test(FaceChain {
+            primary: &primary,
+            em_per_size: primary.em_per_height(),
+            letter_spacing_em: 0.0,
+            fallbacks: &[&hebrew, &arabic],
+        });
+    }
 
     fn host_chain() -> Option<FaceChain<'static>> {
         let Some(primary) = host_fonts::system_font() else {
@@ -1455,14 +1471,9 @@ mod tests {
 
     #[test]
     fn right_to_left_text_is_reordered_and_arabic_joins() {
-        let Some(chain) = host_chain() else {
-            return;
-        };
-        let field = style(300, 40, LineMode::Single);
-        let hebrew = "\u{5E9}\u{5DC}\u{5D5}\u{5DD}";
-        if !covered_somewhere(chain, hebrew) {
-            eprintln!("SKIP: no font covers Hebrew");
-        } else {
+        with_fixture_chain(|chain| {
+            let field = style(300, 40, LineMode::Single);
+            let hebrew = "\u{5E9}\u{5DC}\u{5D5}\u{5DD}";
             let layout = lay_out(
                 hebrew,
                 Selection::Caret(0),
@@ -1470,6 +1481,10 @@ mod tests {
                 chain,
                 Scroll::default(),
             );
+            assert!(layout
+                .glyphs
+                .iter()
+                .all(|glyph| std::ptr::eq(layout.faces[glyph.face], chain.fallbacks[0])));
             let boxes = &layout.lines[0].boxes;
             let first = boxes
                 .iter()
@@ -1485,16 +1500,25 @@ mod tests {
             );
             assert!(first.rtl && last.rtl);
             assert_eq!(caret(&layout).left, first.right.round());
-        }
-        let arabic = "\u{628}\u{628}\u{628}";
-        if !covered_somewhere(chain, arabic) {
-            eprintln!("SKIP: no font covers Arabic");
-            return;
-        }
-        let layout = lay_out(arabic, at_end(arabic), &field, chain, Scroll::default());
-        let glyphs: Vec<u32> = layout.glyphs.iter().map(|glyph| glyph.glyph).collect();
-        assert_eq!(glyphs.len(), 3);
-        assert_ne!(glyphs[0], glyphs[2], "initial and final forms differ");
+
+            let glyphs = |text: &str| -> Vec<u32> {
+                lay_out(text, at_end(text), &field, chain, Scroll::default())
+                    .glyphs
+                    .iter()
+                    .map(|glyph| glyph.glyph)
+                    .collect()
+            };
+            let isolated = glyphs("\u{628}");
+            let forms: Vec<u32> = glyphs("\u{628}\u{628}\u{628}")
+                .into_iter()
+                .filter(|glyph| !isolated.contains(glyph))
+                .collect();
+            assert_eq!(forms.len(), 3, "every letter takes a joining form");
+            assert!(
+                forms[0] != forms[1] && forms[1] != forms[2] && forms[0] != forms[2],
+                "final, medial and initial forms differ: {forms:?}"
+            );
+        });
     }
 
     #[test]
@@ -1541,28 +1565,49 @@ mod tests {
     }
 
     #[test]
-    fn right_to_left_text_draws_greater_or_equal_as_its_mirrored_glyph() {
-        let Some(chain) = host_chain() else {
-            return;
-        };
-        let (Some(less_or_equal), Some(greater_or_equal)) = (
-            chain.primary.glyph_index('\u{2264}'),
-            chain.primary.glyph_index('\u{2265}'),
-        ) else {
-            eprintln!("SKIP: the host font lacks \u{2264} or \u{2265}");
-            return;
-        };
-        let text = "\u{200F}\u{2265}";
-        let field = style(200, 40, LineMode::Single);
-        let layout = lay_out(text, at_end(text), &field, chain, Scroll::default());
-        assert!(layout.lines[0].rtl);
-        let drawn: Vec<u32> = layout
-            .glyphs
-            .iter()
-            .filter(|glyph| glyph.glyph == less_or_equal || glyph.glyph == greater_or_equal)
-            .map(|glyph| glyph.glyph)
-            .collect();
-        assert_eq!(drawn, [less_or_equal]);
+    fn right_to_left_text_draws_greater_than_as_its_mirrored_glyph() {
+        with_fixture_chain(|chain| {
+            let less = chain.primary.glyph_index('<').expect("the fixture maps <");
+            let greater = chain.primary.glyph_index('>').expect("the fixture maps >");
+            let field = style(200, 40, LineMode::Single);
+            let drawn = |text: &str| -> (bool, Vec<u32>) {
+                let layout = lay_out(text, at_end(text), &field, chain, Scroll::default());
+                let glyphs = layout
+                    .glyphs
+                    .iter()
+                    .filter(|glyph| glyph.glyph == less || glyph.glyph == greater)
+                    .map(|glyph| glyph.glyph)
+                    .collect();
+                (layout.lines[0].rtl, glyphs)
+            };
+            assert_eq!(drawn(">"), (false, vec![greater]));
+            assert_eq!(drawn("\u{200F}>"), (true, vec![less]));
+        });
+    }
+
+    #[test]
+    fn cyrillic_is_laid_out_left_to_right_with_the_caret_after_the_last_letter() {
+        with_fixture_chain(|chain| {
+            let text = "Привет";
+            let field = style(300, 40, LineMode::Single);
+            let layout = lay_out(text, at_end(text), &field, chain, Scroll::default());
+            assert!(layout
+                .glyphs
+                .iter()
+                .all(|glyph| glyph.face == 0 && glyph.glyph != 0));
+            assert_eq!(layout.lines.len(), 1);
+            let boxes = &layout.lines[0].boxes;
+            assert_eq!(
+                boxes
+                    .iter()
+                    .map(|cluster| cluster.chars.clone())
+                    .collect::<Vec<_>>(),
+                (0..6).map(|index| index..index + 1).collect::<Vec<_>>()
+            );
+            assert!(boxes.iter().all(|cluster| !cluster.rtl));
+            assert!(boxes.windows(2).all(|pair| pair[0].right <= pair[1].left));
+            assert_eq!(caret(&layout).left, boxes[5].right.round());
+        });
     }
 
     #[test]
@@ -1652,13 +1697,6 @@ mod tests {
             "the missing glyph comes from the chain's own fallback"
         );
         assert!(layout.glyphs.iter().all(|glyph| glyph.glyph != 0));
-    }
-
-    fn covered_somewhere(chain: FaceChain<'_>, text: &str) -> bool {
-        covers(chain.primary, text)
-            || text
-                .chars()
-                .all(|character| host_fonts::fallback_for(character, Presentation::Text).is_some())
     }
 
     #[test]

@@ -5,6 +5,7 @@ use jni::objects::JObject;
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, JValue};
 
+use super::engine_input::{probe_second_finger, TouchEventReadback};
 use super::{
     checked, external_intents, jstring_object_to_string, keep_screen_on, notifications,
     register_framework_natives, take_pending_host_clipboard_text, FrameworkError, ACTIVITY_CLASS,
@@ -79,6 +80,7 @@ pub struct PlatformProbeReport {
     refused_link: NativeOutcome,
     shared_text: NativeOutcome,
     host_clipboard: Option<String>,
+    second_finger: TouchEventReadback,
 }
 
 impl fmt::Display for PlatformProbeReport {
@@ -120,6 +122,7 @@ impl fmt::Display for PlatformProbeReport {
             "Context.nativeShareFile({SHARED_TEXT:?}, {NO_SHARED_FILE}) {}",
             self.shared_text
         )?;
+        writeln!(f, "{}", self.second_finger)?;
         match &self.host_clipboard {
             Some(text) => write!(f, "host clipboard slot holds {text:?}"),
             None => f.write_str("host clipboard slot is empty"),
@@ -166,6 +169,7 @@ fn probe(
     let opened_link = open_uri(env, OPENED_LINK)?;
     let refused_link = open_uri(env, REFUSED_LINK)?;
     let shared_text = share_text(env, SHARED_TEXT)?;
+    let second_finger = probe_second_finger(env)?;
     Ok(PlatformProbeReport {
         pictures,
         movies,
@@ -176,6 +180,7 @@ fn probe(
         refused_link,
         shared_text,
         host_clipboard: take_pending_host_clipboard_text(),
+        second_finger,
     })
 }
 

@@ -1,11 +1,13 @@
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
 use winit::platform::wayland::WindowAttributesExtWayland as _;
 use winit::window::{Window, WindowId};
 
-use super::launch_window::{action_at, displayable, node, scaled, wrap, BUTTON_BACKGROUND};
+use super::launch_window::{
+    action_at, displayable, node, scaled, wrap, ClickTracker, BUTTON_BACKGROUND,
+};
 use super::{GlyphAtlas, TextMeasure, VulkanRenderer};
 use crate::framework::dialogs::{dispatch_dialog_action, DialogAction};
 use crate::framework::view_registry::{self, LayoutParams, RenderNode, MATCH_PARENT, WRAP_CONTENT};
@@ -100,6 +102,17 @@ impl DialogContent {
             );
         }
         (sheet.nodes, sheet.actions)
+    }
+
+    fn action_at(
+        &self,
+        atlas: &GlyphAtlas,
+        extent: ash::vk::Extent2D,
+        scale: f64,
+        point: (f32, f32),
+    ) -> Option<DialogAction> {
+        let (nodes, actions) = self.nodes(atlas, extent.width, scale);
+        action_at(&nodes, &actions, atlas, extent, point)
     }
 }
 
@@ -200,8 +213,7 @@ struct OpenDialog {
     renderer: Option<VulkanRenderer>,
     window: Window,
     scale: f64,
-    cursor: Option<(f32, f32)>,
-    pressed: Option<DialogAction>,
+    clicks: ClickTracker<DialogAction>,
 }
 
 impl OpenDialog {
@@ -231,8 +243,7 @@ impl OpenDialog {
             window,
             renderer,
             scale: 1.0,
-            cursor: None,
-            pressed: None,
+            clicks: ClickTracker::default(),
         };
         dialog.rescale(dialog.window.scale_factor());
         dialog.window.request_redraw();
@@ -251,22 +262,16 @@ impl OpenDialog {
         }
     }
 
-    fn nodes(
-        &self,
-    ) -> Option<(
-        Vec<RenderNode>,
-        Vec<Option<DialogAction>>,
-        ash::vk::Extent2D,
-    )> {
+    fn nodes(&self) -> Option<Vec<RenderNode>> {
         let renderer = self.renderer.as_ref()?;
         let text = renderer.text.as_ref()?;
-        let extent = renderer.swapchain_extent;
-        let (nodes, actions) = self.content.nodes(&text.atlas, extent.width, self.scale);
-        Some((nodes, actions, extent))
+        let width = renderer.swapchain_extent.width;
+        let (nodes, _) = self.content.nodes(&text.atlas, width, self.scale);
+        Some(nodes)
     }
 
     fn draw(&mut self) {
-        let Some((nodes, _, _)) = self.nodes() else {
+        let Some(nodes) = self.nodes() else {
             return;
         };
         if let Some(renderer) = self.renderer.as_mut() {
@@ -276,14 +281,16 @@ impl OpenDialog {
         }
     }
 
-    fn action_under_cursor(&self) -> Option<DialogAction> {
-        let cursor = self.cursor?;
-        let (nodes, actions, extent) = self.nodes()?;
-        let atlas = &self.renderer.as_ref()?.text.as_ref()?.atlas;
-        action_at(&nodes, &actions, atlas, extent, cursor)
-    }
-
     fn window_event(&mut self, vm: &Vm, event: WindowEvent) {
+        let target_at = |point| {
+            let renderer = self.renderer.as_ref()?;
+            let text = renderer.text.as_ref()?;
+            self.content
+                .action_at(&text.atlas, renderer.swapchain_extent, self.scale, point)
+        };
+        if let Some(action) = self.clicks.window_event(&event, target_at) {
+            self.dispatch(vm, action);
+        }
         match event {
             WindowEvent::CloseRequested => self.dispatch(vm, DialogAction::Cancel),
             WindowEvent::KeyboardInput { event, .. }
@@ -292,27 +299,6 @@ impl OpenDialog {
             {
                 self.dispatch(vm, DialogAction::Cancel);
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = Some((position.x as f32, position.y as f32));
-            }
-            WindowEvent::CursorLeft { .. } => self.cursor = None,
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => match state {
-                ElementState::Pressed => self.pressed = self.action_under_cursor(),
-                ElementState::Released => {
-                    let released = self.action_under_cursor();
-                    if let Some(action) = self
-                        .pressed
-                        .take()
-                        .filter(|&pressed| Some(pressed) == released)
-                    {
-                        self.dispatch(vm, action);
-                    }
-                }
-            },
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.mark_resized(size.width, size.height);
@@ -378,6 +364,8 @@ impl DialogWindows {
 mod tests {
     use super::*;
     use crate::graphics::{layout_views, GlyphInfo};
+    use winit::dpi::PhysicalPosition;
+    use winit::event::{DeviceId, Touch, TouchPhase};
 
     fn monospace_atlas() -> GlyphAtlas {
         let glyph = GlyphInfo {
@@ -457,6 +445,54 @@ mod tests {
             action_at(&nodes, &actions, &atlas, extent, (1.0, 1.0)),
             None
         );
+    }
+
+    #[test]
+    fn a_tap_on_a_button_row_dispatches_that_button() {
+        let atlas = monospace_atlas();
+        let extent = ash::vk::Extent2D {
+            width: 1120,
+            height: 720,
+        };
+        let content = content();
+        let (nodes, _) = content.nodes(&atlas, extent.width, 1.0);
+        let views = layout_views(&nodes, extent, Some(TextMeasure { atlas: &atlas }));
+        let center_of = |text: &str| {
+            let view = &views[nodes
+                .iter()
+                .position(|node| node.text.as_deref() == Some(text))
+                .expect("a laid-out row")];
+            PhysicalPosition::new(
+                f64::from(view.x + view.w / 2.0),
+                f64::from(view.y + view.h / 2.0),
+            )
+        };
+        let finger = |phase, location| {
+            WindowEvent::Touch(Touch {
+                device_id: DeviceId::dummy(),
+                phase,
+                location,
+                force: None,
+                id: 9,
+            })
+        };
+        let target_at = |point| content.action_at(&atlas, extent, 1.0, point);
+        for (row, action) in [
+            ("Leave", Some(DialogAction::Click(41))),
+            ("Report", Some(DialogAction::Item(0))),
+            ("Disconnected", None),
+        ] {
+            let mut clicks = ClickTracker::default();
+            let tap = [
+                finger(TouchPhase::Started, center_of(row)),
+                finger(TouchPhase::Ended, center_of(row)),
+            ];
+            let actions: Vec<_> = tap
+                .iter()
+                .filter_map(|event| clicks.window_event(event, target_at))
+                .collect();
+            assert_eq!(actions, Vec::from_iter(action), "{row}");
+        }
     }
 
     #[test]

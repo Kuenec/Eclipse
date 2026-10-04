@@ -8,7 +8,7 @@ use ash::vk;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::error::OsError;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, AsyncRequestSerial, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::platform::pump_events::{EventLoopExtPumpEvents as _, PumpStatus};
@@ -24,6 +24,7 @@ use super::activation::Token;
 use super::{layout_views, GlyphAtlas, GraphicsError, HostEventLoop, TextMeasure, VulkanRenderer};
 use crate::framework::view_registry::{LayoutParams, RenderNode, MATCH_PARENT, WRAP_CONTENT};
 use crate::framework::HostWake;
+use crate::input::{PrimaryTouch, TouchTracker};
 use crate::status::{Progress, StatusUpdate};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -311,8 +312,7 @@ struct StatusScreen {
     activation: Activation,
     commands: Receiver<WindowCommand>,
     answer: Option<Answer>,
-    cursor: Option<(f32, f32)>,
-    pressed: Option<Answer>,
+    clicks: ClickTracker<Answer>,
 }
 
 impl StatusScreen {
@@ -328,8 +328,7 @@ impl StatusScreen {
             activation: Activation::Unrequested,
             commands,
             answer: None,
-            cursor: None,
-            pressed: None,
+            clicks: ClickTracker::default(),
         }
     }
 
@@ -341,29 +340,6 @@ impl StatusScreen {
         if self.awaiting_answer() {
             self.answer = Some(answer);
         }
-    }
-
-    fn click(&mut self, state: ElementState, under_cursor: Option<Answer>) {
-        match state {
-            ElementState::Pressed => self.pressed = under_cursor,
-            ElementState::Released => {
-                if let Some(answer) = self
-                    .pressed
-                    .take()
-                    .filter(|&pressed| Some(pressed) == under_cursor)
-                {
-                    self.give(answer);
-                }
-            }
-        }
-    }
-
-    fn answer_under_cursor(&self) -> Option<Answer> {
-        let cursor = self.cursor?;
-        let renderer = self.renderer.as_ref()?;
-        let text = renderer.text.as_ref()?;
-        self.content
-            .answer_at(&text.atlas, renderer.swapchain_extent, self.scale, cursor)
     }
 
     fn dismiss(&mut self, event_loop: &ActiveEventLoop) {
@@ -552,6 +528,15 @@ impl ApplicationHandler<HostWake> for StatusScreen {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let target_at = |point| {
+            let renderer = self.renderer.as_ref()?;
+            let text = renderer.text.as_ref()?;
+            self.content
+                .answer_at(&text.atlas, renderer.swapchain_extent, self.scale, point)
+        };
+        if let Some(answer) = self.clicks.window_event(&event, target_at) {
+            self.give(answer);
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.give(Answer::Cancel);
@@ -563,18 +548,6 @@ impl ApplicationHandler<HostWake> for StatusScreen {
                 if let Some(answer) = key_answer(&event.logical_key) {
                     self.give(answer);
                 }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = Some((position.x as f32, position.y as f32));
-            }
-            WindowEvent::CursorLeft { .. } => self.cursor = None,
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                let under_cursor = self.answer_under_cursor();
-                self.click(state, under_cursor);
             }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -846,6 +819,104 @@ impl Screen {
     }
 }
 
+pub(super) struct ClickTracker<A> {
+    cursor: Option<(f32, f32)>,
+    pressed: Option<A>,
+    fingers: TouchTracker,
+}
+
+impl<A> Default for ClickTracker<A> {
+    fn default() -> Self {
+        Self {
+            cursor: None,
+            pressed: None,
+            fingers: TouchTracker::default(),
+        }
+    }
+}
+
+impl<A: Copy + PartialEq> ClickTracker<A> {
+    pub(super) fn window_event(
+        &mut self,
+        event: &WindowEvent,
+        target_at: impl Fn((f32, f32)) -> Option<A>,
+    ) -> Option<A> {
+        match *event {
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Some((position.x as f32, position.y as f32));
+                None
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
+                None
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => self.button(state, target_at),
+            WindowEvent::Touch(touch) => self.touch(
+                touch.id,
+                touch.phase,
+                (touch.location.x as f32, touch.location.y as f32),
+                target_at,
+            ),
+            _ => None,
+        }
+    }
+
+    fn button(
+        &mut self,
+        state: ElementState,
+        target_at: impl Fn((f32, f32)) -> Option<A>,
+    ) -> Option<A> {
+        let under_cursor = self.cursor.and_then(target_at);
+        match state {
+            ElementState::Pressed => {
+                self.pressed = under_cursor;
+                None
+            }
+            ElementState::Released => self
+                .pressed
+                .take()
+                .filter(|&pressed| Some(pressed) == under_cursor),
+        }
+    }
+
+    fn touch(
+        &mut self,
+        finger: u64,
+        phase: TouchPhase,
+        (x, y): (f32, f32),
+        target_at: impl Fn((f32, f32)) -> Option<A>,
+    ) -> Option<A> {
+        let mut clicked = None;
+        let motions = self.fingers.touch(finger, phase, x, y);
+        for primary in motions.filter_map(|motion| motion.primary()) {
+            let state = match primary {
+                PrimaryTouch::Press { x, y } => {
+                    self.cursor = Some((x, y));
+                    ElementState::Pressed
+                }
+                PrimaryTouch::Move { x, y } => {
+                    self.cursor = Some((x, y));
+                    continue;
+                }
+                PrimaryTouch::Release { x, y } => {
+                    self.cursor = Some((x, y));
+                    ElementState::Released
+                }
+                PrimaryTouch::Cancel => {
+                    self.pressed = None;
+                    continue;
+                }
+            };
+            clicked = self.button(state, &target_at).or(clicked);
+        }
+        clicked
+    }
+}
+
 pub(super) fn action_at<A: Copy>(
     nodes: &[RenderNode],
     actions: &[Option<A>],
@@ -942,6 +1013,8 @@ pub(super) fn wrap(text: &str, measure: TextMeasure<'_>, width: f32) -> Vec<Stri
 mod tests {
     use super::*;
     use crate::graphics::GlyphInfo;
+    use winit::dpi::PhysicalPosition;
+    use winit::event::{DeviceId, Touch};
 
     fn monospace_atlas() -> GlyphAtlas {
         let glyph = GlyphInfo {
@@ -1120,6 +1193,52 @@ mod tests {
         height: 600,
     };
 
+    fn asking_content() -> Content {
+        Content {
+            prompt: Some(prompt()),
+            ..Content::default()
+        }
+    }
+
+    fn center_of(content: &Content, atlas: &GlyphAtlas, text: &str) -> (f32, f32) {
+        let nodes = content.nodes(atlas, PROMPT_EXTENT, 1.0);
+        let views = layout_views(&nodes, PROMPT_EXTENT, Some(TextMeasure { atlas }));
+        let view = &views[nodes
+            .iter()
+            .position(|node| node.text.as_deref() == Some(text))
+            .expect("a laid-out row")];
+        (view.x + view.w / 2.0, view.y + view.h / 2.0)
+    }
+
+    fn position((x, y): (f32, f32)) -> PhysicalPosition<f64> {
+        PhysicalPosition::new(f64::from(x), f64::from(y))
+    }
+
+    fn cursor_at(point: (f32, f32)) -> WindowEvent {
+        WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: position(point),
+        }
+    }
+
+    fn left_button(state: ElementState) -> WindowEvent {
+        WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state,
+            button: MouseButton::Left,
+        }
+    }
+
+    fn finger(id: u64, phase: TouchPhase, point: (f32, f32)) -> WindowEvent {
+        WindowEvent::Touch(Touch {
+            device_id: DeviceId::dummy(),
+            phase,
+            location: position(point),
+            force: None,
+            id,
+        })
+    }
+
     #[test]
     fn the_prompt_shows_the_question_and_both_choices_until_an_error_replaces_it() {
         let atlas = monospace_atlas();
@@ -1183,48 +1302,105 @@ mod tests {
     #[test]
     fn a_click_answers_only_when_pressed_and_released_on_the_same_choice() {
         let atlas = monospace_atlas();
-        let content = Content {
-            prompt: Some(prompt()),
-            ..Content::default()
-        };
-        let nodes = content.nodes(&atlas, PROMPT_EXTENT, 1.0);
-        let views = layout_views(&nodes, PROMPT_EXTENT, Some(TextMeasure { atlas: &atlas }));
-        let center_of = |text: &str| {
-            let view = &views[nodes
-                .iter()
-                .position(|node| node.text.as_deref() == Some(text))
-                .expect("a laid-out row")];
-            (view.x + view.w / 2.0, view.y + view.h / 2.0)
-        };
+        let content = asking_content();
         let at = |point| content.answer_at(&atlas, PROMPT_EXTENT, 1.0, point);
-        assert_eq!(
-            at(center_of("Leave and join (Enter)")),
-            Some(Answer::Confirm)
-        );
-        assert_eq!(at(center_of("Stay (Esc)")), Some(Answer::Cancel));
-        assert_eq!(at(center_of("Leave the current experience?")), None);
+        let confirm = center_of(&content, &atlas, "Leave and join (Enter)");
+        let cancel = center_of(&content, &atlas, "Stay (Esc)");
+        let question = center_of(&content, &atlas, "Leave the current experience?");
+        assert_eq!(at(confirm), Some(Answer::Confirm));
+        assert_eq!(at(cancel), Some(Answer::Cancel));
+        assert_eq!(at(question), None);
         assert_eq!(at((1.0, 1.0)), None);
         assert_eq!(at((799.0, 599.0)), None);
 
-        for (pressed, released, answer) in [
-            (Some(Answer::Confirm), None, None),
-            (None, Some(Answer::Cancel), None),
-            (Some(Answer::Confirm), Some(Answer::Cancel), None),
+        for (pressed_at, released_at, answer) in [
+            (confirm, question, None),
+            (question, cancel, None),
+            (confirm, cancel, None),
+            (confirm, confirm, Some(Answer::Confirm)),
+            (cancel, cancel, Some(Answer::Cancel)),
+        ] {
+            let mut clicks = ClickTracker::default();
+            let answers: Vec<_> = [
+                cursor_at(pressed_at),
+                left_button(ElementState::Pressed),
+                cursor_at(released_at),
+                left_button(ElementState::Released),
+            ]
+            .iter()
+            .filter_map(|event| clicks.window_event(event, at))
+            .collect();
+            assert_eq!(
+                answers,
+                Vec::from_iter(answer),
+                "{pressed_at:?} then {released_at:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_finger_answers_like_the_left_button_and_others_are_ignored() {
+        use TouchPhase::{Cancelled, Ended, Moved, Started};
+
+        let atlas = monospace_atlas();
+        let content = asking_content();
+        let at = |point| content.answer_at(&atlas, PROMPT_EXTENT, 1.0, point);
+        let confirm = center_of(&content, &atlas, "Leave and join (Enter)");
+        let cancel = center_of(&content, &atlas, "Stay (Esc)");
+        let question = center_of(&content, &atlas, "Leave the current experience?");
+
+        for (name, events, answer) in [
             (
-                Some(Answer::Confirm),
-                Some(Answer::Confirm),
+                "tap",
+                vec![finger(3, Started, confirm), finger(3, Ended, confirm)],
                 Some(Answer::Confirm),
             ),
             (
-                Some(Answer::Cancel),
-                Some(Answer::Cancel),
+                "drag off the choice",
+                vec![
+                    finger(3, Started, cancel),
+                    finger(3, Moved, confirm),
+                    finger(3, Ended, confirm),
+                ],
+                None,
+            ),
+            (
+                "cancelled touch",
+                vec![
+                    finger(3, Started, confirm),
+                    finger(3, Cancelled, confirm),
+                    cursor_at(confirm),
+                    left_button(ElementState::Released),
+                ],
+                None,
+            ),
+            (
+                "second finger",
+                vec![
+                    finger(3, Started, question),
+                    finger(4, Started, confirm),
+                    finger(4, Ended, confirm),
+                    finger(3, Ended, question),
+                ],
+                None,
+            ),
+            (
+                "first finger under a second",
+                vec![
+                    finger(3, Started, cancel),
+                    finger(4, Started, confirm),
+                    finger(4, Ended, confirm),
+                    finger(3, Ended, cancel),
+                ],
                 Some(Answer::Cancel),
             ),
         ] {
-            let mut screen = asking_screen();
-            screen.click(ElementState::Pressed, pressed);
-            screen.click(ElementState::Released, released);
-            assert_eq!(screen.answer, answer, "{pressed:?} then {released:?}");
+            let mut clicks = ClickTracker::default();
+            let answers: Vec<_> = events
+                .iter()
+                .filter_map(|event| clicks.window_event(event, at))
+                .collect();
+            assert_eq!(answers, Vec::from_iter(answer), "{name}");
         }
     }
 

@@ -1893,7 +1893,7 @@ impl Host<'_> {
         &mut self,
         title: &str,
         vm: &eclipse::runtime::Vm,
-        touch_mode: eclipse_config::TouchMode,
+        config: &eclipse_config::Config,
         window_state: WindowStateFile,
     ) -> Result<(), eclipse::graphics::GraphicsError> {
         match &mut self.window {
@@ -1904,7 +1904,7 @@ impl Host<'_> {
                     activation_token,
                     title,
                     Some(vm),
-                    touch_mode,
+                    config,
                     Some(commands),
                     window_state,
                 )
@@ -1914,7 +1914,7 @@ impl Host<'_> {
                 None,
                 title,
                 Some(vm),
-                touch_mode,
+                config,
                 None,
                 window_state,
             ),
@@ -2174,7 +2174,7 @@ fn boot_and_play(
         record_normal_close_at_client_exit(proving.store.clone(), proving.version);
     }
     println!("# Opening the host window (winit; close it to exit)…");
-    host.run_game(&window_title(), &vm, config.touch_mode, window_state)?;
+    host.run_game(&window_title(), &vm, config, window_state)?;
     Ok(())
 }
 

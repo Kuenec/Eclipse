@@ -44,6 +44,8 @@
   <supports>
     <control>keyboard</control>
     <control>pointing</control>
+    <control>gamepad</control>
+    <control>touch</control>
   </supports>
   <provides>
     <binary>eclipse</binary>

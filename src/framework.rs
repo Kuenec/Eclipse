@@ -28,6 +28,7 @@ pub mod bitmap_registry;
 pub mod canvas_registry;
 mod captures;
 pub mod dialogs;
+pub(crate) mod engine_input;
 mod external_intents;
 #[cfg(test)]
 mod fake_jvm;
@@ -13406,6 +13407,20 @@ pub fn engine_mouse_locked_center(vm: &Vm) -> Result<bool, FrameworkError> {
     })
 }
 
+fn engine_surface_view<'local>(
+    env: &mut Env<'local>,
+    handle: view_registry::ViewHandle,
+) -> Result<Option<JObject<'local>>, FrameworkError> {
+    match view_registry::local_jobject(env, handle) {
+        Ok(Ok(surface)) => Ok(surface),
+        Ok(Err(e)) => Err(FrameworkError::Jni(e)),
+        Err(e) => {
+            tracing::debug!(error = %e, "engine touch: surface not dispatchable (ignored)");
+            Ok(None)
+        }
+    }
+}
+
 pub fn dispatch_touch_to_engine_surface(
     vm: &Vm,
     action: MotionAction,
@@ -13443,14 +13458,8 @@ fn touch_engine_surface(
         );
         return Ok(None);
     };
-    let surface = match view_registry::local_jobject(env, handle) {
-        Ok(Ok(Some(surface))) => surface,
-        Ok(Ok(None)) => return Ok(None),
-        Ok(Err(e)) => return Err(FrameworkError::Jni(e)),
-        Err(e) => {
-            tracing::debug!(error = %e, "engine touch: surface not dispatchable (ignored)");
-            return Ok(None);
-        }
+    let Some(surface) = engine_surface_view(env, handle)? else {
+        return Ok(None);
     };
     let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
     let now = checked(env, "SystemClock.uptimeMillis", |env| {
