@@ -2232,11 +2232,8 @@ mod tests {
     }
 
     fn stub(dir: &Path, name: &str, script: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let path = dir.join(name);
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::stub_script::write(&path, script);
         path
     }
 

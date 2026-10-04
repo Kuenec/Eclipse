@@ -4,6 +4,9 @@ mod window;
 
 #[cfg(test)]
 mod headless;
+#[cfg(test)]
+#[path = "../../../tests/support/stub_script.rs"]
+mod stub_script;
 
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString};

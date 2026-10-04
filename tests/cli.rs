@@ -1,5 +1,7 @@
 #[path = "../src/bounded_child.rs"]
 mod bounded_child;
+#[path = "support/stub_script.rs"]
+mod stub_script;
 
 use std::ffi::OsStr;
 use std::io::{Read as _, Write as _};
@@ -475,18 +477,14 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
 
 #[test]
 fn a_failed_window_launch_frees_roblox_and_opens_the_failure_window_on_its_saved_report() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let root = sandbox("failure-window");
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("cli-failure-window-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let eclipse = bin.join("eclipse");
-    if std::fs::hard_link(env!("CARGO_BIN_EXE_eclipse"), &eclipse).is_err() {
-        std::fs::copy(env!("CARGO_BIN_EXE_eclipse"), &eclipse).unwrap();
-    }
-    let window = bin.join("eclipse-settings");
-    std::fs::write(&window, FAILURE_WINDOW_STUB).unwrap();
-    std::fs::set_permissions(&window, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::hard_link(env!("CARGO_BIN_EXE_eclipse"), &eclipse).unwrap();
+    stub_script::write(&bin.join("eclipse-settings"), FAILURE_WINDOW_STUB);
     let app_data = root.join("app-data");
     let runtime = app_data.join("runtime");
     std::fs::create_dir_all(runtime.join("ClientAppSettings.json")).unwrap();
@@ -635,13 +633,9 @@ const UNREACHABLE_PACTL: &str =
     "#!/bin/sh\necho 'Connection failure: Connection refused' >&2\nexit 1\n";
 
 fn eclipse_with_pactl(root: &Path, script: &str, args: &[&OsStr]) -> Command {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("create the stub directory");
-    let pactl = bin.join("pactl");
-    std::fs::write(&pactl, script).expect("write the pactl stub");
-    std::fs::set_permissions(&pactl, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    stub_script::write(&bin.join("pactl"), script);
     let path = std::env::var_os("PATH").unwrap_or_default();
     let mut search = bin.into_os_string();
     search.push(":");
