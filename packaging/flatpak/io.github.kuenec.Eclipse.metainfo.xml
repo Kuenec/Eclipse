@@ -24,7 +24,7 @@
   <screenshots>
     <screenshot type="default">
       <caption>The launch window downloading the official Roblox client</caption>
-      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.10/packaging/flatpak/screenshots/first-launch.png</image>
+      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.11/packaging/flatpak/screenshots/first-launch.png</image>
     </screenshot>
   </screenshots>
   <url type="homepage">https://github.com/Kuenec/Eclipse</url>
@@ -57,6 +57,24 @@
     <color type="primary" scheme_preference="dark">#9e391b</color>
   </branding>
   <releases>
+    <release version="0.1.11" date="2026-10-04">
+      <description>
+        <ul>
+          <li>
+            Closing one of Roblox's own small windows, such as the purchase "Working…" box, no
+            longer resizes the game or crashes Roblox.
+          </li>
+          <li>
+            Eclipse Settings, from the app menu or eclipse settings, sets controls, updates and
+            performance, and copies a bug report or opens the log folder.
+          </li>
+          <li>
+            eclipse doctor checks the setup, and the failure window leads with the cause and how
+            to fix it.
+          </li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.10" date="2026-10-04">
       <description>
         <ul>
