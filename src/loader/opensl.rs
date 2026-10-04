@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
+use eclipse_config::audio::Direction;
 
 use super::aaudio::HostErrorStreak;
 
@@ -1486,6 +1487,67 @@ fn stop_host_stream(host_stream: &HostStream) {
     drop(stream.take());
 }
 
+pub fn reopen_players() {
+    let players: Vec<(Arc<Mutex<PcmRing>>, Arc<HostStream>)> = {
+        let registry = registry().lock().unwrap_or_else(PoisonError::into_inner);
+        registry
+            .slots
+            .iter()
+            .flatten()
+            .filter_map(|state| match &state.kind {
+                ObjectKind::Player(player) => {
+                    Some((Arc::clone(&player.ring), Arc::clone(&player.host_stream)))
+                }
+                ObjectKind::Engine | ObjectKind::OutputMix => None,
+            })
+            .collect()
+    };
+    for (ring, previous) in players {
+        let format = ring.lock().unwrap_or_else(PoisonError::into_inner).format;
+        let reopened = match open_host_stream(&ring, format) {
+            Ok(host_stream) => host_stream,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "OpenSL: host output stream did not reopen; the player keeps its device"
+                );
+                continue;
+            }
+        };
+        stop_host_stream(&previous);
+        if let Err(error) = play_host_stream(&reopened) {
+            tracing::warn!(
+                ?error,
+                "OpenSL: reopened host output stream did not start; the player stays silent"
+            );
+        }
+        let orphan = {
+            let mut registry = registry().lock().unwrap_or_else(PoisonError::into_inner);
+            let player =
+                registry
+                    .slots
+                    .iter_mut()
+                    .flatten()
+                    .find_map(|state| match &mut state.kind {
+                        ObjectKind::Player(player) if Arc::ptr_eq(&player.ring, &ring) => {
+                            Some(player)
+                        }
+                        _ => None,
+                    });
+            match player {
+                Some(player) => {
+                    player.host_stream = reopened;
+                    None
+                }
+                None => Some(reopened),
+            }
+        };
+        if let Some(orphan) = orphan {
+            stop_host_stream(&orphan);
+        }
+    }
+}
+
 struct HostErrorReporter {
     host_stream: Weak<HostStream>,
     host_callbacks: Arc<AtomicU64>,
@@ -1535,10 +1597,24 @@ fn start_host_stream(
     ring: &Arc<Mutex<PcmRing>>,
     format: PcmFormat,
 ) -> Result<Arc<HostStream>, AudioHostError> {
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or(AudioHostError::NoDevice)?;
+    let host_stream = open_host_stream(ring, format)?;
+    play_host_stream(&host_stream)?;
+    Ok(host_stream)
+}
+
+fn play_host_stream(host_stream: &HostStream) -> Result<(), AudioHostError> {
+    let slot = host_stream.lock().unwrap_or_else(PoisonError::into_inner);
+    match slot.as_ref() {
+        Some(stream) => stream.play().map_err(AudioHostError::PlayFailed),
+        None => Ok(()),
+    }
+}
+
+fn open_host_stream(
+    ring: &Arc<Mutex<PcmRing>>,
+    format: PcmFormat,
+) -> Result<Arc<HostStream>, AudioHostError> {
+    let device = crate::audio::host_device(Direction::Output).ok_or(AudioHostError::NoDevice)?;
     let supported = host_stream_config(
         format,
         device
@@ -1562,11 +1638,10 @@ fn start_host_stream(
         _ => return Err(AudioHostError::UnsupportedSampleFormat),
     }
     .map_err(AudioHostError::BuildFailed)?;
-    let mut slot = host_stream.lock().unwrap_or_else(PoisonError::into_inner);
-    slot.insert(stream)
-        .play()
-        .map_err(AudioHostError::PlayFailed)?;
-    drop(slot);
+    host_stream
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .replace(stream);
     Ok(host_stream)
 }
 

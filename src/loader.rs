@@ -1,3 +1,5 @@
+use eclipse_config::audio::Direction;
+
 pub mod aaudio;
 pub mod bionic_env;
 pub mod bionic_locale;
@@ -27,3 +29,11 @@ mod text_overlay;
 pub mod tls;
 pub mod vk_overlay;
 pub mod vulkan_wsi;
+
+pub fn reopen_audio_streams(direction: Direction) {
+    aaudio::reopen_streams(direction);
+    match direction {
+        Direction::Output => opensl::reopen_players(),
+        Direction::Input => {}
+    }
+}

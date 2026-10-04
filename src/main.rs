@@ -222,6 +222,7 @@ fn main() -> ExitCode {
         },
         Some("__controller-access") => controller_access_command(),
         Some("__log-dir") => log_dir_command(),
+        Some("__audio-devices") => audio_devices_command(&args[1..]),
 
         Some("__run-libroblox-init") => {
             let outcome = parse_libroblox_init_lib_dir(&args[1..]).and_then(|lib_dir| {
@@ -714,20 +715,26 @@ fn supervise(launch: &LaunchCommand) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let client = match bridge.client_command(launch) {
+    let mut client = match bridge.client_command(launch) {
         Ok(client) => client,
         Err(error) => {
             report_setup_failure(launch, SETTINGS_CONTEXT, &error);
             return ExitCode::FAILURE;
         }
     };
+    let mut log = run.log;
+    let routing = eclipse::audio::Routing::plan(&eclipse_config::load().config);
+    routing.apply(&mut client);
+    if let Err(error) = routing.write_notes(&mut log) {
+        eprintln!("eclipse: cannot write the sound devices to the log: {error}");
+    }
     let output = supervisor::Output {
         stdout: std::io::stdout(),
         stderr: std::io::stderr(),
         echo_records: echo_client_records(),
     };
     let runtime_dir = bridge.app_data_dir.join(RUNTIME_DIR);
-    match supervisor::run(client, run.lock, &runtime_dir, run.log, output) {
+    match supervisor::run(client, run.lock, &runtime_dir, log, output) {
         Ok(finished) => {
             present_failure(launch, &target, &finished);
             finished.exit_code()
@@ -859,6 +866,7 @@ fn run_client(launch: LaunchCommand, supervision: Option<Supervision>) -> ExitCo
     }
     eclipse::diagnostics::init(eclipse::diagnostics::LogSink::Supervisor(records));
     tracing::debug!(version = eclipse::VERSION, "eclipse client starting");
+    eclipse::audio::hotplug::follow_chosen_devices(eclipse::loader::reopen_audio_streams);
     let loaded = eclipse_config::load();
     eclipse::gpu::configure(loaded.config.vulkan_device);
     let auto_update = loaded.config.roblox_auto_update;
@@ -1003,11 +1011,11 @@ fn edit_config(change: Result<Change, SettingError>) -> Result<String, String> {
         }
         SettingError::UnknownKey(_) | SettingError::Invalid { .. } => error.to_string(),
     })?;
-    let applied = eclipse_config::edit::apply(&path, change).map_err(|error| error.to_string())?;
-    Ok(edit_outcome(change, applied, &path))
+    let applied = eclipse_config::edit::apply(&path, &change).map_err(|error| error.to_string())?;
+    Ok(edit_outcome(&change, applied, &path))
 }
 
-fn edit_outcome(change: Change, applied: Applied, path: &Path) -> String {
+fn edit_outcome(change: &Change, applied: Applied, path: &Path) -> String {
     let name = change.key().name();
     let path = path.display();
     let json = |setting| serde_json::to_string(&setting).expect("a setting has a JSON form");
@@ -1078,6 +1086,43 @@ fn controller_access_command() -> ExitCode {
         DeviceAccess::Visible => ExitCode::SUCCESS,
         DeviceAccess::MissingInFlatpak(_) | DeviceAccess::MissingOnHost => ExitCode::FAILURE,
     }
+}
+
+fn audio_devices_command(arguments: &[OsString]) -> ExitCode {
+    use std::io::Write as _;
+
+    let listed = match arguments {
+        [] => eclipse::audio::query().map(|server| println!("{}", server.devices.to_json())),
+        [watch] if watch == AUDIO_DEVICES_WATCH => exit_when_stdin_closes().and_then(|()| {
+            eclipse::audio::hotplug::watch_devices(|devices| {
+                writeln!(std::io::stdout().lock(), "{}", devices.to_json())
+            })
+        }),
+        _ => Err(AUDIO_DEVICES_USAGE.to_owned()),
+    };
+    match listed {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn exit_when_stdin_closes() -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("eclipse-stdin".to_owned())
+        .spawn(
+            || match std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()) {
+                Ok(_) => std::process::exit(0),
+                Err(error) => {
+                    eprintln!("cannot read standard input: {error}");
+                    std::process::exit(1)
+                }
+            },
+        )
+        .map(drop)
+        .map_err(|error| format!("cannot watch standard input: {error}"))
 }
 
 fn log_dir_command() -> ExitCode {
@@ -1212,6 +1257,10 @@ const NO_CONFIG_DIR: &str =
 const CONFIG_USAGE: &str = "usage: eclipse config [set KEY VALUE | unset KEY]";
 
 const DOCTOR_USAGE: &str = "usage: eclipse doctor [--report [RUN_LOG]]";
+
+const AUDIO_DEVICES_WATCH: &str = "--watch";
+
+const AUDIO_DEVICES_USAGE: &str = "usage: eclipse __audio-devices [--watch]";
 
 const VERIFYING_SIGNATURE: &str = "Verifying the Roblox client's signature…";
 
@@ -3234,6 +3283,7 @@ mod tests {
     #[test]
     fn config_sets_a_setting_from_json_or_text_and_unsets_one() {
         use super::{parse_config_action, ConfigAction, CONFIG_USAGE};
+        use eclipse_config::audio::{AudioDevice, DeviceName};
         use eclipse_config::edit::Change;
         use eclipse_config::{CloseOnLeave, Setting, SettingError, SettingKey, TouchMode};
 
@@ -3257,6 +3307,20 @@ mod tests {
                 set(Setting::CloseOnLeave(CloseOnLeave::LinkLaunches))
             );
         }
+        assert_eq!(
+            action(&[
+                "set",
+                "audio_input_device",
+                "alsa_input.usb-Mic-00.mono-fallback"
+            ]),
+            set(Setting::AudioInputDevice(AudioDevice::Named(
+                DeviceName::parse("alsa_input.usb-Mic-00.mono-fallback").expect("a device name")
+            )))
+        );
+        assert_eq!(
+            action(&["set", "audio_output_device", "default"]),
+            set(Setting::AudioOutputDevice(AudioDevice::SystemDefault))
+        );
         assert_eq!(
             action(&["unset", "touch_mode"]),
             Ok(ConfigAction::Edit(Ok(Change::Unset(SettingKey::TouchMode))))

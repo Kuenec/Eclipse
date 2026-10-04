@@ -1,10 +1,11 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
+use eclipse_config::audio::{AudioDevice, DeviceList, Direction, SoundDevices};
 use eclipse_config::edit::{self, Change, EditError};
 use eclipse_config::{CloseOnLeave, Config, GraphicsOptimizationMode, Loaded, Setting, TouchMode};
 use gtk4::{self as gtk, gio, glib};
@@ -37,6 +38,16 @@ const CONTROLLER_ACCESS_MISSING: i32 = 1;
 
 const LOG_DIR: &str = "__log-dir";
 
+const AUDIO_DEVICES: &str = "__audio-devices";
+
+const AUDIO_DEVICES_WATCH: &str = "--watch";
+
+const STDERR_LIMIT: usize = 64 * 1024;
+
+const AUDIO_NOTE: &str = "Roblox's own audio settings show these choices as Default";
+
+const SYSTEM_DEFAULT: &str = "System default";
+
 const BUG_REPORT_SUBTITLE: &str = "Leaves out your home folder, tokens, cookies and account IDs";
 
 const SERVER_LOCATION_NOTICE: &str = "Eclipse looks up where each Roblox server is with \
@@ -51,7 +62,14 @@ pub(crate) struct Settings {
     rows: Rows,
     refreshing: Cell<bool>,
     installing: Cell<bool>,
+    listing: RefCell<Listing>,
     monitor: gio::FileMonitor,
+}
+
+enum Listing {
+    Waiting,
+    Listed(SoundDevices),
+    Failed(String),
 }
 
 struct Rows {
@@ -60,6 +78,8 @@ struct Rows {
     auto_update: adw::SwitchRow,
     pointer_input: adw::ComboRow,
     controllers: adw::SwitchRow,
+    output: DeviceRow,
+    microphone: DeviceRow,
     close_on_leave: adw::ComboRow,
     server_location: adw::SwitchRow,
     physical_cores: adw::SwitchRow,
@@ -67,6 +87,18 @@ struct Rows {
     opengl: adw::SwitchRow,
     bug_report: adw::ActionRow,
     log_folder: adw::ActionRow,
+}
+
+struct DeviceRow {
+    row: adw::ComboRow,
+    direction: Direction,
+    choices: RefCell<Vec<AudioDevice>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Choice {
+    device: AudioDevice,
+    label: String,
 }
 
 pub(crate) fn open(
@@ -93,6 +125,15 @@ pub(crate) fn open(
             rows.controllers.upcast_ref(),
         ],
     ));
+    let audio = group(
+        "Audio",
+        &[
+            rows.output.row.upcast_ref(),
+            rows.microphone.row.upcast_ref(),
+        ],
+    );
+    audio.set_description(Some(AUDIO_NOTE));
+    page.add(&audio);
     page.add(&group(
         "Experiences",
         &[
@@ -145,11 +186,13 @@ pub(crate) fn open(
         rows,
         refreshing: Cell::new(false),
         installing: Cell::new(false),
+        listing: RefCell::new(Listing::Waiting),
         monitor,
     });
     settings.connect();
     settings.refresh();
     settings.show_controller_access();
+    settings.watch_audio_devices();
     settings.window.present();
     Ok(settings)
 }
@@ -180,6 +223,8 @@ impl Rows {
                 .subtitle(CONTROLLERS_SUBTITLE)
                 .use_markup(false)
                 .build(),
+            output: DeviceRow::new("Output device", Direction::Output),
+            microphone: DeviceRow::new("Microphone", Direction::Input),
             close_on_leave: combo_row(
                 "Close Eclipse after leaving an experience",
                 CloseOnLeave::ALL.map(close_on_leave_label),
@@ -209,7 +254,7 @@ impl Rows {
         }
     }
 
-    fn show(&self, config: &Config, editable: bool) {
+    fn show(&self, config: &Config, editable: bool, listing: &Listing) {
         let Config {
             graphics_optimization_mode,
             touch_mode,
@@ -218,6 +263,8 @@ impl Rows {
             close_on_leave,
             server_location_indicator_enabled,
             allow_gamepad_permission,
+            audio_output_device,
+            audio_input_device,
             fflags: _,
             webview_helper_path: _,
             vulkan_device: _,
@@ -235,22 +282,70 @@ impl Rows {
         self.gamemode.set_active(*enable_gamemode);
         self.controllers.set_active(*allow_gamepad_permission);
         self.opengl.set_active(*use_opengl);
+        self.output.show(audio_output_device, listing);
+        self.microphone.show(audio_input_device, listing);
         for row in self.settings() {
             row.set_sensitive(editable);
         }
     }
 
-    fn settings(&self) -> [&gtk::Widget; 8] {
+    fn settings(&self) -> [&gtk::Widget; 10] {
         [
             self.auto_update.upcast_ref(),
             self.pointer_input.upcast_ref(),
             self.controllers.upcast_ref(),
+            self.output.row.upcast_ref(),
+            self.microphone.row.upcast_ref(),
             self.close_on_leave.upcast_ref(),
             self.server_location.upcast_ref(),
             self.physical_cores.upcast_ref(),
             self.gamemode.upcast_ref(),
             self.opengl.upcast_ref(),
         ]
+    }
+
+    const fn device(&self, direction: Direction) -> &DeviceRow {
+        match direction {
+            Direction::Output => &self.output,
+            Direction::Input => &self.microphone,
+        }
+    }
+}
+
+impl DeviceRow {
+    fn new(title: &str, direction: Direction) -> Self {
+        Self {
+            row: adw::ComboRow::builder()
+                .title(title)
+                .use_markup(false)
+                .build(),
+            direction,
+            choices: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn show(&self, chosen: &AudioDevice, listing: &Listing) {
+        let choices = device_choices(chosen, listing, self.direction);
+        let labels: Vec<&str> = choices.iter().map(|choice| choice.label.as_str()).collect();
+        self.row.set_model(Some(&gtk::StringList::new(&labels)));
+        let selected = choices
+            .iter()
+            .position(|choice| choice.device == *chosen)
+            .and_then(|index| u32::try_from(index).ok())
+            .expect("the chosen device is one of the choices");
+        self.row.set_selected(selected);
+        let subtitle = match listing {
+            Listing::Failed(reason) => format!("Eclipse cannot list the sound devices: {reason}"),
+            Listing::Waiting | Listing::Listed(_) => String::new(),
+        };
+        self.row.set_subtitle(&subtitle);
+        self.choices
+            .replace(choices.into_iter().map(|choice| choice.device).collect());
+    }
+
+    fn chosen(&self) -> Option<AudioDevice> {
+        let index = usize::try_from(self.row.selected()).ok()?;
+        self.choices.borrow().get(index).cloned()
     }
 }
 
@@ -274,6 +369,19 @@ impl Settings {
             &CloseOnLeave::ALL,
             Setting::CloseOnLeave,
         );
+        for direction in Direction::ALL {
+            let settings = Rc::clone(self);
+            rows.device(direction)
+                .row
+                .connect_selected_notify(move |_| {
+                    if settings.refreshing.get() {
+                        return;
+                    }
+                    if let Some(device) = settings.rows.device(direction).chosen() {
+                        settings.change(Setting::audio_device(direction, device));
+                    }
+                });
+        }
 
         let settings = Rc::clone(self);
         rows.server_location.connect_active_notify(move |row| {
@@ -351,7 +459,7 @@ impl Settings {
         if self.refreshing.get() {
             return;
         }
-        if let Err(error) = edit::apply(&self.path, Change::Set(setting)) {
+        if let Err(error) = edit::apply(&self.path, &Change::Set(setting)) {
             self.report("Eclipse did not change the setting", &error.to_string());
         }
         let settings = Rc::clone(self);
@@ -362,7 +470,8 @@ impl Settings {
         let loaded = eclipse_config::load_from(&self.path);
         let refusal = edit::check(&self.path).err();
         self.refreshing.set(true);
-        self.rows.show(&loaded.config, refusal.is_none());
+        self.rows
+            .show(&loaded.config, refusal.is_none(), &self.listing.borrow());
         self.refreshing.set(false);
         match notice(&loaded, refusal.as_ref()) {
             Some(title) => {
@@ -384,6 +493,21 @@ impl Settings {
             let row = &settings.rows.controllers;
             row.set_subtitle(&subtitle);
             row.set_subtitle_selectable(true);
+        });
+    }
+
+    fn watch_audio_devices(self: &Rc<Self>) {
+        let settings = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            let watched = watch_audio_devices(&settings.eclipse, |devices| {
+                settings.listing.replace(Listing::Listed(devices));
+                settings.refresh();
+            })
+            .await;
+            if let Err(reason) = watched {
+                settings.listing.replace(Listing::Failed(reason));
+                settings.refresh();
+            }
         });
     }
 
@@ -589,6 +713,46 @@ const fn close_on_leave_label(policy: CloseOnLeave) -> &'static str {
     }
 }
 
+fn device_choices(chosen: &AudioDevice, listing: &Listing, direction: Direction) -> Vec<Choice> {
+    let listed = match listing {
+        Listing::Listed(devices) => Some(devices.of(direction)),
+        Listing::Waiting | Listing::Failed(_) => None,
+    };
+    let system_default = match listed.and_then(DeviceList::default_device) {
+        Some(device) => format!("{SYSTEM_DEFAULT} ({})", device.description),
+        None => SYSTEM_DEFAULT.to_owned(),
+    };
+    let mut choices = vec![Choice {
+        device: AudioDevice::SystemDefault,
+        label: system_default,
+    }];
+    choices.extend(listed.into_iter().flat_map(|list| {
+        list.devices
+            .iter()
+            .filter(|device| {
+                !device.monitor
+                    || matches!(chosen, AudioDevice::Named(name) if *name == device.name)
+            })
+            .map(|device| Choice {
+                device: AudioDevice::Named(device.name.clone()),
+                label: device.description.clone(),
+            })
+    }));
+    if let AudioDevice::Named(name) = chosen {
+        if !choices.iter().any(|choice| choice.device == *chosen) {
+            let label = match listed {
+                Some(_) => format!("{name} (not connected)"),
+                None => name.to_string(),
+            };
+            choices.push(Choice {
+                device: chosen.clone(),
+                label,
+            });
+        }
+    }
+    choices
+}
+
 fn position<T: PartialEq>(choices: &[T], value: T) -> u32 {
     choices
         .iter()
@@ -713,6 +877,57 @@ async fn log_dir(eclipse: &Path) -> Result<PathBuf, String> {
         eclipse.display(),
         String::from_utf8_lossy(dir).trim()
     ))
+}
+
+async fn watch_audio_devices(
+    eclipse: &Path,
+    mut listed: impl FnMut(SoundDevices),
+) -> Result<(), String> {
+    let process = gio::Subprocess::newv(
+        &[
+            eclipse.as_os_str(),
+            OsStr::new(AUDIO_DEVICES),
+            OsStr::new(AUDIO_DEVICES_WATCH),
+        ],
+        gio::SubprocessFlags::STDIN_PIPE
+            | gio::SubprocessFlags::STDOUT_PIPE
+            | gio::SubprocessFlags::STDERR_PIPE,
+    )
+    .map_err(|error| format!("cannot run {}: {}", eclipse.display(), error.message()))?;
+    let lines = gio::DataInputStream::new(
+        &process
+            .stdout_pipe()
+            .expect("the device watch's stdout is piped at spawn"),
+    );
+    while let Some(line) = lines
+        .read_line_utf8_future(glib::Priority::DEFAULT)
+        .await
+        .map_err(|error| error.message().to_owned())?
+    {
+        listed(SoundDevices::from_json(&line).map_err(|error| {
+            format!(
+                "{} {AUDIO_DEVICES} printed an unreadable list: {error}",
+                eclipse.display()
+            )
+        })?);
+    }
+    process
+        .wait_future()
+        .await
+        .map_err(|error| error.message().to_owned())?;
+    if process.is_successful() {
+        return Ok(());
+    }
+    let stderr = process
+        .stderr_pipe()
+        .expect("the device watch's stderr is piped at spawn")
+        .read_bytes_future(STDERR_LIMIT, glib::Priority::DEFAULT)
+        .await
+        .map_err(|error| error.message().to_owned())?;
+    Err(match String::from_utf8_lossy(&stderr).trim() {
+        "" => format!("{} {AUDIO_DEVICES} failed", eclipse.display()),
+        reason => reason.to_owned(),
+    })
 }
 
 async fn eclipse_version(eclipse: &Path) -> Result<String, String> {
@@ -1022,7 +1237,7 @@ mod tests {
     }
 
     const FAILING_INSTALL: &str = "#!/bin/sh\n\
-        [ \"$1\" = __controller-access ] && exit 0\n\
+        case \"$1\" in __controller-access | __audio-devices) exit 0 ;; esac\n\
         printf '%s\\n' \"$@\" > \"${0%/*}/arguments\"\n\
         echo '# Verifying and installing the Roblox client…'\n\
         echo 'not a Roblox APK' >&2\n\
@@ -1124,6 +1339,251 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    const DEVICES: &str = r#"{
+  "outputs": {
+    "devices": [
+      {"name": "speakers", "description": "Speakers", "monitor": false},
+      {"name": "headset", "description": "Headset", "monitor": false}
+    ],
+    "system_default": "headset"
+  },
+  "inputs": {
+    "devices": [
+      {"name": "headset.monitor", "description": "Monitor of Headset", "monitor": true},
+      {"name": "headset_mic", "description": "Headset Microphone", "monitor": false}
+    ],
+    "system_default": null
+  }
+}"#;
+
+    const REPLUGGED: &str = r#"{"outputs": {"devices": [
+      {"name": "speakers", "description": "Speakers", "monitor": false},
+      {"name": "usb_dac", "description": "USB DAC", "monitor": false}
+    ], "system_default": "speakers"},
+    "inputs": {"devices": [], "system_default": null}}"#;
+
+    const UNPLUGGED: &str = "{\n  \"audio_output_device\": \"unplugged_dac\"\n}\n";
+
+    const HEADSET_CHOSEN: &str = "{\n  \"audio_output_device\": \"headset\"\n}\n";
+
+    fn one_line(json: &str) -> String {
+        json.replace('\n', " ")
+    }
+
+    fn labels(row: &adw::ComboRow) -> Vec<String> {
+        let model = row
+            .model()
+            .and_downcast::<gtk::StringList>()
+            .expect("a string list");
+        (0..model.n_items())
+            .filter_map(|index| model.string(index))
+            .map(String::from)
+            .collect()
+    }
+
+    fn stub(root: &Path, script: &str) {
+        let eclipse = headless::eclipse_path(root);
+        fs::create_dir_all(eclipse.parent().expect("a bin directory")).expect("mkdir");
+        fs::write(&eclipse, script).expect("write the stub");
+        fs::set_permissions(&eclipse, Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    #[test]
+    fn choosing_a_microphone_rewrites_only_audio_input_device() {
+        if let Some(root) = headless::child_root() {
+            let settings = show(&root);
+            let rows = &settings.rows;
+            headless::wait_until("the devices are listed", || {
+                labels(&rows.microphone.row).len() > 1
+            });
+            assert_eq!(
+                labels(&rows.output.row),
+                [
+                    "System default (Headset)",
+                    "Speakers",
+                    "Headset",
+                    "unplugged_dac (not connected)"
+                ]
+            );
+            assert_eq!(rows.output.row.selected(), 3);
+            assert_eq!(
+                labels(&rows.microphone.row),
+                ["System default", "Headset Microphone"]
+            );
+            assert_eq!(rows.microphone.row.selected(), 0);
+            assert_eq!(rows.output.row.subtitle().as_deref(), Some(""));
+            rows.microphone.row.set_selected(1);
+            return;
+        }
+        let root = headless::root("microphone");
+        fs::write(headless::config_path(&root), UNPLUGGED).expect("write config.json");
+        stub(
+            &root,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n__audio-devices) printf '%s\\n' '{}' ;;\n\
+                 __controller-access) exit 0 ;;\n*) exit 2 ;;\nesac\n",
+                one_line(DEVICES)
+            ),
+        );
+
+        headless::run_child(
+            "window::tests::choosing_a_microphone_rewrites_only_audio_input_device",
+            "microphone",
+            &root,
+        );
+
+        let written = fs::read_to_string(headless::config_path(&root)).expect("read config.json");
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(
+            written,
+            "{\n  \"audio_output_device\": \"unplugged_dac\",\n  \
+             \"audio_input_device\": \"headset_mic\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn devices_plugged_in_or_out_while_settings_is_open_update_the_rows() {
+        if let Some(root) = headless::child_root() {
+            let settings = show(&root);
+            let rows = &settings.rows;
+            headless::wait_until("the second list is shown", || {
+                labels(&rows.output.row).contains(&"USB DAC".to_owned())
+            });
+            assert_eq!(
+                labels(&rows.output.row),
+                [
+                    "System default (Speakers)",
+                    "Speakers",
+                    "USB DAC",
+                    "headset (not connected)"
+                ]
+            );
+            assert_eq!(rows.output.row.selected(), 3);
+            return;
+        }
+        let root = headless::root("replugged");
+        fs::write(headless::config_path(&root), HEADSET_CHOSEN).expect("write config.json");
+        stub(
+            &root,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n__audio-devices) [ \"$2\" = --watch ] || exit 2\n\
+                 printf '%s\\n' '{}'\nsleep 0.3\nprintf '%s\\n' '{}'\ncat >/dev/null ;;\n\
+                 __controller-access) exit 0 ;;\n*) exit 2 ;;\nesac\n",
+                one_line(DEVICES),
+                one_line(REPLUGGED)
+            ),
+        );
+
+        headless::run_child(
+            "window::tests::devices_plugged_in_or_out_while_settings_is_open_update_the_rows",
+            "replugged",
+            &root,
+        );
+
+        let written = fs::read_to_string(headless::config_path(&root)).expect("read config.json");
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(written, HEADSET_CHOSEN);
+    }
+
+    #[test]
+    fn without_a_device_list_the_rows_say_why_and_keep_the_choice() {
+        if let Some(root) = headless::child_root() {
+            let settings = show(&root);
+            let rows = &settings.rows;
+            headless::wait_until("the rows say why", || {
+                rows.output
+                    .row
+                    .subtitle()
+                    .is_some_and(|subtitle| !subtitle.is_empty())
+            });
+            assert_eq!(
+                rows.output.row.subtitle().as_deref(),
+                Some(
+                    "Eclipse cannot list the sound devices: `pactl info` failed (exit status: \
+                     1): Connection refused"
+                )
+            );
+            assert_eq!(
+                labels(&rows.output.row),
+                ["System default", "unplugged_dac"]
+            );
+            assert_eq!(rows.output.row.selected(), 1);
+            assert_eq!(labels(&rows.microphone.row), ["System default"]);
+            assert!(rows.settings().iter().all(|row| row.is_sensitive()));
+            return;
+        }
+        let root = headless::root("no-devices");
+        fs::write(headless::config_path(&root), UNPLUGGED).expect("write config.json");
+        stub(
+            &root,
+            "#!/bin/sh\ncase \"$1\" in\n__audio-devices) echo '`pactl info` failed (exit status: 1): \
+             Connection refused' >&2; exit 1 ;;\n__controller-access) exit 0 ;;\n*) exit 2 ;;\nesac\n",
+        );
+
+        headless::run_child(
+            "window::tests::without_a_device_list_the_rows_say_why_and_keep_the_choice",
+            "no-devices",
+            &root,
+        );
+
+        let written = fs::read_to_string(headless::config_path(&root)).expect("read config.json");
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(written, UNPLUGGED);
+    }
+
+    #[test]
+    fn a_chosen_device_is_named_plainly_until_the_list_says_it_is_missing() {
+        let chosen = AudioDevice::Named(
+            eclipse_config::audio::DeviceName::parse("unplugged_dac").expect("a device name"),
+        );
+        let labels = |listing: &Listing| -> Vec<String> {
+            device_choices(&chosen, listing, Direction::Output)
+                .into_iter()
+                .map(|choice| choice.label)
+                .collect()
+        };
+        assert_eq!(
+            labels(&Listing::Waiting),
+            ["System default", "unplugged_dac"]
+        );
+        assert_eq!(
+            labels(&Listing::Listed(SoundDevices::default())),
+            ["System default", "unplugged_dac (not connected)"]
+        );
+        let listed = SoundDevices::from_json(DEVICES).expect("a device list");
+        assert_eq!(
+            device_choices(
+                &AudioDevice::SystemDefault,
+                &Listing::Listed(listed),
+                Direction::Input
+            )
+            .into_iter()
+            .map(|choice| choice.device)
+            .collect::<Vec<_>>(),
+            [
+                AudioDevice::SystemDefault,
+                AudioDevice::Named(
+                    eclipse_config::audio::DeviceName::parse("headset_mic").expect("a name")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn monitor_sources_are_offered_only_when_already_chosen() {
+        let monitor = eclipse_config::audio::DeviceName::parse("headset.monitor").expect("a name");
+        let listing = Listing::Listed(SoundDevices::from_json(DEVICES).expect("a device list"));
+        let labels: Vec<String> =
+            device_choices(&AudioDevice::Named(monitor), &listing, Direction::Input)
+                .into_iter()
+                .map(|choice| choice.label)
+                .collect();
+        assert_eq!(
+            labels,
+            ["System default", "Monitor of Headset", "Headset Microphone"]
+        );
+    }
+
     const REPORT: &str = "Outcome: no launch is logged yet\nLog: none in ~/app-data/logs\n";
 
     #[test]
@@ -1147,7 +1607,7 @@ mod tests {
         fs::write(
             &eclipse,
             format!(
-                "#!/bin/sh\n[ \"$1\" = __controller-access ] && exit 0\n\
+                "#!/bin/sh\ncase \"$1\" in __controller-access | __audio-devices) exit 0 ;; esac\n\
                  printf '%s\\n' \"$@\" > \"${{0%/*}}/arguments\"\nprintf '{}'\n",
                 REPORT.replace('\n', "\\n")
             ),

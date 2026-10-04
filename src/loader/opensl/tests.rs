@@ -1034,6 +1034,50 @@ fn a_host_output_that_cannot_open_reports_the_cpal_cause() {
     );
 }
 
+#[test]
+fn reopened_players_play_on_a_new_host_output() {
+    on_host_output(
+        HostOutput::Null,
+        "reopened_players_play_on_a_new_host_output",
+        || {
+            let test_player = TestPlayer::create().expect("the null host output opens");
+            let host_stream = |player| {
+                with_player_state(player, |p| Arc::clone(&p.host_stream)).expect("a player")
+            };
+            let before = host_stream(test_player.player);
+
+            reopen_players();
+
+            let after = host_stream(test_player.player);
+            assert!(!Arc::ptr_eq(&before, &after));
+            assert!(
+                before.lock().unwrap().is_none(),
+                "the old host output is closed"
+            );
+            assert!(
+                after.lock().unwrap().is_some(),
+                "the new host output is open"
+            );
+            test_player.play();
+            assert_eq!(
+                bq_enqueue_via_vtable(test_player.bq(), &generate_sine_pcm16(440.0, 44_100, 64)),
+                SL_RESULT_SUCCESS
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while player_drained_buffers(test_player.player) == Some(0) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the new host output did not play"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            obj_destroy(test_player.player);
+            test_player.destroy_rest();
+        },
+    );
+}
+
 const HOST_OUTPUT_CHILD: &str = "ECLIPSE_TEST_HOST_OUTPUT_CHILD";
 
 const HOST_OUTPUT_CHILD_LIMIT: Duration = Duration::from_secs(60);
