@@ -24,7 +24,7 @@
   <screenshots>
     <screenshot type="default">
       <caption>The launch window downloading the official Roblox client</caption>
-      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.11/packaging/flatpak/screenshots/first-launch.png</image>
+      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.12/packaging/flatpak/screenshots/first-launch.png</image>
     </screenshot>
   </screenshots>
   <url type="homepage">https://github.com/Kuenec/Eclipse</url>
@@ -57,6 +57,24 @@
     <color type="primary" scheme_preference="dark">#9e391b</color>
   </branding>
   <releases>
+    <release version="0.1.12" date="2026-10-04">
+      <description>
+        <ul>
+          <li>
+            Eclipse Settings can send Roblox's sound and microphone to a chosen device, such as a
+            USB microphone, without changing your desktop defaults.
+          </li>
+          <li>
+            Roblox renders on the GPU you choose with vulkan_device, and on hybrid laptops it sees
+            only that GPU. use_opengl switches to OpenGL ES, which is also picked automatically
+            when no Vulkan GPU works.
+          </li>
+          <li>
+            eclipse doctor names the GPU and driver problems it finds and how to fix them.
+          </li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.11" date="2026-10-04">
       <description>
         <ul>
