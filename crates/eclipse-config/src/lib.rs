@@ -1,3 +1,4 @@
+pub mod audio;
 mod document;
 pub mod edit;
 mod load;
@@ -11,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Serialize, Serializer};
 
+use crate::audio::{AudioDevice, Direction};
+
 pub use document::Position;
 pub use load::{config_path, load, load_from, Loaded, Problem};
 pub use pci_id::PciId;
@@ -18,6 +21,9 @@ pub use pci_id::PciId;
 const SOBER_FAKE_OFF: &str = "fake_off";
 
 const LINK_LAUNCHES: &str = "browser";
+
+const AUDIO_DEVICE_VALUES: &str = "`default` or a device name that `pactl list short sinks` or \
+     `pactl list short sources` prints";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GraphicsOptimizationMode {
@@ -142,6 +148,9 @@ pub struct Config {
     pub vulkan_device: Option<PciId>,
 
     pub use_opengl: bool,
+    pub audio_output_device: AudioDevice,
+
+    pub audio_input_device: AudioDevice,
 
     pub fflags: BTreeMap<String, serde_json::Value>,
 
@@ -160,6 +169,8 @@ impl Default for Config {
             allow_gamepad_permission: true,
             vulkan_device: None,
             use_opengl: false,
+            audio_output_device: AudioDevice::SystemDefault,
+            audio_input_device: AudioDevice::SystemDefault,
             fflags: BTreeMap::new(),
             webview_helper_path: None,
         }
@@ -167,6 +178,14 @@ impl Default for Config {
 }
 
 impl Config {
+    #[must_use]
+    pub const fn audio_device(&self, direction: Direction) -> &AudioDevice {
+        match direction {
+            Direction::Output => &self.audio_output_device,
+            Direction::Input => &self.audio_input_device,
+        }
+    }
+
     fn set_value(&mut self, key: Key, value: serde_json::Value) -> Result<(), String> {
         let reason = |error: serde_json::Error| document::reason(&error);
         match key {
@@ -182,6 +201,8 @@ impl Config {
                 Setting::AllowGamepadPermission(allowed) => self.allow_gamepad_permission = allowed,
                 Setting::VulkanDevice(device) => self.vulkan_device = device,
                 Setting::UseOpengl(enabled) => self.use_opengl = enabled,
+                Setting::AudioOutputDevice(device) => self.audio_output_device = device,
+                Setting::AudioInputDevice(device) => self.audio_input_device = device,
             },
             Key::FileOnly(FileOnlyKey::Fflags) => {
                 self.fflags = serde_json::from_value(value).map_err(reason)?;
@@ -196,7 +217,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum Setting {
     TouchMode(TouchMode),
@@ -208,11 +229,21 @@ pub enum Setting {
     AllowGamepadPermission(bool),
     VulkanDevice(Option<PciId>),
     UseOpengl(bool),
+    AudioOutputDevice(AudioDevice),
+    AudioInputDevice(AudioDevice),
 }
 
 impl Setting {
     #[must_use]
-    pub const fn key(self) -> SettingKey {
+    pub const fn audio_device(direction: Direction, device: AudioDevice) -> Self {
+        match direction {
+            Direction::Output => Self::AudioOutputDevice(device),
+            Direction::Input => Self::AudioInputDevice(device),
+        }
+    }
+
+    #[must_use]
+    pub const fn key(&self) -> SettingKey {
         match self {
             Self::TouchMode(_) => SettingKey::TouchMode,
             Self::GraphicsOptimizationMode(_) => SettingKey::GraphicsOptimizationMode,
@@ -223,6 +254,8 @@ impl Setting {
             Self::AllowGamepadPermission(_) => SettingKey::AllowGamepadPermission,
             Self::VulkanDevice(_) => SettingKey::VulkanDevice,
             Self::UseOpengl(_) => SettingKey::UseOpengl,
+            Self::AudioOutputDevice(_) => SettingKey::AudioOutputDevice,
+            Self::AudioInputDevice(_) => SettingKey::AudioInputDevice,
         }
     }
 }
@@ -238,10 +271,12 @@ pub enum SettingKey {
     AllowGamepadPermission,
     VulkanDevice,
     UseOpengl,
+    AudioOutputDevice,
+    AudioInputDevice,
 }
 
 impl SettingKey {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 11] = [
         Self::TouchMode,
         Self::GraphicsOptimizationMode,
         Self::EnableGamemode,
@@ -251,7 +286,17 @@ impl SettingKey {
         Self::AllowGamepadPermission,
         Self::VulkanDevice,
         Self::UseOpengl,
+        Self::AudioOutputDevice,
+        Self::AudioInputDevice,
     ];
+
+    #[must_use]
+    pub const fn audio_device(direction: Direction) -> Self {
+        match direction {
+            Direction::Output => Self::AudioOutputDevice,
+            Direction::Input => Self::AudioInputDevice,
+        }
+    }
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -265,6 +310,8 @@ impl SettingKey {
             Self::AllowGamepadPermission => "allow_gamepad_permission",
             Self::VulkanDevice => "vulkan_device",
             Self::UseOpengl => "use_opengl",
+            Self::AudioOutputDevice => "audio_output_device",
+            Self::AudioInputDevice => "audio_input_device",
         }
     }
 
@@ -302,6 +349,10 @@ impl SettingKey {
             Self::AllowGamepadPermission => value.as_bool().map(Setting::AllowGamepadPermission),
             Self::VulkanDevice => PciId::from_json(value).map(Setting::VulkanDevice),
             Self::UseOpengl => value.as_bool().map(Setting::UseOpengl),
+            Self::AudioOutputDevice => {
+                AudioDevice::from_json(value).map(Setting::AudioOutputDevice)
+            }
+            Self::AudioInputDevice => AudioDevice::from_json(value).map(Setting::AudioInputDevice),
         };
         setting.ok_or_else(|| format!("expected {}", self.accepted_values()))
     }
@@ -319,6 +370,9 @@ impl SettingKey {
             | Self::UseOpengl => &["true", "false"],
             Self::CloseOnLeave => &CloseOnLeave::ALL.map(CloseOnLeave::json_form),
             Self::VulkanDevice => return PciId::ACCEPTED.to_owned(),
+            Self::AudioOutputDevice | Self::AudioInputDevice => {
+                return AUDIO_DEVICE_VALUES.to_owned();
+            }
         };
         let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
         format!("one of {}", quoted.join(", "))
@@ -443,7 +497,8 @@ mod tests {
             "`use_console_experience` is not a setting; the settings are `touch_mode`, \
              `graphics_optimization_mode`, `enable_gamemode`, `roblox_auto_update`, \
              `close_on_leave`, `server_location_indicator_enabled`, \
-             `allow_gamepad_permission`, `vulkan_device`, `use_opengl`"
+             `allow_gamepad_permission`, `vulkan_device`, `use_opengl`, `audio_output_device`, \
+             `audio_input_device`"
         );
     }
 
@@ -691,6 +746,43 @@ mod tests {
     }
 
     #[test]
+    fn audio_devices_take_default_or_a_device_name() {
+        let quadcast = "alsa_input.usb-HP__Inc_HyperX_QuadCast_4111-00.analog-stereo";
+        let named = AudioDevice::Named(audio::DeviceName::parse(quadcast).expect("a name"));
+        for direction in Direction::ALL {
+            let key = SettingKey::audio_device(direction);
+            assert_eq!(SettingKey::from_name(key.name()), Ok(key));
+            let setting = key.parse(quadcast.into()).expect("a device name");
+            assert_eq!(setting, Setting::audio_device(direction, named.clone()));
+            assert_eq!(setting.key(), key);
+            assert_eq!(
+                serde_json::to_value(&setting).expect("serialize"),
+                serde_json::json!(quadcast)
+            );
+            assert_eq!(
+                key.parse("default".into()),
+                Ok(Setting::audio_device(direction, AudioDevice::SystemDefault))
+            );
+            assert_eq!(
+                key.parse(serde_json::json!(null)),
+                Err(SettingError::Invalid {
+                    key,
+                    message: format!("expected {AUDIO_DEVICE_VALUES}"),
+                })
+            );
+        }
+        let mut config = Config::default();
+        config
+            .set_value(Key::Setting(SettingKey::AudioInputDevice), quadcast.into())
+            .expect("a device name");
+        assert_eq!(config.audio_device(Direction::Input), &named);
+        assert_eq!(
+            config.audio_device(Direction::Output),
+            &AudioDevice::SystemDefault
+        );
+    }
+
+    #[test]
     fn every_schema_key_is_a_setting_or_file_only() {
         let written = serde_json::to_value(Config::default()).expect("serialize");
         let mut schema: Vec<&str> = written
@@ -729,6 +821,8 @@ mod tests {
         assert_eq!(default_json("allow_gamepad_permission"), "true");
         assert_eq!(default_json("vulkan_device"), "null");
         assert_eq!(default_json("use_opengl"), "false");
+        assert_eq!(default_json("audio_output_device"), r#""default""#);
+        assert_eq!(default_json("audio_input_device"), r#""default""#);
         assert_eq!(default_json("fflags"), "{}");
         assert_eq!(default_json("webview_helper_path"), "null");
         for key in SettingKey::ALL {

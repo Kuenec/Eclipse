@@ -1,8 +1,16 @@
 use super::*;
-use std::ffi::{c_char, c_int, CStr};
+use cpal::traits::HostTrait;
+use std::ffi::{c_char, c_int, CStr, OsStr};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use eclipse_config::audio::AudioDevice;
+
+use crate::audio::null_devices::{stream_device, NullDevices};
+use crate::audio::private_server::PrivateServer;
+use crate::audio::Routing;
 use crate::loader::log_capture::formatted_log;
 use crate::loader::native_provider::EclipseNativeProvider;
 use crate::loader::resolve::SymbolProvider;
@@ -146,10 +154,21 @@ unsafe extern "C" fn record_error(_stream: *mut c_void, user_data: *mut c_void, 
     probe.errors.lock().unwrap().push(error);
 }
 
+static UNCHANGED_ROUTE: AtomicU64 = AtomicU64::new(0);
+
 fn renderer<A: cpal::SizedSample>(
     shared: &Arc<StreamShared>,
     callback: DataCallback,
     probe: &CallbackProbe,
+) -> Renderer<A> {
+    routed_renderer(shared, callback, probe, Route::on(&UNCHANGED_ROUTE))
+}
+
+fn routed_renderer<A: cpal::SizedSample>(
+    shared: &Arc<StreamShared>,
+    callback: DataCallback,
+    probe: &CallbackProbe,
+    route: Route,
 ) -> Renderer<A> {
     Renderer::new(
         Arc::clone(shared),
@@ -157,6 +176,11 @@ fn renderer<A: cpal::SizedSample>(
             func: callback,
             user_data: probe.user_data(),
         },
+        Some(ErrorCallbackTarget {
+            func: record_error,
+            user_data: probe.user_data(),
+        }),
+        route,
         0x1234_0000_0007,
         StreamFormat {
             channels: 2,
@@ -888,6 +912,28 @@ fn a_host_error_followed_by_a_host_callback_keeps_the_stream_started() {
     assert_eq!(*probe.errors.lock().unwrap(), [AAUDIO_ERROR_DISCONNECTED]);
 }
 
+#[test]
+fn a_route_change_disconnects_a_running_stream_once() {
+    static ROUTE: AtomicU64 = AtomicU64::new(0);
+    let shared = Arc::new(StreamShared::new(4));
+    shared.state.swap(StreamState::Started);
+    let probe = CallbackProbe::default();
+    let mut renderer = routed_renderer::<i16>(&shared, write_i16_ramp, &probe, Route::on(&ROUTE));
+
+    renderer.render_output(&mut [0.0f32; 16]);
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    assert!(probe.errors.lock().unwrap().is_empty());
+
+    ROUTE.fetch_add(1, Ordering::AcqRel);
+    let mut out = [1.0f32; 16];
+    renderer.render_output(&mut out);
+    renderer.render_output(&mut out);
+    assert_eq!(shared.state.load(), StreamState::Disconnected);
+    assert_eq!(*probe.errors.lock().unwrap(), [AAUDIO_ERROR_DISCONNECTED]);
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(out, [0.0f32; 16]);
+}
+
 type DlopenFn = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
 type DlsymFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
 
@@ -1134,4 +1180,345 @@ fn fmod_output_sequence_plays_through_the_host_device() {
         assert_eq!((api.delete)(builder), AAUDIO_OK);
     }
     assert!(probe.errors.lock().unwrap().is_empty());
+}
+
+const ROUTED_CHILD: &str = "ECLIPSE_TEST_ROUTED_AAUDIO_CHILD";
+
+const ROUTED_TEST: &str =
+    "loader::aaudio::tests::aaudio_streams_reach_the_devices_chosen_in_the_settings";
+
+const ROUTED_LIMIT: Duration = Duration::from_secs(30);
+
+unsafe extern "C" fn count_input(
+    _stream: *mut c_void,
+    user_data: *mut c_void,
+    _audio: *mut c_void,
+    _frames: i32,
+) -> i32 {
+    let probe = unsafe { &*(user_data as *const CallbackProbe) };
+    probe.calls.fetch_add(1, Ordering::SeqCst);
+    AAUDIO_CALLBACK_RESULT_CONTINUE
+}
+
+fn started_stream(
+    api: &FmodView,
+    direction: i32,
+    callback: DataCallback,
+    probe: &CallbackProbe,
+) -> *mut c_void {
+    let mut builder = std::ptr::null_mut();
+    let mut stream = std::ptr::null_mut();
+    unsafe {
+        assert_eq!((api.create)(&mut builder), AAUDIO_OK);
+        (api.set_i32[2])(builder, direction);
+        (api.set_data)(builder, Some(callback), probe.user_data() as *mut c_void);
+        (api.set_error)(
+            builder,
+            Some(record_error),
+            probe.user_data() as *mut c_void,
+        );
+        assert_eq!((api.open)(builder, &mut stream), AAUDIO_OK);
+        assert_eq!((api.delete)(builder), AAUDIO_OK);
+        let sample_bytes = match (api.get[4])(stream) {
+            AAUDIO_FORMAT_PCM_I16 => 2,
+            AAUDIO_FORMAT_PCM_FLOAT => 4,
+            other => panic!("unexpected format {other}"),
+        };
+        let channels = usize::try_from((api.get[5])(stream)).expect("a channel count");
+        probe
+            .bytes_per_frame
+            .store(sample_bytes * channels, Ordering::SeqCst);
+        assert_eq!((api.start)(stream), AAUDIO_OK);
+    }
+    stream
+}
+
+fn play_silence_and_record_until(stop: &Path) {
+    let pulse = cpal::DeviceId::new(cpal::HostId::Alsa, crate::audio::PULSE_PCM);
+    for direction in Direction::ALL {
+        let device = crate::audio::host_device(direction).expect("a host device");
+        assert_eq!(
+            device.id().ok().as_ref(),
+            Some(&pulse),
+            "{direction:?} streams must open the PulseAudio plug-in, which plays to the chosen device"
+        );
+    }
+    let api = fmod_view();
+    let output = CallbackProbe::default();
+    let input = CallbackProbe::default();
+    let streams = [
+        started_stream(&api, AAUDIO_DIRECTION_OUTPUT, write_silence, &output),
+        started_stream(&api, AAUDIO_DIRECTION_INPUT, count_input, &input),
+    ];
+    let deadline = Instant::now() + ROUTED_LIMIT;
+    while !stop.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the parent test did not see the streams within {ROUTED_LIMIT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for stream in streams {
+        unsafe {
+            assert_eq!((api.stop)(stream), AAUDIO_OK);
+            assert_eq!((api.close)(stream), AAUDIO_OK);
+        }
+    }
+    assert!(
+        output.calls.load(Ordering::SeqCst) > 0,
+        "no output callbacks"
+    );
+    assert!(input.calls.load(Ordering::SeqCst) > 0, "no input callbacks");
+}
+
+#[test]
+fn aaudio_streams_reach_the_devices_chosen_in_the_settings() {
+    if let Some(stop) = std::env::var_os(ROUTED_CHILD) {
+        play_silence_and_record_until(Path::new(&stop));
+        return;
+    }
+    let Some(devices) = NullDevices::create("aaudio") else {
+        return;
+    };
+    let pulse = cpal::DeviceId::new(cpal::HostId::Alsa, crate::audio::PULSE_PCM);
+    if cpal::default_host().device_by_id(&pulse).is_none() {
+        eprintln!("aaudio_streams_reach_the_devices_chosen_in_the_settings: no ALSA pulse device");
+        return;
+    }
+    let routing = Routing::plan(&eclipse_config::Config {
+        audio_output_device: AudioDevice::Named(devices.sink.clone()),
+        audio_input_device: AudioDevice::Named(devices.source.clone()),
+        ..eclipse_config::Config::default()
+    });
+    let stop = std::env::temp_dir().join(format!("eclipse-aaudio-routed-{}", std::process::id()));
+    std::fs::remove_file(&stop).ok();
+    let mut command = Command::new(std::env::current_exe().expect("the test binary has a path"));
+    command
+        .args(["--exact", ROUTED_TEST, "--test-threads=1"])
+        .env(ROUTED_CHILD, &stop)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    routing.apply(&mut command);
+    let child = command.spawn().expect("start the child test");
+    let wanted = (
+        Some(devices.sink.to_string()),
+        Some(devices.source.to_string()),
+    );
+    let deadline = Instant::now() + ROUTED_LIMIT;
+    let mut seen = (None, None);
+    while seen != wanted && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        seen = (
+            stream_device(Direction::Output, child.id()),
+            stream_device(Direction::Input, child.id()),
+        );
+    }
+    std::fs::write(&stop, "").expect("stop the child test");
+    let output = child.wait_with_output().expect("wait for the child test");
+    std::fs::remove_file(&stop).ok();
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "status={:?}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(seen, wanted);
+}
+
+const FOLLOW_CONTROLLER: &str = "ECLIPSE_TEST_FOLLOW_CONTROLLER";
+
+const FOLLOW_PLAYER: &str = "ECLIPSE_TEST_FOLLOW_PLAYER";
+
+const FOLLOW_TEST: &str =
+    "loader::aaudio::tests::streams_follow_a_chosen_device_that_returns_or_stops_being_the_default";
+
+const FOLLOW_LIMIT: Duration = Duration::from_secs(120);
+
+const MOVE_LIMIT: Duration = Duration::from_secs(10);
+
+const SETTLE: Duration = Duration::from_millis(500);
+
+struct ChildTest(Option<Child>);
+
+impl ChildTest {
+    fn id(&self) -> u32 {
+        self.0.as_ref().expect("the child test runs").id()
+    }
+}
+
+impl Drop for ChildTest {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            child.kill().ok();
+            child.wait().ok();
+        }
+    }
+}
+
+fn run_follow_test(
+    variable: &str,
+    value: &OsStr,
+    configure: impl FnOnce(&mut Command),
+) -> ChildTest {
+    let mut command = Command::new(std::env::current_exe().expect("the test binary has a path"));
+    command
+        .args(["--exact", FOLLOW_TEST, "--test-threads=1", "--nocapture"])
+        .env(variable, value)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure(&mut command);
+    ChildTest(Some(command.spawn().expect("start the child test")))
+}
+
+fn assert_passed(mut child: ChildTest) {
+    let output = child
+        .0
+        .take()
+        .expect("the child test runs")
+        .wait_with_output()
+        .expect("wait for the child test");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "status={:?}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn play_and_record_reopening_until(stop: &Path) {
+    crate::audio::hotplug::follow_chosen_devices(crate::loader::reopen_audio_streams);
+    let api = fmod_view();
+    let output = CallbackProbe::default();
+    let input = CallbackProbe::default();
+    let open = |direction| match direction {
+        AAUDIO_DIRECTION_OUTPUT => started_stream(&api, direction, write_silence, &output),
+        _ => started_stream(&api, direction, count_input, &input),
+    };
+    let mut streams = [
+        (
+            AAUDIO_DIRECTION_OUTPUT,
+            &output,
+            open(AAUDIO_DIRECTION_OUTPUT),
+        ),
+        (AAUDIO_DIRECTION_INPUT, &input, open(AAUDIO_DIRECTION_INPUT)),
+    ];
+    let deadline = Instant::now() + FOLLOW_LIMIT;
+    while !stop.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the controller never stopped the player"
+        );
+        for (direction, probe, stream) in &mut streams {
+            let errors = std::mem::take(&mut *probe.errors.lock().unwrap());
+            if errors.is_empty() {
+                continue;
+            }
+            assert_eq!(errors, [AAUDIO_ERROR_DISCONNECTED]);
+            unsafe { assert_eq!((api.close)(*stream), AAUDIO_OK) };
+            *stream = open(*direction);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for (_, _, stream) in streams {
+        unsafe {
+            assert_eq!((api.stop)(stream), AAUDIO_OK);
+            assert_eq!((api.close)(stream), AAUDIO_OK);
+        }
+    }
+}
+
+fn wait_for_streams_on(player: &ChildTest, devices: &NullDevices, moment: &str) {
+    let wanted = (
+        Some(devices.sink.to_string()),
+        Some(devices.source.to_string()),
+    );
+    let deadline = Instant::now() + MOVE_LIMIT;
+    loop {
+        let seen = (
+            stream_device(Direction::Output, player.id()),
+            stream_device(Direction::Input, player.id()),
+        );
+        if seen == wanted {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{moment}: the streams are on {seen:?}, not {wanted:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn unplug_and_replug_the_chosen_devices() {
+    let server = std::env::var_os("PULSE_SERVER").expect("the parent names the sound server");
+    assert!(
+        PrivateServer::is_private(&server),
+        "refusing to change devices on {server:?}"
+    );
+    let pulse = cpal::DeviceId::new(cpal::HostId::Alsa, crate::audio::PULSE_PCM);
+    if cpal::default_host().device_by_id(&pulse).is_none() {
+        eprintln!("{FOLLOW_TEST}: no ALSA pulse device");
+        return;
+    }
+    let fallback = NullDevices::create("fallback").expect("the private server answers");
+    fallback.make_system_default();
+    let chosen = NullDevices::create("chosen").expect("the private server answers");
+    let routing = Routing::plan(&eclipse_config::Config {
+        audio_output_device: AudioDevice::Named(chosen.sink.clone()),
+        audio_input_device: AudioDevice::Named(chosen.source.clone()),
+        ..eclipse_config::Config::default()
+    });
+    let stop = std::env::temp_dir().join(format!("eclipse-follow-{}", std::process::id()));
+    std::fs::remove_file(&stop).ok();
+    let player = run_follow_test(FOLLOW_PLAYER, stop.as_os_str(), |command| {
+        routing.apply(command);
+    });
+
+    wait_for_streams_on(&player, &chosen, "at the start");
+    drop(chosen);
+    wait_for_streams_on(&player, &fallback, "after the chosen devices are unplugged");
+    let other = NullDevices::create("other").expect("the private server answers");
+    std::thread::sleep(SETTLE);
+    let chosen = NullDevices::create("chosen").expect("the private server answers");
+    wait_for_streams_on(
+        &player,
+        &chosen,
+        "after another device appears and the chosen ones are plugged in again",
+    );
+    chosen.make_system_default();
+    std::thread::sleep(SETTLE);
+    fallback.make_system_default();
+    wait_for_streams_on(
+        &player,
+        &chosen,
+        "after the chosen devices were the defaults and stopped being them",
+    );
+
+    std::fs::write(&stop, "").expect("stop the player");
+    assert_passed(player);
+    std::fs::remove_file(&stop).ok();
+    drop(other);
+}
+
+#[test]
+fn streams_follow_a_chosen_device_that_returns_or_stops_being_the_default() {
+    if let Some(stop) = std::env::var_os(FOLLOW_PLAYER) {
+        play_and_record_reopening_until(Path::new(&stop));
+        return;
+    }
+    if std::env::var_os(FOLLOW_CONTROLLER).is_some() {
+        unplug_and_replug_the_chosen_devices();
+        return;
+    }
+    let Some(server) = PrivateServer::start("follow") else {
+        return;
+    };
+    let controller = run_follow_test(FOLLOW_CONTROLLER, OsStr::new("1"), |command| {
+        command.env("PULSE_SERVER", server.address());
+    });
+    assert_passed(controller);
 }

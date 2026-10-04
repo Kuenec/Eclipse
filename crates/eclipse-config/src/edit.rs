@@ -18,7 +18,7 @@ const MISSING_FILE: &[u8] = b"{}";
 
 const INDENT: &str = "  ";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     Set(Setting),
     Unset(SettingKey),
@@ -26,10 +26,10 @@ pub enum Change {
 
 impl Change {
     #[must_use]
-    pub const fn key(self) -> SettingKey {
+    pub const fn key(&self) -> SettingKey {
         match self {
             Self::Set(setting) => setting.key(),
-            Self::Unset(key) => key,
+            Self::Unset(key) => *key,
         }
     }
 }
@@ -125,7 +125,7 @@ struct Original {
     permissions: Permissions,
 }
 
-pub fn apply(path: &Path, change: Change) -> Result<Applied, EditError> {
+pub fn apply(path: &Path, change: &Change) -> Result<Applied, EditError> {
     let original = read_original(path)?;
     let document = editable_document(path, original.as_ref())?;
     let Some(contents) = edited(&document, change) else {
@@ -181,7 +181,7 @@ fn read_original(path: &Path) -> Result<Option<Original>, EditError> {
     Ok(Some(Original { bytes, permissions }))
 }
 
-fn edited(document: &Document<'_>, change: Change) -> Option<String> {
+fn edited(document: &Document<'_>, change: &Change) -> Option<String> {
     let name = change.key().name();
     let current = document
         .entries
@@ -190,7 +190,7 @@ fn edited(document: &Document<'_>, change: Change) -> Option<String> {
     let value = match (change, current) {
         (Change::Set(setting), Some(current)) if holds(current, setting) => return None,
         (Change::Set(setting), _) => {
-            Some(serde_json::to_string(&setting).expect("a setting has a JSON form"))
+            Some(serde_json::to_string(setting).expect("a setting has a JSON form"))
         }
         (Change::Unset(_), None) => return None,
         (Change::Unset(_), Some(_)) => None,
@@ -209,8 +209,9 @@ fn edited(document: &Document<'_>, change: Change) -> Option<String> {
     Some(layout(&entries))
 }
 
-fn holds(value: &RawValue, setting: Setting) -> bool {
-    serde_json::from_str(value.get()).is_ok_and(|value| setting.key().parse(value) == Ok(setting))
+fn holds(value: &RawValue, setting: &Setting) -> bool {
+    serde_json::from_str(value.get())
+        .is_ok_and(|value| setting.key().parse(value).as_ref() == Ok(setting))
 }
 
 fn layout(entries: &[(&str, &str)]) -> String {
@@ -288,6 +289,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
+    use crate::audio::{AudioDevice, DeviceName};
     use crate::{load_from, GraphicsOptimizationMode, TouchMode};
 
     const FIXTURE: &str = r#"{
@@ -336,7 +338,7 @@ mod tests {
 
     fn rewritten(tag: &str, text: &str, change: Change) -> String {
         let (dir, path) = config_with(tag, text.as_bytes());
-        let applied = apply(&path, change).expect("apply");
+        let applied = apply(&path, &change).expect("apply");
         let after = fs::read_to_string(&path).expect("read config.json back");
         let entries = names(&dir);
         fs::remove_dir_all(&dir).ok();
@@ -390,6 +392,35 @@ mod tests {
     }
 
     #[test]
+    fn a_chosen_microphone_is_written_kept_and_removed_by_name() {
+        let quadcast = "alsa_input.usb-HP__Inc_HyperX_QuadCast_4111-00.analog-stereo";
+        let microphone = Change::Set(Setting::AudioInputDevice(AudioDevice::Named(
+            DeviceName::parse(quadcast).expect("a device name"),
+        )));
+        let (dir, path) = config_with("microphone", FIXTURE.as_bytes());
+
+        let set = apply(&path, &microphone).expect("set");
+        let written = fs::read_to_string(&path).expect("read config.json");
+        let again = apply(&path, &microphone).expect("set again");
+        let unset = apply(&path, &Change::Unset(SettingKey::AudioInputDevice)).expect("unset");
+        let removed = fs::read_to_string(&path).expect("read config.json");
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            (set, again, unset),
+            (Applied::Written, Applied::Unchanged, Applied::Written)
+        );
+        assert_eq!(
+            written,
+            FIXTURE.replace(
+                "\"True\"}\n}",
+                &format!("\"True\"}},\n  \"audio_input_device\": \"{quadcast}\"\n}}")
+            )
+        );
+        assert_eq!(removed, FIXTURE);
+    }
+
+    #[test]
     fn unsetting_the_last_key_leaves_an_empty_object() {
         let written = rewritten(
             "unset-last",
@@ -427,13 +458,13 @@ mod tests {
         let config_dir = dir.join("eclipse");
         let path = config_dir.join("config.json");
         assert_eq!(
-            apply(&path, Change::Unset(SettingKey::TouchMode)).expect("unset"),
+            apply(&path, &Change::Unset(SettingKey::TouchMode)).expect("unset"),
             Applied::Unchanged
         );
         assert!(!config_dir.exists());
 
         assert_eq!(
-            apply(&path, Change::Set(Setting::EnableGamemode(false))).expect("set"),
+            apply(&path, &Change::Set(Setting::EnableGamemode(false))).expect("set"),
             Applied::Written
         );
         let written = fs::read_to_string(&path).expect("read config.json");
@@ -457,7 +488,7 @@ mod tests {
                 .expect("age config.json");
             let modified = fs::metadata(&path).and_then(|metadata| metadata.modified());
 
-            let applied = apply(&path, fake_off).expect("apply");
+            let applied = apply(&path, &fake_off).expect("apply");
 
             let after = fs::metadata(&path).and_then(|metadata| metadata.modified());
             let bytes = fs::read(&path).expect("read config.json");
@@ -507,7 +538,7 @@ mod tests {
                     if &path == config && &reported == destination),
                 "{config:?}"
             );
-            let error = apply(config, TOUCH_ON).expect_err("a link");
+            let error = apply(config, &TOUCH_ON).expect_err("a link");
             assert!(
                 matches!(&error, EditError::Link { path, target: reported }
                     if path == config && reported == destination),
@@ -532,7 +563,7 @@ mod tests {
         fs::set_permissions(&path, Permissions::from_mode(0o444)).expect("make it read-only");
 
         let checked = check(&path);
-        let error = apply(&path, TOUCH_ON).expect_err("read-only");
+        let error = apply(&path, &TOUCH_ON).expect_err("read-only");
 
         let after = (fs::read(&path).expect("read config.json"), mode(&path));
         let entries = names(&dir);
@@ -568,7 +599,7 @@ mod tests {
             let (dir, path) = config_with(tag, bytes);
 
             let checked = check(&path).expect_err(tag);
-            let error = apply(&path, TOUCH_ON).expect_err(tag);
+            let error = apply(&path, &TOUCH_ON).expect_err(tag);
 
             let reported = load_from(&path).problems;
             let after = fs::read(&path).expect("read config.json");
@@ -596,7 +627,7 @@ mod tests {
         let (dir, path) = config_with("mode", FIXTURE.as_bytes());
         fs::set_permissions(&path, Permissions::from_mode(0o600)).expect("make it private");
 
-        let applied = apply(&path, TOUCH_ON).expect("apply");
+        let applied = apply(&path, &TOUCH_ON).expect("apply");
 
         let after = mode(&path);
         fs::remove_dir_all(&dir).ok();

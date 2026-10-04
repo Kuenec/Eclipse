@@ -27,7 +27,7 @@ xdg-mime default io.github.kuenec.Eclipse.UrlHandler.desktop x-scheme-handler/ro
 
 ## Voice chat
 
-Voice chat uses your system's default microphone. Choose it in your desktop's sound settings.
+Voice chat uses the microphone chosen under **Audio** in Settings, or your system's default one. Roblox's own audio settings always call it Default.
 
 ## Robux
 
@@ -46,6 +46,8 @@ Controllers need Flatpak 1.16 or newer. On older Flatpak, run `flatpak override 
 | `graphics_optimization_mode` | `"balanced"` | `"performance"` pins Eclipse to physical cores |
 | `enable_gamemode` | `true` | Turns on GameMode while Roblox runs, if GameMode is installed |
 | `allow_gamepad_permission` | `true` | `false` turns controllers off |
+| `audio_output_device` | `"default"` | The speakers or headphones Roblox plays to, named as `pactl list short sinks` names them |
+| `audio_input_device` | `"default"` | The microphone Roblox records from, named as `pactl list short sources` names it |
 | `roblox_auto_update` | `true` | `false` stops launches from updating Roblox; `update` and `run --check-update` still do |
 | `close_on_leave` | `"browser"` | Closes Eclipse when you leave an experience that a link started; `true` closes it after any experience, `false` never |
 | `server_location_indicator_enabled` | `false` | Shows where the Roblox server is in the window title and a notification. ipinfo.io receives the server's address and sees your IP address |

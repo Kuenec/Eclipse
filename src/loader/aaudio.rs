@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
+use eclipse_config::audio::Direction;
 
 use super::ndk_registry::{NdkHandle, Slab};
 
@@ -79,6 +80,56 @@ struct ErrorCallbackTarget {
     user_data: usize,
 }
 
+impl ErrorCallbackTarget {
+    fn report_disconnected(self, stream: usize) {
+        unsafe {
+            (self.func)(
+                stream as *mut c_void,
+                self.user_data as *mut c_void,
+                AAUDIO_ERROR_DISCONNECTED,
+            )
+        };
+    }
+}
+
+static OUTPUT_ROUTE_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+static INPUT_ROUTE_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+fn route_changes(direction: Direction) -> &'static AtomicU64 {
+    match direction {
+        Direction::Output => &OUTPUT_ROUTE_CHANGES,
+        Direction::Input => &INPUT_ROUTE_CHANGES,
+    }
+}
+
+pub fn reopen_streams(direction: Direction) {
+    route_changes(direction).fetch_add(1, Ordering::AcqRel);
+}
+
+#[derive(Clone, Copy)]
+struct Route {
+    changes: &'static AtomicU64,
+    opened_at: u64,
+}
+
+impl Route {
+    fn of(direction: Direction) -> Self {
+        Self::on(route_changes(direction))
+    }
+
+    fn on(changes: &'static AtomicU64) -> Self {
+        Self {
+            changes,
+            opened_at: changes.load(Ordering::Acquire),
+        }
+    }
+
+    fn changed(self) -> bool {
+        self.changes.load(Ordering::Acquire) != self.opened_at
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 enum StreamState {
@@ -150,12 +201,6 @@ impl Request {
             (Self::Stop, _) => Ok(StreamState::Stopped),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Direction {
-    Output,
-    Input,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -482,6 +527,8 @@ fn collides_with_callback(stream: *mut c_void) -> bool {
 struct Renderer<A> {
     shared: Arc<StreamShared>,
     callback: DataCallbackTarget,
+    error_callback: Option<ErrorCallbackTarget>,
+    route: Route,
     stream: usize,
     channels: usize,
     scratch: Box<[A]>,
@@ -491,6 +538,8 @@ impl<A: cpal::SizedSample> Renderer<A> {
     fn new(
         shared: Arc<StreamShared>,
         callback: DataCallbackTarget,
+        error_callback: Option<ErrorCallbackTarget>,
+        route: Route,
         stream: NdkHandle,
         format: StreamFormat,
     ) -> Self {
@@ -501,9 +550,26 @@ impl<A: cpal::SizedSample> Renderer<A> {
         Self {
             shared,
             callback,
+            error_callback,
+            route,
             stream: stream as usize,
             channels,
             scratch: vec![A::EQUILIBRIUM; capacity * channels].into_boxed_slice(),
+        }
+    }
+
+    fn follow_route(&self) {
+        if !self.route.changed()
+            || self.shared.state.swap(StreamState::Disconnected) == StreamState::Disconnected
+        {
+            return;
+        }
+        tracing::info!(
+            target: "eclipse::audio",
+            "AAudio: stream disconnected so that it reopens on the chosen device"
+        );
+        if let Some(target) = self.error_callback {
+            target.report_disconnected(self.stream);
         }
     }
 
@@ -544,6 +610,7 @@ impl<A: cpal::SizedSample> Renderer<A> {
     where
         T: cpal::SizedSample + cpal::FromSample<A>,
     {
+        self.follow_route();
         self.note_burst(out.len());
         let chunk_len = self.scratch.len();
         for chunk in out.chunks_mut(chunk_len) {
@@ -562,6 +629,7 @@ impl<A: cpal::SizedSample> Renderer<A> {
         T: cpal::SizedSample,
         A: cpal::FromSample<T>,
     {
+        self.follow_route();
         self.note_burst(input.len());
         let chunk_len = self.scratch.len();
         for chunk in input.chunks(chunk_len) {
@@ -629,13 +697,7 @@ impl ErrorReporter {
         }
         tracing::warn!(target: "eclipse::audio", %error, "AAudio: stream disconnected");
         if let Some(target) = self.callback {
-            unsafe {
-                (target.func)(
-                    self.stream as *mut c_void,
-                    target.user_data as *mut c_void,
-                    AAUDIO_ERROR_DISCONNECTED,
-                )
-            };
+            target.report_disconnected(self.stream);
         }
     }
 }
@@ -661,17 +723,32 @@ fn build_host_stream(
         streak: HostErrorStreak::default(),
     };
     let shared = Arc::clone(shared);
+    let route = Route::of(plan.direction);
     match plan.format.app {
         SampleFormat::I16 => build_for_app::<i16>(
             device,
             plan,
-            Renderer::new(shared, data_callback, stream, plan.format),
+            Renderer::new(
+                shared,
+                data_callback,
+                params.error_callback,
+                route,
+                stream,
+                plan.format,
+            ),
             reporter,
         ),
         SampleFormat::Float => build_for_app::<f32>(
             device,
             plan,
-            Renderer::new(shared, data_callback, stream, plan.format),
+            Renderer::new(
+                shared,
+                data_callback,
+                params.error_callback,
+                route,
+                stream,
+                plan.format,
+            ),
             reporter,
         ),
     }
@@ -806,12 +883,7 @@ fn plan_host_stream(
 
 fn open_stream(settings: &BuilderSettings) -> Result<NdkHandle, i32> {
     let params = StreamParameters::parse(settings)?;
-    let host = cpal::default_host();
-    let device = match params.direction {
-        Direction::Output => host.default_output_device(),
-        Direction::Input => host.default_input_device(),
-    }
-    .ok_or(AAUDIO_ERROR_UNAVAILABLE)?;
+    let device = crate::audio::host_device(params.direction).ok_or(AAUDIO_ERROR_UNAVAILABLE)?;
     let plan = plan_host_stream(&device, &params)?;
     let burst = match plan.config.buffer_size {
         cpal::BufferSize::Fixed(frames) => frames,

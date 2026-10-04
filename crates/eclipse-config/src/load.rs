@@ -318,6 +318,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+    use crate::audio::{AudioDevice, DeviceName};
     use crate::{CloseOnLeave, GraphicsOptimizationMode, PciId, TouchMode};
 
     const FLATPAK_ID: &str = "io.github.kuenec.Eclipse";
@@ -826,6 +827,11 @@ mod tests {
                     device: 0x2f04,
                 }),
                 use_opengl: true,
+                audio_output_device: AudioDevice::Named(
+                    DeviceName::parse("alsa_output.pci-0000_00_1f.3.analog-stereo")
+                        .expect("a device name"),
+                ),
+                audio_input_device: AudioDevice::SystemDefault,
                 fflags: BTreeMap::from([("DFIntExample".to_owned(), 42.into())]),
                 webview_helper_path: Some(PathBuf::from("/opt/eclipse-webview")),
             },

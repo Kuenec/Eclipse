@@ -1330,6 +1330,8 @@ Config
   Loads: yes
   In effect:
     allow_gamepad_permission: true
+    audio_input_device: \"default\"
+    audio_output_device: \"default\"
     close_on_leave: \"browser\"
     enable_gamemode: true
     fflags: 2 flags, names only: [\"DFIntTaskSchedulerTargetFps\",\
