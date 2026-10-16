@@ -1,4 +1,5 @@
 use std::io;
+use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt as _;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -17,6 +18,7 @@ use tracing::Level;
 
 use crate::bounded_child::{self, Bounded};
 use crate::diagnostics::RunLog;
+use crate::inheritance_cutoff::InheritanceCutoff;
 
 pub mod hotplug;
 #[cfg(test)]
@@ -31,6 +33,8 @@ const LOG_TARGET: &str = "eclipse::audio";
 const PACTL: &str = "pactl";
 
 const PACTL_LIMIT: Duration = Duration::from_secs(2);
+
+const FIRST_NON_STDIO_FD: RawFd = 3;
 
 const PIPEWIRE_SERVER: &str = "PipeWire";
 
@@ -65,13 +69,15 @@ fn pactl_command(arguments: &[&str]) -> Command {
         .env_remove("LC_ALL")
         .env("LC_NUMERIC", "C");
     let parent = rustix::process::getpid();
+    let cutoff = InheritanceCutoff::at(FIRST_NON_STDIO_FD);
     unsafe {
-        command.pre_exec(move || end_with(parent));
+        command.pre_exec(move || end_with(parent, cutoff));
     }
     command
 }
 
-fn end_with(parent: Pid) -> io::Result<()> {
+fn end_with(parent: Pid, cutoff: InheritanceCutoff) -> io::Result<()> {
+    cutoff.mark_close_on_exec()?;
     rustix::process::set_parent_process_death_signal(Some(Signal::TERM))?;
     if rustix::process::getppid() != Some(parent) {
         return Err(Errno::SRCH.into());

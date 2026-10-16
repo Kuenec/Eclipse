@@ -80,8 +80,6 @@ struct GameWindow<'vm> {
 
     primary_press: Option<(ViewHandle, f32, f32)>,
 
-    synthetic_tap_done: bool,
-
     handed_off: bool,
 
     engine_surface_size: EngineSurfaceSize,
@@ -91,26 +89,6 @@ struct GameWindow<'vm> {
     handoff_at: Option<std::time::Instant>,
 
     engine_synthetic_tap_done: bool,
-
-    engine_synthetic_typed_done: bool,
-
-    engine_last_focus_tap: Option<std::time::Instant>,
-
-    engine_typed_at: Option<std::time::Instant>,
-
-    engine_synthetic_next_done: bool,
-
-    engine_next_at: Option<std::time::Instant>,
-
-    engine_synthetic_typed2_done: bool,
-
-    engine_last_focus_tap2: Option<std::time::Instant>,
-
-    engine_typed2_at: Option<std::time::Instant>,
-
-    engine_synthetic_submit_done: bool,
-
-    engine_reflect_done: bool,
 
     synthetic_gamepad_done: bool,
 
@@ -623,8 +601,6 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                         }
                     }
                 }
-
-                self.maybe_synthetic_tap();
             }
 
             WindowEvent::Focused(focused) => {
@@ -2543,203 +2519,25 @@ impl GameWindow<'_> {
         }
     }
 
-    fn maybe_synthetic_tap(&mut self) {
-        if self.synthetic_tap_done || std::env::var_os("ECLIPSE_SYNTHETIC_TAP").is_none() {
-            return;
-        }
-        self.synthetic_tap_done = true;
-        let Some(renderer) = self.renderer.as_ref() else {
-            return;
-        };
-        if let Some((cx, cy)) = renderer.first_clickable_center() {
-            tracing::info!(
-                x = cx,
-                y = cy,
-                "synthetic tap: aiming at first clickable view center"
-            );
-
-            self.cursor = Some((cx, cy));
-            self.handle_primary_press();
-            self.handle_primary_release();
-            return;
-        }
-
-        let Some((handle, cx, cy)) = renderer.first_view_center() else {
-            tracing::info!("synthetic tap: no views in the tree (nothing to tap)");
-            return;
-        };
-        tracing::info!(
-            handle,
-            x = cx,
-            y = cy,
-            "synthetic tap: no clickable view; driving DOWN+UP MotionEvent at deepest leaf view (JNI-chain diagnostic)"
-        );
-        self.dispatch_touch(handle, crate::framework::MotionAction::Down, cx, cy);
-        self.dispatch_touch(handle, crate::framework::MotionAction::Up, cx, cy);
-    }
-
     fn maybe_synthetic_engine_tap(&mut self) {
-        if !self.handed_off {
+        if self.engine_synthetic_tap_done
+            || !self.handed_off
+            || self
+                .handoff_at
+                .is_none_or(|at| at.elapsed() < SYNTHETIC_INPUT_DELAY)
+        {
             return;
         }
-        let Some(at) = self.handoff_at else { return };
-        let elapsed = at.elapsed();
-
-        if !self.engine_reflect_done && elapsed >= std::time::Duration::from_secs(8) {
-            self.engine_reflect_done = true;
-            if let Some(vm) = self
-                .vm
-                .filter(|_| std::env::var_os("ECLIPSE_REFLECT_INPUT").is_some())
-            {
-                crate::framework::reflect_engine_input_methods(vm);
-            }
-        }
-
-        if !self.engine_synthetic_tap_done && elapsed >= std::time::Duration::from_secs(6) {
-            self.engine_synthetic_tap_done = true;
-            if let Some((x, y)) =
-                std::env::var_os("ECLIPSE_SYNTHETIC_ENGINE_TAP").and_then(|s| parse_xy(&s))
-            {
-                tracing::info!(
-                    x,
-                    y,
-                    "synthetic ENGINE tap (stage 0): DOWN+UP → onTouchEventInternal"
-                );
-                self.cursor = Some((x, y));
-                self.engine_primary_press();
-                self.engine_primary_release();
-            }
-        }
-
-        if !self.engine_synthetic_typed_done && elapsed >= std::time::Duration::from_secs(10) {
-            if let Some((x, y, text)) =
-                std::env::var_os("ECLIPSE_SYNTHETIC_TYPE").and_then(|s| parse_xy_text(&s))
-            {
-                if crate::framework::active_text_field() != 0 {
-                    self.engine_synthetic_typed_done = true;
-                    tracing::info!(
-                        chars = text.chars().count(),
-                        "synthetic TYPE (stage 2): field focused — typing into the active text field"
-                    );
-                    if let Some(vm) = self.vm {
-                        let handled = crate::framework::edit_active_text_field(
-                            vm,
-                            crate::framework::TextEdit::Type(&text),
-                        );
-                        tracing::info!(handled, "synthetic TYPE text → active text field");
-                    }
-
-                    crate::loader::ndk_registry::wake_all_loopers();
-                    self.engine_typed_at = Some(std::time::Instant::now());
-                } else if self
-                    .engine_last_focus_tap
-                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(1500))
-                {
-                    self.engine_last_focus_tap = Some(std::time::Instant::now());
-                    tracing::info!(
-                        x,
-                        y,
-                        "synthetic TYPE (stage 1): focus-tap (retry until focused)"
-                    );
-                    self.cursor = Some((x, y));
-                    self.engine_primary_press();
-                    self.engine_primary_release();
-                }
-            }
-        }
-
-        if self.engine_synthetic_typed_done
-            && !self.engine_synthetic_next_done
-            && self
-                .engine_typed_at
-                .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(3))
-        {
-            if let Some((x, y)) =
-                std::env::var_os("ECLIPSE_SYNTHETIC_NEXT").and_then(|s| parse_xy(&s))
-            {
-                self.engine_synthetic_next_done = true;
-                self.engine_next_at = Some(std::time::Instant::now());
-                tracing::info!(
-                    x,
-                    y,
-                    "synthetic NEXT (stage 3): tapping Next to confirm detection"
-                );
-                self.cursor = Some((x, y));
-                self.engine_primary_press();
-                self.engine_primary_release();
-                crate::loader::ndk_registry::wake_all_loopers();
-            }
-        }
-
-        if self.engine_synthetic_next_done
-            && !self.engine_synthetic_typed2_done
-            && self
-                .engine_next_at
-                .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(3))
-        {
-            let parsed =
-                std::env::var_os("ECLIPSE_SYNTHETIC_TYPE2").and_then(|s| match parse_xy_text(&s) {
-                    Some((x, y, text)) => Some((Some((x, y)), text)),
-                    None => s.to_str().map(|t| (None, t.to_owned())),
-                });
-            if let Some((target, text)) = parsed.filter(|(_, text)| !text.is_empty()) {
-                let focused = crate::framework::active_text_field() != 0;
-                if let Some((x, y)) = target.filter(|_| {
-                    self.engine_last_focus_tap2.is_none()
-                        || (!focused
-                            && self.engine_last_focus_tap2.is_some_and(|t| {
-                                t.elapsed() >= std::time::Duration::from_millis(1500)
-                            }))
-                }) {
-                    self.engine_last_focus_tap2 = Some(std::time::Instant::now());
-                    tracing::info!(
-                        x,
-                        y,
-                        "synthetic TYPE2 (stage 4): focus-tap (retry until focused)"
-                    );
-                    self.cursor = Some((x, y));
-                    self.engine_primary_press();
-                    self.engine_primary_release();
-                } else if focused {
-                    self.engine_synthetic_typed2_done = true;
-                    self.engine_typed2_at = Some(std::time::Instant::now());
-                    tracing::info!(
-                        chars = text.chars().count(),
-                        "synthetic TYPE2 (stage 4): typing into the field focused after Next (password)"
-                    );
-                    if let Some(vm) = self.vm {
-                        let handled = crate::framework::edit_active_text_field(
-                            vm,
-                            crate::framework::TextEdit::Type(&text),
-                        );
-                        tracing::info!(handled, "synthetic TYPE2 text → active text field");
-                    }
-                    crate::loader::ndk_registry::wake_all_loopers();
-                }
-            }
-        }
-
-        if self.engine_synthetic_typed2_done
-            && !self.engine_synthetic_submit_done
-            && self
-                .engine_typed2_at
-                .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(3))
-        {
-            if let Some((x, y)) =
-                std::env::var_os("ECLIPSE_SYNTHETIC_SUBMIT").and_then(|s| parse_xy(&s))
-            {
-                self.engine_synthetic_submit_done = true;
-                tracing::info!(
-                    x,
-                    y,
-                    "synthetic SUBMIT (stage 5): tapping the submit button"
-                );
-                self.cursor = Some((x, y));
-                self.engine_primary_press();
-                self.engine_primary_release();
-                crate::loader::ndk_registry::wake_all_loopers();
-            }
-        }
+        self.engine_synthetic_tap_done = true;
+        let Some((x, y)) =
+            std::env::var_os("ECLIPSE_SYNTHETIC_ENGINE_TAP").and_then(|spec| parse_xy(&spec))
+        else {
+            return;
+        };
+        tracing::info!(x, y, "synthetic engine tap: DOWN+UP → onTouchEventInternal");
+        self.cursor = Some((x, y));
+        self.engine_primary_press();
+        self.engine_primary_release();
     }
 }
 
@@ -2778,7 +2576,6 @@ pub fn run_windowed(
         unfocused_fps_limit: config.unfocused_fps_limit,
         cursor: None,
         primary_press: None,
-        synthetic_tap_done: false,
         engine_window: None,
         web_view_parent: None,
         handed_off: false,
@@ -2786,16 +2583,6 @@ pub fn run_windowed(
         engine_tap_downtime: None,
         handoff_at: None,
         engine_synthetic_tap_done: false,
-        engine_synthetic_typed_done: false,
-        engine_last_focus_tap: None,
-        engine_typed_at: None,
-        engine_synthetic_next_done: false,
-        engine_next_at: None,
-        engine_synthetic_typed2_done: false,
-        engine_last_focus_tap2: None,
-        engine_typed2_at: None,
-        engine_synthetic_submit_done: false,
-        engine_reflect_done: false,
         synthetic_gamepad_done: false,
         synthetic_touch_done: false,
         gamepads: match vm {
@@ -3435,17 +3222,6 @@ fn parse_xy(spec: &std::ffi::OsStr) -> Option<(f32, f32)> {
     let s = spec.to_str()?;
     let (xs, ys) = s.split_once(',')?;
     Some((xs.trim().parse().ok()?, ys.trim().parse().ok()?))
-}
-
-fn parse_xy_text(spec: &std::ffi::OsStr) -> Option<(f32, f32, String)> {
-    let s = spec.to_str()?;
-    let (xy, text) = s.split_once(':')?;
-    let (xs, ys) = xy.split_once(',')?;
-    Some((
-        xs.trim().parse().ok()?,
-        ys.trim().parse().ok()?,
-        text.to_string(),
-    ))
 }
 
 fn desktop_mouse_button(button: MouseButton) -> Option<i32> {
@@ -4561,24 +4337,6 @@ impl WindowRenderer {
     fn hit_test_at(&self, x: f32, y: f32) -> Option<ViewHandle> {
         let (_, views) = self.laid_out_tree()?;
         hit_test(&views, x, y)
-    }
-
-    fn first_clickable_center(&self) -> Option<(f32, f32)> {
-        let (_, views) = self.laid_out_tree()?;
-        views
-            .iter()
-            .find(|v| v.clickable)
-            .map(|v| (v.x + v.w / 2.0, v.y + v.h / 2.0))
-    }
-
-    fn first_view_center(&self) -> Option<(ViewHandle, f32, f32)> {
-        let (nodes, views) = self.laid_out_tree()?;
-        nodes
-            .iter()
-            .zip(views.iter())
-            .rev()
-            .find(|(n, _)| n.children.is_empty())
-            .map(|(_, v)| (v.handle, v.x + v.w / 2.0, v.y + v.h / 2.0))
     }
 
     fn custom_view_draw_targets(&self) -> Vec<crate::framework::DrawTarget> {
@@ -6669,101 +6427,6 @@ impl Drop for VulkanRenderer {
             self.host.surface_loader.destroy_surface(self.surface, None);
         }
     }
-}
-
-use crate::framework::matrix_registry::Affine;
-use crate::framework::path_registry::{PathGeometry, Verb};
-use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
-
-#[derive(Debug, Clone, Copy)]
-pub struct FillStyle {
-    pub argb: i32,
-
-    pub even_odd: bool,
-}
-
-impl Default for FillStyle {
-    fn default() -> Self {
-        Self {
-            argb: 0xFF00_0000u32 as i32,
-            even_odd: false,
-        }
-    }
-}
-
-fn argb_to_rgba8(argb: i32) -> (u8, u8, u8, u8) {
-    let v = argb as u32;
-    let a = (v >> 24) as u8;
-    let r = (v >> 16) as u8;
-    let g = (v >> 8) as u8;
-    let b = v as u8;
-    (r, g, b, a)
-}
-
-fn build_tiny_skia_path(geometry: &PathGeometry) -> Option<tiny_skia::Path> {
-    let mut pb = PathBuilder::new();
-    let pts = &geometry.points;
-    let mut i = 0usize;
-    for verb in &geometry.verbs {
-        let need = verb.point_count() * 2;
-        if i + need > pts.len() {
-            break;
-        }
-        match verb {
-            Verb::MoveTo => pb.move_to(pts[i], pts[i + 1]),
-            Verb::LineTo => pb.line_to(pts[i], pts[i + 1]),
-            Verb::QuadTo => pb.quad_to(pts[i], pts[i + 1], pts[i + 2], pts[i + 3]),
-            Verb::CubicTo => pb.cubic_to(
-                pts[i],
-                pts[i + 1],
-                pts[i + 2],
-                pts[i + 3],
-                pts[i + 4],
-                pts[i + 5],
-            ),
-            Verb::Close => pb.close(),
-        }
-        i += need;
-    }
-    pb.finish()
-}
-
-fn affine_to_transform(m: &Affine) -> Transform {
-    Transform::from_row(m.m[0], m.m[3], m.m[1], m.m[4], m.m[2], m.m[5])
-}
-
-pub fn rasterize_path(
-    geometry: &PathGeometry,
-    matrix: &Affine,
-    style: FillStyle,
-    width: u32,
-    height: u32,
-) -> Option<Pixmap> {
-    let mut pixmap = Pixmap::new(width, height)?;
-    let path = build_tiny_skia_path(geometry)?;
-    let (r, g, b, a) = argb_to_rgba8(style.argb);
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(r, g, b, a);
-    paint.anti_alias = true;
-    let fill_rule = if style.even_odd {
-        FillRule::EvenOdd
-    } else {
-        FillRule::Winding
-    };
-    pixmap.fill_path(&path, &paint, fill_rule, affine_to_transform(matrix), None);
-    Some(pixmap)
-}
-
-pub fn rasterize_path_rgba(
-    geometry: &PathGeometry,
-    matrix: &Affine,
-    style: FillStyle,
-    width: u32,
-    height: u32,
-) -> Option<(Vec<u8>, u32, u32)> {
-    let pixmap = rasterize_path(geometry, matrix, style, width, height)?;
-    let (w, h) = (pixmap.width(), pixmap.height());
-    Some((pixmap.take_demultiplied(), w, h))
 }
 
 #[derive(Debug)]
@@ -9342,118 +9005,6 @@ mod tests {
         assert_eq!(find_host_visible_memory_type(&props, filter), Some(2));
 
         assert_eq!(find_host_visible_memory_type(&props, 0b001), None);
-    }
-
-    fn px(rgba: &[u8], w: u32, x: u32, y: u32) -> (u8, u8, u8, u8) {
-        let i = ((y * w + x) * 4) as usize;
-        (rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3])
-    }
-
-    fn rect_path(x0: f32, y0: f32, x1: f32, y1: f32) -> PathGeometry {
-        let mut g = PathGeometry::default();
-        g.move_to(x0, y0);
-        g.line_to(x1, y0);
-        g.line_to(x1, y1);
-        g.line_to(x0, y1);
-        g.close();
-        g
-    }
-
-    #[test]
-    fn argb_to_rgba8_splits_channels() {
-        let (r, g, b, a) = argb_to_rgba8(0x8012_3456u32 as i32);
-        assert_eq!((r, g, b, a), (0x12, 0x34, 0x56, 0x80));
-    }
-
-    #[test]
-    fn affine_to_transform_maps_affine_coefficients() {
-        let mut m = Affine::IDENTITY;
-        m.set_translate(10.0, 20.0);
-        let t = affine_to_transform(&m);
-        assert_eq!((t.sx, t.sy, t.tx, t.ty), (1.0, 1.0, 10.0, 20.0));
-        assert_eq!((t.kx, t.ky), (0.0, 0.0));
-    }
-
-    #[test]
-    fn rasterize_filled_rect_has_opaque_interior_and_clear_exterior() {
-        let geometry = rect_path(10.0, 10.0, 30.0, 30.0);
-        let style = FillStyle {
-            argb: 0xFFFF_0000u32 as i32,
-            even_odd: false,
-        };
-        let (rgba, w, h) =
-            rasterize_path_rgba(&geometry, &Affine::IDENTITY, style, 40, 40).expect("rasterizes");
-        assert_eq!((w, h), (40, 40));
-        assert_eq!(rgba.len(), (40 * 40 * 4) as usize);
-
-        assert_eq!(px(&rgba, w, 20, 20), (255, 0, 0, 255));
-
-        assert_eq!(px(&rgba, w, 0, 0), (0, 0, 0, 0));
-        assert_eq!(px(&rgba, w, 39, 39), (0, 0, 0, 0));
-
-        assert_eq!(px(&rgba, w, 5, 5), (0, 0, 0, 0));
-        assert_eq!(px(&rgba, w, 25, 15).3, 255, "inside the rect is opaque");
-    }
-
-    #[test]
-    fn rasterize_honors_the_transform() {
-        let geometry = rect_path(0.0, 0.0, 10.0, 10.0);
-        let mut m = Affine::IDENTITY;
-        m.set_translate(20.0, 20.0);
-        let style = FillStyle {
-            argb: 0xFF00_FF00u32 as i32,
-            even_odd: false,
-        };
-        let (rgba, w, _h) = rasterize_path_rgba(&geometry, &m, style, 40, 40).expect("rasterizes");
-
-        assert_eq!(px(&rgba, w, 25, 25), (0, 255, 0, 255));
-        assert_eq!(px(&rgba, w, 5, 5), (0, 0, 0, 0));
-    }
-
-    #[test]
-    fn empty_path_does_not_rasterize() {
-        assert!(rasterize_path(
-            &PathGeometry::default(),
-            &Affine::IDENTITY,
-            FillStyle::default(),
-            16,
-            16
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn zero_size_pixmap_is_rejected() {
-        let geometry = rect_path(0.0, 0.0, 5.0, 5.0);
-        assert!(
-            rasterize_path(&geometry, &Affine::IDENTITY, FillStyle::default(), 0, 16).is_none()
-        );
-    }
-
-    #[test]
-    fn build_path_is_safe_against_undersupplied_points() {
-        let geometry = PathGeometry {
-            verbs: vec![Verb::CubicTo],
-            points: vec![1.0, 2.0],
-        };
-        assert!(build_tiny_skia_path(&geometry).is_none());
-    }
-
-    #[test]
-    fn even_odd_donut_leaves_a_hole() {
-        let mut geometry = rect_path(5.0, 5.0, 45.0, 45.0);
-        let inner = rect_path(20.0, 20.0, 30.0, 30.0);
-        geometry.verbs.extend(inner.verbs);
-        geometry.points.extend(inner.points);
-        let style = FillStyle {
-            argb: 0xFF00_00FFu32 as i32,
-            even_odd: true,
-        };
-        let (rgba, w, _h) =
-            rasterize_path_rgba(&geometry, &Affine::IDENTITY, style, 50, 50).expect("rasterizes");
-
-        assert_eq!(px(&rgba, w, 10, 25), (0, 0, 255, 255));
-        assert_eq!(px(&rgba, w, 25, 25).3, 0, "even-odd hole is transparent");
     }
 
     #[test]

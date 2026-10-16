@@ -10321,79 +10321,6 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
     });
 }
 
-pub fn reflect_engine_input_methods(vm: &Vm) {
-    let raw = vm.as_raw();
-    if raw.is_null() {
-        return;
-    }
-
-    let java_vm = unsafe { JavaVM::from_raw(raw) };
-    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            for class_name in [
-                jni_str!("com/roblox/engine/jni/NativeGLInterface"),
-                jni_str!("com/roblox/engine/jni/NativeInputInterface"),
-            ] {
-                let cls = match env.find_class(class_name) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        env.exception_clear();
-                        tracing::info!(class = %class_name.to_str(), "reflect-input: class not loaded");
-                        continue;
-                    }
-                };
-                let methods_obj = match checked(env, "Class.getDeclaredMethods", |env| {
-                    env.call_method(
-                        &cls,
-                        jni_str!("getDeclaredMethods"),
-                        jni_sig!("()[Ljava/lang/reflect/Method;"),
-                        &[],
-                    )?
-                    .l()
-                }) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let methods: JObjectArray = match env.cast_local::<JObjectArray>(methods_obj) {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-                let len = methods.len(env).unwrap_or(0);
-                tracing::info!(class = %class_name.to_str(), methods = len, "reflect-input: declared methods");
-                for i in 0..len {
-                    let Ok(m) = methods.get_element(env, i) else {
-                        continue;
-                    };
-                    let Ok(s_obj) = checked(env, "Method.toString", |env| {
-                        env.call_method(
-                            &m,
-                            jni_str!("toString"),
-                            jni_sig!("()Ljava/lang/String;"),
-                            &[],
-                        )?
-                        .l()
-                    }) else {
-                        continue;
-                    };
-
-                    let s = unsafe { JString::from_raw(env, s_obj.into_raw()) };
-                    if let Ok(desc) = s.try_to_string(env) {
-                        if desc.contains("Pass")
-                            || desc.contains("Input")
-                            || desc.contains("Text")
-                            || desc.contains("Key")
-                            || desc.contains("Char")
-                        {
-                            tracing::info!(method = %desc, "reflect-input: bridge method");
-                        }
-                    }
-                }
-            }
-        }));
-        Ok(())
-    });
-}
-
 extern "system" fn radio_button_set_text<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
@@ -15962,9 +15889,9 @@ mod tests {
 
         let sync_start = input_end;
         let sync_end = src[sync_start..]
-            .find("\npub fn reflect_engine_input_methods")
+            .find("\nextern \"system\" fn radio_button_set_text")
             .map(|offset| sync_start + offset)
-            .expect("input reflection helper");
+            .expect("radio button text native");
         let sync = &src[sync_start..sync_end];
         assert!(sync.contains("syncTextboxTextAndCursorPosition2"));
         assert!(!sync.contains("nativePassText"));

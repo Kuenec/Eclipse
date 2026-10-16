@@ -31,6 +31,14 @@ const CLOCK_MONOTONIC: c_int = 1;
 
 const MUTEX_INIT_MAGIC: i32 = 0x6d75_7831u32 as i32;
 
+const MUTEX_INIT_PENDING: i32 = 0x6d75_7830u32 as i32;
+
+const STATIC_MUTEX_TYPE_SHIFT: i32 = 14;
+
+const STATIC_MUTEX_TYPE_BITS: i32 = 0x3;
+
+const MUTEX_LOCK_BITS: i32 = 0x3;
+
 const COND_INIT_MAGIC: i32 = 0x636e_6431u32 as i32;
 
 const ONCE_NOT_STARTED: i32 = 0;
@@ -156,18 +164,33 @@ const MUTEX_OWNER: usize = 3;
 const MUTEX_DEPTH: usize = 4;
 
 unsafe fn mutex_ensure_init(p: *mut c_void) {
-    unsafe {
-        if let Some(magic) = word(p, MUTEX_MAGIC, MUTEX_WORDS) {
-            if magic.load(Ordering::Acquire) == 0
-                && magic
-                    .compare_exchange(0, MUTEX_INIT_MAGIC, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                if let Some(ty) = word(p, MUTEX_TYPE, MUTEX_WORDS) {
-                    ty.store(PTHREAD_MUTEX_NORMAL, Ordering::Release);
-                }
-            }
-        }
+    let Some(magic) = (unsafe { word(p, MUTEX_MAGIC, MUTEX_WORDS) }) else {
+        return;
+    };
+    let current = magic.load(Ordering::Acquire);
+    if current != 0 && current != MUTEX_INIT_PENDING {
+        return;
+    }
+    if current == 0
+        && magic
+            .compare_exchange(0, MUTEX_INIT_PENDING, Ordering::Acquire, Ordering::Acquire)
+            .is_ok()
+    {
+        let (state, ty) = unsafe {
+            (
+                word(p, MUTEX_STATE, MUTEX_WORDS).unwrap(),
+                word(p, MUTEX_TYPE, MUTEX_WORDS).unwrap(),
+            )
+        };
+        let static_type =
+            (state.load(Ordering::Relaxed) >> STATIC_MUTEX_TYPE_SHIFT) & STATIC_MUTEX_TYPE_BITS;
+        ty.store(static_type, Ordering::Relaxed);
+        state.store(0, Ordering::Relaxed);
+        magic.store(MUTEX_INIT_MAGIC, Ordering::Release);
+        return;
+    }
+    while magic.load(Ordering::Acquire) == MUTEX_INIT_PENDING {
+        std::thread::yield_now();
     }
 }
 
@@ -321,7 +344,7 @@ unsafe extern "C" fn eclipse_pthread_mutex_destroy(m: *mut c_void) -> c_int {
 
     unsafe {
         if let Some(state) = word(m, MUTEX_STATE, MUTEX_WORDS) {
-            if state.load(Ordering::Acquire) != 0 {
+            if state.load(Ordering::Acquire) & MUTEX_LOCK_BITS != 0 {
                 return EBUSY;
             }
         }
@@ -1252,6 +1275,9 @@ unsafe extern "C" fn eclipse_pthread_create(
 
 unsafe extern "C" fn eclipse_pthread_join(thread: usize, retval: *mut *mut c_void) -> c_int {
     let tid = thread as i32;
+    if tid == gettid() {
+        return EDEADLK;
+    }
     let Some(host_handle) = take_host_handle(tid) else {
         return ESRCH;
     };
@@ -1845,6 +1871,70 @@ mod tests {
             );
             assert_eq!(eclipse_pthread_mutex_unlock(mp), 0);
         }
+    }
+
+    fn on_a_thread_within_five_seconds<T: Send + 'static>(
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done_tx.send(body()).unwrap());
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the mutex calls must finish instead of hanging")
+    }
+
+    fn leaked_static_mutex(word0: i32) -> usize {
+        let m: &'static mut [i32] = Box::leak(zeroed_words(MUTEX_WORDS));
+        m[MUTEX_STATE] = word0;
+        m.as_mut_ptr() as usize
+    }
+
+    #[test]
+    fn a_statically_initialized_recursive_mutex_relocks_and_excludes_others() {
+        const PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP: i32 = 1 << 14;
+        let mp = leaked_static_mutex(PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP);
+        let other_thread = move |call: unsafe extern "C" fn(*mut c_void) -> c_int| {
+            std::thread::spawn(move || unsafe { call(mp as *mut c_void) })
+                .join()
+                .unwrap()
+        };
+        let results = on_a_thread_within_five_seconds(move || unsafe {
+            let m = mp as *mut c_void;
+            [
+                eclipse_pthread_mutex_lock(m),
+                eclipse_pthread_mutex_lock(m),
+                other_thread(eclipse_pthread_mutex_trylock),
+                eclipse_pthread_mutex_unlock(m),
+                eclipse_pthread_mutex_unlock(m),
+                other_thread(eclipse_pthread_mutex_lock),
+            ]
+        });
+        assert_eq!(results, [0, 0, EBUSY, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_statically_initialized_errorcheck_mutex_reports_misuse() {
+        const PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP: i32 = 2 << 14;
+        let mp = leaked_static_mutex(PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP);
+        let results = on_a_thread_within_five_seconds(move || unsafe {
+            let m = mp as *mut c_void;
+            [
+                eclipse_pthread_mutex_lock(m),
+                eclipse_pthread_mutex_lock(m),
+                eclipse_pthread_mutex_unlock(m),
+                eclipse_pthread_mutex_unlock(m),
+            ]
+        });
+        assert_eq!(results, [0, EDEADLK, 0, EPERM]);
+    }
+
+    #[test]
+    fn an_untouched_static_recursive_mutex_can_be_destroyed() {
+        let mp = leaked_static_mutex(1 << 14);
+        assert_eq!(
+            unsafe { eclipse_pthread_mutex_destroy(mp as *mut c_void) },
+            0
+        );
     }
 
     #[test]
@@ -2679,6 +2769,50 @@ mod tests {
         assert!(
             !registry.iter().any(|thread| tids.contains(&thread.tid)),
             "a self-detached thread leaves no registry entry"
+        );
+    }
+
+    #[test]
+    fn a_self_join_is_refused_and_leaves_the_thread_detachable() {
+        static FAILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn join_then_detach_self(_a: *mut c_void) -> *mut c_void {
+            let me = unsafe { eclipse_pthread_self() };
+            if unsafe { eclipse_pthread_join(me, std::ptr::null_mut()) } != EDEADLK {
+                FAILED.fetch_add(1, Ordering::Relaxed);
+            }
+            if unsafe { eclipse_pthread_detach(me) } != 0 {
+                FAILED.fetch_add(1, Ordering::Relaxed);
+            }
+            std::ptr::null_mut()
+        }
+        let mut tid: usize = 0;
+        let tp = std::ptr::addr_of_mut!(tid) as *mut c_void;
+        assert_eq!(
+            unsafe {
+                eclipse_pthread_create(
+                    tp,
+                    std::ptr::null(),
+                    Some(join_then_detach_self),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        wait_until_exited_or_parked(tid);
+        assert_eq!(
+            FAILED.load(Ordering::Relaxed),
+            0,
+            "a self-join returns EDEADLK and keeps the thread detachable"
+        );
+        let registered = THREAD_REGISTRY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|thread| thread.tid == tid as i32);
+        assert!(!registered, "the self-detach dropped the registry entry");
+        assert_eq!(
+            unsafe { eclipse_pthread_join(eclipse_pthread_self(), std::ptr::null_mut()) },
+            EDEADLK
         );
     }
 

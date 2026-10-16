@@ -91,29 +91,6 @@ impl PathGeometry {
     pub fn close(&mut self) {
         self.verbs.push(Verb::Close);
     }
-
-    pub fn reset(&mut self) {
-        self.verbs.clear();
-        self.points.clear();
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.verbs.is_empty()
-    }
-
-    pub fn bounds(&self) -> Option<(f32, f32, f32, f32)> {
-        let mut it = self.points.as_chunks::<2>().0.iter();
-        let first = it.next()?;
-        let (mut min_x, mut min_y) = (first[0], first[1]);
-        let (mut max_x, mut max_y) = (first[0], first[1]);
-        for p in std::iter::once(first).chain(it) {
-            min_x = min_x.min(p[0]);
-            min_y = min_y.min(p[1]);
-            max_x = max_x.max(p[0]);
-            max_y = max_y.max(p[1]);
-        }
-        Some((min_x, min_y, max_x, max_y))
-    }
 }
 
 struct Slot {
@@ -273,28 +250,6 @@ mod tests {
     }
 
     #[test]
-    fn bounds_covers_all_points() {
-        let mut g = PathGeometry::default();
-        g.move_to(10.0, 5.0);
-        g.line_to(-3.0, 40.0);
-        g.line_to(100.0, -2.0);
-        let (min_x, min_y, max_x, max_y) = g.bounds().expect("non-empty path has bounds");
-        assert_eq!((min_x, min_y, max_x, max_y), (-3.0, -2.0, 100.0, 40.0));
-        assert!(PathGeometry::default().bounds().is_none());
-    }
-
-    #[test]
-    fn reset_clears_geometry() {
-        let mut g = PathGeometry::default();
-        g.move_to(1.0, 1.0);
-        g.line_to(2.0, 2.0);
-        assert!(!g.is_empty());
-        g.reset();
-        assert!(g.is_empty());
-        assert!(g.points.is_empty());
-    }
-
-    #[test]
     fn freed_handle_is_stale_and_does_not_alias_reused_slot() {
         let old = allocate(PathGeometry::default()).expect("allocate old");
         with_path(old, |g| g.move_to(1.0, 1.0)).expect("write old");
@@ -307,7 +262,7 @@ mod tests {
             "a freed handle must be StaleHandle, never alias the reused slot"
         );
         assert!(
-            get(new).expect("read new").is_empty(),
+            get(new).expect("read new").verbs.is_empty(),
             "reused slot is a fresh empty path"
         );
         free(new).expect("free new");

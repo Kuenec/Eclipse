@@ -40,8 +40,7 @@ impl FontSource {
     }
 
     fn load(&self) -> Result<RasterFont, String> {
-        let data = std::fs::read(&self.path).map_err(|error| error.to_string())?;
-        RasterFont::open(data.into(), self.index)
+        RasterFont::open(&self.path, self.index)
     }
 }
 
@@ -375,6 +374,20 @@ mod tests {
         let chosen = load_first_font([FontSource::file(bogus.clone()), missing, real.clone()]);
         std::fs::remove_file(&bogus).expect("remove the bogus font");
         assert_eq!(chosen.map(|(source, _)| source), Some(real));
+    }
+
+    #[test]
+    fn a_loaded_face_holds_its_file_contents_and_draws() {
+        let Some((source, font)) = sorted_fonts(c"sans-serif", Some('A'), Presentation::Text)
+            .into_iter()
+            .find_map(|source| source.load().ok().map(|font| (source, font)))
+        else {
+            eprintln!("SKIP: fontconfig lists no loadable sans-serif font");
+            return;
+        };
+        let contents = std::fs::read(&source.path).expect("read the font file");
+        assert!(font.data() == contents.as_slice());
+        assert!(draws(&font, 'A', Presentation::Text));
     }
 
     #[test]

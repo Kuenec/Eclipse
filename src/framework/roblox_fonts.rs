@@ -157,9 +157,14 @@ fn asset_font(asset: &str) -> Option<&'static RasterFont> {
     if let Some(font) = fonts.get(asset) {
         return *font;
     }
-    let loaded = super::read_asset_bytes(asset)
-        .ok_or_else(|| "asset is missing from the APK".to_string())
-        .and_then(|bytes| RasterFont::open(bytes.into(), 0));
+    let loaded = super::app_data_dir()
+        .ok_or_else(|| "the app data directory is unknown".to_string())
+        .and_then(|app_data| {
+            RasterFont::open(
+                &crate::storage::extracted_assets_dir(&app_data).join(asset),
+                0,
+            )
+        });
     let font = match loaded {
         Ok(font) => Some(&*Box::leak(Box::new(font))),
         Err(error) => {
@@ -247,7 +252,7 @@ mod tests {
         let load = |asset: &str| -> Option<&'static RasterFont> {
             let bytes = read(asset)?;
             loaded.borrow_mut().push(asset.to_owned());
-            let font = RasterFont::open(bytes.into(), 0).expect("fixture font opens");
+            let font = RasterFont::from_copy(&bytes, 0).expect("fixture font opens");
             Some(Box::leak(Box::new(font)))
         };
 

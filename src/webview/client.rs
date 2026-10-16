@@ -18,6 +18,7 @@ use super::proto::{
 };
 use super::redact::url_scheme_and_host_for_log;
 use crate::framework::view_registry;
+use crate::inheritance_cutoff::InheritanceCutoff;
 
 pub const HELPER_NOT_FOUND_MARKER: &str = "helper binary not found";
 
@@ -816,8 +817,10 @@ fn spawn_with_control_socket(
         .map(|(fd, target)| (fd.as_raw_fd(), *target))
         .collect();
     cmd.arg(format!("--ipc-fd={CONTROL_FD}"));
+    let cutoff = InheritanceCutoff::at(CONTROL_FD);
     unsafe {
         cmd.pre_exec(move || {
+            cutoff.mark_close_on_exec()?;
             for &(source, target) in &mapping {
                 if libc::dup2(source, target) != target {
                     return Err(std::io::Error::last_os_error());
@@ -2814,6 +2817,39 @@ mod tests {
             Some(7),
             "the helper must finish on its own after the io thread that started it exits: \
              {status:?}"
+        );
+    }
+
+    #[test]
+    fn the_helper_inherits_only_its_control_socket() {
+        use std::os::fd::FromRawFd as _;
+
+        let mut ends = [0; 2];
+        let piped = unsafe { libc::pipe(ends.as_mut_ptr()) };
+        assert_eq!(piped, 0, "pipe: {}", std::io::Error::last_os_error());
+        let pipe = ends.map(|end| {
+            let above_control = unsafe { libc::fcntl(end, libc::F_DUPFD, CONTROL_FD + 1) };
+            assert!(
+                above_control > CONTROL_FD,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            drop(unsafe { OwnedFd::from_raw_fd(end) });
+            unsafe { OwnedFd::from_raw_fd(above_control) }
+        });
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "[ -S /proc/self/fd/3 ] && [ ! -e /proc/self/fd/$1 ] && [ ! -e /proc/self/fd/$2 ]",
+            "sh",
+        ])
+        .args(pipe.iter().map(|end| end.as_raw_fd().to_string()));
+        let (_control, mut child) =
+            spawn_with_control_socket(cmd, None).expect("spawn a stand-in helper");
+        let status = child.wait().expect("wait for the stand-in helper");
+        assert!(
+            status.success(),
+            "the helper must not hold Roblox's descriptors: {status:?}"
         );
     }
 
