@@ -1057,15 +1057,24 @@ mod tests {
     use super::*;
 
     const SIZE: f32 = 24.0;
-    const NOTO_SANS: &[u8] = include_bytes!("../tests/fixtures/fonts/NotoSans-subset.ttf");
-    const NOTO_SANS_HEBREW: &[u8] =
-        include_bytes!("../tests/fixtures/fonts/NotoSansHebrew-subset.ttf");
-    const NOTO_SANS_ARABIC: &[u8] =
-        include_bytes!("../tests/fixtures/fonts/NotoSansArabic-subset.ttf");
+    const NOTO_SANS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fonts/NotoSans-subset.ttf"
+    );
+    const NOTO_SANS_HEBREW: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fonts/NotoSansHebrew-subset.ttf"
+    );
+    const NOTO_SANS_ARABIC: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fonts/NotoSansArabic-subset.ttf"
+    );
 
     fn with_fixture_chain(test: impl FnOnce(FaceChain<'_>)) {
-        let [primary, hebrew, arabic] = [NOTO_SANS, NOTO_SANS_HEBREW, NOTO_SANS_ARABIC]
-            .map(|font| RasterFont::open(font.into(), 0).expect("a fixture font opens"));
+        let [primary, hebrew, arabic] =
+            [NOTO_SANS, NOTO_SANS_HEBREW, NOTO_SANS_ARABIC].map(|font| {
+                RasterFont::open(std::path::Path::new(font), 0).expect("a fixture font opens")
+            });
         test(FaceChain {
             primary: &primary,
             em_per_size: primary.em_per_height(),
@@ -1657,7 +1666,7 @@ mod tests {
             eprintln!("SKIP: no host font covers what the primary face lacks");
             return;
         };
-        let bundled = RasterFont::open(covering.data().to_vec().into(), covering.index())
+        let bundled = RasterFont::from_copy(covering.data(), covering.index())
             .expect("bundled fallback opens");
         let fallbacks = [&bundled];
         let ratio = 0.793_650_8;

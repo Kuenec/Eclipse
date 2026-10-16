@@ -119,12 +119,6 @@ pub struct PartialSymbolStats {
     pub unresolved: Vec<String>,
 }
 
-impl PartialSymbolStats {
-    pub fn total_applied(&self) -> usize {
-        self.applied_nonnull + self.applied_weak_zero
-    }
-}
-
 fn page_floor(addr: u64, page: u64) -> u64 {
     addr & !(page - 1)
 }
@@ -455,18 +449,6 @@ impl MappedObject {
         self.restore_protection(img, page_size)?;
 
         Ok(stats)
-    }
-
-    pub fn map_and_relocate_with_scope(
-        img: &ElfImage<'_>,
-        file: &[u8],
-        page_size: u64,
-        build_scope: impl FnOnce(u64, &[super::elf::DynSym]) -> Scope,
-    ) -> Result<(Self, MapStats, SymbolRelocStats), MapError> {
-        let (mut obj, map_stats) = Self::map_and_relocate(img, file, page_size)?;
-        let scope = build_scope(obj.load_base(), &img.dynsyms);
-        let sym_stats = obj.relocate_symbols(img, &scope, page_size)?;
-        Ok((obj, map_stats, sym_stats))
     }
 
     fn populate_segment(

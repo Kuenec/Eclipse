@@ -1,4 +1,6 @@
 use std::ffi::OsStr;
+use std::fs;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
 use super::*;
 
@@ -231,5 +233,30 @@ fn targets_reach_the_client_as_pulse_variables() {
             (OsStr::new("PULSE_SINK"), Some(OsStr::new(HEADSET))),
             (OsStr::new("PULSE_SOURCE"), Some(OsStr::new(HEADSET_MIC))),
         ]
+    );
+}
+
+#[test]
+fn pactl_inherits_none_of_the_clients_descriptors() {
+    let mut ends = [0; 2];
+    let piped = unsafe { libc::pipe(ends.as_mut_ptr()) };
+    assert_eq!(piped, 0, "pipe: {}", io::Error::last_os_error());
+    let pipe = ends.map(|end| unsafe { OwnedFd::from_raw_fd(end) });
+    let dir = crate::loader::link::tests::temp_dir("pactl-descriptors");
+    crate::stub_script::write(
+        &dir.join(PACTL),
+        "#!/bin/sh\nshift\nfor fd; do\n  if [ -e /proc/self/fd/$fd ]; then\n    \
+         echo \"inherited fd $fd\" >&2\n    exit 1\n  fi\ndone\n",
+    );
+    let numbers = pipe.each_ref().map(|end| end.as_raw_fd().to_string());
+    let mut command = pactl_command(&numbers.each_ref().map(String::as_str));
+    command.env("PATH", &dir);
+    let output = bounded_child::output(&mut command, Duration::from_secs(30));
+    fs::remove_dir_all(&dir).expect("remove the stand-in pactl");
+    assert!(
+        output.status.success(),
+        "pactl must not hold the client's descriptors: {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
 }

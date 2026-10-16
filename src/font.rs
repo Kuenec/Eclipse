@@ -5,7 +5,11 @@ use harfrust::{Shaper, ShaperData};
 use read_fonts::tables::cmap::{CmapSubtable, EncodingRecord, PlatformId};
 use read_fonts::tables::os2::SelectionFlags;
 use read_fonts::{FontRef, ReadError, TableProvider};
+use std::borrow::Borrow;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
+
+use crate::mapped_file::MappedFile;
 
 const MAX_GLYPH_DIMENSION: u32 = 4096;
 const WINDOWS_UNICODE_BMP_ENCODING: u16 = 1;
@@ -25,7 +29,16 @@ const LOAD_STRIKE_IMAGE: LoadFlag = LoadFlag::from_bits_retain(
         | LoadFlag::COLOR.bits(),
 );
 
-type MemoryFace = Face<Arc<[u8]>>;
+#[derive(Clone)]
+struct FontBytes(Arc<MappedFile>);
+
+impl Borrow<[u8]> for FontBytes {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+type MemoryFace = Face<FontBytes>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GlyphSource {
@@ -34,7 +47,7 @@ pub(crate) enum GlyphSource {
 }
 
 pub(crate) struct RasterFont {
-    data: Arc<[u8]>,
+    data: FontBytes,
     index: u32,
     source: GlyphSource,
     color: bool,
@@ -48,7 +61,9 @@ pub(crate) struct RasterFont {
 }
 
 impl RasterFont {
-    pub(crate) fn open(data: Arc<[u8]>, index: u32) -> Result<Self, String> {
+    pub(crate) fn open(path: &Path, index: u32) -> Result<Self, String> {
+        let file = MappedFile::open(path).map_err(|error| error.to_string())?;
+        let data = FontBytes(Arc::new(file));
         let face = load_face(data.clone(), index)?;
         let source = if face.is_scalable() {
             GlyphSource::Outlines
@@ -65,7 +80,7 @@ impl RasterFont {
                 f32::from(face.em_size()),
             ),
             GlyphSource::ColorStrikes => {
-                let (units_per_em, metrics) = strike_font_metrics(&data, index)
+                let (units_per_em, metrics) = strike_font_metrics(data.borrow(), index)
                     .map_err(|error| format!("colour bitmap font tables: {error}"))?;
                 (
                     metrics.ascent,
@@ -95,7 +110,7 @@ impl RasterFont {
     }
 
     pub(crate) fn data(&self) -> &[u8] {
-        &self.data
+        &self.data.0
     }
 
     pub(crate) fn index(&self) -> u32 {
@@ -127,13 +142,13 @@ impl RasterFont {
     }
 
     pub(crate) fn shaper(&self) -> Option<Shaper<'_>> {
-        let font = FontRef::from_index(&self.data, self.index).ok()?;
+        let font = FontRef::from_index(self.data(), self.index).ok()?;
         let shaping = self.shaping.get_or_init(|| ShaperData::new(&font));
         Some(shaping.shaper(&font).build())
     }
 
     pub(crate) fn glyph_index(&self, character: char) -> Option<u32> {
-        nominal_glyph(&self.data, self.index, character)
+        nominal_glyph(self.data(), self.index, character)
     }
 
     pub(crate) fn scaled(&self, height: f32) -> Option<ScaledFont> {
@@ -291,7 +306,7 @@ fn select_strike(face: &mut MemoryFace, strike: i32) -> Option<()> {
     (error == freetype::ffi::FT_Err_Ok).then_some(())
 }
 
-fn load_face(data: Arc<[u8]>, index: u32) -> Result<MemoryFace, String> {
+fn load_face(data: FontBytes, index: u32) -> Result<MemoryFace, String> {
     let library = Library::init().map_err(|error| format!("{error:?}"))?;
     library
         .new_memory_face2(data, index as isize)
@@ -599,6 +614,18 @@ impl RasterGlyph<'_> {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+impl RasterFont {
+    pub(crate) fn from_copy(bytes: &[u8], index: u32) -> Result<Self, String> {
+        let dir = crate::loader::link::tests::temp_dir("font-copy");
+        let path = dir.join("font");
+        std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
+        let font = Self::open(&path, index);
+        std::fs::remove_dir_all(&dir).map_err(|error| error.to_string())?;
+        font
     }
 }
 

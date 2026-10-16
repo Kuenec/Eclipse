@@ -12,6 +12,7 @@ use super::map::{
 use super::reloc::{self, Rela, SymbolResolver};
 use super::resolve::{HostDlsymProvider, LoadedObjectProvider, Scope, ScopedResolver};
 use super::tls::TlsLayout;
+use crate::mapped_file::MappedFile;
 
 const R_X86_64_IRELATIVE: u32 = 37;
 
@@ -96,7 +97,7 @@ pub struct LoadedObject {
 
     pub path: PathBuf,
 
-    pub bytes: Vec<u8>,
+    pub(crate) bytes: MappedFile,
 
     pub mapped: MappedObject,
 
@@ -119,8 +120,6 @@ impl LoadedObject {
 
 pub struct LoadedImageSet {
     pub objects: Vec<LoadedObject>,
-
-    pub scope: Scope,
 
     pub tls_layout: TlsLayout,
 
@@ -387,7 +386,6 @@ impl Linker {
 
         Ok(LoadedImageSet {
             objects,
-            scope,
             tls_layout,
             stats,
             unresolved,
@@ -401,7 +399,7 @@ impl Linker {
         pending: &PendingLoad,
         page: u64,
     ) -> Result<(LoadedObject, Vec<String>), LinkError> {
-        let bytes = std::fs::read(&pending.path).map_err(|e| LinkError::Io {
+        let bytes = MappedFile::open(&pending.path).map_err(|e| LinkError::Io {
             path: pending.path.clone(),
             error: e.to_string(),
         })?;
@@ -1349,7 +1347,8 @@ pub(crate) mod tests {
 
     #[test]
     fn real_libroblox_bionic_env_resolves_categorizes_and_partially_applies() {
-        use crate::loader::bionic_env::{categorize_imports, BionicEnv, ImportCategory};
+        use crate::loader::bionic_env::import_census::{categorize_imports, ImportCategory};
+        use crate::loader::bionic_env::BionicEnv;
 
         let Some(apk_path) = roblox_native_libs_apk() else {
             eprintln!("real_libroblox_bionic_env_...: no Roblox APK; skipping");
@@ -1376,12 +1375,6 @@ pub(crate) mod tests {
         drop(img);
 
         let bionic = BionicEnv::with_host_baseline(true, false);
-        eprintln!(
-            "BionicEnv: host_libc_present={} eclipse_natives={} missing_gl={:?}",
-            bionic.host_libc_present(),
-            bionic.eclipse_natives_present(),
-            bionic.missing_gl()
-        );
 
         let mut full_scope = Scope::new();
         full_scope.push(Box::new(LoadedObjectProvider::new(base, &dynsyms)));
@@ -1524,7 +1517,8 @@ pub(crate) mod tests {
 
     #[test]
     fn real_libroblox_eclipse_natives_fully_resolve_all_imports() {
-        use crate::loader::bionic_env::{categorize_imports, BionicEnv};
+        use crate::loader::bionic_env::import_census::categorize_imports;
+        use crate::loader::bionic_env::BionicEnv;
         use crate::loader::native_provider::EclipseNativeProvider;
         use crate::loader::resolve::{HostDlsymProvider, SymbolProvider};
 

@@ -482,6 +482,15 @@ mod tests {
     }
 
     #[test]
+    fn a_verb_without_its_points_yields_no_path() {
+        let geometry = PathGeometry {
+            verbs: vec![Verb::CubicTo],
+            points: vec![1.0, 2.0],
+        };
+        assert!(geometry_to_path(&geometry).is_none());
+    }
+
+    #[test]
     fn pack_unpack_round_trips() {
         for &(index, generation) in &[(0u32, 1u32), (1, 1), (5, 42), (u32::MAX, u32::MAX), (3, 7)] {
             let handle = pack(index, generation);
