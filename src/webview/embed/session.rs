@@ -56,7 +56,7 @@ use wayland_protocols::wp::viewporter::client::{
 };
 
 use super::globals::{Global, Provision};
-use super::wire::{Args, Message as Request, Wire, WireError};
+use super::wire::{Args, Message as Request, Wire, WireError, MAX_FDS_PER_SEND, MAX_REQUEST_SIZE};
 use super::{outgoing, RegistryChange, Upstream};
 
 const DISPLAY_ID: u32 = 1;
@@ -70,6 +70,10 @@ const SHM_FORMAT_LIMIT: usize = 256;
 const ALWAYS_SUPPORTED_SHM_FORMATS: [u32; 2] = [0, 1];
 
 const POOL_LIMIT: usize = 64;
+
+const FORWARDED_BYTES_PER_FLUSH: usize = MAX_REQUEST_SIZE / 2;
+
+const FORWARDED_FDS_PER_FLUSH: usize = MAX_FDS_PER_SEND / 2;
 
 #[derive(Debug)]
 pub(super) struct Violation {
@@ -426,6 +430,10 @@ impl Session {
         self.awaiting.is_none()
     }
 
+    pub(super) fn holds_requests(&self) -> bool {
+        self.wants_read() && matches!(self.wire.header(), Ok(Some(_)))
+    }
+
     pub(super) fn flush(&mut self) -> Result<(), WireError> {
         self.wire.flush()
     }
@@ -449,6 +457,8 @@ impl Session {
     }
 
     pub(super) fn process(&mut self, up: &Upstream) -> Result<(), SessionEnd> {
+        let mut bytes_left = 0;
+        let mut fds_left = 0;
         while self.wants_read() {
             let Some(header) = self.wire.header()? else {
                 break;
@@ -477,6 +487,20 @@ impl Session {
                     violation(header.object, interface, desc, "newer than the object").into(),
                 );
             }
+            let fds = desc
+                .signature
+                .iter()
+                .filter(|kind| matches!(kind, ArgumentType::Fd))
+                .count();
+            if header.size() > bytes_left || fds > fds_left {
+                if !up.accepts_requests() {
+                    break;
+                }
+                bytes_left = FORWARDED_BYTES_PER_FLUSH.max(header.size());
+                fds_left = FORWARDED_FDS_PER_FLUSH.max(fds);
+            }
+            bytes_left -= header.size();
+            fds_left -= fds;
             let request = self.wire.decode(header, desc.signature)?;
             self.request(up, request, interface, desc)?;
             if let Some(error) = self.failed.take() {
