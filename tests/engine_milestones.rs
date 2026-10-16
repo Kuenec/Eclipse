@@ -452,6 +452,118 @@ fn framework_overlay_preserves_connectivity_v2_contract() {
 }
 
 #[test]
+fn framework_overlay_defines_the_client_apis_with_aosp_signatures() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    let declared = |text: &str, declaration: &str| {
+        text.lines()
+            .filter(|line| *line == format!(".method {declaration}"))
+            .count()
+    };
+    for declaration in [
+        "public static getEdgeSlop()I",
+        "public static getFadingEdgeLength()I",
+        "public static getGlobalActionKeyTimeout()J",
+        "public static getJumpTapTimeout()I",
+        "public static getMaximumDrawingCacheSize()I",
+        "public static getMaximumFlingVelocity()I",
+        "public static getPressedStateDuration()I",
+        "public static getScrollBarSize()I",
+        "public static getTouchSlop()I",
+        "public static getWindowTouchSlop()I",
+        "public static getZoomControlsTimeout()J",
+        "public static getMinVolume()F",
+        "public static getMaxVolume()F",
+        "public static resolveOpacity(II)I",
+        "public static getOffsetBefore(Ljava/lang/CharSequence;I)I",
+        "public static getOffsetAfter(Ljava/lang/CharSequence;I)I",
+        "public final requestUnbufferedDispatch(Landroid/view/MotionEvent;)V",
+        "public getDataState()I",
+    ] {
+        assert_eq!(
+            declared(generator, declaration),
+            1,
+            "the overlay must define `{declaration}` once, the AOSP signature the client calls; \
+             without it the client dies with NoSuchMethodError"
+        );
+    }
+    for copied in [
+        "cp \"$view_configuration_sm\" \"$work/smali-view/android/view/ViewConfiguration.smali\"",
+        "cp \"$audio_track_sm\" \"$work/smali-view/android/media/AudioTrack.smali\"",
+        "cp \"$drawable_sm\" \"$work/smali-view/android/graphics/drawable/Drawable.smali\"",
+        "cp \"$text_utils_sm\" \"$work/smali-view/android/text/TextUtils.smali\"",
+        "cp \"$telephony_manager_sm\" \
+         \"$work/smali-view/android/telephony/TelephonyManager.smali\"",
+        "cp \"$vsm\" \"$work/smali-view/android/view/View.smali\"",
+        "cp \"$here/smali/android/text/AndroidCharacter.smali\" \"$work/smali-view/android/text/\"",
+        "cp \"$here/smali/android/graphics/ImageFormat.smali\" \"$work/smali-view/android/graphics/\"",
+        "cp \"$here/smali/android/telephony/cdma/CdmaCellLocation.smali\" \
+         \"$work/smali-view/android/telephony/cdma/\"",
+        "    ClientFrameworkApisProbe)\"",
+    ] {
+        assert!(
+            generator.contains(copied),
+            "the overlay no longer ships or checks the client's framework APIs: missing \
+             {copied:?}"
+        );
+    }
+    let link_properties =
+        include_str!("../tools/framework-overlay/smali/android/net/LinkProperties.smali");
+    for declaration in [
+        "public getPrivateDnsServerName()Ljava/lang/String;",
+        "public isPrivateDnsActive()Z",
+    ] {
+        assert_eq!(
+            declared(link_properties, declaration),
+            1,
+            "LinkProperties must define `{declaration}`, which AppsFlyer reads on API 28"
+        );
+    }
+    for (smali, class, superclass, declaration) in [
+        (
+            include_str!("../tools/framework-overlay/smali/android/text/AndroidCharacter.smali"),
+            "Landroid/text/AndroidCharacter;",
+            "Ljava/lang/Object;",
+            "public static getMirror(C)C",
+        ),
+        (
+            include_str!("../tools/framework-overlay/smali/android/graphics/ImageFormat.smali"),
+            "Landroid/graphics/ImageFormat;",
+            "Ljava/lang/Object;",
+            "public static getBitsPerPixel(I)I",
+        ),
+        (
+            include_str!(
+                "../tools/framework-overlay/smali/android/telephony/cdma/CdmaCellLocation.smali"
+            ),
+            "Landroid/telephony/cdma/CdmaCellLocation;",
+            "Landroid/telephony/CellLocation;",
+            "public static convertQuartSecToDecDegrees(I)D",
+        ),
+    ] {
+        let mut lines = smali.lines();
+        assert_eq!(
+            lines.next(),
+            Some(format!(".class public {class}").as_str())
+        );
+        assert_eq!(lines.next(), Some(format!(".super {superclass}").as_str()));
+        assert_eq!(
+            declared(smali, declaration),
+            1,
+            "{class} must define `{declaration}`, as AOSP does"
+        );
+        assert_eq!(
+            declared(smali, "public constructor <init>()V"),
+            1,
+            "{class} must have AOSP's public no-argument constructor"
+        );
+        assert!(
+            smali.contains(&format!("invoke-direct {{p0}}, {superclass}-><init>()V")),
+            "{class}() must run the {superclass} constructor"
+        );
+    }
+}
+
+#[test]
 fn framework_overlay_preserves_key_generation_quote_contract() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source_path =
@@ -1247,6 +1359,43 @@ fn platform_test_obtains_a_second_finger_motion_event_under_check_jni() {
              at (30.75, 40.5)"
                 .to_owned(),
         ],
+    );
+}
+
+#[test]
+fn platform_test_calls_the_appsflyer_statics_under_check_jni() {
+    if !platform_test_can_boot() {
+        return;
+    }
+
+    let root = PlatformTestRoot::create("appsflyer-statics");
+    let text = root.run_with_vm_options("-Xcheck:jni");
+
+    let returned = [
+        ("ViewConfiguration.getEdgeSlop()", "12"),
+        ("ViewConfiguration.getFadingEdgeLength()", "12"),
+        ("ViewConfiguration.getJumpTapTimeout()", "500"),
+        ("ViewConfiguration.getMaximumDrawingCacheSize()", "1536000"),
+        ("ViewConfiguration.getMaximumFlingVelocity()", "8000"),
+        ("ViewConfiguration.getPressedStateDuration()", "64"),
+        ("ViewConfiguration.getScrollBarSize()", "4"),
+        ("ViewConfiguration.getTouchSlop()", "8"),
+        ("ViewConfiguration.getWindowTouchSlop()", "16"),
+        ("ViewConfiguration.getGlobalActionKeyTimeout()", "500"),
+        ("ViewConfiguration.getZoomControlsTimeout()", "3000"),
+        ("AudioTrack.getMinVolume()", "0.0"),
+        ("AudioTrack.getMaxVolume()", "1.0"),
+        ("Drawable.resolveOpacity(-1, -3)", "-3"),
+        ("TextUtils.getOffsetAfter(\"a\u{1F600}b\", 1)", "3"),
+        ("TextUtils.getOffsetBefore(\"a\u{1F600}b\", 3)", "1"),
+        ("AndroidCharacter.getMirror(U+0028)", "U+0029"),
+        ("ImageFormat.getBitsPerPixel(0x11)", "12"),
+        ("CdmaCellLocation.convertQuartSecToDecDegrees(14400)", "1.0"),
+        ("Process.getGidForName(\"\")", "-1"),
+    ];
+    assert_lines(
+        &text,
+        &returned.map(|(call, value)| format!("__platform-test: {call} returned {value}")),
     );
 }
 

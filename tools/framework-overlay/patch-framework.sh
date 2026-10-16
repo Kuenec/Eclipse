@@ -775,6 +775,452 @@ down_time_writes="$(grep -cE '^    iput-wide [pv][0-9]+, [pv][0-9]+, Landroid/vi
 [ "$event_time_writes/$down_time_writes" = "4/4" ] \
     || fail "MotionEvent.smali writes eventTime $event_time_writes times and eclipseDownTime $down_time_writes times (expected 4 each) — installed MotionEvent drifted; update patch-framework.sh"
 
+view_configuration_sm="$work/smali/android/view/ViewConfiguration.smali"
+[ -f "$view_configuration_sm" ] || fail "ViewConfiguration.smali not found after baksmali"
+view_configuration_constants=(
+    'getEdgeSlop()I'
+    'getFadingEdgeLength()I'
+    'getGlobalActionKeyTimeout()J'
+    'getJumpTapTimeout()I'
+    'getMaximumDrawingCacheSize()I'
+    'getMaximumFlingVelocity()I'
+    'getPressedStateDuration()I'
+    'getScrollBarSize()I'
+    'getTouchSlop()I'
+    'getWindowTouchSlop()I'
+    'getZoomControlsTimeout()J'
+)
+for view_configuration_method in "${view_configuration_constants[@]}"; do
+    ! grep -qF " $view_configuration_method" "$view_configuration_sm" || fail "ViewConfiguration.smali already declares $view_configuration_method — installed ViewConfiguration drifted; update patch-framework.sh"
+done
+cat >> "$view_configuration_sm" <<'ECLIPSE_VIEW_CONFIGURATION_CONSTANTS'
+
+
+.method public static getEdgeSlop()I
+    .registers 1
+
+    const/16 v0, 0xc
+
+    return v0
+.end method
+
+.method public static getFadingEdgeLength()I
+    .registers 1
+
+    const/16 v0, 0xc
+
+    return v0
+.end method
+
+.method public static getGlobalActionKeyTimeout()J
+    .registers 2
+
+    const-wide/16 v0, 0x1f4
+
+    return-wide v0
+.end method
+
+.method public static getJumpTapTimeout()I
+    .registers 1
+
+    const/16 v0, 0x1f4
+
+    return v0
+.end method
+
+.method public static getMaximumDrawingCacheSize()I
+    .registers 1
+
+    const v0, 0x177000
+
+    return v0
+.end method
+
+.method public static getMaximumFlingVelocity()I
+    .registers 1
+
+    const/16 v0, 0x1f40
+
+    return v0
+.end method
+
+.method public static getPressedStateDuration()I
+    .registers 1
+
+    const/16 v0, 0x40
+
+    return v0
+.end method
+
+.method public static getScrollBarSize()I
+    .registers 1
+
+    const/4 v0, 0x4
+
+    return v0
+.end method
+
+.method public static getTouchSlop()I
+    .registers 1
+
+    const/16 v0, 0x8
+
+    return v0
+.end method
+
+.method public static getWindowTouchSlop()I
+    .registers 1
+
+    const/16 v0, 0x10
+
+    return v0
+.end method
+
+.method public static getZoomControlsTimeout()J
+    .registers 2
+
+    const-wide/16 v0, 0xbb8
+
+    return-wide v0
+.end method
+ECLIPSE_VIEW_CONFIGURATION_CONSTANTS
+for view_configuration_method in "${view_configuration_constants[@]}"; do
+    n="$(grep -cxF ".method public static $view_configuration_method" "$view_configuration_sm")" || true
+    [ "$n" = "1" ] || fail "ViewConfiguration.smali $view_configuration_method found $n times (expected 1)"
+done
+
+audio_track_sm="$work/smali/android/media/AudioTrack.smali"
+[ -f "$audio_track_sm" ] || fail "AudioTrack.smali not found after baksmali"
+for audio_track_method in 'getMinVolume()F' 'getMaxVolume()F'; do
+    ! grep -qF " $audio_track_method" "$audio_track_sm" || fail "AudioTrack.smali already declares $audio_track_method — installed AudioTrack drifted; update patch-framework.sh"
+done
+cat >> "$audio_track_sm" <<'ECLIPSE_AUDIO_TRACK_GAIN_RANGE'
+
+
+.method public static getMinVolume()F
+    .registers 1
+
+    const/4 v0, 0x0
+
+    return v0
+.end method
+
+.method public static getMaxVolume()F
+    .registers 1
+
+    const/high16 v0, 0x3f800000
+
+    return v0
+.end method
+ECLIPSE_AUDIO_TRACK_GAIN_RANGE
+for audio_track_method in 'getMinVolume()F' 'getMaxVolume()F'; do
+    n="$(grep -cxF ".method public static $audio_track_method" "$audio_track_sm")" || true
+    [ "$n" = "1" ] || fail "AudioTrack.smali $audio_track_method found $n times (expected 1)"
+done
+
+drawable_sm="$work/smali/android/graphics/drawable/Drawable.smali"
+[ -f "$drawable_sm" ] || fail "Drawable.smali not found after baksmali"
+! grep -qF ' resolveOpacity(II)I' "$drawable_sm" || fail "Drawable.smali already declares resolveOpacity — installed Drawable drifted; update patch-framework.sh"
+cat >> "$drawable_sm" <<'ECLIPSE_DRAWABLE_RESOLVE_OPACITY'
+
+
+.method public static resolveOpacity(II)I
+    .registers 3
+
+    if-ne p0, p1, :opacities_differ
+
+    return p0
+
+    :opacities_differ
+    if-eqz p0, :unknown
+
+    if-eqz p1, :unknown
+
+    const/4 v0, -0x3
+
+    if-eq p0, v0, :resolved
+
+    if-eq p1, v0, :resolved
+
+    const/4 v0, -0x2
+
+    if-eq p0, v0, :resolved
+
+    if-eq p1, v0, :resolved
+
+    const/4 v0, -0x1
+
+    :resolved
+    return v0
+
+    :unknown
+    const/4 v0, 0x0
+
+    return v0
+.end method
+ECLIPSE_DRAWABLE_RESOLVE_OPACITY
+n="$(grep -cxF '.method public static resolveOpacity(II)I' "$drawable_sm")" || true
+[ "$n" = "1" ] || fail "Drawable.smali resolveOpacity found $n times (expected 1)"
+
+text_utils_sm="$work/smali/android/text/TextUtils.smali"
+[ -f "$text_utils_sm" ] || fail "TextUtils.smali not found after baksmali"
+[ -f "$work/smali/android/text/style/ReplacementSpan.smali" ] || fail "the installed framework lost android.text.style.ReplacementSpan — TextUtils offsets could not skip replacement spans"
+for text_utils_method in 'getOffsetBefore(Ljava/lang/CharSequence;I)I' 'getOffsetAfter(Ljava/lang/CharSequence;I)I'; do
+    ! grep -qF " $text_utils_method" "$text_utils_sm" || fail "TextUtils.smali already declares $text_utils_method — installed TextUtils drifted; update patch-framework.sh"
+done
+cat >> "$text_utils_sm" <<'ECLIPSE_TEXT_UTILS_OFFSETS'
+
+
+.method public static getOffsetBefore(Ljava/lang/CharSequence;I)I
+    .registers 6
+
+    const/4 v0, 0x0
+
+    if-nez p1, :offset_not_first
+
+    return v0
+
+    :offset_not_first
+    const/4 v1, 0x1
+
+    if-ne p1, v1, :step_back
+
+    return v0
+
+    :step_back
+    add-int/lit8 v1, p1, -0x1
+
+    invoke-interface {p0, v1}, Ljava/lang/CharSequence;->charAt(I)C
+
+    move-result v1
+
+    const v2, 0xdc00
+
+    if-lt v1, v2, :step_back_one_char
+
+    const v2, 0xdfff
+
+    if-gt v1, v2, :step_back_one_char
+
+    add-int/lit8 v1, p1, -0x2
+
+    invoke-interface {p0, v1}, Ljava/lang/CharSequence;->charAt(I)C
+
+    move-result v1
+
+    const v2, 0xd800
+
+    if-lt v1, v2, :step_back_one_char
+
+    const v2, 0xdbff
+
+    if-gt v1, v2, :step_back_one_char
+
+    add-int/lit8 p1, p1, -0x2
+
+    goto :check_replacement_spans
+
+    :step_back_one_char
+    add-int/lit8 p1, p1, -0x1
+
+    :check_replacement_spans
+    instance-of v1, p0, Landroid/text/Spanned;
+
+    if-eqz v1, :done
+
+    check-cast p0, Landroid/text/Spanned;
+
+    const-class v1, Landroid/text/style/ReplacementSpan;
+
+    invoke-interface {p0, p1, p1, v1}, Landroid/text/Spanned;->getSpans(IILjava/lang/Class;)[Ljava/lang/Object;
+
+    move-result-object v1
+
+    check-cast v1, [Landroid/text/style/ReplacementSpan;
+
+    :next_span
+    array-length v2, v1
+
+    if-ge v0, v2, :done
+
+    aget-object v2, v1, v0
+
+    invoke-interface {p0, v2}, Landroid/text/Spanned;->getSpanStart(Ljava/lang/Object;)I
+
+    move-result v2
+
+    aget-object v3, v1, v0
+
+    invoke-interface {p0, v3}, Landroid/text/Spanned;->getSpanEnd(Ljava/lang/Object;)I
+
+    move-result v3
+
+    if-ge v2, p1, :span_not_around_offset
+
+    if-le v3, p1, :span_not_around_offset
+
+    move p1, v2
+
+    :span_not_around_offset
+    add-int/lit8 v0, v0, 0x1
+
+    goto :next_span
+
+    :done
+    return p1
+.end method
+
+.method public static getOffsetAfter(Ljava/lang/CharSequence;I)I
+    .registers 6
+
+    invoke-interface {p0}, Ljava/lang/CharSequence;->length()I
+
+    move-result v0
+
+    if-eq p1, v0, :at_end
+
+    add-int/lit8 v1, v0, -0x1
+
+    if-ne p1, v1, :step_forward
+
+    :at_end
+    return v0
+
+    :step_forward
+    invoke-interface {p0, p1}, Ljava/lang/CharSequence;->charAt(I)C
+
+    move-result v0
+
+    const v1, 0xd800
+
+    if-lt v0, v1, :step_forward_one_char
+
+    const v1, 0xdbff
+
+    if-gt v0, v1, :step_forward_one_char
+
+    add-int/lit8 v0, p1, 0x1
+
+    invoke-interface {p0, v0}, Ljava/lang/CharSequence;->charAt(I)C
+
+    move-result v1
+
+    const v2, 0xdc00
+
+    if-lt v1, v2, :check_replacement_spans
+
+    const v2, 0xdfff
+
+    if-gt v1, v2, :check_replacement_spans
+
+    add-int/lit8 v0, p1, 0x2
+
+    goto :check_replacement_spans
+
+    :step_forward_one_char
+    add-int/lit8 v0, p1, 0x1
+
+    :check_replacement_spans
+    instance-of v1, p0, Landroid/text/Spanned;
+
+    if-eqz v1, :done
+
+    check-cast p0, Landroid/text/Spanned;
+
+    const-class v1, Landroid/text/style/ReplacementSpan;
+
+    invoke-interface {p0, v0, v0, v1}, Landroid/text/Spanned;->getSpans(IILjava/lang/Class;)[Ljava/lang/Object;
+
+    move-result-object v1
+
+    check-cast v1, [Landroid/text/style/ReplacementSpan;
+
+    const/4 p1, 0x0
+
+    :next_span
+    array-length v2, v1
+
+    if-ge p1, v2, :done
+
+    aget-object v2, v1, p1
+
+    invoke-interface {p0, v2}, Landroid/text/Spanned;->getSpanStart(Ljava/lang/Object;)I
+
+    move-result v2
+
+    aget-object v3, v1, p1
+
+    invoke-interface {p0, v3}, Landroid/text/Spanned;->getSpanEnd(Ljava/lang/Object;)I
+
+    move-result v3
+
+    if-ge v2, v0, :span_not_around_offset
+
+    if-le v3, v0, :span_not_around_offset
+
+    move v0, v3
+
+    :span_not_around_offset
+    add-int/lit8 p1, p1, 0x1
+
+    goto :next_span
+
+    :done
+    return v0
+.end method
+ECLIPSE_TEXT_UTILS_OFFSETS
+for text_utils_method in 'getOffsetBefore(Ljava/lang/CharSequence;I)I' 'getOffsetAfter(Ljava/lang/CharSequence;I)I'; do
+    n="$(grep -cxF ".method public static $text_utils_method" "$text_utils_sm")" || true
+    [ "$n" = "1" ] || fail "TextUtils.smali $text_utils_method found $n times (expected 1)"
+done
+
+! grep -qF ' requestUnbufferedDispatch(' "$vsm" || fail "View.smali already declares requestUnbufferedDispatch — installed View drifted; update patch-framework.sh"
+cat >> "$vsm" <<'ECLIPSE_VIEW_UNBUFFERED_DISPATCH'
+
+
+.method public final requestUnbufferedDispatch(Landroid/view/MotionEvent;)V
+    .registers 2
+
+    invoke-virtual {p1}, Landroid/view/MotionEvent;->getAction()I
+
+    return-void
+.end method
+ECLIPSE_VIEW_UNBUFFERED_DISPATCH
+n="$(grep -cxF '.method public final requestUnbufferedDispatch(Landroid/view/MotionEvent;)V' "$vsm")" || true
+[ "$n" = "1" ] || fail "View.smali requestUnbufferedDispatch found $n times (expected 1)"
+
+telephony_manager_sm="$work/smali/android/telephony/TelephonyManager.smali"
+[ -f "$telephony_manager_sm" ] || fail "TelephonyManager.smali not found after baksmali"
+! grep -qF ' getDataState()I' "$telephony_manager_sm" || fail "TelephonyManager.smali already declares getDataState — installed TelephonyManager drifted; update patch-framework.sh"
+cat >> "$telephony_manager_sm" <<'ECLIPSE_TELEPHONY_DATA_STATE'
+
+
+.method public getDataState()I
+    .registers 2
+
+    const/4 v0, 0x0
+
+    return v0
+.end method
+ECLIPSE_TELEPHONY_DATA_STATE
+n="$(grep -cxF '.method public getDataState()I' "$telephony_manager_sm")" || true
+[ "$n" = "1" ] || fail "TelephonyManager.smali getDataState found $n times (expected 1)"
+
+for client_static_class in android/text/AndroidCharacter android/graphics/ImageFormat android/telephony/cdma/CdmaCellLocation; do
+    [ ! -e "$work/smali/$client_static_class.smali" ] || fail "the installed framework already ships ${client_static_class//\//.} — installed framework drifted; drop Eclipse's copy"
+    [ -f "$here/smali/$client_static_class.smali" ] || fail "${client_static_class##*/}.smali missing at $here/smali/$client_static_class.smali"
+done
+[ -f "$work/smali/android/telephony/CellLocation.smali" ] || fail "the installed framework lost android.telephony.CellLocation, the superclass of CdmaCellLocation"
+mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/media" "$work/smali-view/android/graphics/drawable" "$work/smali-view/android/text" "$work/smali-view/android/telephony/cdma"
+cp "$telephony_manager_sm" "$work/smali-view/android/telephony/TelephonyManager.smali"
+cp "$view_configuration_sm" "$work/smali-view/android/view/ViewConfiguration.smali"
+cp "$audio_track_sm" "$work/smali-view/android/media/AudioTrack.smali"
+cp "$drawable_sm" "$work/smali-view/android/graphics/drawable/Drawable.smali"
+cp "$text_utils_sm" "$work/smali-view/android/text/TextUtils.smali"
+cp "$here/smali/android/text/AndroidCharacter.smali" "$work/smali-view/android/text/"
+cp "$here/smali/android/graphics/ImageFormat.smali" "$work/smali-view/android/graphics/"
+cp "$here/smali/android/telephony/cdma/CdmaCellLocation.smali" "$work/smali-view/android/telephony/cdma/"
+
 fsm="$work/smali/android/app/Fragment.smali"
 [ -f "$fsm" ] || fail "Fragment.smali not found after baksmali"
 n="$(grep -cF '.method public onCreate(Landroid/os/Bundle;)V' "$fsm")" || true
@@ -1683,6 +2129,27 @@ display_output="$(env \
     DisplayRefreshRateProbe)"
 [ "$display_output" = 'display-refresh-rates-ok' ] \
     || fail "display refresh-rate regression probe returned '$display_output'"
+
+client_apis_probe="$here/tests/ClientFrameworkApisProbe.java"
+[ -f "$client_apis_probe" ] || fail "client framework API regression probe missing at $client_apis_probe"
+mkdir -p "$work/client-apis-probe/classes" "$work/client-apis-probe/cache" "$work/client-apis-probe/data"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/client-apis-probe/classes" "$client_apis_probe"
+"$DX" --dex --output="$work/client-apis-probe/probe.jar" "$work/client-apis-probe/classes"
+client_apis_boot_class_path="$boot_class_path:$work/jar/api-impl.jar:$work/client-apis-probe/probe.jar"
+client_apis_boot_class_path_locations="$boot_class_path_locations:/system/framework/api-impl.jar:/system/framework/probe.jar"
+client_apis_output="$(env \
+    ANDROID_DATA="$work/client-apis-probe/data" \
+    XDG_CACHE_HOME="$work/client-apis-probe/cache" \
+    BOOTCLASSPATH="$client_apis_boot_class_path" \
+    "$DALVIKVM" \
+    -Ximage:"$work/art/oat/boot.art" \
+    -Xbootclasspath:"$client_apis_boot_class_path" \
+    -Xbootclasspath-locations:"$client_apis_boot_class_path_locations" \
+    -Ximage-compiler-option --no-generate-debug-info \
+    -Ximage-compiler-option --no-generate-mini-debug-info \
+    ClientFrameworkApisProbe)"
+[ "$client_apis_output" = 'client-framework-apis-ok' ] \
+    || fail "client framework API regression probe returned '$client_apis_output'"
 
 motion_event_probe="$here/tests/MotionEventPointersProbe.java"
 [ -f "$motion_event_probe" ] || fail "MotionEvent pointer regression probe missing at $motion_event_probe"

@@ -22,6 +22,8 @@ use crate::apk::res_config::ResConfig;
 use crate::apk::signature::SigningCertificateHistory;
 use crate::runtime::Vm;
 
+mod android_groups;
+mod appsflyer_statics;
 mod asset_configuration;
 pub mod asset_registry;
 pub mod bitmap_registry;
@@ -2933,6 +2935,8 @@ const PROCESS_IS_64_BIT_NAME: &JNIStr = jni_str!("is64Bit");
 const PROCESS_IS_64_BIT_SIG: &JNIStr = jni_str!("()Z");
 const PROCESS_GET_THREAD_PRIORITY_NAME: &JNIStr = jni_str!("getThreadPriority");
 const PROCESS_GET_THREAD_PRIORITY_SIG: &JNIStr = jni_str!("(I)I");
+const PROCESS_GET_GID_FOR_NAME_NAME: &JNIStr = jni_str!("getGidForName");
+const PROCESS_GET_GID_FOR_NAME_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)I");
 
 fn cpu_clock_millis(clock: libc::clockid_t) -> jlong {
     let mut ts = libc::timespec {
@@ -3001,6 +3005,22 @@ extern "system" fn process_get_thread_priority<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+extern "system" fn process_get_gid_for_name<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    name: JString<'local>,
+) -> jint {
+    env.with_env(|env| -> jni::errors::Result<jint> {
+        if name.is_null() {
+            let _ = env.throw_new_void(jni_str!("java/lang/NullPointerException"));
+            return Ok(-1);
+        }
+        let chars = name.mutf8_chars(env)?;
+        Ok(android_groups::gid_for_name(chars.to_bytes()))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 extern "system" fn process_is_64_bit<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3033,12 +3053,19 @@ fn register_process_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 process_get_thread_priority as *mut std::ffi::c_void,
             )
         },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PROCESS_GET_GID_FOR_NAME_NAME,
+                PROCESS_GET_GID_FOR_NAME_SIG,
+                process_get_gid_for_name as *mut std::ffi::c_void,
+            )
+        },
     ];
 
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/Process",
-        "registered Eclipse's backing for getElapsedCpuTime (CLOCK_PROCESS_CPUTIME_ID → ms), is64Bit and getThreadPriority"
+        "registered Eclipse's backing for getElapsedCpuTime (CLOCK_PROCESS_CPUTIME_ID → ms), is64Bit, getThreadPriority and getGidForName"
     );
     Ok(())
 }
@@ -17414,6 +17441,32 @@ mod tests {
         assert_eq!(
             fake_jvm::take_exception().as_deref(),
             Some("java/lang/IllegalArgumentException")
+        );
+    }
+
+    #[test]
+    fn process_get_gid_for_name_resolves_android_groups_and_rejects_a_null_name() {
+        fake_jvm::with_env(register_process_natives).expect("register Process");
+        assert!(fake_jvm::registered_native(
+            "android/os/Process",
+            "getGidForName",
+            "(Ljava/lang/String;)I"
+        )
+        .is_some());
+
+        let resolved = fake_jvm::with_env(|env| {
+            ["", "inet", "u0_a12"].map(|name| {
+                let name = env.new_string(name).expect("name");
+                process_get_gid_for_name(fake_jvm::native_env(), JClass::null(), name)
+            })
+        });
+        assert_eq!(resolved, [-1, 3003, 10012]);
+        assert_eq!(fake_jvm::take_exception(), None);
+
+        process_get_gid_for_name(fake_jvm::native_env(), JClass::null(), JString::null());
+        assert_eq!(
+            fake_jvm::take_exception().as_deref(),
+            Some("java/lang/NullPointerException")
         );
     }
 
