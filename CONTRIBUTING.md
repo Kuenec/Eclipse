@@ -37,6 +37,8 @@ To record frame times, run `flatpak run --filesystem=xdg-run/eclipse-perf:create
 
 A hidden or minimized window draws at most 5 frames a second; set `ECLIPSE_HIDDEN_PACING=off` to measure it at full rate, as `tools/perf/measure.py` does.
 
+To list the Android framework classes, methods and fields a Roblox build references that Eclipse's framework lacks, run `tools/framework-coverage/scan.py --framework build/flatpak-app/files/lib/eclipse/framework --json gaps.json base.apk split_config.x86_64.apk`. The `startup` flag is a heuristic that can miss or overstate gaps: it follows code from the Application, the content providers, the launcher Activity, the classes the native libraries name and the views of layouts that code reads.
+
 ## Layout
 
 | Path | Contents |
@@ -52,6 +54,7 @@ A hidden or minimized window draws at most 5 frames a second; set `ECLIPSE_HIDDE
 | `crates/eclipse-config/` | Settings schema and config.json loading |
 | `crates/eclipse-settings/` | Settings window |
 | `tools/framework-overlay/` | Android framework patches and probes |
+| `tools/framework-coverage/` | Scanner for framework APIs the client references that Eclipse lacks |
 | `tools/perf/` | Performance measurement harness |
 | `packaging/flatpak/` | Flatpak manifest and metadata |
 
