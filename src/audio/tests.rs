@@ -245,12 +245,20 @@ fn pactl_inherits_none_of_the_clients_descriptors() {
     let dir = crate::loader::link::tests::temp_dir("pactl-descriptors");
     crate::stub_script::write(
         &dir.join(PACTL),
-        "#!/bin/sh\nshift\nfor fd; do\n  if [ -e /proc/self/fd/$fd ]; then\n    \
-         echo \"inherited fd $fd\" >&2\n    exit 1\n  fi\ndone\n",
+        "#!/bin/sh\nshift\nfor link in /proc/$$/fd/*; do\n  \
+         if [ \"$(readlink \"$link\")\" = \"$1\" ]; then\n    \
+         echo \"inherited $1 as $link\" >&2\n    exit 1\n  fi\ndone\n",
     );
-    let numbers = pipe.each_ref().map(|end| end.as_raw_fd().to_string());
-    let mut command = pactl_command(&numbers.each_ref().map(String::as_str));
-    command.env("PATH", &dir);
+    let identity = fs::read_link(format!("/proc/self/fd/{}", pipe[0].as_raw_fd()))
+        .expect("read the pipe's identity");
+    let identity = identity.to_str().expect("pipe identities are ASCII");
+    let mut command = pactl_command(&[identity]);
+    let system_path = std::env::var_os("PATH").expect("the test runs with a PATH");
+    let path = std::env::join_paths(
+        std::iter::once(dir.clone()).chain(std::env::split_paths(&system_path)),
+    )
+    .expect("join the stand-in pactl's directory to PATH");
+    command.env("PATH", path);
     let output = bounded_child::output(&mut command, Duration::from_secs(30));
     fs::remove_dir_all(&dir).expect("remove the stand-in pactl");
     assert!(

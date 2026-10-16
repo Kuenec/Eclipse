@@ -1333,10 +1333,6 @@ mod tests {
     }
 
     fn main_frame_navigations_reach_the_app_and_frame_navigations_do_not() {
-        if gtk::init().is_err() {
-            eprintln!("SKIP: no display for a WebKit view (WAYLAND_DISPLAY or DISPLAY)");
-            return;
-        }
         let site = Site::start();
         let (root, app, host) = app_with_host("navigation");
         let host = Host::listen(host);
@@ -1489,10 +1485,6 @@ mod tests {
     }
 
     fn unanswered_bridge_calls_are_limited_by_their_total_size() {
-        if gtk::init().is_err() {
-            eprintln!("SKIP: no display for a WebKit view (WAYLAND_DISPLAY or DISPLAY)");
-            return;
-        }
         let site = Site::start();
         let (root, app, host) = app_with_host("bridge-budget");
         let host = Host::listen(host);
@@ -1561,6 +1553,10 @@ mod tests {
         a_reply_too_large_to_send_reaches_the_host_as_a_failure();
         webkit_keeps_cookies_in_memory_and_hands_them_to_the_host();
         a_cookie_flood_still_reaches_the_host_in_one_snapshot();
+        if gtk::init().is_err() {
+            eprintln!("SKIP: no display for a WebKit view (WAYLAND_DISPLAY or DISPLAY)");
+            return;
+        }
         main_frame_navigations_reach_the_app_and_frame_navigations_do_not();
         unanswered_bridge_calls_are_limited_by_their_total_size();
     }
