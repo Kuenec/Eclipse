@@ -445,6 +445,10 @@ impl Upstream {
         )
     }
 
+    fn accepts_requests(&self) -> bool {
+        self.backend.flush().is_ok()
+    }
+
     fn send(&self, message: Outgoing, creates: bool) -> Result<ObjectId, InvalidId> {
         let data = creates.then(|| Arc::clone(&self.forwarded) as Arc<dyn ObjectData>);
         self.backend.send_request(message, data, None)
@@ -673,14 +677,15 @@ impl Proxy {
         if self.session.is_none() {
             return self.wait_for_control(blocked);
         }
-        let reading = !blocked && self.session.as_ref().is_some_and(Session::wants_read);
+        let backlog = blocked || self.session.as_ref().is_some_and(Session::holds_requests);
+        let reading = !backlog && self.session.as_ref().is_some_and(Session::wants_read);
         let Some(guard) = self.up.backend.prepare_read() else {
             return Ok(Flow::Continue);
         };
         let ready = {
             let upstream = guard.connection_fd();
             let mut upstream_flags = PollFlags::IN;
-            if blocked {
+            if backlog {
                 upstream_flags |= PollFlags::OUT;
             }
             let helper = self.session.as_ref().and_then(|session| {

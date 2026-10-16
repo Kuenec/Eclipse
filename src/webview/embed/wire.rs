@@ -79,6 +79,12 @@ pub(super) struct Header {
     size: usize,
 }
 
+impl Header {
+    pub(super) fn size(self) -> usize {
+        self.size
+    }
+}
+
 pub(super) struct Wire {
     stream: UnixStream,
     max_message: usize,

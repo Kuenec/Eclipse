@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +36,7 @@ use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base, xdg_wm_base::XdgWmBase,
 };
 
-use super::wire::{Args, Wire, WireError};
+use super::wire::{Args, Wire, WireError, MAX_REQUEST_SIZE};
 use super::{Connector, Embedder};
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -518,11 +518,28 @@ fn game_bind(
     )
 }
 
+fn limit_buffers_like_libwayland_1_22(backend: &Backend) {
+    let library = unsafe {
+        libloading::os::unix::Library::open(
+            Some("libwayland-client.so.0"),
+            libc::RTLD_NOW | libc::RTLD_NOLOAD,
+        )
+    }
+    .expect("libwayland-client is loaded");
+    let Ok(set_max_buffer_size) = (unsafe {
+        library.get::<unsafe extern "C" fn(*mut c_void, usize)>(b"wl_display_set_max_buffer_size\0")
+    }) else {
+        return;
+    };
+    unsafe { set_max_buffer_size(backend.display_ptr().cast(), MAX_REQUEST_SIZE) };
+}
+
 impl Game {
     pub(crate) fn start() -> Self {
         let (client, server) = UnixStream::pair().expect("socketpair");
         let mut compositor = Compositor::start(server);
         let backend = Backend::connect(client).expect("libwayland-client");
+        limit_buffers_like_libwayland_1_22(&backend);
         let registry = game_request(
             &backend,
             backend.display_id(),
@@ -1487,20 +1504,24 @@ fn damage_until_unread(helper: &mut Helper, surface: u32) -> usize {
                 )
                 .expect("encode a damage request");
         }
-        let deadline = Instant::now() + QUIET;
-        helper.wire.flush().expect("send damage");
-        while helper.wire.wants_write() && Instant::now() < deadline {
-            let fd = helper.wire.fd();
-            let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
-            let _ = poll(&mut fds, Some(&Timespec::try_from(QUIET).expect("timeout")));
-            helper.wire.flush().expect("send damage");
-        }
+        send_pending(helper, QUIET);
         if helper.wire.wants_write() {
             break;
         }
         sent += BATCH * DAMAGE_SIZE;
     }
     sent
+}
+
+fn send_pending(helper: &mut Helper, within: Duration) {
+    let deadline = Instant::now() + within;
+    helper.wire.flush().expect("send the helper's requests");
+    while helper.wire.wants_write() && Instant::now() < deadline {
+        let fd = helper.wire.fd();
+        let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
+        let _ = poll(&mut fds, Some(&Timespec::try_from(QUIET).expect("timeout")));
+        helper.wire.flush().expect("send the helper's requests");
+    }
 }
 
 #[test]
@@ -1518,9 +1539,89 @@ fn a_compositor_that_stops_reading_stops_the_proxy_reading_the_helper() {
     game.compositor.stall(false);
     assert!(
         sent < FLOOD_LIMIT / 4,
-        "the helper pushed {sent} bytes into the game's unbounded libwayland buffer while the \
-         compositor read nothing"
+        "the proxy took {sent} bytes from the helper while the compositor read nothing"
     );
+}
+
+#[test]
+fn requests_held_back_from_a_stalled_compositor_reach_it_once_it_reads_again() {
+    let mut game = Game::start();
+    let mut helper = game.helper();
+    let (registry, _) = helper.registry();
+    let compositor = helper.bind(registry, 1, WlCompositor::interface(), 6);
+    let surface = new_surface(&mut helper, compositor);
+    game.compositor
+        .created("wl_compositor", "create_surface", 1);
+
+    game.compositor.stall(true);
+    damage_until_unread(&mut helper, surface);
+    let callback = helper.create(wl_callback::WlCallback::interface(), 1);
+    helper
+        .wire
+        .push(
+            1,
+            wl_display::REQ_SYNC_OPCODE,
+            vec![Argument::NewId(callback)],
+        )
+        .expect("encode a sync");
+    game.compositor.stall(false);
+    send_pending(&mut helper, WAIT);
+    helper.wait_for("the sync queued behind the held damage", |event| {
+        event.object == callback && event.message == "done"
+    });
+}
+
+#[test]
+fn a_burst_of_file_descriptors_for_a_stalled_compositor_leaves_the_game_connection_working() {
+    const POOLS: usize = 120;
+    let mut game = Game::start();
+    rustix::net::sockopt::set_socket_send_buffer_size(game.backend.poll_fd(), 0)
+        .expect("shrink the game's socket");
+    let mut helper = game.helper();
+    let (registry, _) = helper.registry();
+    let shm = helper.bind(registry, 3, WlShm::interface(), 1);
+    let file = shm_file(4096);
+    game.compositor.stall(true);
+    std::thread::sleep(QUIET);
+
+    let control = Arc::clone(&game.connector.control);
+    let paused = control.requests();
+    rustix::io::write(&control.wake, &1u64.to_ne_bytes()).expect("wake the proxy");
+    for _ in 0..POOLS {
+        let pool = helper.create(wl_shm_pool::WlShmPool::interface(), 1);
+        let copy = file.try_clone().expect("share the pool file");
+        helper
+            .wire
+            .push(
+                shm,
+                wl_shm::REQ_CREATE_POOL_OPCODE,
+                vec![
+                    Argument::NewId(pool),
+                    Argument::Fd(copy),
+                    Argument::Int(4096),
+                ],
+            )
+            .expect("encode a pool");
+        helper
+            .wire
+            .push(pool, wl_shm_pool::REQ_DESTROY_OPCODE, Vec::new())
+            .expect("encode its destruction");
+    }
+    send_pending(&mut helper, WAIT);
+    drop(paused);
+    std::thread::sleep(QUIET);
+
+    game.compositor.stall(false);
+    let callback = helper.create(wl_callback::WlCallback::interface(), 1);
+    helper.request(
+        1,
+        wl_display::REQ_SYNC_OPCODE,
+        vec![Argument::NewId(callback)],
+    );
+    helper.wait_for("the sync after the burst", |event| {
+        event.object == callback && event.message == "done"
+    });
+    assert_eq!(game.compositor.saw("wl_shm", "create_pool").len(), POOLS);
 }
 
 fn dmabuf_with_formats(helper: &mut Helper, registry: u32) -> u32 {
