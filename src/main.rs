@@ -2730,7 +2730,7 @@ fn preload_app_native_libs(
     report_preloaded(&engine);
     loaded.push(engine);
 
-    let filenames = apk.native_lib_filenames(TARGET_ABI);
+    let filenames = apk.native_lib_filenames(TARGET_ABI)?;
     println!(
         "# Pre-loading {} other x86_64 JNI lib(s) via the Rust loader (tolerant of per-lib failure)…",
         filenames.iter().filter(|f| *f != ENGINE_LIB).count()

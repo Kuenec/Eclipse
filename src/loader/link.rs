@@ -1752,7 +1752,9 @@ pub(crate) mod tests {
         };
 
         let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
-        let filenames = apk.native_lib_filenames(crate::apk::TARGET_ABI);
+        let filenames = apk
+            .native_lib_filenames(crate::apk::TARGET_ABI)
+            .expect("list the Roblox APK's native libs");
         let boot_path_libs: Vec<&String> = filenames
             .iter()
             .filter(|f| {

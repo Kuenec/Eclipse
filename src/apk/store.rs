@@ -1222,30 +1222,29 @@ impl Staging<'_> {
             path: bundle.to_path_buf(),
             source,
         })?;
-        let mut archive = ZipArchive::new(BufReader::new(file)).map_err(|source| {
-            StoreError::UnreadableBundle {
-                path: bundle.to_path_buf(),
-                source,
+        let unreadable = |source| StoreError::UnreadableBundle {
+            path: bundle.to_path_buf(),
+            source,
+        };
+        let mut archive = ZipArchive::new(BufReader::new(file)).map_err(unreadable)?;
+        let mut members = Vec::new();
+        for index in 0..archive.len() {
+            let entry = archive.by_index_data(index).map_err(unreadable)?;
+            if let Some(role) = bundle_member_role(&entry.name().map_err(unreadable)?) {
+                members.push((index, role));
             }
-        })?;
-        let members: Vec<(String, StagedFile)> = archive
-            .file_names()
-            .filter_map(|name| bundle_member_role(name).map(|role| (name.to_owned(), role)))
-            .collect();
+        }
         if !members.iter().any(|(_, role)| *role == StagedFile::Base) {
             return Err(StoreError::BundleMissingBase(bundle.to_path_buf()));
         }
-        for (name, role) in &members {
-            let mut entry = archive.by_name(name).map_err(|source| match source {
+        for (index, role) in members {
+            let mut entry = archive.by_index(index).map_err(|source| match source {
                 ZipError::UnsupportedArchive(message) if message == ZipError::PASSWORD_REQUIRED => {
                     StoreError::EncryptedBundle(bundle.to_path_buf())
                 }
-                source => StoreError::UnreadableBundle {
-                    path: bundle.to_path_buf(),
-                    source,
-                },
+                source => unreadable(source),
             })?;
-            self.write_staged(*role, bundle, &mut entry)?;
+            self.write_staged(role, bundle, &mut entry)?;
         }
         Ok(())
     }
@@ -2183,6 +2182,25 @@ mod tests {
     }
 
     #[test]
+    fn a_bundle_member_under_a_directory_whose_name_is_not_utf8_is_staged() {
+        let root = temp_root("bundle-cp437");
+        let sources = temp_root("bundle-cp437-sources");
+        let base = synthetic_apk(None, false);
+        let mut bundle = zip_of(&[("#/base.apk", &base)], stored());
+        crate::apk::tests::rename_zip_entry(&mut bundle, "#/base.apk", b"\x80/base.apk");
+        fs::write(sources.join("roblox.apkm"), bundle).unwrap();
+
+        let store = Store::at(root.clone());
+        let staging = store.begin(&StatusSink::terminal()).unwrap();
+        staging.add_source(&sources.join("roblox.apkm")).unwrap();
+
+        assert_eq!(entries(staging.dir()), [BASE_APK]);
+        assert_eq!(fs::read(staging.dir().join(BASE_APK)).unwrap(), base);
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&sources).ok();
+    }
+
+    #[test]
     fn unusable_bundles_are_typed_errors() {
         let root = temp_root("bad-bundles");
         let sources = temp_root("bad-bundle-sources");
@@ -2305,6 +2323,7 @@ mod tests {
         assert!(repaired
             .native_libs_mut()
             .native_lib_filenames(crate::apk::TARGET_ABI)
+            .expect("list native libs")
             .iter()
             .any(|name| name == crate::apk::ENGINE_LIB));
         drop(repaired);

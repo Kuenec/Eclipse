@@ -18776,7 +18776,7 @@ mod tests {
         let arsc = build_arsc_package(0x01);
         let apk_bytes = {
             let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("resources.arsc", opts).expect("zip entry");
             zw.write_all(&arsc).expect("write arsc");

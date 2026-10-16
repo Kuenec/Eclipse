@@ -144,6 +144,7 @@ fn extracted_entry_matches(path: &Path, size: u64, crc32: u32) -> io::Result<boo
 }
 
 struct PlannedEntry {
+    index: usize,
     name: String,
     dest: PathBuf,
     size: u64,
@@ -484,17 +485,20 @@ impl Apk {
         })
     }
 
-    pub fn native_lib_filenames(&self, abi: &str) -> Vec<String> {
+    pub fn native_lib_filenames(&self, abi: &str) -> Result<Vec<String>, ApkError> {
         let prefix = format!("lib/{abi}/");
-        let mut names: Vec<String> = self
-            .archive
-            .file_names()
-            .filter_map(|n| n.strip_prefix(&prefix))
-            .filter(|rest| !rest.is_empty() && !rest.contains('/') && rest.ends_with(".so"))
-            .map(str::to_owned)
-            .collect();
+        let mut names = Vec::new();
+        for name in self.archive.file_names() {
+            let name = name?;
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if !rest.is_empty() && !rest.contains('/') && rest.ends_with(".so") {
+                names.push(rest.to_owned());
+            }
+        }
         names.sort();
-        names
+        Ok(names)
     }
 
     pub fn x86_64_engine(&mut self) -> Result<X8664Engine, ApkError> {
@@ -529,23 +533,21 @@ impl Apk {
     ) -> Result<usize, ApkError> {
         let prefix = format!("lib/{abi}/");
 
-        let names: Vec<String> = self
-            .archive
-            .file_names()
-            .filter(|n| n.starts_with(&prefix) && n.ends_with(".so"))
-            .map(str::to_owned)
-            .collect();
-        let mut planned = Vec::with_capacity(names.len());
-        for name in names {
-            let base = name.rsplit('/').next().unwrap_or(name.as_str());
+        let mut planned = Vec::new();
+        for index in 0..self.archive.len() {
+            let entry = self.archive.by_index_data(index)?;
+            let name = entry.name()?;
+            if !name.starts_with(&prefix) || !name.ends_with(".so") {
+                continue;
+            }
+            let base = name.rsplit('/').next().unwrap_or(&name);
             let dest = dest_dir.join(base);
-            let entry = self.archive.by_name(&name)?;
-            let (size, crc32) = (entry.size(), entry.crc32());
             planned.push(PlannedEntry {
-                name,
+                index,
+                name: name.into_owned(),
                 dest,
-                size,
-                crc32,
+                size: entry.size(),
+                crc32: entry.crc32(),
             });
         }
         self.extract_planned(dest_dir, &planned, UnplannedEntries::Keep, status)
@@ -558,15 +560,13 @@ impl Apk {
     ) -> Result<usize, ApkError> {
         const PREFIX: &str = "assets/";
 
-        let names: Vec<String> = self
-            .archive
-            .file_names()
-            .filter(|n| n.starts_with(PREFIX) && !n.ends_with('/'))
-            .map(str::to_owned)
-            .collect();
-        let mut planned = Vec::with_capacity(names.len());
-        for name in names {
-            let entry = self.archive.by_name(&name)?;
+        let mut planned = Vec::new();
+        for index in 0..self.archive.len() {
+            let entry = self.archive.by_index_data(index)?;
+            let name = entry.name()?;
+            if !name.starts_with(PREFIX) || name.ends_with('/') {
+                continue;
+            }
 
             let Some(safe) = entry.enclosed_name() else {
                 continue;
@@ -592,12 +592,12 @@ impl Apk {
                 .into());
             }
             let dest = dest_dir.join(rel);
-            let (size, crc32) = (entry.size(), entry.crc32());
             planned.push(PlannedEntry {
-                name,
+                index,
+                name: name.into_owned(),
                 dest,
-                size,
-                crc32,
+                size: entry.size(),
+                crc32: entry.crc32(),
             });
         }
         self.extract_planned(dest_dir, &planned, UnplannedEntries::Remove, status)
@@ -665,7 +665,7 @@ impl Apk {
         if let Some(parent) = planned.dest.parent() {
             std::fs::create_dir_all(parent).map_err(|error| io_context(error, "create", parent))?;
         }
-        let mut entry = self.archive.by_name(&planned.name)?;
+        let mut entry = self.archive.by_index(planned.index)?;
         let mut out =
             File::create(temporary).map_err(|error| io_context(error, "create", temporary))?;
         io::copy(&mut entry, &mut out).map_err(|error| {
@@ -683,7 +683,7 @@ impl Apk {
     }
 
     fn manifest_bytes(&mut self) -> Result<Vec<u8>, ApkError> {
-        let entry = match self.archive.by_name(MANIFEST_ENTRY) {
+        let mut entry = match self.archive.by_name(MANIFEST_ENTRY) {
             Ok(entry) => entry,
             Err(zip::result::ZipError::FileNotFound) => {
                 return Err(ApkError::EntryMissing(MANIFEST_ENTRY.to_owned()));
@@ -695,10 +695,9 @@ impl Apk {
             return Err(ApkError::ManifestTooLarge(declared));
         }
         let mut bytes = Vec::with_capacity(declared as usize);
-        entry.take(declared + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > declared {
-            return Err(ApkError::ManifestLongerThanDeclared(declared));
-        }
+        entry.read_to_end(&mut bytes).map_err(|error| {
+            io_context(error, &format!("read {MANIFEST_ENTRY} from"), &self.path)
+        })?;
         Ok(bytes)
     }
 
@@ -713,7 +712,9 @@ impl Apk {
 
         let cap = entry.size().min(READ_ENTRY_PREALLOC_CAP) as usize;
         let mut buf = Vec::with_capacity(cap);
-        entry.read_to_end(&mut buf)?;
+        entry
+            .read_to_end(&mut buf)
+            .map_err(|error| io_context(error, &format!("read {name} from"), &self.path))?;
         Ok(buf)
     }
 
@@ -1089,8 +1090,6 @@ pub enum ApkError {
     EngineMissing,
 
     ManifestTooLarge(u64),
-
-    ManifestLongerThanDeclared(u64),
 }
 
 impl fmt::Display for ApkError {
@@ -1114,10 +1113,6 @@ impl fmt::Display for ApkError {
                 "{MANIFEST_ENTRY} declares {declared} bytes, more than the {MAX_MANIFEST_BYTES} \
                  bytes Eclipse reads from an APK"
             ),
-            Self::ManifestLongerThanDeclared(declared) => write!(
-                f,
-                "{MANIFEST_ENTRY} inflates past the {declared} bytes its zip entry declares"
-            ),
         }
     }
 }
@@ -1131,8 +1126,7 @@ impl std::error::Error for ApkError {
             Self::EntryMissing(_)
             | Self::EntryOffsetUnknown(_)
             | Self::EngineMissing
-            | Self::ManifestTooLarge(_)
-            | Self::ManifestLongerThanDeclared(_) => None,
+            | Self::ManifestTooLarge(_) => None,
         }
     }
 }
@@ -1342,6 +1336,32 @@ mod tests {
             writer.write_all(bytes).expect("write_all");
         }
         writer.finish().expect("finish").into_inner()
+    }
+
+    pub(super) fn rename_zip_entry(zip: &mut [u8], name: &str, raw_name: &[u8]) {
+        assert_eq!(name.len(), raw_name.len(), "{name} keeps its length");
+        let starts: Vec<usize> = zip
+            .windows(name.len())
+            .enumerate()
+            .filter_map(|(start, window)| (window == name.as_bytes()).then_some(start))
+            .collect();
+        assert_eq!(
+            starts.len(),
+            2,
+            "{name} is in its local header and in the central directory"
+        );
+        for start in starts {
+            zip[start..start + raw_name.len()].copy_from_slice(raw_name);
+        }
+    }
+
+    fn understate_first_entry_size(zip: &mut [u8], declared: u32) {
+        zip[22..26].copy_from_slice(&declared.to_le_bytes());
+        let central = zip
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .expect("a central directory header");
+        zip[central + 24..central + 28].copy_from_slice(&declared.to_le_bytes());
     }
 
     fn temp_file(tag: &str, bytes: &[u8]) -> PathBuf {
@@ -1731,7 +1751,9 @@ mod tests {
             ("classes.dex", b"dex"),
         ]);
         let (apk, path) = open_apk(&bytes, "lib-filenames");
-        let names = apk.native_lib_filenames("x86_64");
+        let names = apk
+            .native_lib_filenames("x86_64")
+            .expect("list native libs");
         std::fs::remove_file(&path).ok();
         assert_eq!(
             names,
@@ -1744,7 +1766,10 @@ mod tests {
 
         let java_only = build_apk(&[(MANIFEST_ENTRY, FIXTURE_MANIFEST), ("classes.dex", b"dex")]);
         let (apk2, p2) = open_apk(&java_only, "lib-filenames-empty");
-        assert!(apk2.native_lib_filenames("x86_64").is_empty());
+        assert!(apk2
+            .native_lib_filenames("x86_64")
+            .expect("list native libs")
+            .is_empty());
         std::fs::remove_file(&p2).ok();
     }
 
@@ -1901,7 +1926,9 @@ mod tests {
         let dest = Path::new("/extracted/assets");
         let planned: Vec<PlannedEntry> = ["top.bin", "a/one.bin", "a/b/two.bin", "a/b/three.bin"]
             .into_iter()
-            .map(|name| PlannedEntry {
+            .enumerate()
+            .map(|(index, name)| PlannedEntry {
+                index,
                 name: format!("assets/{name}"),
                 dest: dest.join(name),
                 size: 1,
@@ -1961,6 +1988,28 @@ mod tests {
             .expect("re-extract assets");
         assert_eq!(again, 0, "idempotent re-extract writes 0 files");
 
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&apk_path).ok();
+    }
+
+    #[test]
+    fn extract_assets_writes_an_entry_whose_name_is_not_utf8() {
+        let mut bytes = build_apk(&[("assets/ok.txt", b"OK"), ("assets/#.bin", b"CP437")]);
+        rename_zip_entry(&mut bytes, "assets/#.bin", b"assets/\x80.bin");
+        let (mut apk, apk_path) = open_apk(&bytes, "extract-cp437");
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-extract-cp437-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let count = apk
+            .extract_assets(&dir, &StatusSink::terminal())
+            .expect("extract assets");
+
+        assert_eq!(count, 2);
+        assert_eq!(std::fs::read(dir.join("ok.txt")).unwrap(), b"OK");
+        assert_eq!(std::fs::read(dir.join("\u{c7}.bin")).unwrap(), b"CP437");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&apk_path).ok();
     }
@@ -2478,23 +2527,35 @@ mod tests {
 
     #[test]
     fn package_info_rejects_a_manifest_longer_than_its_declared_size() {
-        const DECLARED: u32 = 16;
         let payload = vec![0u8; 8 * 1024];
         let mut bytes =
             build_apk_methods(&[(MANIFEST_ENTRY, &payload, CompressionMethod::Deflated)]);
-        bytes[22..26].copy_from_slice(&DECLARED.to_le_bytes());
-        let central = bytes
-            .windows(4)
-            .position(|window| window == b"PK\x01\x02")
-            .expect("a central directory header");
-        bytes[central + 24..central + 28].copy_from_slice(&DECLARED.to_le_bytes());
+        understate_first_entry_size(&mut bytes, 16);
         let (mut apk, path) = open_apk(&bytes, "manifest-understated");
         let info = apk.package_info();
         std::fs::remove_file(&path).ok();
-        assert!(
-            matches!(info, Err(ApkError::ManifestLongerThanDeclared(16))),
-            "got {info:?}"
-        );
+        let Err(ApkError::Io(error)) = &info else {
+            panic!("got {info:?}");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        let context = format!("read {MANIFEST_ENTRY} from {}", path.display());
+        assert!(error.to_string().contains(&context), "{error}");
+    }
+
+    #[test]
+    fn read_entry_names_the_entry_and_apk_when_the_entry_is_longer_than_declared() {
+        let payload = vec![0u8; 8 * 1024];
+        let mut bytes = build_apk_methods(&[("res.bin", &payload, CompressionMethod::Deflated)]);
+        understate_first_entry_size(&mut bytes, 16);
+        let (mut apk, path) = open_apk(&bytes, "entry-understated");
+        let read = apk.read_entry("res.bin");
+        std::fs::remove_file(&path).ok();
+        let Err(ApkError::Io(error)) = &read else {
+            panic!("got {read:?}");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        let context = format!("read res.bin from {}", path.display());
+        assert!(error.to_string().contains(&context), "{error}");
     }
 
     #[test]
@@ -2762,10 +2823,16 @@ mod tests {
         assert_eq!(set.base_path(), dir.join(BASE_APK));
         assert_eq!(set.native_libs_path(), dir.join(NATIVE_SPLIT_APK));
         assert_eq!(
-            set.native_libs_mut().native_lib_filenames(TARGET_ABI),
+            set.native_libs_mut()
+                .native_lib_filenames(TARGET_ABI)
+                .expect("list native libs"),
             vec![ENGINE_LIB.to_string()]
         );
-        assert!(set.base_mut().native_lib_filenames(TARGET_ABI).is_empty());
+        assert!(set
+            .base_mut()
+            .native_lib_filenames(TARGET_ABI)
+            .expect("list native libs")
+            .is_empty());
         drop(set);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2977,6 +3044,7 @@ mod tests {
         assert!(set
             .native_libs_mut()
             .native_lib_filenames(TARGET_ABI)
+            .expect("list native libs")
             .iter()
             .any(|name| name == ENGINE_LIB));
 
