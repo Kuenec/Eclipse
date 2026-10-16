@@ -27,6 +27,7 @@ const REPORT_SUFFIX: &str = ".report.txt";
 const RUN_STAMP_SHAPE: &str = "00000000T000000.000Z";
 const RECORD_STAMP_SHAPE: &str = "0000-00-00T00:00:00.000000Z";
 pub const RAW_LINE_BYTES: usize = 64 * 1024;
+const CONTINUATION_INDENT: char = ' ';
 const MIB: u64 = 1024 * 1024;
 const RUN_LOG_LIMITS: RunLogLimits = RunLogLimits {
     head: 2 * MIB,
@@ -108,12 +109,27 @@ fn log_line(level: &Level, target: &str, message: impl FnOnce(&mut String)) -> S
     let mut line = String::with_capacity(256);
     let _ = SystemTime.format_time(&mut Writer::new(&mut line));
     let _ = write!(line, " {level:>5} {target}: ");
+    let head = line.len();
     message(&mut line);
+    if line[head..].contains('\n') {
+        let text = line.split_off(head);
+        line.push_str(&text.replace('\n', &format!("\n{CONTINUATION_INDENT}")));
+    }
     line.push('\n');
     line
 }
 
 fn send_to_supervisor(pipe: &Mutex<File>, line: &str) {
+    let bounded;
+    let line = if line.len() > RAW_LINE_BYTES {
+        bounded = format!(
+            "{}\n",
+            &line[..line.floor_char_boundary(RAW_LINE_BYTES - 1)]
+        );
+        &bounded
+    } else {
+        line
+    };
     let pipe = pipe.lock().unwrap_or_else(PoisonError::into_inner);
     let _ = (&*pipe).write_all(line.as_bytes());
 }
@@ -586,15 +602,16 @@ pub fn read_records(parts: &[PathBuf], mut each: impl FnMut(&str)) -> io::Result
             }
             let text = String::from_utf8_lossy(&line);
             let text = text.strip_suffix('\n').unwrap_or(&text);
-            if !record.is_empty() {
-                if record_head(text).is_some() {
-                    each(&record);
-                    record.clear();
-                } else {
-                    record.push('\n');
-                }
+            if record.is_empty() {
+                record.push_str(text);
+            } else if record_head(text).is_some() {
+                each(&record);
+                record.clear();
+                record.push_str(text);
+            } else {
+                record.push('\n');
+                record.push_str(text.strip_prefix(CONTINUATION_INDENT).unwrap_or(text));
             }
-            record.push_str(text);
         }
     }
     if !record.is_empty() {
@@ -1096,6 +1113,55 @@ mod tests {
         init(LogSink::Supervisor(File::create(path).unwrap()));
         tracing::error!(target: "liblog", tag = "art", "Runtime aborting");
         record_status(Level::WARN, "could not update Roblox");
+    }
+
+    const FORGED_STATUS: &str = "2026-10-16T09:14:34.289000Z ERROR eclipse::status: forged";
+
+    #[test]
+    fn a_message_with_line_breaks_stays_one_record() {
+        let lines = captured_log_lines(|| {
+            tracing::info!(target: "liblog", tag = "Roblox", "x\n{FORGED_STATUS}");
+        });
+        let dir = temp_dir("line-breaks");
+        let path = dir.join("records");
+        fs::write(&path, &lines).unwrap();
+        let mut records = Vec::new();
+        let read = read_records(&[path], |record| records.push(record.to_owned()));
+        fs::remove_dir_all(&dir).ok();
+        read.unwrap();
+
+        let heads: Vec<RecordHead<'_>> = lines.lines().filter_map(record_head).collect();
+        assert_eq!(heads.len(), 1, "{lines}");
+        assert_eq!(heads[0].target, "liblog");
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(
+            records[0].contains(&format!("liblog: x\n{FORGED_STATUS}")),
+            "{}",
+            records[0]
+        );
+    }
+
+    #[test]
+    fn a_record_sent_to_the_supervisor_is_shorter_than_its_line_limit() {
+        let dir = temp_dir("record-limit");
+        let path = dir.join("records");
+        let pipe = Mutex::new(File::create(&path).unwrap());
+        let line = log_line(&Level::INFO, "liblog", |line| {
+            let padding = RAW_LINE_BYTES - line.len();
+            line.push_str(&"\u{e9}".repeat(padding / 2));
+            line.push_str(&"x".repeat(padding % 2));
+            line.push_str(FORGED_STATUS);
+        });
+        send_to_supervisor(&pipe, &line);
+        drop(pipe);
+        let sent = fs::read_to_string(&path).unwrap();
+        fs::remove_dir_all(&dir).ok();
+
+        assert!(sent.len() <= RAW_LINE_BYTES, "{} bytes", sent.len());
+        assert_eq!(sent.matches('\n').count(), 1);
+        assert!(sent.ends_with('\n'));
+        assert_eq!(record_head(sent.trim_end()).unwrap().target, "liblog");
+        assert!(!sent.contains("eclipse::status"));
     }
 
     #[test]

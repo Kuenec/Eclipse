@@ -2189,4 +2189,48 @@ mod tests {
         assert_eq!(LoadError::BadUrl.android_code(), -12);
         assert_eq!(LoadError::FileNotFound.android_code(), -14);
     }
+
+    #[test]
+    fn mutated_streams_fail_or_decode_messages_that_round_trip() {
+        let consumer: Vec<u8> = all_consumer_msgs()
+            .iter()
+            .flat_map(|msg| msg.encode().expect("encode"))
+            .collect();
+        let helper: Vec<u8> = all_helper_msgs()
+            .iter()
+            .flat_map(|msg| msg.encode().expect("encode"))
+            .collect();
+        let jar = encode_cookies(&[
+            a_cookie("session", CookieExpiry::Session),
+            a_cookie(
+                "persistent",
+                CookieExpiry::At {
+                    epoch_s: 1_900_000_000,
+                },
+            ),
+        ])
+        .expect("encode");
+        let mut mutations = crate::mutation::Mutations::new(0x9a7e_57ad);
+        for _ in 0..3000 {
+            let bytes = mutations.of(&consumer);
+            let _ = consumer_frame_len(&bytes);
+            let mut stream = bytes.as_slice();
+            while let Ok(msg) = read_consumer_msg(&mut stream) {
+                let encoded = msg.encode().expect("a decoded message encodes");
+                assert_eq!(read_consumer_msg(&mut encoded.as_slice()), Ok(msg));
+            }
+
+            let bytes = mutations.of(&helper);
+            let mut stream = bytes.as_slice();
+            while let Ok(msg) = read_helper_msg(&mut stream) {
+                let encoded = msg.encode().expect("a decoded message encodes");
+                assert_eq!(read_helper_msg(&mut encoded.as_slice()), Ok(msg));
+            }
+
+            if let Ok(cookies) = decode_cookies(&mutations.of(&jar)) {
+                let encoded = encode_cookies(&cookies).expect("decoded cookies encode");
+                assert_eq!(decode_cookies(&encoded), Ok(cookies));
+            }
+        }
+    }
 }

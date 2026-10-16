@@ -21,7 +21,7 @@ const MAX_PATH_BYTES: usize = 1024;
 
 const MAX_DOMAIN_BYTES: usize = 253;
 
-const MAX_COOKIES_PER_DOMAIN: usize = 180;
+const MAX_COOKIES_PER_SITE: usize = 180;
 
 const MAX_COOKIES: usize = 1000;
 
@@ -102,6 +102,10 @@ fn domain_key(cookie: &StoredCookie) -> &str {
     cookie.domain.strip_prefix('.').unwrap_or(&cookie.domain)
 }
 
+fn exact_site(domain: &str) -> &str {
+    domain
+}
+
 fn admissible(cookie: &StoredCookie) -> bool {
     !cookie.name.is_empty()
         && !cookie.domain.is_empty()
@@ -130,13 +134,73 @@ fn without_duplicate_keys(cookies: Vec<StoredCookie>) -> Vec<StoredCookie> {
     kept
 }
 
+fn site_allowances<'a>(sites: &[&'a str]) -> HashMap<&'a str, usize> {
+    let mut arrival: Vec<&str> = Vec::new();
+    let mut allowed: HashMap<&str, usize> = HashMap::new();
+    for &site in sites {
+        let count = allowed.entry(site).or_insert_with(|| {
+            arrival.push(site);
+            0
+        });
+        *count = (*count + 1).min(MAX_COOKIES_PER_SITE);
+    }
+    if allowed.values().sum::<usize>() <= MAX_COOKIES {
+        return allowed;
+    }
+    let kept_at = |level: usize| {
+        allowed
+            .values()
+            .map(|&count| count.min(level))
+            .sum::<usize>()
+    };
+    let levels: Vec<usize> = (0..MAX_COOKIES_PER_SITE).collect();
+    let level = levels.partition_point(|&level| kept_at(level) <= MAX_COOKIES) - 1;
+    let mut spare = MAX_COOKIES - kept_at(level);
+    for site in arrival {
+        let count = allowed
+            .get_mut(site)
+            .expect("every site that arrived has an allowance");
+        let extra = usize::from(*count > level && spare > 0);
+        spare -= extra;
+        *count = (*count).min(level) + extra;
+    }
+    allowed
+}
+
+fn kept_within_limits(cookies: &[StoredCookie], site_of: impl Fn(&str) -> &str) -> Vec<bool> {
+    let sites: Vec<&str> = cookies
+        .iter()
+        .map(|cookie| site_of(domain_key(cookie)))
+        .collect();
+    let mut left = site_allowances(&sites);
+    let mut keep = vec![false; sites.len()];
+    for (position, site) in sites.iter().enumerate().rev() {
+        let left = left.get_mut(site).expect("every site has an allowance");
+        if *left > 0 {
+            *left -= 1;
+            keep[position] = true;
+        }
+    }
+    keep
+}
+
+pub fn within_limits(
+    cookies: Vec<StoredCookie>,
+    now: SystemTime,
+    site_of: impl Fn(&str) -> &str,
+) -> Vec<StoredCookie> {
+    let mut jar = CookieJar {
+        cookies: without_duplicate_keys(cookies.into_iter().filter(admissible).collect()),
+    };
+    jar.enforce_limits(unix_seconds(now), site_of);
+    jar.cookies
+}
+
 impl CookieJar {
     pub fn from_cookies(cookies: Vec<StoredCookie>, now: SystemTime) -> Self {
-        let mut jar = Self {
-            cookies: without_duplicate_keys(cookies.into_iter().filter(admissible).collect()),
-        };
-        jar.enforce_limits(unix_seconds(now));
-        jar
+        Self {
+            cookies: within_limits(cookies, now, exact_site),
+        }
     }
 
     pub fn set_from_header(
@@ -167,7 +231,7 @@ impl CookieJar {
                 true
             }
         };
-        let evicted = self.enforce_limits(now_s);
+        let evicted = self.enforce_limits(now_s, exact_site);
         Ok(changed || evicted)
     }
 
@@ -224,7 +288,7 @@ impl CookieJar {
                 .map(|(cookie, _)| cookie.clone()),
         );
         let mut replaced = Self { cookies: next };
-        replaced.enforce_limits(unix_seconds(now));
+        replaced.enforce_limits(unix_seconds(now), exact_site);
         let changed = replaced != *self;
         *self = replaced;
         changed
@@ -243,22 +307,10 @@ impl CookieJar {
         proto::encode_cookies(&self.cookies)
     }
 
-    fn enforce_limits(&mut self, now_s: i64) -> bool {
+    fn enforce_limits(&mut self, now_s: i64, site_of: impl Fn(&str) -> &str) -> bool {
         let before = self.cookies.len();
         self.cookies.retain(|cookie| !is_expired(cookie, now_s));
-        let mut keep = vec![true; self.cookies.len()];
-        let mut per_domain: HashMap<&str, usize> = HashMap::new();
-        let mut kept = 0;
-        for (position, cookie) in self.cookies.iter().enumerate().rev() {
-            let in_domain = per_domain.entry(domain_key(cookie)).or_insert(0);
-            *in_domain += 1;
-            if *in_domain > MAX_COOKIES_PER_DOMAIN || kept == MAX_COOKIES {
-                keep[position] = false;
-            } else {
-                kept += 1;
-            }
-        }
-        let mut keep = keep.into_iter();
+        let mut keep = kept_within_limits(&self.cookies, site_of).into_iter();
         self.cookies.retain(|_| keep.next().unwrap_or(false));
         self.cookies.len() != before
     }
@@ -917,14 +969,14 @@ mod tests {
     }
 
     #[test]
-    fn a_full_domain_and_a_full_jar_evict_their_oldest_cookies() {
+    fn a_full_site_and_a_full_jar_evict_their_oldest_cookies() {
         let mut jar = CookieJar::default();
         set(
             &mut jar,
             "https://www.roblox.com/",
             "expired-soon=1; Max-Age=1",
         );
-        for index in 0..MAX_COOKIES_PER_DOMAIN - 1 {
+        for index in 0..MAX_COOKIES_PER_SITE - 1 {
             set(&mut jar, "https://www.roblox.com/", &format!("c{index}=1"));
         }
         let later = at(NOW_S + 5);
@@ -933,16 +985,16 @@ mod tests {
             Ok(true)
         );
         let sent = jar.matching("https://www.roblox.com/", later);
-        assert_eq!(sent.len(), MAX_COOKIES_PER_DOMAIN);
+        assert_eq!(sent.len(), MAX_COOKIES_PER_SITE);
         assert_eq!(sent[0].name, "c0", "the expired cookie went first");
         jar.set_from_header("https://www.roblox.com/", "newer=1", later)
             .expect("accepted");
         let sent = jar.matching("https://www.roblox.com/", later);
-        assert_eq!(sent.len(), MAX_COOKIES_PER_DOMAIN);
+        assert_eq!(sent.len(), MAX_COOKIES_PER_SITE);
         assert_eq!(
             (
                 sent[0].name.as_str(),
-                sent[MAX_COOKIES_PER_DOMAIN - 1].name.as_str()
+                sent[MAX_COOKIES_PER_SITE - 1].name.as_str()
             ),
             ("c1", "newer"),
             "then the oldest cookie of the full domain"
@@ -958,9 +1010,87 @@ mod tests {
         }
         let all = jar.all_unexpired(now());
         assert_eq!(all.len(), MAX_COOKIES);
-        assert_eq!(all[0].name, "c1", "the oldest cookie of a full jar goes");
+        assert_eq!(all[0].name, "c0");
+        assert!(
+            all.iter().all(|cookie| cookie.name != "c900"),
+            "the newest of the largest sites loses its oldest cookie"
+        );
         let encoded = jar.encode().expect("a full jar encodes");
         assert!(encoded.len() < proto::GLOBAL_FRAME_CAP as usize);
+    }
+
+    #[test]
+    fn a_full_jar_of_the_largest_cookies_fits_one_snapshot_frame() {
+        let name_and_value = MAX_NAME_AND_VALUE_BYTES;
+        let flood = (0..MAX_COOKIES / MAX_COOKIES_PER_SITE + 1)
+            .flat_map(|site| {
+                let domain = format!(".{}{site:03}.example", "d".repeat(MAX_DOMAIN_BYTES - 11));
+                (0..MAX_COOKIES_PER_SITE).map(move |index| {
+                    let name = format!("c{index}");
+                    StoredCookie {
+                        value: "v".repeat(name_and_value - name.len()),
+                        path: format!("/{}", "p".repeat(MAX_PATH_BYTES - 1)),
+                        expiry: CookieExpiry::At { epoch_s: i64::MAX },
+                        ..stored(&name, &domain)
+                    }
+                })
+            })
+            .collect();
+        let cookies = within_limits(flood, now(), exact_site);
+
+        assert_eq!(cookies.len(), MAX_COOKIES);
+        assert!(proto::HelperMsg::CookieSnapshot { cookies }
+            .encode()
+            .is_ok());
+    }
+
+    fn snapshots_keep_the_roblox_login(flood: Vec<StoredCookie>) {
+        let login = StoredCookie {
+            secure: true,
+            http_only: true,
+            ..stored(".ROBLOSECURITY", ".roblox.com")
+        };
+        let mut jar = CookieJar::from_cookies(vec![login.clone()], now());
+        for login_listed_first in [true, false, true, false] {
+            let mut snapshot = flood.clone();
+            if login_listed_first {
+                snapshot.insert(0, login.clone());
+            } else {
+                snapshot.push(login.clone());
+            }
+            jar.replace_all(snapshot, now());
+            assert!(jar.all_unexpired(now()).len() <= MAX_COOKIES);
+            assert_eq!(
+                names(&jar.matching("https://www.roblox.com/home", now())),
+                [".ROBLOSECURITY"],
+                "listed first: {login_listed_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn subdomains_of_one_site_cannot_evict_another_sites_login() {
+        let mut host = "attacker.example".to_string();
+        let mut flood = Vec::new();
+        for level in 0..12 {
+            host = format!("l{level}.{host}");
+            flood.extend(
+                (0..MAX_COOKIES_PER_SITE)
+                    .map(|index| stored(&format!("c{index}"), &format!(".{host}"))),
+            );
+        }
+        snapshots_keep_the_roblox_login(flood);
+    }
+
+    #[test]
+    fn many_full_sites_cannot_evict_another_sites_login() {
+        let flood = (0..12)
+            .flat_map(|site| {
+                (0..MAX_COOKIES_PER_SITE)
+                    .map(move |index| stored(&format!("c{index}"), &format!("site{site}.example")))
+            })
+            .collect();
+        snapshots_keep_the_roblox_login(flood);
     }
 
     #[test]

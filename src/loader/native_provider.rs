@@ -485,9 +485,12 @@ unsafe extern "C" fn eclipse_strncpy_chk2(
     src: *const c_char,
     n: usize,
     dst_len: usize,
-    _src_len: usize,
+    src_len: usize,
 ) -> *mut c_char {
     if n > dst_len {
+        std::process::abort();
+    }
+    if n > src_len && unsafe { libc::strnlen(src, src_len) } == src_len {
         std::process::abort();
     }
 
@@ -3528,6 +3531,69 @@ mod tests {
         assert!(!p.is_null());
 
         assert_eq!(unsafe { *p } as u8, b'c');
+    }
+
+    const STRNCPY_OVERREAD_CHILD: &str = "ECLIPSE_TEST_STRNCPY_OVERREAD_CHILD";
+
+    #[test]
+    fn strncpy_chk2_aborts_before_reading_past_its_source_buffer() {
+        if std::env::var_os(STRNCPY_OVERREAD_CHILD).is_some() {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) }, 0);
+            let backing = *b"AAAAAAAAsecr\0xyz";
+            let mut dst = [0u8; 16];
+            unsafe {
+                eclipse_strncpy_chk2(dst.as_mut_ptr().cast(), backing.as_ptr().cast(), 16, 16, 8)
+            };
+            println!("copied {:?}", String::from_utf8_lossy(&dst));
+            return;
+        }
+        use std::os::unix::process::ExitStatusExt as _;
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the test harness executable must have a path"),
+        )
+        .args([
+            "--exact",
+            "loader::native_provider::tests::strncpy_chk2_aborts_before_reading_past_its_source_buffer",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(STRNCPY_OVERREAD_CHILD, "1")
+        .output()
+        .expect("the strncpy child must start");
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "status={:?}, stdout={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn strncpy_chk2_copies_within_its_source_buffer_and_pads_with_nul() {
+        let unterminated = *b"ABCDEFGH";
+        let mut whole = [0xffu8; 8];
+        unsafe {
+            eclipse_strncpy_chk2(
+                whole.as_mut_ptr().cast(),
+                unterminated.as_ptr().cast(),
+                8,
+                8,
+                8,
+            )
+        };
+        assert_eq!(&whole, b"ABCDEFGH");
+
+        let short = *b"hi\0zzz";
+        let mut padded = [0xffu8; 12];
+        unsafe {
+            eclipse_strncpy_chk2(padded.as_mut_ptr().cast(), short.as_ptr().cast(), 12, 12, 6)
+        };
+        assert_eq!(&padded, b"hi\0\0\0\0\0\0\0\0\0\0");
     }
 
     #[test]

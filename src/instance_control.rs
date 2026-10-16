@@ -3,7 +3,9 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::os::unix::io::AsRawFd as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -27,6 +29,7 @@ const SOCKET_HASH_BYTES: usize = 8;
 const SOCKET_PATH_LIMIT: usize = 107;
 const PRIVATE_DIR_MODE: u32 = 0o700;
 const SOCKET_MODE: u32 = 0o600;
+const LOCK_MODE: u32 = 0o600;
 const SHARED_MODE_BITS: u32 = 0o077;
 const PROTOCOL_VERSION: u8 = 1;
 const MESSAGE_LIMIT: usize = 4096;
@@ -78,6 +81,7 @@ fn try_lock(path: &Path) -> Result<Option<HeldLock>, String> {
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(LOCK_MODE)
         .open(path)
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     match lock.try_lock() {
@@ -603,6 +607,10 @@ pub(crate) fn socket_test_root(tag: &str) -> PathBuf {
         .unwrap_or_else(|error| panic!("cannot create {}: {error}", root.display()));
     root
 }
+
+#[cfg(test)]
+#[path = "../tests/support/mutation.rs"]
+mod mutation;
 
 #[cfg(test)]
 mod tests {
@@ -1403,5 +1411,30 @@ mod tests {
         let status = child.0.wait().unwrap();
         assert!(status.success(), "the child exited with {status}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn mutated_requests_fail_or_parse_to_requests_that_round_trip() {
+        let framed = |request: &Request| {
+            let mut message = vec![PROTOCOL_VERSION];
+            message.extend(serde_json::to_vec(request).expect("requests serialize"));
+            message
+        };
+        let requests = [
+            Request::Show {
+                token: Some(token("t-1")),
+            },
+            Request::open(&target("1818"), Some(token("t-2"))),
+            Request::Quit,
+        ];
+        let mut mutations = mutation::Mutations::new(0x00c0_7e57);
+        for request in &requests {
+            let original = framed(request);
+            for _ in 0..3000 {
+                if let Ok(parsed) = parse_request(&mutations.of(&original)) {
+                    assert_eq!(parse_request(&framed(&parsed)), Ok(parsed));
+                }
+            }
+        }
     }
 }

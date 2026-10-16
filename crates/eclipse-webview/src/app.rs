@@ -2,6 +2,7 @@ use crate::cookies;
 use crate::logging::{self, Redacted};
 use crate::view::{self, Frame, Route, Unparented, View};
 use crate::wire::{Inbound, Wire};
+use eclipse_webview::cookie_jar;
 use eclipse_webview::proto::{
     ClearScope, ConsumerMsg, CookiePair, HelperMsg, ParentSize, ParentWindow, ProtoError,
     StoredCookie,
@@ -13,7 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use webkit6::javascriptcore;
 use webkit6::prelude::*;
 use webkit6::soup;
@@ -21,6 +22,8 @@ use webkit6::soup;
 const SNAPSHOT_DELAY: Duration = Duration::from_millis(500);
 
 const MAX_PENDING: usize = 256;
+
+const MAX_PENDING_BRIDGE_BYTES: usize = 16 * 1024 * 1024;
 
 const FETCH_DESTINATION_HEADER: &str = "Sec-Fetch-Dest";
 
@@ -81,6 +84,7 @@ struct PendingReply {
     view: i64,
     reply: webkit6::ScriptMessageReply,
     context: javascriptcore::Context,
+    payload_len: usize,
 }
 
 struct PendingPolicy {
@@ -513,11 +517,27 @@ impl App {
             reply.return_error_message("too many unanswered bridge calls");
             return;
         }
+        let payload_json = value.to_str().to_string();
+        let payload_len = payload_json.len();
+        let queued: usize = self
+            .replies
+            .borrow()
+            .values()
+            .map(|pending| pending.payload_len)
+            .sum();
+        if queued + payload_len > MAX_PENDING_BRIDGE_BYTES {
+            logging::warn(format_args!(
+                "{queued} bytes of bridge calls are unanswered; rejecting {payload_len} more \
+                 from view {id}"
+            ));
+            reply.return_error_message("too much unanswered bridge data");
+            return;
+        }
         let call_id = self.next_id();
         let call = HelperMsg::BridgeCall {
             view: id,
             call_id,
-            payload_json: value.to_str().to_string(),
+            payload_json,
         };
         let frame = match call.encode() {
             Ok(frame) => frame,
@@ -535,6 +555,7 @@ impl App {
                 view: id,
                 reply: reply.clone(),
                 context,
+                payload_len,
             },
         );
         self.transmit(&frame, call.name());
@@ -839,11 +860,16 @@ impl App {
                         return;
                     }
                 };
+                let stored = cookies
+                    .into_iter()
+                    .map(|mut cookie| cookies::from_soup(&mut cookie))
+                    .collect();
                 let snapshot = HelperMsg::CookieSnapshot {
-                    cookies: cookies
-                        .into_iter()
-                        .map(|mut cookie| cookies::from_soup(&mut cookie))
-                        .collect(),
+                    cookies: cookie_jar::within_limits(
+                        stored,
+                        SystemTime::now(),
+                        cookies::registrable_site,
+                    ),
                 };
                 match snapshot.encode() {
                     Ok(frame) => {
@@ -1068,6 +1094,67 @@ mod tests {
         assert!(
             files.iter().all(|file| !file.ends_with("cookies.sqlite")),
             "WebKit must keep cookies in memory, the host's jar is their only file: {files:?}"
+        );
+    }
+
+    fn a_cookie_flood_still_reaches_the_host_in_one_snapshot() {
+        let (root, app, host) = app_with_host("cookie-flood");
+        let host = Host::listen(host);
+        let login = soup::Cookie::new(".ROBLOSECURITY", "token", ".roblox.com", "/", 3600);
+        let mut cookies = vec![login];
+        let mut domain = ".attacker.example".to_string();
+        for level in 0..12 {
+            domain = format!(".l{level}{domain}");
+            cookies.extend((0..184).map(|index| {
+                soup::Cookie::new(&format!("c{index}"), &"v".repeat(4000), &domain, "/", 3600)
+            }));
+        }
+        let pending = Rc::new(Cell::new(cookies.len()));
+        let failed = Rc::new(Cell::new(0));
+        for cookie in &cookies {
+            let (pending, failed) = (Rc::clone(&pending), Rc::clone(&failed));
+            app.engine.cookie_manager().add_cookie(
+                cookie,
+                None::<&gio::Cancellable>,
+                move |result| {
+                    pending.set(pending.get() - 1);
+                    failed.set(failed.get() + usize::from(result.is_err()));
+                },
+            );
+        }
+        pump_until("store the cookies", || pending.get() == 0);
+        let sent = Rc::new(Cell::new(None));
+        let noted = Rc::clone(&sent);
+        app.snapshot(move |ok| noted.set(Some(ok)));
+        pump_until("list its cookies", || sent.get().is_some());
+        let sent = sent.get();
+        let mut snapshot = None;
+        if sent == Some(true) {
+            pump_until("hand the snapshot to the host", || {
+                host.drain();
+                snapshot = host
+                    .recent
+                    .borrow_mut()
+                    .drain(..)
+                    .find_map(|msg| match msg {
+                        HelperMsg::CookieSnapshot { cookies } => Some(cookies),
+                        _ => None,
+                    });
+                snapshot.is_some()
+            });
+        }
+        drop(app);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+
+        assert_eq!(failed.get(), 0);
+        assert_eq!(sent, Some(true), "the snapshot must fit one frame");
+        let snapshot = snapshot.expect("pump_until waited for the snapshot");
+        assert!(snapshot.len() <= 1000, "{} cookies", snapshot.len());
+        assert!(
+            snapshot
+                .iter()
+                .any(|cookie| cookie.name == ".ROBLOSECURITY"),
+            "the flood must not push out another site's login"
         );
     }
 
@@ -1401,12 +1488,80 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
+    fn unanswered_bridge_calls_are_limited_by_their_total_size() {
+        if gtk::init().is_err() {
+            eprintln!("SKIP: no display for a WebKit view (WAYLAND_DISPLAY or DISPLAY)");
+            return;
+        }
+        let site = Site::start();
+        let (root, app, host) = app_with_host("bridge-budget");
+        let host = Host::listen(host);
+        let view = 1;
+        let evaluations = Cell::new(0);
+        let evaluate = |script: &str| {
+            let request_id = evaluations.get() + 1;
+            evaluations.set(request_id);
+            app.handle(ConsumerMsg::EvaluateJs {
+                view,
+                request_id,
+                script: script.to_string(),
+            });
+            let mut result = None;
+            pump_until("run a page script", || {
+                result = host.take_result(request_id);
+                result.is_some()
+            });
+            result.expect("pump_until waited for the result")
+        };
+        let forwarded = || {
+            host.drain();
+            host.recent
+                .borrow()
+                .iter()
+                .filter(|msg| matches!(msg, HelperMsg::BridgeCall { .. }))
+                .count()
+        };
+
+        app.handle(ConsumerMsg::CreateView { view });
+        app.handle(ConsumerMsg::LoadUrl {
+            view,
+            url: site.url("/main"),
+        });
+        pump_until("finish loading the page", || {
+            host.take_finished(&site.url("/main"))
+        });
+        evaluate(&format!(
+            "window.refused=[];var payload='x'.repeat(7*1024*1024);\
+             for(var i=0;i<3;i++){{window.webkit.messageHandlers.{}.postMessage(payload)\
+             .catch(function(e){{window.refused.push(String(e&&e.message||e));}});}}true",
+            crate::bridge::MESSAGE_HANDLER
+        ));
+        pump_until("forward the first bridge calls", || forwarded() >= 2);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while forwarded() < 3 && evaluate("window.refused.length") == "0" {
+            assert!(
+                Instant::now() < deadline,
+                "the third bridge call was neither sent nor refused"
+            );
+        }
+        let refused = evaluate("window.refused.join()");
+        let forwarded = forwarded();
+        app.handle(ConsumerMsg::CloseView { view });
+        drop(app);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+
+        assert_eq!(forwarded, 2, "only calls within the budget reach the host");
+        assert_eq!(refused, "\"too much unanswered bridge data\"");
+    }
+
     #[test]
     fn webkit_backed_checks_run_on_the_one_thread_that_starts_webkit() {
         an_engine_tears_down_without_touching_a_finalized_session();
         a_page_message_too_large_to_send_is_dropped_without_ending_the_helper();
         a_reply_too_large_to_send_reaches_the_host_as_a_failure();
         webkit_keeps_cookies_in_memory_and_hands_them_to_the_host();
+        a_cookie_flood_still_reaches_the_host_in_one_snapshot();
         main_frame_navigations_reach_the_app_and_frame_navigations_do_not();
+        unanswered_bridge_calls_are_limited_by_their_total_size();
     }
 }

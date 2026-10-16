@@ -769,7 +769,7 @@ impl Tally {
     }
 }
 
-pub fn create_client_cache(dir: &Path) -> Result<(), StorageError> {
+pub fn create_owner_only_dir(dir: &Path) -> Result<(), StorageError> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(OWNER_ONLY)
@@ -990,7 +990,7 @@ mod tests {
     fn trim_removes_oldest_files_down_to_three_quarters_of_the_cap() {
         let scratch = Scratch::new("cap");
         let cache = scratch.cache();
-        create_client_cache(&cache).unwrap();
+        create_owner_only_dir(&cache).unwrap();
         fs::create_dir_all(cache.join("sounds")).unwrap();
         let names = [
             "rbx-storage/0a/oldest",
@@ -1054,7 +1054,7 @@ mod tests {
     fn a_cache_under_the_cap_keeps_every_file() {
         let scratch = Scratch::new("under");
         let cache = scratch.cache();
-        create_client_cache(&cache).unwrap();
+        create_owner_only_dir(&cache).unwrap();
         write_aged(&cache.join("rbx-storage/0a/kept"), 64 * KIB, first_launch());
 
         let trimmed = trim_client_cache(&cache, 1536 * KIB, first_launch());
@@ -1067,7 +1067,7 @@ mod tests {
     fn trim_runs_at_most_once_a_day() {
         let scratch = Scratch::new("daily");
         let cache = scratch.cache();
-        create_client_cache(&cache).unwrap();
+        create_owner_only_dir(&cache).unwrap();
         let first = first_launch();
         assert_eq!(
             trim_client_cache(&cache, 768 * KIB, first).unwrap(),
@@ -1102,7 +1102,7 @@ mod tests {
     fn a_trim_time_in_the_future_does_not_stop_trimming() {
         let scratch = Scratch::new("clock");
         let cache = scratch.cache();
-        create_client_cache(&cache).unwrap();
+        create_owner_only_dir(&cache).unwrap();
         let future = first_launch() + 10 * TRIM_INTERVAL;
         trim_client_cache(&cache, 256 * KIB, future).unwrap();
 
@@ -1116,7 +1116,7 @@ mod tests {
     fn stale_content_provider_directories_are_removed() {
         let scratch = Scratch::new("providers");
         let cache = scratch.cache();
-        create_client_cache(&cache).unwrap();
+        create_owner_only_dir(&cache).unwrap();
         for dir in ["ContentProvider_74084", "ContentProvider_12"] {
             write_aged(&cache.join(dir).join("shared.png"), KIB, first_launch());
         }
@@ -1150,7 +1150,7 @@ mod tests {
         fs::create_dir_all(&cache).unwrap();
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
 
-        create_client_cache(&cache).unwrap();
+        create_owner_only_dir(&cache).unwrap();
 
         let mode = fs::metadata(&cache).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
@@ -1238,7 +1238,7 @@ mod tests {
             &layout.art_cache.join("system@framework@boot.art"),
             32 * KIB,
         );
-        create_client_cache(&layout.client_cache).unwrap();
+        create_owner_only_dir(&layout.client_cache).unwrap();
         let blob = layout.client_cache.join("rbx-storage/0a/blob");
         write(&blob, 56 * KIB);
         fs::create_dir_all(layout.client_cache.join("http")).unwrap();

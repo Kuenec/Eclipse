@@ -820,7 +820,7 @@ struct ClientSettingsBridge {
 
 impl ClientSettingsBridge {
     fn locate() -> Result<Self, String> {
-        let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
+        let app_data_dir = owner_only_app_data_dir()?;
         let runtime_dir = app_data_dir.join(RUNTIME_DIR);
         std::fs::create_dir_all(&runtime_dir)
             .map_err(|error| format!("cannot create {}: {error}", runtime_dir.display()))?;
@@ -2186,8 +2186,14 @@ fn stage_client_settings(
     Ok(())
 }
 
-fn lock_out_clients() -> Result<instance_control::HeldLock, String> {
+fn owner_only_app_data_dir() -> Result<PathBuf, String> {
     let app_data_dir = eclipse::framework::app_data_dir().ok_or(NO_APP_DATA_DIR)?;
+    eclipse::storage::create_owner_only_dir(&app_data_dir).map_err(|error| error.to_string())?;
+    Ok(app_data_dir)
+}
+
+fn lock_out_clients() -> Result<instance_control::HeldLock, String> {
+    let app_data_dir = owner_only_app_data_dir()?;
     match instance_control::lock_client(&app_data_dir.join(RUNTIME_DIR))? {
         ClientLock::Acquired(lock) => Ok(lock),
         ClientLock::Held(lock) => Err(format!(
@@ -2545,7 +2551,7 @@ fn extract_client(
 
 fn prepare_client_cache(status: &StatusSink) -> Result<ClientCacheDir, Box<dyn std::error::Error>> {
     let client_cache = eclipse::runtime::client_cache_dir()?;
-    eclipse::storage::create_client_cache(client_cache.path())?;
+    eclipse::storage::create_owner_only_dir(client_cache.path())?;
     match eclipse::storage::trim_client_cache(
         client_cache.path(),
         eclipse::storage::CLIENT_CACHE_CAP,

@@ -1559,7 +1559,7 @@ mod tests {
         assert_eq!(finished.unwrap().end, RunEnd::Ended);
         let stderr = String::from_utf8(stderr).unwrap();
         assert!(
-            stderr.contains("  WARN liblog: first line\ncontinued line\n"),
+            stderr.contains("  WARN liblog: first line\n continued line\n"),
             "{stderr}"
         );
         assert!(!stderr.contains("printed by the status sink"), "{stderr}");

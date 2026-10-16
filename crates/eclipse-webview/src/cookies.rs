@@ -1,5 +1,6 @@
 use eclipse_webview::proto::{CookieExpiry, SameSite, StoredCookie};
 use gtk4::glib;
+use std::net::IpAddr;
 use webkit6::soup;
 
 const SESSION_COOKIE_MAX_AGE: i32 = -1;
@@ -26,6 +27,20 @@ pub(crate) fn to_soup(cookie: &StoredCookie) -> Result<soup::Cookie, glib::BoolE
         soup_cookie.set_expires(&glib::DateTime::from_unix_utc(epoch_s)?);
     }
     Ok(soup_cookie)
+}
+
+pub(crate) fn registrable_site(domain: &str) -> &str {
+    if domain.parse::<IpAddr>().is_ok() {
+        return domain;
+    }
+    let mut site = domain;
+    while let Some((_, parent)) = site.split_once('.') {
+        if !parent.contains('.') || soup::tld_domain_is_public_suffix(parent) {
+            return site;
+        }
+        site = parent;
+    }
+    domain
 }
 
 pub(crate) fn from_soup(cookie: &mut soup::Cookie) -> StoredCookie {
@@ -147,5 +162,21 @@ mod tests {
         let mismatched = "elsewhere=1; Domain=example.com";
         assert!(cookie_jar::parse_set_cookie(url, mismatched, SystemTime::now()).is_err());
         assert!(soup::Cookie::parse(mismatched, Some(&origin)).is_none());
+    }
+
+    #[test]
+    fn cookies_are_grouped_by_the_site_that_registered_their_domain() {
+        for (domain, site) in [
+            ("www.roblox.com", "roblox.com"),
+            ("roblox.com", "roblox.com"),
+            ("l1.l0.attacker.example", "attacker.example"),
+            ("com", "com"),
+            ("user.github.io", "user.github.io"),
+            ("shop.example.co.uk", "example.co.uk"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("localhost", "localhost"),
+        ] {
+            assert_eq!(registrable_site(domain), site, "{domain}");
+        }
     }
 }
