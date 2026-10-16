@@ -910,6 +910,84 @@ fn framework_overlay_lets_voice_chat_start() {
 }
 
 #[test]
+fn framework_overlay_declares_the_microphone_and_keeps_the_audio_mode() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "if-eqz v0, :eclipse_not_microphone",
+        "grep -qF '\"android.hardware.microphone\"' \"$pmsm\"",
+        "{$1\\n.field private static volatile mode:I\\n}",
+        "replace_upstream_method \"$audio_manager_sm\" \"$UPSTREAM_GET_AUDIO_MODE\" \"$AUDIO_MODE_GETTER\"",
+        "replace_upstream_method \"$audio_manager_sm\" \"$UPSTREAM_SET_AUDIO_MODE\" \"$AUDIO_MODE_SETTER\"",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost microphone fragment {needle:?}; Roblox's voice chat would \
+             again see a device without a microphone or a mode that never changes"
+        );
+    }
+    let feature = generator
+        .lines()
+        .find(|line| line.contains(":eclipse_not_low_latency_audio\\n    const-string"))
+        .expect("the hasSystemFeature insert");
+    let (_, microphone) = feature
+        .split_once("const-string v0, \"android.hardware.microphone\"")
+        .expect("the microphone feature literal");
+    let (declared, _) = microphone
+        .split_once(":eclipse_not_microphone\\n}")
+        .expect("the microphone feature branch");
+    assert!(
+        declared.contains("const/4 v0, 0x1\\n\\n    return v0"),
+        "android.hardware.microphone must be declared unconditionally, as a phone declares it"
+    );
+    for (variable, ordered) in [
+        (
+            "AUDIO_MODE_GETTER=",
+            &["sget v0, Landroid/media/AudioManager;->mode:I", "return v0"][..],
+        ),
+        (
+            "AUDIO_MODE_SETTER=",
+            &[
+                "if-ltz p1, :eclipse_audio_mode_unchanged",
+                "const/4 v0, 0x2",
+                "if-eq p1, v0, :eclipse_audio_mode_unchanged",
+                "const/4 v0, 0x4",
+                "if-ge p1, v0, :eclipse_audio_mode_unchanged",
+                "sput p1, Landroid/media/AudioManager;->mode:I",
+                ":eclipse_audio_mode_unchanged",
+            ][..],
+        ),
+    ] {
+        let mut rest = generator
+            .lines()
+            .find(|line| line.starts_with(variable))
+            .unwrap_or_else(|| panic!("patch-framework.sh lost {variable}"));
+        for needle in ordered {
+            let (_, after) = rest.split_once(needle).unwrap_or_else(|| {
+                panic!(
+                    "{variable} lost {needle:?} or reordered it; setMode must keep only the \
+                     modes an app may set on API 28, and getMode must read that one mode"
+                )
+            });
+            rest = after;
+        }
+    }
+
+    let probe = include_str!("../tools/framework-overlay/tests/VoiceChatProbe.java");
+    for needle in [
+        "\"android.hardware.microphone\"",
+        "requireMicrophoneFeature();",
+        "requireSystemWideAudioMode();",
+        "{MODE_CURRENT, MODE_IN_CALL, API_28_MODE_COUNT}",
+    ] {
+        assert!(
+            probe.contains(needle),
+            "VoiceChatProbe lost {needle:?}; the build would no longer prove the declared \
+             microphone or the kept audio mode"
+        );
+    }
+}
+
+#[test]
 fn framework_overlay_reads_audio_properties_from_the_runtime() {
     let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
     for needle in [
@@ -1415,6 +1493,29 @@ fn platform_test_constructs_the_clients_webrtc_audio_manager_under_check_jni() {
              for native manager 0x5eeda0d1, hardware AEC false, AGC false, NS false, low-latency \
              output true and input true, pro audio false, AAudio false, 512 output and 512 input \
              frames per buffer; init returned true, OpenSL ES blacklisted false"
+                .to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn platform_test_shows_the_client_a_microphone_and_its_voice_chat_mode_under_check_jni() {
+    if !platform_test_can_boot() {
+        return;
+    }
+
+    let root = PlatformTestRoot::create("microphone");
+    let text = root.run_with_vm_options("-Xcheck:jni");
+
+    assert_lines(
+        &text,
+        &[
+            "__platform-test: WebRtcAudioManager communication mode enabled true after the \
+             client set MODE_IN_COMMUNICATION and false after another AudioManager set \
+             MODE_NORMAL"
+                .to_owned(),
+            "__platform-test: WebRtcAudioUtils.hasMicrophone() returned true; \
+             Context.checkPermission(android.permission.RECORD_AUDIO) returned 0"
                 .to_owned(),
         ],
     );

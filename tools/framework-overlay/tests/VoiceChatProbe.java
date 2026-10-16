@@ -14,6 +14,12 @@ public final class VoiceChatProbe {
     private static final String AOSP_EFFECT_TYPE_AEC = "7b491460-8d4d-11e0-bd61-0002a5d5c51b";
     private static final String AOSP_EFFECT_TYPE_NS = "58b4b260-8e06-11e0-aa8e-0002a5d5c51b";
     private static final int VOICE_AUDIO_SESSION = 1;
+    private static final String FEATURE_MICROPHONE = "android.hardware.microphone";
+    private static final int MODE_CURRENT = -1;
+    private static final int MODE_NORMAL = 0;
+    private static final int MODE_IN_CALL = 2;
+    private static final int MODE_IN_COMMUNICATION = 3;
+    private static final int API_28_MODE_COUNT = 4;
 
     private static void require(boolean condition, String message) {
         if (!condition) {
@@ -53,6 +59,44 @@ public final class VoiceChatProbe {
         requirePermission(packageManager, checkPermission,
                 "android.permission.ACCESS_FINE_LOCATION", PERMISSION_DENIED,
                 "ATL's location policy still applies");
+    }
+
+    private static void requireMicrophoneFeature() throws ReflectiveOperationException {
+        Class<?> packageManagerClass = Class.forName("android.content.pm.PackageManager");
+        Object packageManager = allocateWithoutLoadedApp(packageManagerClass);
+        boolean declared = (Boolean) packageManagerClass
+                .getMethod("hasSystemFeature", String.class)
+                .invoke(packageManager, FEATURE_MICROPHONE);
+        require(declared, FEATURE_MICROPHONE
+                + " is not declared; every phone and the device Eclipse shows Google Play has one");
+    }
+
+    private static void requireAudioMode(Object audioManager, Method getMode, int expected,
+            String reason) throws ReflectiveOperationException {
+        int actual = (Integer) getMode.invoke(audioManager);
+        require(actual == expected,
+                "getMode() returned " + actual + ", expected " + expected + ": " + reason);
+    }
+
+    private static void requireSystemWideAudioMode() throws ReflectiveOperationException {
+        Class<?> audioManagerClass = Class.forName("android.media.AudioManager");
+        Object caller = audioManagerClass.getConstructor().newInstance();
+        Object reader = audioManagerClass.getConstructor().newInstance();
+        Method setMode = audioManagerClass.getMethod("setMode", int.class);
+        Method getMode = audioManagerClass.getMethod("getMode");
+
+        requireAudioMode(reader, getMode, MODE_NORMAL, "a process starts in MODE_NORMAL");
+        setMode.invoke(caller, MODE_IN_COMMUNICATION);
+        requireAudioMode(reader, getMode, MODE_IN_COMMUNICATION,
+                "the mode is system-wide, so the AudioManager voice chat reads must see it");
+        for (int ignored : new int[] {MODE_CURRENT, MODE_IN_CALL, API_28_MODE_COUNT}) {
+            setMode.invoke(caller, ignored);
+            requireAudioMode(reader, getMode, MODE_IN_COMMUNICATION, "setMode(" + ignored
+                    + ") must keep the mode: MODE_CURRENT names it, MODE_IN_CALL needs a"
+                    + " permission apps never get, and API 28 has no fifth mode");
+        }
+        setMode.invoke(caller, MODE_NORMAL);
+        requireAudioMode(reader, getMode, MODE_NORMAL, "ending voice chat restores MODE_NORMAL");
     }
 
     private static Object voiceCallAudioAttributes() throws ReflectiveOperationException {
@@ -151,6 +195,8 @@ public final class VoiceChatProbe {
 
     public static void main(String[] arguments) throws ReflectiveOperationException {
         requireMicrophonePermission();
+        requireMicrophoneFeature();
+        requireSystemWideAudioMode();
         requireVoiceCallAudioManager();
         requireNoHardwareVoiceEffects();
         System.out.println("voice-chat-ok");
