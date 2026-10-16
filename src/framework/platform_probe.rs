@@ -10,6 +10,7 @@ use jni::sys::{jboolean, jint, jlong};
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
+use super::appsflyer_statics::{self, AppsFlyerStatics};
 use super::engine_input::{probe_second_finger, TouchEventReadback};
 use super::{
     checked, external_intents, jstring_object_to_string, keep_screen_on, notifications,
@@ -155,6 +156,7 @@ pub struct PlatformProbeReport {
     pub movies: String,
     pub temporary: String,
     keep_screen_on: Vec<(WindowFlagCall, bool)>,
+    appsflyer_statics: AppsFlyerStatics,
     notification_builder: i64,
     opened_link: NativeOutcome,
     refused_link: NativeOutcome,
@@ -182,6 +184,7 @@ impl fmt::Display for PlatformProbeReport {
             };
             writeln!(f, "Window.{call} {screen}")?;
         }
+        writeln!(f, "{}", self.appsflyer_statics)?;
         writeln!(
             f,
             "NotificationManager natives returned without an exception; nativeInitBuilder \
@@ -247,6 +250,7 @@ fn probe(
     let movies = path_of(env, movies)?;
     let temporary = system_property(env, "java.io.tmpdir")?;
     let keep_screen_on = window_flag_calls(env)?;
+    let appsflyer_statics = appsflyer_statics::probe(env)?;
     let notification_builder = client_notifications(env)?;
     let opened_link = open_uri(env, OPENED_LINK)?;
     let refused_link = open_uri(env, REFUSED_LINK)?;
@@ -258,6 +262,7 @@ fn probe(
         movies,
         temporary,
         keep_screen_on,
+        appsflyer_statics,
         notification_builder,
         opened_link,
         refused_link,
