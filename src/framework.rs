@@ -385,6 +385,8 @@ const NO_ASSET_COOKIE: i32 = -1;
 
 const DATA_NULL_UNDEFINED: i32 = 0;
 
+const DATA_NULL_EMPTY: i32 = 1;
+
 const TYPE_NULL: i32 = 0;
 
 const TYPE_REFERENCE: u8 = 0x01;
@@ -688,8 +690,9 @@ fn merge_theme_style(
     out: &mut std::collections::HashMap<i32, theme_registry::ThemeAttr>,
     style_res: u32,
     config: &ResConfig,
-) -> usize {
+) -> Option<usize> {
     let mut contributed = 0usize;
+    let mut found = false;
     let mut current = style_res;
     let mut visited = std::collections::HashSet::new();
     for _ in 0..MAX_THEME_PARENT_DEPTH {
@@ -705,6 +708,7 @@ fn merge_theme_style(
         let Some(style) = table.resolve_style(current, config) else {
             break;
         };
+        found = true;
         for entry in &style.entries {
             if entry.attr_id == 0 {
                 continue;
@@ -723,7 +727,7 @@ fn merge_theme_style(
         }
         current = style.parent_id;
     }
-    contributed
+    found.then_some(contributed)
 }
 
 const MAX_ATTR_RESOLVE_DEPTH: usize = 16;
@@ -733,7 +737,15 @@ fn resolve_theme_attr(
     attr_id: i32,
     config: &ResConfig,
 ) -> Option<TypedEntry> {
-    let mut cur = *attrs.get(&attr_id)?;
+    resolve_theme_value(attrs, *attrs.get(&attr_id)?, config)
+}
+
+fn resolve_theme_value(
+    attrs: &std::collections::HashMap<i32, theme_registry::ThemeAttr>,
+    value: theme_registry::ThemeAttr,
+    config: &ResConfig,
+) -> Option<TypedEntry> {
+    let mut cur = value;
 
     let mut resource_id = if cur.type_ == TYPE_REFERENCE {
         u32_to_i32(cur.data)
@@ -789,19 +801,6 @@ fn resolve_theme_attr(
         resource_id,
         asset_cookie,
     })
-}
-
-fn resolve_theme_attributes(
-    theme: jlong,
-    ids: &[i32],
-    config: &ResConfig,
-) -> Vec<Option<TypedEntry>> {
-    theme_registry::with_theme(theme, |t| {
-        ids.iter()
-            .map(|&id| resolve_theme_attr(&t.attrs, id, config))
-            .collect()
-    })
-    .unwrap_or_else(|_| vec![None; ids.len()])
 }
 
 fn resolve_inline_theme_refs(theme: jlong, entries: &mut [Option<TypedEntry>], config: &ResConfig) {
@@ -1008,13 +1007,107 @@ extern "system" fn asset_manager_copy_theme<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+fn is_defined(entry: &TypedEntry) -> bool {
+    entry.value_type != TYPE_NULL || entry.data == DATA_NULL_EMPTY
+}
+
+fn is_null_reference(entry: &TypedEntry) -> bool {
+    entry.value_type == i32::from(TYPE_REFERENCE) && entry.data == 0
+}
+
+fn xml_style_value(parser: jlong) -> Option<(u8, u32)> {
+    xml_registry::with_block(parser, |block| {
+        block
+            .current_element()?
+            .attributes
+            .iter()
+            .find(|a| a.namespace.is_none() && a.name.as_deref() == Some("style"))
+            .map(|a| (a.value_type, a.value_data))
+    })
+    .ok()
+    .flatten()
+}
+
+fn style_bag(
+    style_res: u32,
+    config: &ResConfig,
+) -> Option<std::collections::HashMap<i32, theme_registry::ThemeAttr>> {
+    let mut bag = std::collections::HashMap::new();
+    merge_theme_style(&mut bag, style_res, config)?;
+    Some(bag)
+}
+
+fn theme_style_bag(
+    attrs: &std::collections::HashMap<i32, theme_registry::ThemeAttr>,
+    attr_id: i32,
+    config: &ResConfig,
+) -> Option<std::collections::HashMap<i32, theme_registry::ThemeAttr>> {
+    let entry = resolve_theme_attr(attrs, attr_id, config)?;
+    if entry.value_type != i32::from(TYPE_REFERENCE) {
+        return None;
+    }
+    style_bag(u32::from_ne_bytes(entry.data.to_ne_bytes()), config)
+}
+
+fn resolve_styled_attributes(
+    theme: jlong,
+    parser: jlong,
+    def_style_attr: i32,
+    def_style_res: u32,
+    ids: &[i32],
+    config: &ResConfig,
+) -> Vec<Option<TypedEntry>> {
+    let mut xml = vec![None; ids.len()];
+    let mut xml_style = None;
+    if parser != 0 {
+        xml = resolve_xml_attributes(parser, ids, config);
+        resolve_inline_theme_refs(theme, &mut xml, config);
+        xml_style = xml_style_value(parser);
+    }
+
+    let resolve = |attrs: &std::collections::HashMap<i32, theme_registry::ThemeAttr>| {
+        let xml_style_bag = match xml_style {
+            Some((TYPE_ATTRIBUTE, attr)) => theme_style_bag(attrs, u32_to_i32(attr), config),
+            Some((TYPE_REFERENCE, style_res)) => style_bag(style_res, config),
+            _ => None,
+        };
+        let default_style_bag = theme_style_bag(attrs, def_style_attr, config)
+            .or_else(|| style_bag(def_style_res, config));
+        let bags = [xml_style_bag, default_style_bag];
+        ids.iter()
+            .zip(&xml)
+            .map(|(id, xml_entry)| {
+                xml_entry
+                    .filter(is_defined)
+                    .or_else(|| {
+                        bags.iter().flatten().find_map(|bag| {
+                            let value = *bag.get(id)?;
+                            let entry =
+                                resolve_theme_value(attrs, value, config).unwrap_or(TypedEntry {
+                                    value_type: i32::from(value.type_),
+                                    data: u32_to_i32(value.data),
+                                    resource_id: 0,
+                                    asset_cookie: 0,
+                                });
+                            Some(entry).filter(is_defined)
+                        })
+                    })
+                    .or_else(|| resolve_theme_attr(attrs, *id, config))
+                    .filter(|entry| is_defined(entry) && !is_null_reference(entry))
+            })
+            .collect()
+    };
+    theme_registry::with_theme(theme, |t| resolve(&t.attrs))
+        .unwrap_or_else(|_| resolve(&std::collections::HashMap::new()))
+}
+
 extern "system" fn asset_manager_apply_style<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
     theme: jlong,
     parser: jlong,
-    _def_style_attr: jint,
-    _def_style_res: jint,
+    def_style_attr: jint,
+    def_style_res: jint,
     attrs: JIntArray<'local>,
     _length: jint,
     out_values: jlong,
@@ -1028,18 +1121,14 @@ extern "system" fn asset_manager_apply_style<'local>(
             let config = asset_configuration::of(env, &this);
             let mut ids = vec![0i32; n];
             attrs.get_region(env, 0, &mut ids)?;
-            if parser != 0 {
-                entries = resolve_xml_attributes(parser, &ids, &config);
-
-                resolve_inline_theme_refs(theme, &mut entries, &config);
-            }
-
-            let theme_entries = resolve_theme_attributes(theme, &ids, &config);
-            for (slot, theme_entry) in entries.iter_mut().zip(theme_entries) {
-                if slot.is_none() {
-                    *slot = theme_entry;
-                }
-            }
+            entries = resolve_styled_attributes(
+                theme,
+                parser,
+                def_style_attr,
+                u32::from_ne_bytes(def_style_res.to_ne_bytes()),
+                &ids,
+                &config,
+            );
         }
         let changed = entries.iter().filter(|e| e.is_some()).count();
 
@@ -1048,9 +1137,11 @@ extern "system" fn asset_manager_apply_style<'local>(
             target: "android.content.res.AssetManager",
             theme,
             parser,
+            def_style_attr = format_args!("0x{def_style_attr:08x}"),
+            def_style_res = format_args!("0x{def_style_res:08x}"),
             attrs = n,
             changed,
-            "AssetManager.applyStyle: resolved styled attributes (XML element + theme, non-GTK)"
+            "AssetManager.applyStyle: resolved styled attributes (XML element, style=, default style, theme)"
         );
         Ok(())
     })
@@ -16138,6 +16229,226 @@ mod tests {
         assert_eq!(e.value_type, i32::from(TYPE_ATTRIBUTE));
     }
 
+    const TYPE_INT_DEC: u8 = 0x10;
+    const ATTR_XML_WINS: u32 = 0x7f04_0001;
+    const ATTR_STYLE_WINS: u32 = 0x7f04_0002;
+    const ATTR_DEFAULT_WINS: u32 = 0x7f04_0003;
+    const ATTR_THEME_ONLY: u32 = 0x7f04_0004;
+    const ATTR_NULLED: u32 = 0x7f04_0005;
+    const ATTR_THEMED: u32 = 0x7f04_0006;
+    const ATTR_THEME_LAYOUT: u32 = 0x7f04_0007;
+    const ATTR_UNSET_STYLE: u32 = 0x7f04_0008;
+    const ATTR_ALERT_DIALOG_STYLE: u32 = 0x7f04_002b;
+    const ATTR_LAYOUT: u32 = 0x0101_00f2;
+    const STYLE_XML: u32 = 0x7f13_0000;
+    const STYLE_ALERT_DIALOG: u32 = 0x7f13_0001;
+    const STYLE_ALERT_DIALOG_BASE: u32 = 0x7f13_0002;
+    const STYLE_DEFAULT_RES: u32 = 0x7f13_0003;
+    const LAYOUT_ALERT_DIALOG: u32 = 0x7f0c_0009;
+    const LAYOUT_DEFAULT_RES: u32 = 0x7f0c_0010;
+
+    fn install_app_style_table() {
+        let table = build_style_arsc(&[
+            TestStyle {
+                parent: 0,
+                items: &[
+                    (ATTR_XML_WINS, TYPE_INT_DEC, 2),
+                    (ATTR_STYLE_WINS, TYPE_INT_DEC, 2),
+                ],
+            },
+            TestStyle {
+                parent: STYLE_ALERT_DIALOG_BASE,
+                items: &[
+                    (ATTR_XML_WINS, TYPE_INT_DEC, 3),
+                    (ATTR_STYLE_WINS, TYPE_INT_DEC, 3),
+                    (ATTR_DEFAULT_WINS, TYPE_INT_DEC, 3),
+                ],
+            },
+            TestStyle {
+                parent: 0,
+                items: &[
+                    (ATTR_DEFAULT_WINS, TYPE_INT_DEC, 30),
+                    (ATTR_LAYOUT, TYPE_REFERENCE, LAYOUT_ALERT_DIALOG),
+                ],
+            },
+            TestStyle {
+                parent: 0,
+                items: &[
+                    (ATTR_DEFAULT_WINS, TYPE_INT_DEC, 5),
+                    (ATTR_NULLED, TYPE_REFERENCE, 0),
+                    (ATTR_THEMED, TYPE_ATTRIBUTE, ATTR_THEME_LAYOUT),
+                    (ATTR_LAYOUT, TYPE_REFERENCE, LAYOUT_DEFAULT_RES),
+                ],
+            },
+        ]);
+        let installed = APP_ARSC.get_or_init(|| Some(table.clone()));
+        assert_eq!(
+            installed.as_deref(),
+            Some(table.as_slice()),
+            "the app resource table is the style fixture"
+        );
+        APK_PATH.get_or_init(String::new);
+    }
+
+    fn theme_with(attrs: &[(u32, u8, u32)]) -> jlong {
+        let theme = theme_registry::allocate().expect("allocate theme");
+        theme_registry::with_theme(theme, |t| {
+            for &(attr, type_, data) in attrs {
+                t.attrs.insert(
+                    u32_to_i32(attr),
+                    theme_registry::ThemeAttr {
+                        type_,
+                        data,
+                        source_package: 0x7f,
+                    },
+                );
+            }
+        })
+        .expect("populate theme");
+        theme
+    }
+
+    fn reference(resid: u32) -> Option<TypedEntry> {
+        Some(TypedEntry {
+            value_type: i32::from(TYPE_REFERENCE),
+            data: u32_to_i32(resid),
+            resource_id: u32_to_i32(resid),
+            asset_cookie: 0,
+        })
+    }
+
+    #[test]
+    fn apply_style_layers_xml_over_xml_style_over_default_style_over_theme() {
+        use crate::apk::axml::{XmlAttribute, XmlDocument, XmlElement, XmlEventKind};
+        install_app_style_table();
+        let theme = theme_with(&[
+            (ATTR_XML_WINS, TYPE_INT_DEC, 4),
+            (ATTR_STYLE_WINS, TYPE_INT_DEC, 4),
+            (ATTR_DEFAULT_WINS, TYPE_INT_DEC, 4),
+            (ATTR_THEME_ONLY, TYPE_INT_DEC, 4),
+            (ATTR_ALERT_DIALOG_STYLE, TYPE_REFERENCE, STYLE_ALERT_DIALOG),
+        ]);
+        let element = XmlElement {
+            namespace: None,
+            name: Some("View".to_string()),
+            attributes: vec![
+                XmlAttribute {
+                    namespace: Some("http://schemas.android.com/apk/res-auto".to_string()),
+                    name: Some("xmlWins".to_string()),
+                    name_resource: ATTR_XML_WINS,
+                    value_type: TYPE_INT_DEC,
+                    value_data: 1,
+                    value_string: None,
+                },
+                XmlAttribute {
+                    namespace: None,
+                    name: Some("style".to_string()),
+                    name_resource: 0,
+                    value_type: TYPE_REFERENCE,
+                    value_data: STYLE_XML,
+                    value_string: None,
+                },
+            ],
+            line: 0,
+        };
+        let parser = xml_registry::store(XmlDocument {
+            events: vec![XmlEventKind::StartTag(0), XmlEventKind::EndTag(0)],
+            elements: vec![element],
+            texts: vec![],
+            namespaces: vec![],
+            strings: vec![],
+        })
+        .expect("store element");
+        xml_registry::with_block(parser, |b| {
+            b.next_event();
+        })
+        .expect("advance to the element");
+        let ids = [
+            ATTR_XML_WINS,
+            ATTR_STYLE_WINS,
+            ATTR_DEFAULT_WINS,
+            ATTR_THEME_ONLY,
+            ATTR_LAYOUT,
+        ]
+        .map(u32_to_i32);
+        let int = |data| {
+            Some(TypedEntry {
+                value_type: i32::from(TYPE_INT_DEC),
+                data,
+                resource_id: 0,
+                asset_cookie: 0,
+            })
+        };
+
+        let from_attr = resolve_styled_attributes(
+            theme,
+            parser,
+            u32_to_i32(ATTR_ALERT_DIALOG_STYLE),
+            STYLE_DEFAULT_RES,
+            &ids,
+            &ResConfig::default(),
+        );
+        assert_eq!(
+            from_attr,
+            [
+                int(1),
+                int(2),
+                int(3),
+                int(4),
+                reference(LAYOUT_ALERT_DIALOG)
+            ],
+            "XML beats style= beats the theme's alertDialogStyle (and its parent) beats the theme"
+        );
+
+        let from_res = resolve_styled_attributes(
+            theme,
+            0,
+            u32_to_i32(ATTR_UNSET_STYLE),
+            STYLE_DEFAULT_RES,
+            &ids,
+            &ResConfig::default(),
+        );
+        assert_eq!(
+            from_res,
+            [
+                int(4),
+                int(4),
+                int(5),
+                int(4),
+                reference(LAYOUT_DEFAULT_RES)
+            ],
+            "an unset default style attribute falls back to the default style resource"
+        );
+
+        xml_registry::free(parser).expect("free element");
+        theme_registry::free(theme).expect("free theme");
+    }
+
+    #[test]
+    fn apply_style_resolves_style_theme_references_and_null() {
+        install_app_style_table();
+        let theme = theme_with(&[
+            (ATTR_NULLED, TYPE_INT_DEC, 4),
+            (ATTR_THEME_LAYOUT, TYPE_REFERENCE, LAYOUT_ALERT_DIALOG),
+        ]);
+
+        let entries = resolve_styled_attributes(
+            theme,
+            0,
+            0,
+            STYLE_DEFAULT_RES,
+            &[ATTR_NULLED, ATTR_THEMED].map(u32_to_i32),
+            &ResConfig::default(),
+        );
+        assert_eq!(
+            entries,
+            [None, reference(LAYOUT_ALERT_DIALOG)],
+            "@null in the default style hides the theme value; its ?attr resolves against the theme"
+        );
+
+        theme_registry::free(theme).expect("free theme");
+    }
+
     #[test]
     fn styled_type_string_cookie_routes_to_the_owning_pool() {
         use crate::framework::theme_registry::ThemeAttr;
@@ -16308,7 +16619,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_theme_attributes_reads_a_registered_theme_and_is_total_on_bad_handles() {
+    fn resolve_styled_attributes_reads_a_registered_theme_and_is_total_on_bad_handles() {
         use crate::framework::theme_registry;
         let theme = theme_registry::allocate().expect("allocate theme");
         let attr_a = u32_to_i32(0x7f01_0058);
@@ -16325,13 +16636,15 @@ mod tests {
         })
         .expect("populate theme");
 
-        let out = resolve_theme_attributes(theme, &[attr_a, attr_b], &ResConfig::default());
+        let out =
+            resolve_styled_attributes(theme, 0, 0, 0, &[attr_a, attr_b], &ResConfig::default());
         assert_eq!(out.len(), 2);
         assert!(out[0].is_some(), "registered attr resolves");
         assert!(out[1].is_none(), "unset attr is None (→ TYPE_NULL default)");
 
         let bogus = i64::MAX;
-        let out = resolve_theme_attributes(bogus, &[attr_a, attr_b], &ResConfig::default());
+        let out =
+            resolve_styled_attributes(bogus, 0, 0, 0, &[attr_a, attr_b], &ResConfig::default());
         assert_eq!(out, vec![None, None]);
 
         theme_registry::free(theme).expect("free theme");
@@ -18613,61 +18926,104 @@ mod tests {
         assert_eq!(VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG.to_str(), "(JJ)V");
     }
 
+    fn push_u16(v: &mut Vec<u8>, x: u16) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+
+    fn push_u32(v: &mut Vec<u8>, x: u32) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+
     fn build_arsc_package(package_id: u32) -> Vec<u8> {
-        fn u16(v: &mut Vec<u8>, x: u16) {
-            v.extend_from_slice(&x.to_le_bytes());
-        }
-        fn u32(v: &mut Vec<u8>, x: u32) {
-            v.extend_from_slice(&x.to_le_bytes());
-        }
-
-        let mut pool = Vec::new();
-        u16(&mut pool, 0x0001);
-        u16(&mut pool, 28);
-        u32(&mut pool, 28);
-        u32(&mut pool, 0);
-        u32(&mut pool, 0);
-        u32(&mut pool, 0);
-        u32(&mut pool, 28);
-        u32(&mut pool, 0);
-
         let mut type_chunk = Vec::new();
-        u16(&mut type_chunk, 0x0201);
-        u16(&mut type_chunk, 20);
-        u32(&mut type_chunk, 40);
+        push_u16(&mut type_chunk, 0x0201);
+        push_u16(&mut type_chunk, 20);
+        push_u32(&mut type_chunk, 40);
         type_chunk.push(1);
         type_chunk.push(0);
-        u16(&mut type_chunk, 0);
-        u32(&mut type_chunk, 1);
-        u32(&mut type_chunk, 24);
-        u32(&mut type_chunk, 0);
-        u16(&mut type_chunk, 8);
-        u16(&mut type_chunk, 0);
-        u32(&mut type_chunk, 0);
-        u16(&mut type_chunk, 8);
+        push_u16(&mut type_chunk, 0);
+        push_u32(&mut type_chunk, 1);
+        push_u32(&mut type_chunk, 24);
+        push_u32(&mut type_chunk, 0);
+        push_u16(&mut type_chunk, 8);
+        push_u16(&mut type_chunk, 0);
+        push_u32(&mut type_chunk, 0);
+        push_u16(&mut type_chunk, 8);
         type_chunk.push(0);
         type_chunk.push(0x10);
-        u32(&mut type_chunk, 7);
+        push_u32(&mut type_chunk, 7);
+        build_arsc_table(package_id, &type_chunk)
+    }
+
+    struct TestStyle {
+        parent: u32,
+        items: &'static [(u32, u8, u32)],
+    }
+
+    fn build_style_arsc(styles: &[TestStyle]) -> Vec<u8> {
+        const HEADER: usize = 20;
+        let mut offsets = Vec::new();
+        let mut entries = Vec::new();
+        for style in styles {
+            push_u32(&mut offsets, entries.len() as u32);
+            push_u16(&mut entries, 16);
+            push_u16(&mut entries, 0x0001);
+            push_u32(&mut entries, 0);
+            push_u32(&mut entries, style.parent);
+            push_u32(&mut entries, style.items.len() as u32);
+            for &(attr, value_type, data) in style.items {
+                push_u32(&mut entries, attr);
+                push_u16(&mut entries, 8);
+                entries.push(0);
+                entries.push(value_type);
+                push_u32(&mut entries, data);
+            }
+        }
+        let entries_start = HEADER + offsets.len();
+        let mut type_chunk = Vec::new();
+        push_u16(&mut type_chunk, 0x0201);
+        push_u16(&mut type_chunk, HEADER as u16);
+        push_u32(&mut type_chunk, (entries_start + entries.len()) as u32);
+        type_chunk.push(0x13);
+        type_chunk.push(0);
+        push_u16(&mut type_chunk, 0);
+        push_u32(&mut type_chunk, styles.len() as u32);
+        push_u32(&mut type_chunk, entries_start as u32);
+        type_chunk.extend_from_slice(&offsets);
+        type_chunk.extend_from_slice(&entries);
+        build_arsc_table(0x7f, &type_chunk)
+    }
+
+    fn build_arsc_table(package_id: u32, type_chunk: &[u8]) -> Vec<u8> {
+        let mut pool = Vec::new();
+        push_u16(&mut pool, 0x0001);
+        push_u16(&mut pool, 28);
+        push_u32(&mut pool, 28);
+        push_u32(&mut pool, 0);
+        push_u32(&mut pool, 0);
+        push_u32(&mut pool, 0);
+        push_u32(&mut pool, 28);
+        push_u32(&mut pool, 0);
 
         const PKG_HEADER: usize = 284;
         let mut pkg = Vec::new();
-        u16(&mut pkg, 0x0200);
-        u16(&mut pkg, PKG_HEADER as u16);
-        u32(&mut pkg, (PKG_HEADER + type_chunk.len()) as u32);
-        u32(&mut pkg, package_id);
+        push_u16(&mut pkg, 0x0200);
+        push_u16(&mut pkg, PKG_HEADER as u16);
+        push_u32(&mut pkg, (PKG_HEADER + type_chunk.len()) as u32);
+        push_u32(&mut pkg, package_id);
         pkg.resize(pkg.len() + 256, 0);
-        u32(&mut pkg, 0);
-        u32(&mut pkg, 0);
-        u32(&mut pkg, 0);
-        u32(&mut pkg, 0);
+        push_u32(&mut pkg, 0);
+        push_u32(&mut pkg, 0);
+        push_u32(&mut pkg, 0);
+        push_u32(&mut pkg, 0);
         debug_assert_eq!(pkg.len(), PKG_HEADER);
-        pkg.extend_from_slice(&type_chunk);
+        pkg.extend_from_slice(type_chunk);
 
         let mut table = Vec::new();
-        u16(&mut table, 0x0002);
-        u16(&mut table, 12);
-        u32(&mut table, (12 + pool.len() + pkg.len()) as u32);
-        u32(&mut table, 1);
+        push_u16(&mut table, 0x0002);
+        push_u16(&mut table, 12);
+        push_u32(&mut table, (12 + pool.len() + pkg.len()) as u32);
+        push_u32(&mut table, 1);
         table.extend_from_slice(&pool);
         table.extend_from_slice(&pkg);
         table
