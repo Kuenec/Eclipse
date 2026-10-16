@@ -1226,4 +1226,33 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn mutated_archives_never_verify_and_never_panic() {
+        let manifest = crate::apk::axml::fixture::Manifest {
+            package: "com.roblox.client",
+            version_code: Some(3170),
+            version_name: Some("2.740.931"),
+            split: None,
+            launcher: Some("com.roblox.client.startup.ActivitySplash"),
+        }
+        .encode();
+        let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("AndroidManifest.xml", SimpleFileOptions::default())
+            .expect("start entry");
+        writer.write_all(&manifest).expect("write entry");
+        let zip = writer.finish().expect("finish zip").into_inner();
+        let signed = with_signing_block(&zip, &v2_block(&[signer(b"key")]));
+        let path = temp_path("mutated-archive");
+        let mut mutations = crate::mutation::Mutations::new(0x21b5_e0cd);
+        for _ in 0..1500 {
+            std::fs::write(&path, mutations.of(&signed)).expect("write the archive");
+            assert!(verify_roblox_signing_history(&open(&path)).is_err());
+            if let Ok(mut apk) = crate::apk::Apk::open(&path) {
+                let _ = apk.manifest();
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
 }

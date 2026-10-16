@@ -118,8 +118,41 @@ fn an_app_data_directory_that_cannot_be_created_is_named() {
 
     let stderr = stderr(&output);
     assert!(!output.status.success(), "{stderr}");
-    let expected = format!("cannot create {}", app_data.join("runtime").display());
+    let expected = format!("cannot create {}: ", app_data.display());
     assert!(stderr.contains(&expected), "{stderr}");
+}
+
+#[test]
+fn launches_and_installs_keep_the_app_data_directory_to_its_owner() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = |path: &Path| {
+        std::fs::metadata(path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    for command in ["run", "install"] {
+        let root = sandbox(&format!("owner-only-{command}"));
+        let app_data = root.join("app-data");
+        std::fs::create_dir(&app_data).unwrap();
+        std::fs::set_permissions(&app_data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let missing = root.join("missing.apk");
+
+        let output = eclipse(
+            &root,
+            &app_data,
+            &[OsStr::new(command), missing.as_os_str()],
+        );
+        let modes = (
+            mode(&app_data),
+            mode(&app_data.join("runtime").join("client.lock")),
+        );
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(modes, (0o700, 0o600), "{command}: {}", stderr(&output));
+    }
 }
 
 #[test]
@@ -161,7 +194,7 @@ fn a_run_logs_the_clients_output_and_how_it_ended() {
     );
     assert!(
         log.ends_with(&format!(
-            "  INFO eclipse::supervisor: Roblox stopped after Eclipse reported why\nLast \
+            "  INFO eclipse::supervisor: Roblox stopped after Eclipse reported why\n Last \
              error: {error}\n"
         )),
         "{log}"

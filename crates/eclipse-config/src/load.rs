@@ -184,7 +184,7 @@ fn sandbox_share(target: &Path) -> &Path {
     if target.starts_with(NIX_STORE) {
         return Path::new(NIX_STORE);
     }
-    target.parent().unwrap_or(target)
+    target
 }
 
 #[must_use]
@@ -311,6 +311,10 @@ fn read_entries(document: &Document<'_>, path: &Path, loaded: &mut Loaded) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/mutation.rs"]
+mod mutation;
 
 #[cfg(test)]
 mod tests {
@@ -589,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dangling_link_elsewhere_names_the_directory_of_its_target() {
+    fn a_dangling_link_elsewhere_names_its_target() {
         let dir = sandbox("dangling-elsewhere");
         let path = dir.join("config.json");
         let gone = dir.join("gone");
@@ -601,7 +605,7 @@ mod tests {
         let message = shared.problems[0].to_string();
         let expected = format!(
             "flatpak override --user --filesystem={}:ro {FLATPAK_ID}",
-            gone.display()
+            gone.join("missing.json").display()
         );
         assert!(message.contains(&expected), "{message}");
         assert_eq!(
@@ -616,7 +620,23 @@ mod tests {
     }
 
     #[test]
-    fn the_flatpak_override_quotes_a_directory_the_shell_would_split() {
+    fn a_dangling_link_to_a_file_in_home_shares_only_that_file() {
+        let dir = sandbox("dangling-home-file");
+        let path = dir.join("config.json");
+        let home = dir.join("home");
+        symlink(home.join("eclipse.json"), &path).expect("create the link");
+        let loaded = load_in(&path, Some(FLATPAK_ID.to_owned()));
+        fs::remove_dir_all(&dir).ok();
+
+        let message = loaded.problems[0].to_string();
+        let file_share = format!("--filesystem={}:ro", home.join("eclipse.json").display());
+        let home_share = format!("--filesystem={}:ro", home.display());
+        assert!(message.contains(&file_share), "{message}");
+        assert!(!message.contains(&home_share), "{message}");
+    }
+
+    #[test]
+    fn the_flatpak_override_quotes_a_path_the_shell_would_split() {
         let dir = sandbox("dangling-spaced");
         let path = dir.join("config.json");
         symlink(dir.join("Kue's dots").join("gone.json"), &path).expect("create the link");
@@ -625,7 +645,7 @@ mod tests {
 
         let message = loaded.problems[0].to_string();
         let expected = format!(
-            r"`flatpak override --user '--filesystem={}/Kue'\''s dots:ro' {FLATPAK_ID}`",
+            r"`flatpak override --user '--filesystem={}/Kue'\''s dots/gone.json:ro' {FLATPAK_ID}`",
             dir.display()
         );
         assert!(message.contains(&expected), "{message}");
@@ -676,7 +696,10 @@ mod tests {
         let message = loaded.problems[0].to_string();
         let expected = format!(
             "flatpak override --user --filesystem={}:ro {FLATPAK_ID}",
-            home.join("dotfiles").join("eclipse").display()
+            home.join("dotfiles")
+                .join("eclipse")
+                .join("config.json")
+                .display()
         );
         assert!(message.contains(&expected), "{message}");
         assert!(!message.contains(".."), "{message}");
@@ -1049,6 +1072,28 @@ mod tests {
     fn config_path_lives_under_eclipse_dir() {
         if let Some(path) = config_path() {
             assert!(path.ends_with("eclipse/config.json"), "got {path:?}");
+        }
+    }
+
+    #[test]
+    fn mutated_config_files_load_with_their_problems_named() {
+        let original = br#"{
+            "graphics_optimization_mode": "performance",
+            "touch_mode": "fake-off",
+            "close_on_leave": "browser",
+            "vulkan_device": "1002:164e",
+            "unfocused_fps_limit": 30,
+            "audio_output_device": "Speakers",
+            "fflags": {"DFIntTaskSchedulerTargetFps": 144, "FFlagX": true},
+            "unknown": [1, 2.5, null, "\u00e9\n"]
+        }"#;
+        let mut mutations = mutation::Mutations::new(0xc0f1_9fed);
+        for _ in 0..1500 {
+            let (_, loaded) = load_bytes("mutated", &mutations.of(original));
+            for problem in &loaded.problems {
+                assert!(!problem.to_string().is_empty());
+            }
+            let _ = loaded.unused_keys_message();
         }
     }
 }

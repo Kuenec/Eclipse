@@ -813,6 +813,36 @@ mod tests {
         None
     }
 
+    #[test]
+    fn mutated_tables_fail_or_answer_lookups_without_panicking() {
+        let config = ResConfig::default();
+        let mut mutations = crate::mutation::Mutations::new(0x5eed_a85c);
+        for original in [build_fixture(), build_style_fixture()] {
+            for _ in 0..4000 {
+                let bytes = mutations.of(&original);
+                let Ok(table) = parse_arsc(&bytes) else {
+                    continue;
+                };
+                for package in table.package_ids() {
+                    let _ = table.package_name(package);
+                    for type_id in 0..4u8 {
+                        let _ = table.type_name(package, type_id);
+                        for entry in 0..4u16 {
+                            let id = (u32::from(package) << 24)
+                                | (u32::from(type_id) << 16)
+                                | u32::from(entry);
+                            if let Some(value) = table.resource_value(id, &config) {
+                                let _ = table.key_name(package, value.key_index);
+                                let _ = table.value_string(value.data);
+                            }
+                            let _ = table.resolve_style(id, &config);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn build_fixture() -> Vec<u8> {
         let mut pool = Vec::new();
         push_u16(&mut pool, RES_STRING_POOL_TYPE);

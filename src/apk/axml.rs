@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::cell::Cell;
 use std::fmt;
 
 use super::intent_filter::{PathMatcher, ViewHandler};
@@ -33,6 +34,8 @@ const ANDROID_NS_URI: &str = "http://schemas.android.com/apk/res/android";
 
 const MAX_INTENT_FILTER_DATA_BYTES: usize = 64 * 1024;
 
+const STRING_BYTES_PER_DOCUMENT_BYTE: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxmlError {
     Truncated,
@@ -60,6 +63,8 @@ pub enum AxmlError {
     NoLauncher,
 
     IntentFilterDataTooLarge,
+
+    StringDataTooLarge,
 }
 
 impl fmt::Display for AxmlError {
@@ -79,6 +84,9 @@ impl fmt::Display for AxmlError {
             Self::NoLauncher => "binary XML has no MAIN/LAUNCHER activity",
             Self::IntentFilterDataTooLarge => {
                 "binary XML intent filters declare more data than Eclipse reads"
+            }
+            Self::StringDataTooLarge => {
+                "binary XML refers to more string data than Eclipse reads for its size"
             }
         };
         f.write_str(msg)
@@ -421,10 +429,12 @@ struct StringPool<'a> {
 
     data_start: usize,
     is_utf8: bool,
+    read_bytes: Cell<usize>,
+    read_budget: usize,
 }
 
 impl<'a> StringPool<'a> {
-    fn parse(chunk: &Chunk<'a>) -> Result<Self, AxmlError> {
+    fn parse(chunk: &Chunk<'a>, document_len: usize) -> Result<Self, AxmlError> {
         let buf = chunk.bytes;
 
         let string_count = read_u32(buf, 8)? as usize;
@@ -450,6 +460,8 @@ impl<'a> StringPool<'a> {
             offsets_start,
             data_start: strings_start,
             is_utf8,
+            read_bytes: Cell::new(0),
+            read_budget: document_len.saturating_mul(STRING_BYTES_PER_DOCUMENT_BYTE),
         })
     }
 
@@ -470,12 +482,29 @@ impl<'a> StringPool<'a> {
             .data_start
             .checked_add(rel)
             .ok_or(AxmlError::Overflow)?;
-        let s = if self.is_utf8 {
-            decode_utf8(self.chunk, start)?
+        let data = if self.is_utf8 {
+            utf8_data(self.chunk, start)?
         } else {
-            decode_utf16(self.chunk, start)?
+            utf16_data(self.chunk, start)?
         };
-        Ok(Some(s))
+        self.charge(data.len())?;
+        let text = if self.is_utf8 {
+            super::decode_modified_utf8(data).ok_or(AxmlError::BadString)?
+        } else {
+            decode_utf16(data)
+        };
+        Ok(Some(text))
+    }
+
+    fn charge(&self, bytes: usize) -> Result<(), AxmlError> {
+        let total = self
+            .read_bytes
+            .get()
+            .checked_add(bytes)
+            .filter(|&total| total <= self.read_budget)
+            .ok_or(AxmlError::StringDataTooLarge)?;
+        self.read_bytes.set(total);
+        Ok(())
     }
 
     fn materialize(&self) -> Result<Vec<String>, AxmlError> {
@@ -487,15 +516,14 @@ impl<'a> StringPool<'a> {
     }
 }
 
-fn decode_utf8(buf: &[u8], start: usize) -> Result<String, AxmlError> {
+fn utf8_data(buf: &[u8], start: usize) -> Result<&[u8], AxmlError> {
     let (_, after_char) = read_var_len_u8(buf, start)?;
     let (byte_len, after_len) = read_var_len_u8(buf, after_char)?;
     let end = after_len.checked_add(byte_len).ok_or(AxmlError::Overflow)?;
-    let data = buf.get(after_len..end).ok_or(AxmlError::BadString)?;
-    super::decode_modified_utf8(data).ok_or(AxmlError::BadString)
+    buf.get(after_len..end).ok_or(AxmlError::BadString)
 }
 
-fn decode_utf16(buf: &[u8], start: usize) -> Result<String, AxmlError> {
+fn utf16_data(buf: &[u8], start: usize) -> Result<&[u8], AxmlError> {
     let first = read_u16(buf, start)? as usize;
     let (char_len, data_start) = if first & 0x8000 != 0 {
         let next = read_u16(buf, start.checked_add(2).ok_or(AxmlError::Overflow)?)? as usize;
@@ -508,15 +536,17 @@ fn decode_utf16(buf: &[u8], start: usize) -> Result<String, AxmlError> {
     let end = data_start
         .checked_add(byte_len)
         .ok_or(AxmlError::Overflow)?;
-    let data = buf.get(data_start..end).ok_or(AxmlError::BadString)?;
+    buf.get(data_start..end).ok_or(AxmlError::BadString)
+}
 
+fn decode_utf16(data: &[u8]) -> String {
     let units: Vec<u16> = data
         .as_chunks::<2>()
         .0
         .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    Ok(String::from_utf16_lossy(&units))
+    String::from_utf16_lossy(&units)
 }
 
 fn read_var_len_u8(buf: &[u8], off: usize) -> Result<(usize, usize), AxmlError> {
@@ -536,7 +566,7 @@ fn find_string_pool<'a>(root: &Chunk<'a>) -> Result<StringPool<'a>, AxmlError> {
     for child in root.children() {
         let child = child?;
         if child.kind == RES_STRING_POOL_TYPE {
-            return StringPool::parse(&child);
+            return StringPool::parse(&child, root.bytes.len());
         }
     }
     Err(AxmlError::NoStringPool)
@@ -1193,6 +1223,136 @@ mod tests {
             buf.extend_from_slice(c);
         }
         buf
+    }
+
+    fn utf16_pool(strings: &[&[u16]]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut offsets = Vec::new();
+        for units in strings {
+            offsets.push(data.len() as u32);
+            let len = units.len() as u32;
+            if len > 0x7FFF {
+                u16b(&mut data, 0x8000 | (len >> 16) as u16);
+            }
+            u16b(&mut data, len as u16);
+            for unit in *units {
+                u16b(&mut data, *unit);
+            }
+            u16b(&mut data, 0);
+        }
+        let strings_start = STRING_POOL_HEADER_SIZE + offsets.len() * 4;
+        let size = (strings_start + data.len()) as u32;
+        let mut pool = build_pool_header(size, strings.len() as u32, 0, strings_start as u32, &[]);
+        for offset in offsets {
+            u32b(&mut pool, offset);
+        }
+        pool.extend_from_slice(&data);
+        pool
+    }
+
+    fn repeated_string_document(chars: usize, attributes: u16) -> Vec<u8> {
+        let long = vec![u16::from(b'a'); chars];
+        let manifest: Vec<u16> = "manifest".encode_utf16().collect();
+        let pool = utf16_pool(&[&long, &manifest]);
+
+        let mut element = Vec::new();
+        u16b(&mut element, RES_XML_START_ELEMENT_TYPE);
+        u16b(&mut element, XML_NODE_HEADER_SIZE as u16);
+        u32b(&mut element, 0);
+        u32b(&mut element, 1);
+        u32b(&mut element, NO_STRING);
+        u32b(&mut element, NO_STRING);
+        u32b(&mut element, 1);
+        u16b(&mut element, 20);
+        u16b(&mut element, ATTRIBUTE_MIN_SIZE as u16);
+        u16b(&mut element, attributes);
+        element.extend_from_slice(&[0; 6]);
+        for _ in 0..attributes {
+            u32b(&mut element, 0);
+            u32b(&mut element, 0);
+            u32b(&mut element, 0);
+            u16b(&mut element, 8);
+            element.push(0);
+            element.push(TYPE_STRING);
+            u32b(&mut element, 0);
+        }
+        let size = element.len() as u32;
+        element[4..8].copy_from_slice(&size.to_le_bytes());
+        build_axml(&[&pool, &element])
+    }
+
+    #[test]
+    fn attributes_repeating_one_long_string_are_refused_instead_of_decoded_again() {
+        let axml = repeated_string_document(256 * 1024, 64);
+
+        assert_eq!(
+            read_manifest(&axml).map(|manifest| manifest.package),
+            Err(AxmlError::StringDataTooLarge)
+        );
+        assert_eq!(
+            parse_document(&axml).map(|document| document.elements.len()),
+            Err(AxmlError::StringDataTooLarge)
+        );
+    }
+
+    fn decoded_bytes(document: &XmlDocument) -> usize {
+        let text = |text: &Option<String>| text.as_ref().map_or(0, String::len);
+        let elements: usize = document
+            .elements
+            .iter()
+            .map(|element| {
+                text(&element.namespace)
+                    + text(&element.name)
+                    + element
+                        .attributes
+                        .iter()
+                        .map(|attribute| {
+                            text(&attribute.namespace)
+                                + text(&attribute.name)
+                                + text(&attribute.value_string)
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+        document.strings.iter().map(String::len).sum::<usize>()
+            + elements
+            + document
+                .texts
+                .iter()
+                .map(|xml| text(&xml.text))
+                .sum::<usize>()
+            + document
+                .namespaces
+                .iter()
+                .map(|namespace| text(&namespace.prefix) + text(&namespace.uri))
+                .sum::<usize>()
+    }
+
+    #[test]
+    fn mutated_documents_fail_or_decode_within_their_string_budget() {
+        let manifest = fixture::Manifest {
+            package: "com.roblox.client",
+            version_code: Some(3170),
+            version_name: Some("2.740.931"),
+            split: None,
+            launcher: Some("com.roblox.client.startup.ActivitySplash"),
+        }
+        .encode();
+        let mut mutations = crate::mutation::Mutations::new(0x0a8d_31c5);
+        for original in [manifest, repeated_string_document(48, 6)] {
+            for _ in 0..4000 {
+                let bytes = mutations.of(&original);
+                let _ = read_manifest(&bytes);
+                if let Ok(document) = parse_document(&bytes) {
+                    let decoded = decoded_bytes(&document);
+                    assert!(
+                        decoded <= bytes.len() * STRING_BYTES_PER_DOCUMENT_BYTE * 3 / 2,
+                        "{decoded} decoded bytes from a {}-byte document",
+                        bytes.len()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

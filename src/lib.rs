@@ -21,6 +21,9 @@ pub mod input;
 pub mod links;
 pub mod loader;
 mod mapped_file;
+#[cfg(test)]
+#[path = "../tests/support/mutation.rs"]
+mod mutation;
 mod on_screen_keyboard;
 pub mod performance;
 pub mod portal;

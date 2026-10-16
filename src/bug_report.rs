@@ -958,7 +958,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.join("eclipse-20261003T091434.289Z.tail.log"),
-            format!("{}    at a continuation line\n", lines(300..400)),
+            format!("{}     at a continuation line\n", lines(300..400)),
         )
         .unwrap();
 
