@@ -12,7 +12,7 @@ This accepts the two APKs, a folder holding them, or an `.apks`, `.xapk` or `.ap
 
 ## Download from Google Play
 
-`update --play` downloads Roblox from Google Play after a one-time `play-login`.
+`update --play` downloads Roblox from Google Play after a one-time `play-login`. Once you have signed in, automatic updates also check Google Play next to APKPure and install the newest release either offers.
 
 > [!WARNING]
 > Google may restrict accounts that use unofficial Play clients. Use a secondary account.

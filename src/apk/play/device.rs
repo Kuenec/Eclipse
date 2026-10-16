@@ -1,4 +1,4 @@
-use super::proto::Encoder;
+use crate::apk::proto::Encoder;
 
 const MANUFACTURER: &str = "Google";
 const BRAND: &str = "google";
@@ -248,10 +248,8 @@ pub(super) fn upload_config_request() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::proto::{
-        bytes_field, message_at, repeated_bytes, string_field, varint_field,
-    };
     use super::*;
+    use crate::apk::proto::{bytes_field, message_at, repeated_bytes, string_field, varint_field};
 
     fn strings(message: &[u8], field: u32) -> Vec<&str> {
         repeated_bytes(message, field)

@@ -89,7 +89,7 @@ HIDE_RULE_MISSING = (
     "measure.py's processes, never every Eclipse window, to a special workspace "
     "and sets that global"
 )
-UPDATE_CHECK_MARKER = "Checking APKCombo"
+UPDATE_CHECK_MARKER = "for the newest Roblox client"
 FATAL_MARKERS = ("Roblox could not start", "eclipse run:", "panicked")
 VERSION_CODE = re.compile(r"\(versionCode (\d+)\)")
 GPU_NAME = re.compile(r'\[FLog::Graphics\] Vulkan Device: (.*?)(?: tag="[^"]*")?$')

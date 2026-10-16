@@ -1,6 +1,5 @@
 mod base64;
 mod device;
-mod proto;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -8,22 +7,22 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::store::{InstalledVersion, Store, StoreError, UpdateOutcome};
+use super::proto::{
+    bytes_field, fixed64_field, message_at, repeated_bytes, string_field, varint_field, Encoder,
+    ProtoError,
+};
+use super::store::{Staging, StoreError};
 use super::{
     ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, NATIVE_SPLIT_APK, NATIVE_SPLIT_NAME,
     ROBLOX_PACKAGE,
 };
 use crate::https::{self, Download, DownloadError, Host, Resume};
 use crate::status::StatusSink;
-use proto::{
-    bytes_field, fixed64_field, message_at, repeated_bytes, string_field, varint_field, Encoder,
-    ProtoError,
-};
 
 const AUTH_URL: &str = "https://android.clients.google.com/auth";
 const CHECKIN_URL: &str = "https://android.clients.google.com/checkin";
@@ -128,6 +127,7 @@ pub fn sign_in(email: &str, oauth_token: &Secret) -> Result<Credentials, PlayErr
         &agent,
         "the oauth_token exchange",
         None,
+        None,
         &[
             ("Email", email),
             ("Token", oauth_token.expose()),
@@ -165,35 +165,27 @@ pub fn sign_in(email: &str, oauth_token: &Secret) -> Result<Credentials, PlayErr
     })
 }
 
-pub fn update(
+pub fn latest(
     credentials: &Credentials,
-    store: &Store,
-    current: Option<&ApkSet>,
-    status: &StatusSink,
-) -> Result<UpdateOutcome, PlayError> {
-    let session = Session::start(credentials)?;
-    let latest = session.latest_version()?;
-    let previous = current.map(InstalledVersion::from);
-    if let Some(installed) = previous
-        .as_ref()
-        .filter(|installed| installed.version_code >= latest)
-    {
-        return Ok(UpdateOutcome::UpToDate {
-            installed: installed.clone(),
-        });
-    }
+    deadline: Option<Instant>,
+) -> Result<VersionCode, PlayError> {
+    Session::start(credentials, deadline)?.latest_version(deadline)
+}
 
-    if let Err(error) = session.acquire(latest) {
+pub fn install(
+    credentials: &Credentials,
+    version: VersionCode,
+    staging: Staging<'_>,
+    status: &StatusSink,
+) -> Result<ApkSet, PlayError> {
+    let session = Session::start(credentials, None)?;
+    if let Err(error) = session.acquire(version) {
         tracing::debug!(%error, "Google Play acquire failed; continuing with purchase");
     }
-    let delivery_token = session.purchase(latest)?;
-    let delivery = session.delivery(latest, &delivery_token)?;
+    let delivery_token = session.purchase(version)?;
+    let delivery = session.delivery(version, &delivery_token)?;
 
-    let staging = store.begin(status)?;
     let downloads = https::download_agent();
-    status.step(format!(
-        "Downloading Roblox versionCode {latest} from Google Play…"
-    ));
     download(
         &downloads,
         &delivery.base,
@@ -207,8 +199,20 @@ pub fn update(
         status,
     )?;
     status.step("Checking Roblox's signature and installing it…");
-    let set = Box::new(staging.commit(Some(latest))?);
-    Ok(UpdateOutcome::Updated { previous, set })
+    Ok(staging.commit(Some(version))?)
+}
+
+fn until<B>(
+    request: ureq::RequestBuilder<B>,
+    deadline: Option<Instant>,
+) -> ureq::RequestBuilder<B> {
+    match deadline {
+        None => request,
+        Some(deadline) => request
+            .config()
+            .timeout_global(Some(deadline.saturating_duration_since(Instant::now())))
+            .build(),
+    }
 }
 
 struct Session<'a> {
@@ -218,7 +222,7 @@ struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    fn start(credentials: &'a Credentials) -> Result<Self, PlayError> {
+    fn start(credentials: &'a Credentials, deadline: Option<Instant>) -> Result<Self, PlayError> {
         let agent = https::request_agent();
         let gsf = credentials.gsf_id.hex();
         let sdk = device::SDK_INT.to_string();
@@ -227,6 +231,7 @@ impl<'a> Session<'a> {
             &agent,
             "the Google Play sign-in",
             Some(credentials.gsf_id),
+            deadline,
             &[
                 ("androidId", &gsf),
                 ("sdk_version", &sdk),
@@ -275,11 +280,12 @@ impl<'a> Session<'a> {
         )
     }
 
-    fn latest_version(&self) -> Result<VersionCode, PlayError> {
+    fn latest_version(&self, deadline: Option<Instant>) -> Result<VersionCode, PlayError> {
         const STEP: &str = "the Roblox details request";
-        let response = self
+        let request = self
             .store_headers(self.agent.get(format!("{FDFE_URL}/details")))
-            .query("doc", ROBLOX_PACKAGE)
+            .query("doc", ROBLOX_PACKAGE);
+        let response = until(request, deadline)
             .call()
             .map_err(|error| PlayError::http(STEP, error))?;
         let body = api_body(STEP, response)?;
@@ -375,6 +381,7 @@ fn auth_request(
     agent: &ureq::Agent,
     step: &'static str,
     gsf_id: Option<GsfId>,
+    deadline: Option<Instant>,
     form: &[(&str, &str)],
 ) -> Result<BTreeMap<String, String>, PlayError> {
     let mut request = agent
@@ -384,7 +391,7 @@ fn auth_request(
     if let Some(gsf_id) = gsf_id {
         request = request.header("device", gsf_id.hex());
     }
-    let response = request
+    let response = until(request, deadline)
         .send_form(form.iter().copied())
         .map_err(|error| PlayError::http(step, error))?;
     let status = response.status().as_u16();

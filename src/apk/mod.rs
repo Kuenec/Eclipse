@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-pub mod apkcombo;
+pub mod apkpure;
 pub mod arsc;
 pub mod axml;
 pub mod cache;
@@ -8,9 +8,11 @@ mod file_reader;
 mod intent_filter;
 mod locale_data;
 pub mod play;
+mod proto;
 pub mod res_config;
 pub mod signature;
 pub mod store;
+pub mod update;
 
 use std::collections::HashSet;
 use std::fmt;
@@ -1227,8 +1229,8 @@ impl fmt::Display for ApkSetError {
                 f,
                 "{} is not the official, unmodified Roblox client ({source}); Eclipse only runs \
                  APKs signed by Roblox Corporation, so download Roblox with `eclipse update` \
-                 (APKCombo) or `eclipse update --play` (Google Play), or `eclipse install` \
-                 Roblox's own release files",
+                 or `eclipse update --play` (Google Play), or `eclipse install` Roblox's own \
+                 release files",
                 path.display()
             ),
             Self::WrongPackage { path, package } => write!(

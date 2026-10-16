@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 use eclipse_config::{temp_file, CloseOnLeave, Config};
 use serde::Serialize;
 
+use crate::apk::ROBLOX_PACKAGE;
 use crate::client_log::{self, ClientEvent, GameRpc, JobId, PlaceId, Tap, UniverseId};
 use crate::framework::lifecycle::{self, QuitReason};
 use crate::graphics::title_suffix;
-use crate::portal::{self, Notice, NoticeId, PortalError, PortalRequest};
+use crate::portal::{self, ExternalUri, Notice, NoticeId, PortalError, PortalRequest};
 use crate::server_location::{self, Location, Locator, LookupError};
 
 const SESSION_FILE: &str = "session.json";
@@ -88,6 +89,7 @@ pub fn start(
     runtime_dir: &Path,
     config: &Config,
     origin: LaunchOrigin,
+    update: impl Fn() + Send + 'static,
 ) -> Result<(), SessionError> {
     clear(runtime_dir)?;
     let (tap, events) = Tap::new(GameRpc::Ignored);
@@ -102,6 +104,7 @@ pub fn start(
         quit: quit_after_leaving,
         title: title_suffix::request,
         experience: publish_experience,
+        update,
     };
     spawn(state, events, effects).map_err(SessionError::Spawn)?;
     client_log::install(tap).map_err(|_| SessionError::AlreadyStarted)?;
@@ -121,10 +124,10 @@ pub fn clear(runtime_dir: &Path) -> Result<(), SessionError> {
     }
 }
 
-fn spawn<Fetch, Submit, Quit, Title, Publish>(
+fn spawn<Fetch, Submit, Quit, Title, Publish, Update>(
     mut state: SessionState,
     events: Receiver<ClientEvent>,
-    mut effects: Effects<Fetch, Submit, Quit, Title, Publish>,
+    mut effects: Effects<Fetch, Submit, Quit, Title, Publish, Update>,
 ) -> io::Result<JoinHandle<()>>
 where
     Fetch: FnMut(IpAddr) -> Result<Location, LookupError> + Send + 'static,
@@ -132,6 +135,7 @@ where
     Quit: Fn() + Send + 'static,
     Title: Fn(Option<String>) + Send + 'static,
     Publish: Fn(Experience) + Send + 'static,
+    Update: Fn() + Send + 'static,
 {
     std::thread::Builder::new()
         .name(THREAD_NAME.to_owned())
@@ -183,6 +187,7 @@ struct SessionState {
     after_leaving: AfterLeaving,
     left_at: Option<Instant>,
     teleporting: bool,
+    upgrade_required: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -190,6 +195,8 @@ enum Action {
     Enter { join: Join, server: IpAddr },
     Leave,
     Explain318,
+    Update,
+    OpenStorePage,
     Quit,
 }
 
@@ -200,6 +207,7 @@ impl SessionState {
             after_leaving,
             left_at: None,
             teleporting: false,
+            upgrade_required: false,
         }
     }
 
@@ -241,6 +249,12 @@ impl SessionState {
             }
             ClientEvent::ReturnedToApp => self.returned_to_app(now),
             ClientEvent::AttestationRequired => Some(Action::Explain318),
+            ClientEvent::UpgradeRequired => {
+                self.upgrade_required = true;
+                Some(Action::Update)
+            }
+            ClientEvent::StorePageOpened if self.upgrade_required => Some(Action::Update),
+            ClientEvent::StorePageOpened => Some(Action::OpenStorePage),
             ClientEvent::RpcPending => None,
         }
     }
@@ -260,7 +274,7 @@ impl SessionState {
     }
 }
 
-struct Effects<Fetch, Submit, Quit, Title, Publish> {
+struct Effects<Fetch, Submit, Quit, Title, Publish, Update> {
     runtime_dir: PathBuf,
     locator: Option<Locator<Fetch>>,
     shown: Option<Location>,
@@ -268,21 +282,26 @@ struct Effects<Fetch, Submit, Quit, Title, Publish> {
     quit: Quit,
     title: Title,
     experience: Publish,
+    update: Update,
 }
 
-impl<Fetch, Submit, Quit, Title, Publish> Effects<Fetch, Submit, Quit, Title, Publish>
+impl<Fetch, Submit, Quit, Title, Publish, Update>
+    Effects<Fetch, Submit, Quit, Title, Publish, Update>
 where
     Fetch: FnMut(IpAddr) -> Result<Location, LookupError>,
     Submit: Fn(PortalRequest) -> Result<(), PortalError>,
     Quit: Fn(),
     Title: Fn(Option<String>),
     Publish: Fn(Experience),
+    Update: Fn(),
 {
     fn perform(&mut self, action: Action) {
         match action {
             Action::Enter { join, server } => self.enter(join, server),
             Action::Leave => self.leave(),
             Action::Explain318 => explain_attestation(&self.submit),
+            Action::Update => (self.update)(),
+            Action::OpenStorePage => open_store_page(&self.submit),
             Action::Quit => (self.quit)(),
         }
     }
@@ -363,6 +382,15 @@ fn explain_attestation(submit: &impl Fn(PortalRequest) -> Result<(), PortalError
     }
 }
 
+fn open_store_page(submit: &impl Fn(PortalRequest) -> Result<(), PortalError>) {
+    let page = format!("https://play.google.com/store/apps/details?id={ROBLOX_PACKAGE}");
+    let page = ExternalUri::parse(&page).expect("Roblox's store page is a web link");
+    match submit(PortalRequest::OpenUri(page)) {
+        Ok(()) => tracing::info!("handed Roblox's store page to the desktop portal"),
+        Err(error) => tracing::warn!(%error, "the desktop portal did not take Roblox's store page"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +423,7 @@ mod tests {
         fn(),
         fn(Option<String>),
         fn(Experience),
+        fn(),
     >;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -504,6 +533,10 @@ mod tests {
 
     fn unwatched(_: Experience) {}
 
+    fn current() {
+        panic!("only Roblox calling this version too old asks for an update");
+    }
+
     fn located(_: IpAddr) -> Result<Location, LookupError> {
         Location::from_ipinfo(IPINFO)
     }
@@ -525,6 +558,7 @@ mod tests {
             quit: stay,
             title: untitled,
             experience: unwatched,
+            update: current,
         }
     }
 
@@ -626,6 +660,7 @@ mod tests {
             quit: stay,
             title: untitled,
             experience: |experience| published.borrow_mut().push(experience),
+            update: current,
         };
 
         effects.perform(first_enter());
@@ -672,6 +707,7 @@ mod tests {
             quit: stay,
             title: |suffix| titles.borrow_mut().push(suffix),
             experience: unwatched,
+            update: current,
         };
 
         effects.perform(first_enter());
@@ -749,6 +785,7 @@ mod tests {
             quit: stay,
             title: untitled,
             experience: unwatched,
+            update: current,
         };
         let log = crate::loader::log_capture::formatted_log("info", || {
             effects.perform(action.unwrap());
@@ -773,6 +810,51 @@ mod tests {
                 title: ATTESTATION_TITLE.to_owned(),
                 body: ATTESTATION_EXPLANATION.to_owned(),
             }
+        );
+        assert_eq!(names(&dir), Vec::<String>::new());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn roblox_store_page_asks_for_an_update_only_after_roblox_called_this_version_too_old() {
+        let dir = scratch("update");
+        let mut state = SessionState::new(AfterLeaving::Close);
+        let asked = RefCell::new(0);
+        let opened = RefCell::new(Vec::new());
+        let mut effects = Effects {
+            runtime_dir: dir.clone(),
+            locator: None::<Locator<Fetch>>,
+            shown: None,
+            submit: |request| {
+                let PortalRequest::OpenUri(uri) = request else {
+                    panic!("Roblox's store page is opened, not announced");
+                };
+                opened.borrow_mut().push(uri);
+                Ok(())
+            },
+            quit: stay,
+            title: untitled,
+            experience: unwatched,
+            update: || *asked.borrow_mut() += 1,
+        };
+        for (event, expected) in [
+            (ClientEvent::StorePageOpened, Action::OpenStorePage),
+            (ClientEvent::UpgradeRequired, Action::Update),
+            (ClientEvent::StorePageOpened, Action::Update),
+            (ClientEvent::UpgradeRequired, Action::Update),
+        ] {
+            let action = state.apply(event, Instant::now());
+            assert_eq!(action, Some(expected), "{event:?}");
+            effects.perform(action.unwrap());
+        }
+        assert_eq!(asked.into_inner(), 3);
+        assert!(
+            opened.into_inner()
+                == [ExternalUri::parse(
+                    "https://play.google.com/store/apps/details?id=com.roblox.client"
+                )
+                .unwrap()],
+            "the store page Roblox opens to be rated goes to the browser"
         );
         assert_eq!(names(&dir), Vec::<String>::new());
         fs::remove_dir_all(&dir).ok();
@@ -950,6 +1032,7 @@ mod tests {
             quit: move || quit.send(()).unwrap(),
             title: untitled,
             experience: unwatched,
+            update: current,
         };
         let thread = spawn(SessionState::new(AfterLeaving::Close), events, effects).unwrap();
 
@@ -974,14 +1057,14 @@ mod tests {
                 close_on_leave: CloseOnLeave::Always,
                 ..Config::default()
             };
-            start(&dir, &config, LaunchOrigin::App).unwrap();
+            start(&dir, &config, LaunchOrigin::App, current).unwrap();
             assert_eq!(
                 names(&dir),
                 Vec::<String>::new(),
                 "start removed the stale file"
             );
             assert!(matches!(
-                start(&dir, &config, LaunchOrigin::App),
+                start(&dir, &config, LaunchOrigin::App, current),
                 Err(SessionError::AlreadyStarted)
             ));
             let lines: Vec<&str> = SYNTHETIC_JOINS.lines().collect();

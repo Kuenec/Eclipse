@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256, Sha512};
 
 const ROBLOX_CERTIFICATE_SHA256: &str =
     "44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477";
+pub(super) const ROBLOX_CERTIFICATE_SHA1: &str = "f450e842186fe75cfeb0ad887ea95f8d98383b38";
 const ROBLOX_PUBLIC_KEY_SHA256: &str =
     "ca8dde727caf292fcdad1526b5f3a8a3bd0f69128ace74b1287d4cd58fc2fa3b";
 
@@ -872,6 +873,24 @@ mod tests {
                 .expect("the 2014 certificate has a public key");
             assert_eq!(sha256_hex(original_key), ROBLOX_PUBLIC_KEY_SHA256);
         }
+    }
+
+    #[test]
+    fn the_pinned_certificate_sha1_names_the_pinned_certificate() {
+        let Some(apks) = official_apks() else {
+            return;
+        };
+        let history =
+            verify_roblox_signing_history(&open(&apks[0])).expect("official APK verifies");
+        let certificate = &history.certificates()[0];
+        let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, certificate);
+        let hex: String = digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(sha256_hex(certificate), ROBLOX_CERTIFICATE_SHA256);
+        assert_eq!(hex, ROBLOX_CERTIFICATE_SHA1);
     }
 
     #[test]

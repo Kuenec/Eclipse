@@ -120,6 +120,7 @@ pub enum NoticeId {
     Attestation,
     ServerLocation,
     Graphics,
+    RobloxUpdate,
     Client(i32),
 }
 
@@ -131,6 +132,7 @@ impl NoticeId {
             Self::Attestation => "eclipse-attestation".to_owned(),
             Self::ServerLocation => "eclipse-server-location".to_owned(),
             Self::Graphics => "eclipse-graphics".to_owned(),
+            Self::RobloxUpdate => "eclipse-roblox-update".to_owned(),
             Self::Client(id) => format!("client-{id}"),
         }
     }
@@ -852,6 +854,7 @@ mod tests {
             "eclipse-server-location"
         );
         assert_eq!(NoticeId::Graphics.wire_id(), "eclipse-graphics");
+        assert_eq!(NoticeId::RobloxUpdate.wire_id(), "eclipse-roblox-update");
         assert_eq!(NoticeId::Client(7).wire_id(), "client-7");
         assert_eq!(NoticeId::Client(-2).wire_id(), "client--2");
     }
