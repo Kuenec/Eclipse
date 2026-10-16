@@ -126,6 +126,70 @@ fn disconnects_no_op_leaves_startup_returns_and_udmux_lines_yield_nothing() {
     }
 }
 
+const STARTUP_BTID: &str = "1234567890123456";
+
+fn startup_finished(status: &str) -> String {
+    format!(
+        "2026-10-16T09:21:38.433Z,0.433534,009e,6,Info [FLog::JNIAppBridge] ... StartupController \
+         finished starting: stage = 2, BTID = {STARTUP_BTID}, upgradeStatus = {status}."
+    )
+}
+
+#[test]
+fn roblox_saying_an_upgrade_is_required_is_an_event_without_the_btid() {
+    let line = startup_finished("2");
+    let required = parse(&line);
+    assert_eq!(required, Some(Record::Event(ClientEvent::UpgradeRequired)));
+    assert!(!format!("{required:?}").contains(STARTUP_BTID));
+    for status in ["0", "1", "3", "4", "22", "2, upgradeStatus = 3"] {
+        assert_eq!(parse(&startup_finished(status)), None, "{status}");
+    }
+    for record in [
+        startup_finished("2").replace("JNIAppBridge", "CreatorOutput"),
+        with_header("[FLog::CreatorOutput] [FLog::JNIAppBridge] ... StartupController finished starting: stage = 2, upgradeStatus = 2."),
+        with_header("[FLog::JNIAppBridge] ... StartupController started: upgradeStatus = 2."),
+    ] {
+        assert_eq!(parse(&record), None, "{record}");
+    }
+}
+
+#[test]
+fn a_join_roblox_blocks_for_an_upgrade_is_an_upgrade_event() {
+    let blocked = "canStartGame = false: Upgrade required";
+    let (tap, events) = Tap::new(GameRpc::Ignored);
+    with_test_tap(tap, || {
+        offer_java("GameManager", &format!("[c.f()-14]: {blocked}"));
+        offer_java("GameManager", &format!("[STACKTRACE MISMATCH]: {blocked}"));
+        for (tag, message) in [
+            ("GameManager", blocked.to_owned()),
+            ("GameManager", format!("[c.f()-14]: {blocked}.")),
+            (
+                "GameManager",
+                "[c.q()-7]: Game launch halted - Can't start game.".to_owned(),
+            ),
+            ("Roblox", format!("[c.f()-14]: {blocked}")),
+            ("UpgradeCheckHelper", format!("[d.b()-69]: {blocked}")),
+        ] {
+            offer_java(tag, &message);
+        }
+    });
+    assert_eq!(
+        events.try_iter().collect::<Vec<_>>(),
+        [ClientEvent::UpgradeRequired, ClientEvent::UpgradeRequired]
+    );
+}
+
+#[test]
+fn delivered_events_reach_the_installed_tap() {
+    let (tap, events) = Tap::new(GameRpc::Ignored);
+    with_test_tap(tap, || deliver(ClientEvent::StorePageOpened));
+    assert_eq!(
+        events.try_iter().collect::<Vec<_>>(),
+        [ClientEvent::StorePageOpened]
+    );
+    deliver(ClientEvent::StorePageOpened);
+}
+
 #[test]
 fn malformed_joining_lines_yield_nothing() {
     for body in [

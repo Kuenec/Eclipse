@@ -91,6 +91,7 @@ flowchart LR
 - **Something failed?** Logs of the last five launches are in `~/.var/app/io.github.kuenec.Eclipse/data/eclipse/app-data/logs/`; `eclipse.log` is the newest, and a long launch continues in its `.tail.log` file.
 - **More detail:** `flatpak run --env=RUST_LOG=debug io.github.kuenec.Eclipse run`
 - **Signature error:** the files are not Roblox's official release. Install a clean copy.
+- **Roblox says it is out of date?** Eclipse updates Roblox from APKPure, which can lag behind Roblox's x86-64 releases. Run `update --play` after a one-time `play-login`, or install Roblox's own files with **Install from files** in Settings.
 - **Error 318:** that experience requires Android device attestation, which Eclipse cannot pass. Other experiences are not affected.
 - **Logged out after updating from 0.1.4 or older?** Eclipse carries your login over from the old web engine once. If it could not, the log says why; sign in again.
 - **Uninstall everything:** `flatpak uninstall --user --delete-data io.github.kuenec.Eclipse`

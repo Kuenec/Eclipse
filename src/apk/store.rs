@@ -21,6 +21,7 @@ use crate::status::StatusSink;
 const STORE_DIR: &str = "roblox";
 const CURRENT_FILE: &str = "current.json";
 const LAST_CHECK_FILE: &str = "last-update-check.json";
+const UPGRADE_REQUIRED_FILE: &str = "upgrade-required.json";
 const VERIFIED_FILE: &str = "verified.json";
 const LOCK_FILE: &str = "install.lock";
 const STATE_FILE: &str = "state.json";
@@ -117,17 +118,22 @@ struct LastCheck {
     outcome: CheckOutcome,
 }
 
+#[derive(Serialize, Deserialize)]
+struct UpgradeRequired {
+    version_code: VersionCode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeclaredFile {
-    #[serde(rename = "apkcombo_base_sha1")]
-    ApkComboBaseSha1([u8; SHA1_OUTPUT_LEN]),
+    #[serde(rename = "file_sha1", alias = "apkcombo_base_sha1")]
+    Sha1([u8; SHA1_OUTPUT_LEN]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidate {
     pub version: VersionCode,
 
-    pub file: DeclaredFile,
+    pub file: Option<DeclaredFile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +204,10 @@ pub fn plan(
         CheckMode::Explicit => Plan::Download,
         CheckMode::Scheduled => match rejections.left.get(&candidate.version) {
             Some(&because) => Plan::Rejected(Rejection::Left(because)),
-            None if rejections.files.contains(&candidate.file) => {
+            None if candidate
+                .file
+                .is_some_and(|file| rejections.files.contains(&file)) =>
+            {
                 Plan::Rejected(Rejection::FailedVerification)
             }
             None => Plan::Download,
@@ -521,6 +530,38 @@ impl Store {
                 outcome: check.outcome,
             },
         )
+    }
+
+    pub fn record_upgrade_required(&self, version: VersionCode) -> Result<(), StoreError> {
+        create_dir_all(&self.root)?;
+        replace_json(
+            &self.root,
+            UPGRADE_REQUIRED_FILE,
+            &UpgradeRequired {
+                version_code: version,
+            },
+        )
+    }
+
+    pub fn upgrade_required(&self) -> Result<Option<VersionCode>, StoreError> {
+        let path = self.root.join(UPGRADE_REQUIRED_FILE);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(StoreError::Io { path, source }),
+        };
+        match serde_json::from_slice::<UpgradeRequired>(&bytes) {
+            Ok(record) => Ok(Some(record.version_code)),
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "cannot read which Roblox version Roblox said is too old, so the next update \
+                     check keeps its usual schedule"
+                );
+                Ok(None)
+            }
+        }
     }
 
     pub fn install(&self, sources: &[PathBuf], status: &StatusSink) -> Result<ApkSet, StoreError> {
@@ -2537,7 +2578,7 @@ mod tests {
     fn candidate(code: u32, digest: u8) -> Candidate {
         Candidate {
             version: VersionCode(code),
-            file: DeclaredFile::ApkComboBaseSha1([digest; SHA1_OUTPUT_LEN]),
+            file: Some(DeclaredFile::Sha1([digest; SHA1_OUTPUT_LEN])),
         }
     }
 
@@ -3067,7 +3108,7 @@ mod tests {
         let rolled_back = left(LeftBecause::RolledBack);
         let file = Rejections {
             left: BTreeMap::new(),
-            files: vec![offered.file],
+            files: offered.file.into_iter().collect(),
         };
         assert_eq!(
             plan_with(&crashed, 3170, CheckMode::Scheduled),
@@ -3094,7 +3135,7 @@ mod tests {
         }
         let unrelated = Rejections {
             left: BTreeMap::from([(VersionCode(3120), LeftBecause::FailedToStart)]),
-            files: vec![candidate(3212, 0x41).file],
+            files: candidate(3212, 0x41).file.into_iter().collect(),
         };
         assert_eq!(
             plan_with(&unrelated, 3170, CheckMode::Scheduled),
@@ -3122,17 +3163,67 @@ mod tests {
         let store = Store::at(root.clone());
         for digest in 0..10 {
             store
-                .reject_file(DeclaredFile::ApkComboBaseSha1([digest; SHA1_OUTPUT_LEN]))
+                .reject_file(DeclaredFile::Sha1([digest; SHA1_OUTPUT_LEN]))
                 .unwrap();
         }
         store
-            .reject_file(DeclaredFile::ApkComboBaseSha1([5; SHA1_OUTPUT_LEN]))
+            .reject_file(DeclaredFile::Sha1([5; SHA1_OUTPUT_LEN]))
             .unwrap();
         let kept: Vec<DeclaredFile> = [2, 3, 4, 6, 7, 8, 9, 5]
             .into_iter()
-            .map(|digest| DeclaredFile::ApkComboBaseSha1([digest; SHA1_OUTPUT_LEN]))
+            .map(|digest| DeclaredFile::Sha1([digest; SHA1_OUTPUT_LEN]))
             .collect();
         assert_eq!(store.rejections(crate::VERSION).unwrap().files, kept);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_version_roblox_called_too_old_is_remembered_across_launches() {
+        let root = temp_root("upgrade-required");
+        let store = Store::at(root.clone());
+        assert_eq!(store.upgrade_required().unwrap(), None);
+        store.record_upgrade_required(VersionCode(3212)).unwrap();
+        assert_eq!(
+            Store::at(root.clone()).upgrade_required().unwrap(),
+            Some(VersionCode(3212))
+        );
+        store.record_upgrade_required(VersionCode(3222)).unwrap();
+        assert_eq!(store.upgrade_required().unwrap(), Some(VersionCode(3222)));
+        fs::write(root.join(UPGRADE_REQUIRED_FILE), b"{").unwrap();
+        assert_eq!(store.upgrade_required().unwrap(), None);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rejected_apkcombo_files_from_older_eclipse_still_parse() {
+        let root = temp_root("old-rejected-file");
+        fs::create_dir_all(&root).unwrap();
+        let state = serde_json::json!({
+            "schema": STATE_SCHEMA,
+            "versions": {"3212": "proven"},
+            "fallback_from": null,
+            "rejected_versions": [],
+            "rejected_files": [{"apkcombo_base_sha1": vec![0x41u8; 20]}],
+        });
+        fs::write(root.join(STATE_FILE), serde_json::to_vec(&state).unwrap()).unwrap();
+        let store = Store::at(root.clone());
+        assert_eq!(
+            store.rejections(crate::VERSION).unwrap().files,
+            [DeclaredFile::Sha1([0x41; SHA1_OUTPUT_LEN])]
+        );
+        assert_eq!(state_of(&store, 3212), VersionState::Proven);
+        store
+            .reject_file(DeclaredFile::Sha1([0x42; SHA1_OUTPUT_LEN]))
+            .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(
+            written["rejected_files"],
+            serde_json::json!([
+                {"file_sha1": vec![0x41u8; 20]},
+                {"file_sha1": vec![0x42u8; 20]}
+            ])
+        );
         fs::remove_dir_all(&root).ok();
     }
 

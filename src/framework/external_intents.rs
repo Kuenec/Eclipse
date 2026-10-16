@@ -9,6 +9,8 @@ use jni::sys::jint;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, NativeMethod};
 
 use super::{queue_host_clipboard_text, FrameworkError, ACTIVITY_CLASS, CONTEXT_CLASS};
+use crate::apk::ROBLOX_PACKAGE;
+use crate::client_log::{self, ClientEvent};
 use crate::portal::{self, ExternalUri, Notice, NoticeId, PortalError, PortalRequest, UriRefusal};
 
 pub(super) const NATIVE_OPEN_URI_NAME: &JNIStr = jni_str!("nativeOpenURI");
@@ -21,6 +23,11 @@ pub(super) const NATIVE_SHARE_FILE_SIG: MethodSignature<'static, 'static> =
 const ACTIVITY_NOT_FOUND_EXCEPTION: &JNIStr = jni_str!("android/content/ActivityNotFoundException");
 const ACTIVITY_TARGET: &str = "android.app.Activity";
 const CONTEXT_TARGET: &str = "android.content.Context";
+
+const STORE_DETAILS_PAGES: [&str; 2] = [
+    "market://details?",
+    "https://play.google.com/store/apps/details?",
+];
 
 const LINK_REFUSED_TITLE: &str = "Can't open this link";
 const LINK_REFUSED_BODY: &str = "Eclipse opens web and email links only.";
@@ -70,10 +77,31 @@ impl fmt::Display for LinkNotOpened {
     }
 }
 
+fn names_roblox_in_the_store(text: &str) -> bool {
+    STORE_DETAILS_PAGES
+        .iter()
+        .find_map(|page| text.strip_prefix(page))
+        .is_some_and(|query| {
+            query
+                .split('&')
+                .any(|pair| pair.strip_prefix("id=") == Some(ROBLOX_PACKAGE))
+        })
+}
+
 fn open_link(
     text: &str,
     submit: impl Fn(PortalRequest) -> Result<(), PortalError>,
+    report_store_page: impl FnOnce(),
 ) -> Result<(), LinkNotOpened> {
+    if names_roblox_in_the_store(text) {
+        tracing::info!(
+            target: ACTIVITY_TARGET,
+            "Activity.nativeOpenURI: Roblox opened its own app store page; Eclipse checks for a \
+             newer Roblox if Roblox called this version too old and opens the page otherwise"
+        );
+        report_store_page();
+        return Ok(());
+    }
     let uri = match ExternalUri::parse(text) {
         Ok(uri) => uri,
         Err(refusal) => {
@@ -163,13 +191,18 @@ extern "system" fn activity_native_open_uri<'local>(
     _class: JClass<'local>,
     uri: JString<'local>,
 ) {
-    open_uri_from_java(env, &uri, portal::submit);
+    open_uri_from_java(env, &uri, portal::submit, report_store_page);
+}
+
+fn report_store_page() {
+    client_log::deliver(ClientEvent::StorePageOpened);
 }
 
 fn open_uri_from_java<'local>(
     mut env: EnvUnowned<'local>,
     uri: &JString<'local>,
     submit: impl Fn(PortalRequest) -> Result<(), PortalError>,
+    report_store_page: impl FnOnce(),
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let uri = if uri.is_null() {
@@ -177,7 +210,7 @@ fn open_uri_from_java<'local>(
         } else {
             uri.try_to_string(env)?
         };
-        let Err(not_opened) = open_link(&uri, submit) else {
+        let Err(not_opened) = open_link(&uri, submit, report_store_page) else {
             return Ok(());
         };
         let message = format!(
@@ -260,7 +293,9 @@ mod tests {
                 Some(uri) => env.new_string(uri).expect("uri string"),
                 None => JString::null(),
             };
-            open_uri_from_java(fake_jvm::native_env(), &uri, notices_into(&posted));
+            open_uri_from_java(fake_jvm::native_env(), &uri, notices_into(&posted), || {
+                panic!("only Roblox's store page goes to the session")
+            });
         });
         Refused {
             exception: fake_jvm::take_exception(),
@@ -295,16 +330,56 @@ mod tests {
         let opened = RefCell::new(Vec::new());
         fake_jvm::with_env(|env| {
             let uri = env.new_string(link).expect("uri string");
-            open_uri_from_java(fake_jvm::native_env(), &uri, |request| {
-                let PortalRequest::OpenUri(uri) = request else {
-                    panic!("a web link must only be opened");
-                };
-                opened.borrow_mut().push(uri);
-                Ok(())
-            });
+            open_uri_from_java(
+                fake_jvm::native_env(),
+                &uri,
+                |request| {
+                    let PortalRequest::OpenUri(uri) = request else {
+                        panic!("a web link must only be opened");
+                    };
+                    opened.borrow_mut().push(uri);
+                    Ok(())
+                },
+                || panic!("a web link is not Roblox's store page"),
+            );
         });
         assert_eq!(fake_jvm::take_exception(), None);
         assert!(opened.into_inner() == [ExternalUri::parse(link).expect("a web link")]);
+    }
+
+    #[test]
+    fn roblox_store_pages_go_to_the_session_instead_of_the_portal() {
+        for link in [
+            "market://details?id=com.roblox.client",
+            "https://play.google.com/store/apps/details?id=com.roblox.client",
+            "https://play.google.com/store/apps/details?hl=en&id=com.roblox.client",
+        ] {
+            let asked = RefCell::new(0);
+            fake_jvm::with_env(|env| {
+                let uri = env.new_string(link).expect("uri string");
+                open_uri_from_java(
+                    fake_jvm::native_env(),
+                    &uri,
+                    |_| panic!("{link} reached the portal"),
+                    || *asked.borrow_mut() += 1,
+                );
+            });
+            assert_eq!(fake_jvm::take_exception(), None, "{link}");
+            assert_eq!(asked.into_inner(), 1, "{link}");
+        }
+        for link in [
+            "https://play.google.com/store/apps/details?id=com.roblox.client.extra",
+            "https://play.google.com/store/apps/details?id=com.other.app",
+            "https://play.google.com/store/apps/developer?id=com.roblox.client",
+        ] {
+            assert!(!names_roblox_in_the_store(link), "{link}");
+        }
+        let refused = refuse_from_java(Some("market://details?id=com.other.app"));
+        assert_eq!(refused.exception.as_deref(), Some(ACTIVITY_NOT_FOUND));
+        assert_eq!(
+            refused.posted,
+            posted(NoticeId::Link, LINK_REFUSED_TITLE, LINK_REFUSED_BODY)
+        );
     }
 
     #[test]
@@ -341,10 +416,15 @@ mod tests {
         let attempts = RefCell::new(0);
         fake_jvm::with_env(|env| {
             let uri = env.new_string("https://example.org/x").expect("uri string");
-            open_uri_from_java(fake_jvm::native_env(), &uri, |_| {
-                *attempts.borrow_mut() += 1;
-                Err(PortalError::Busy)
-            });
+            open_uri_from_java(
+                fake_jvm::native_env(),
+                &uri,
+                |_| {
+                    *attempts.borrow_mut() += 1;
+                    Err(PortalError::Busy)
+                },
+                || panic!("a web link is not Roblox's store page"),
+            );
         });
         assert_eq!(
             fake_jvm::take_exception().as_deref(),

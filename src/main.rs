@@ -8,7 +8,8 @@ use eclipse::apk::store::{
     Attempt, CheckMode, CheckOutcome, InstalledVersion, Proof, Rollback, Store, UpdateCheck,
     UpdateOutcome,
 };
-use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode};
+use eclipse::apk::update::{Sources, UpdateError};
+use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode, TARGET_ABI};
 use eclipse::framework::lifecycle::{
     exit_without_vm_teardown, finish_android_process, record_normal_close_at_client_exit,
     ClientEnd, Stage,
@@ -84,10 +85,11 @@ COMMANDS:
                 the window. With no PATH, runs the installed client in a window that shows the
                 download and any error: the first run downloads Roblox, and later runs check
                 for a Roblox update at most every 6 hours, or 30 minutes after a failed check,
-                and start the installed Roblox if APKCombo has not answered within 3 seconds.
-                --check-update checks now and waits for the answer. With roblox_auto_update set
-                to false in config.json, only `update`, `run --check-update` and a first install
-                download Roblox.
+                and start the installed Roblox if no source has answered within 3 seconds.
+                Once Roblox says the installed version is too old, every start checks and
+                waits for the answer. --check-update checks now and waits for the answer.
+                With roblox_auto_update set to false in config.json, only `update`,
+                `run --check-update` and a first install download Roblox.
                 A new Roblox that fails to start twice is replaced by the version kept before it.
                 PATH may be an APK file or a directory holding base.apk and
                 split_config.x86_64.apk. Only one Roblox client runs at a time; running it
@@ -100,9 +102,10 @@ COMMANDS:
                 Verify and install the Roblox client: base.apk plus split_config.x86_64.apk,
                 a directory holding them, or an .apks/.xapk/.apkm bundle.
     update [--play]
-                Download and install the newest Roblox client from APKCombo, without any
-                account. With --play, download it from Google Play with the account saved by
-                play-login instead.
+                Download and install the newest Roblox client. Eclipse asks APKPure, without
+                any account, and Google Play once play-login has saved an account, and installs
+                the newest release; when one source fails it uses the next. With --play, ask
+                Google Play only.
     play-login  Sign in to Google Play with your own Google account (once, for update --play).
     rollback    Go back to the Roblox version before the current one, which Eclipse keeps until a
                 new version has been played and closed once. Automatic updates skip the one left.
@@ -128,8 +131,8 @@ COMMANDS:
 
 NOTE: Eclipse runs only the official, unmodified Roblox client signed by Roblox Corporation.
     It never hosts or modifies it. `eclipse update` downloads Roblox's own release files from
-    APKCombo (or Google Play with --play) and installs them only when Roblox's signature
-    verifies; anything else is discarded.
+    APKPure or Google Play and installs them only when Roblox's signature verifies; anything
+    else is discarded.
 ";
 
 fn main() -> ExitCode {
@@ -351,22 +354,40 @@ enum LaunchCheck {
     Now,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Unknown,
+    UpdateRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeptBecause {
+    AutomaticUpdatesOff,
+    NothingNewer,
+    CheckFailed,
+    NewerFailedToStart,
+}
+
 impl LaunchCheck {
     fn wanted(
         self,
         installed: Option<VersionCode>,
         last_check: Option<&UpdateCheck>,
         now: SystemTime,
+        verdict: Verdict,
     ) -> bool {
-        match self {
-            Self::WhenDue => eclipse::apk::store::update_due(installed, last_check, now),
-            Self::OnlyWhenMissing => installed.is_none(),
-            Self::Now => true,
+        match (self, verdict) {
+            (Self::WhenDue, Verdict::UpdateRequired) | (Self::Now, _) => true,
+            (Self::WhenDue, Verdict::Unknown) => {
+                eclipse::apk::store::update_due(installed, last_check, now)
+            }
+            (Self::OnlyWhenMissing, _) => installed.is_none(),
         }
     }
 
-    fn time_limit(self, installed: Option<VersionCode>) -> Option<Duration> {
-        (self == Self::WhenDue && installed.is_some()).then_some(LAUNCH_CHECK_BUDGET)
+    fn time_limit(self, installed: Option<VersionCode>, verdict: Verdict) -> Option<Duration> {
+        (self == Self::WhenDue && installed.is_some() && verdict == Verdict::Unknown)
+            .then_some(LAUNCH_CHECK_BUDGET)
     }
 }
 
@@ -1267,6 +1288,8 @@ const AUDIO_DEVICES_USAGE: &str = "usage: eclipse __audio-devices [--watch]";
 
 const VERIFYING_SIGNATURE: &str = "Verifying the Roblox client's signature…";
 
+const ROBLOX_UPDATE_TITLE: &str = "Roblox update";
+
 const CLIENT_SETTINGS_FILE: &str = "ClientAppSettings.json";
 
 const PLAY_LOGIN_STEPS: &str = "\
@@ -1421,33 +1444,33 @@ fn clean_storage(
     Ok(eclipse::storage::clean(layout, status)?)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum UpdateSource {
-    ApkCombo,
-    GooglePlay,
-}
-
-fn parse_update_source(arguments: &[OsString]) -> Result<UpdateSource, String> {
+fn parse_update_source(arguments: &[OsString]) -> Result<Sources, String> {
     match arguments {
-        [] => Ok(UpdateSource::ApkCombo),
-        [flag] if flag == "--play" => Ok(UpdateSource::GooglePlay),
+        [] => Ok(Sources::Every),
+        [flag] if flag == "--play" => Ok(Sources::GooglePlay),
         _ => Err("usage: eclipse update [--play]".to_string()),
     }
 }
 
 fn update_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     eclipse::runtime::android_cpu_baseline()?;
-    let source = parse_update_source(arguments)?;
+    let sources = parse_update_source(arguments)?;
     let _client = lock_out_clients()?;
     let store = Store::open()?;
     let current = store.usable_current()?;
     let status = StatusSink::terminal();
-    let updated = match source {
-        UpdateSource::ApkCombo => {
-            update_from_apkcombo(&store, current.as_ref(), CheckMode::Explicit, None, &status)
-        }
-        UpdateSource::GooglePlay => update_from_play(&store, current.as_ref(), &status),
-    }?;
+    let updated = update_from_sources(
+        &store,
+        current.as_ref(),
+        sources,
+        CheckMode::Explicit,
+        None,
+        &status,
+    )
+    .map_err(|error| match sources {
+        Sources::Every => with_update_advice(error, &user_packaging()),
+        Sources::GooglePlay => error,
+    })?;
     remove_unkept_versions(&store, &status);
     if let Some(updated) = updated {
         prepare_for_next_launch(updated, &status);
@@ -1455,29 +1478,205 @@ fn update_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn update_from_apkcombo(
+fn update_from_sources(
     store: &Store,
     current: Option<&ApkSet>,
+    sources: Sources,
     mode: CheckMode,
     check_deadline: Option<Instant>,
     status: &StatusSink,
 ) -> Result<Option<ApkSet>, Box<dyn std::error::Error>> {
-    status.step("Checking APKCombo for the newest Roblox client…");
-    let outcome = eclipse::apk::apkcombo::update(store, current, mode, check_deadline, status)?;
+    let outcome =
+        eclipse::apk::update::update(store, current, sources, mode, check_deadline, status)?;
     finish_update(store, outcome, status)
 }
 
-fn update_from_play(
+fn user_packaging() -> Packaging {
+    Packaging::detect().unwrap_or_else(|error| {
+        tracing::warn!(%error, "update advice names the commands as installed on the host");
+        Packaging::Host
+    })
+}
+
+fn update_advice(packaging: &Packaging) -> String {
+    format!(
+        "To update now, run `{}` after a one-time `{}` with your own Google account, or install \
+         Roblox's own files with Install from files in Eclipse Settings.",
+        packaging.command("update --play"),
+        packaging.command("play-login")
+    )
+}
+
+fn with_update_advice(
+    error: Box<dyn std::error::Error>,
+    packaging: &Packaging,
+) -> Box<dyn std::error::Error> {
+    match error.downcast_ref::<UpdateError>() {
+        Some(UpdateError::NothingInstalled(_)) => {
+            format!("{error}. {}", update_advice(packaging)).into()
+        }
+        _ => error,
+    }
+}
+
+fn too_old(installed: &InstalledVersion) -> String {
+    format!("Roblox says version {installed} is too old to join games.")
+}
+
+fn nothing_newer(packaging: &Packaging) -> String {
+    format!(
+        "Eclipse has no newer {TARGET_ABI} build of Roblox to install yet. {}",
+        update_advice(packaging)
+    )
+}
+
+fn roblox_refuses(
+    installed: &InstalledVersion,
+    kept: KeptBecause,
+    packaging: &Packaging,
+) -> String {
+    match kept {
+        KeptBecause::AutomaticUpdatesOff => format!(
+            "{} Automatic updates are off; run `{}` to update it.",
+            too_old(installed),
+            packaging.command("update")
+        ),
+        KeptBecause::NothingNewer => {
+            format!("{} {}", too_old(installed), nothing_newer(packaging))
+        }
+        KeptBecause::CheckFailed => format!(
+            "{} Eclipse could not update it, so it starts this version.",
+            too_old(installed)
+        ),
+        KeptBecause::NewerFailedToStart => {
+            format!("{} {}", too_old(installed), update_advice(packaging))
+        }
+    }
+}
+
+fn update_when_asked(installed: InstalledVersion, auto_update: bool) -> impl Fn() + Send + 'static {
+    let checking = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    move || {
+        if checking.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            tracing::info!("Eclipse is already checking for a newer Roblox");
+            return;
+        }
+        let checked = installed.clone();
+        let done = std::sync::Arc::clone(&checking);
+        let spawned = std::thread::Builder::new()
+            .name("eclipse-update".to_owned())
+            .spawn(move || {
+                update_for_roblox(&checked, auto_update);
+                done.store(false, std::sync::atomic::Ordering::Release);
+            });
+        if let Err(error) = spawned {
+            checking.store(false, std::sync::atomic::Ordering::Release);
+            post_update_notice(format!(
+                "{} Eclipse cannot start its update check: {error}",
+                too_old(&installed)
+            ));
+        }
+    }
+}
+
+fn update_for_roblox(installed: &InstalledVersion, auto_update: bool) {
+    match Store::open() {
+        Ok(store) => answer_refusal(
+            &store,
+            installed,
+            auto_update,
+            &user_packaging(),
+            post_update_notice,
+        ),
+        Err(error) => post_update_notice(format!(
+            "{} Eclipse cannot open its Roblox store: {error}",
+            too_old(installed)
+        )),
+    }
+}
+
+fn answer_refusal(
     store: &Store,
-    current: Option<&ApkSet>,
-    status: &StatusSink,
-) -> Result<Option<ApkSet>, Box<dyn std::error::Error>> {
-    let credentials = eclipse::apk::play::Account::open()?
-        .credentials()?
-        .ok_or("not signed in to Google Play; run `eclipse play-login` first")?;
-    status.step("Checking Google Play for the newest Roblox client…");
-    let outcome = eclipse::apk::play::update(&credentials, store, current, status)?;
-    finish_update(store, outcome, status)
+    installed: &InstalledVersion,
+    auto_update: bool,
+    packaging: &Packaging,
+    notify: impl Fn(String),
+) {
+    if let Err(error) = store.record_upgrade_required(installed.version_code) {
+        tracing::warn!(
+            %error,
+            "cannot record that Roblox called this version too old, so the next start keeps the \
+             usual update schedule"
+        );
+    }
+    if !auto_update {
+        notify(roblox_refuses(
+            installed,
+            KeptBecause::AutomaticUpdatesOff,
+            packaging,
+        ));
+        return;
+    }
+    let reason = too_old(installed);
+    notify(format!("{reason} Eclipse is looking for a newer version."));
+    let status = StatusSink::terminal();
+    let checked = store
+        .usable_current()
+        .map_err(Into::into)
+        .and_then(|current| {
+            update_if_due(
+                store,
+                Some(installed.version_code),
+                LaunchCheck::Now,
+                |_| {
+                    update_from_sources(
+                        store,
+                        current.as_ref(),
+                        Sources::Every,
+                        CheckMode::Scheduled,
+                        None,
+                        &status,
+                    )
+                },
+            )
+        });
+    notify(match checked {
+        Ok(Some(updated)) => format!(
+            "Eclipse installed Roblox {}. Close Eclipse and start it again to use it.",
+            InstalledVersion::from(&updated)
+        ),
+        Ok(None) => format!("{reason} {}", nothing_newer(packaging)),
+        Err(error) => format!(
+            "{reason} Eclipse could not update it: {}",
+            with_update_advice(error, packaging)
+        ),
+    });
+}
+
+fn post_update_notice(body: String) {
+    eclipse::diagnostics::record_status(tracing::Level::WARN, &body);
+    let notice = eclipse::portal::Notice {
+        id: eclipse::portal::NoticeId::RobloxUpdate,
+        title: ROBLOX_UPDATE_TITLE.to_owned(),
+        body,
+    };
+    if let Err(error) = eclipse::portal::submit(eclipse::portal::PortalRequest::Notify(notice)) {
+        tracing::warn!(%error, "could not post a desktop notification");
+    }
+}
+
+fn warn_if_roblox_refuses(store: &Store, set: &ApkSet, kept: KeptBecause, status: &StatusSink) {
+    match store.upgrade_required() {
+        Ok(Some(version)) if version == set.version_code() => status.warning(roblox_refuses(
+            &InstalledVersion::from(set),
+            kept,
+            &user_packaging(),
+        )),
+        Ok(_) => {}
+        Err(error) => status.warning(format!(
+            "could not read whether Roblox called this version too old: {error}"
+        )),
+    }
 }
 
 fn finish_update(
@@ -1491,7 +1690,9 @@ fn finish_update(
     })?;
     let (previous, set) = match outcome {
         UpdateOutcome::UpToDate { installed } => {
-            status.outcome(format!("Roblox {installed} is up to date"));
+            status.outcome(format!(
+                "Roblox {installed} is the newest version Eclipse can install"
+            ));
             return Ok(None);
         }
         UpdateOutcome::Updated { previous, set } => (previous, set),
@@ -1512,11 +1713,15 @@ fn update_if_due(
 ) -> Result<Option<ApkSet>, Box<dyn std::error::Error>> {
     let last_check = store.last_check()?;
     let now = SystemTime::now();
-    if !check.wanted(installed, last_check.as_ref(), now) {
+    let verdict = match store.upgrade_required()? {
+        Some(version) if Some(version) == installed => Verdict::UpdateRequired,
+        Some(_) | None => Verdict::Unknown,
+    };
+    if !check.wanted(installed, last_check.as_ref(), now, verdict) {
         return Ok(None);
     }
     let deadline = check
-        .time_limit(installed)
+        .time_limit(installed, verdict)
         .map(|limit| Instant::now() + limit);
     let error = match update(deadline) {
         Ok(updated) => return Ok(updated),
@@ -1563,26 +1768,24 @@ fn installed_apk_set(
         )),
     }
     status.step(VERIFYING_SIGNATURE);
-    let mut set = installed_or_updated_set(&store, status, |current| {
+    let set = set_to_launch(&store, check, status, |current| {
         update_if_due(
             &store,
             current.map(ApkSet::version_code),
             check,
             |deadline| {
-                update_from_apkcombo(&store, current, CheckMode::Scheduled, deadline, status)
+                update_from_sources(
+                    &store,
+                    current,
+                    Sources::Every,
+                    CheckMode::Scheduled,
+                    deadline,
+                    status,
+                )
+                .map_err(|error| with_update_advice(error, &user_packaging()))
             },
         )
     })?;
-    match store.fall_back_if_failing(eclipse::VERSION) {
-        Ok(Some(fell_back)) => {
-            set = store.verified_current()?.ok_or(NOT_INSTALLED)?;
-            status.warning(fell_back.to_string());
-        }
-        Ok(None) => {}
-        Err(error) => status.warning(format!(
-            "could not go back to the Roblox version Eclipse kept: {error}"
-        )),
-    }
     remove_unkept_versions(&store, status);
     if let Some(cache) = eclipse::runtime::dalvik_cache_dir() {
         remove_other_version_oats(&cache, store.root(), set.base_path(), set.version_code())?;
@@ -1657,6 +1860,34 @@ fn remove_other_version_oats(
         }
     }
     Ok(())
+}
+
+fn set_to_launch(
+    store: &Store,
+    check: LaunchCheck,
+    status: &StatusSink,
+    update: impl FnOnce(Option<&ApkSet>) -> Result<Option<ApkSet>, Box<dyn std::error::Error>>,
+) -> Result<ApkSet, Box<dyn std::error::Error>> {
+    let mut kept = match check {
+        LaunchCheck::OnlyWhenMissing => KeptBecause::AutomaticUpdatesOff,
+        LaunchCheck::WhenDue | LaunchCheck::Now => KeptBecause::NothingNewer,
+    };
+    let mut set = installed_or_updated_set(store, status, |current| {
+        update(current).inspect_err(|_| kept = KeptBecause::CheckFailed)
+    })?;
+    match store.fall_back_if_failing(eclipse::VERSION) {
+        Ok(Some(fell_back)) => {
+            set = store.verified_current()?.ok_or(NOT_INSTALLED)?;
+            kept = KeptBecause::NewerFailedToStart;
+            status.warning(fell_back.to_string());
+        }
+        Ok(None) => {}
+        Err(error) => status.warning(format!(
+            "could not go back to the Roblox version Eclipse kept: {error}"
+        )),
+    }
+    warn_if_roblox_refuses(store, &set, kept, status);
+    Ok(set)
 }
 
 fn installed_or_updated_set(
@@ -1994,6 +2225,7 @@ fn play_file(
     eclipse::runtime::prepare_art_boot_environment()?;
     status.step(VERIFYING_SIGNATURE);
     let prepared = prepare_client(ApkSet::open(paths)?, &status)?;
+    let installed = InstalledVersion::from(&prepared.apks);
     boot_and_play(
         prepared,
         None,
@@ -2004,7 +2236,18 @@ fn play_file(
         &loaded.config,
         None,
         &mut None,
+        keep_given_files(installed),
     )
+}
+
+fn keep_given_files(installed: InstalledVersion) -> impl Fn() + Send + 'static {
+    move || {
+        tracing::warn!(
+            "{} This run uses the Roblox files it was started with, so Eclipse does not update \
+             them.",
+            too_old(&installed)
+        );
+    }
 }
 
 type Preparation = std::thread::JoinHandle<Result<(PreparedClient, Option<Proving>), String>>;
@@ -2107,6 +2350,7 @@ fn play_in_window(
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
     let target = slot.begin_play();
     let mut attempt = None;
+    let installed = InstalledVersion::from(&prepared.apks);
     let played = boot_and_play(
         prepared,
         target.as_ref(),
@@ -2117,6 +2361,7 @@ fn play_in_window(
         config,
         proving.as_ref(),
         &mut attempt,
+        update_when_asked(installed, config.roblox_auto_update),
     );
     let closed_by_user = played
         .as_ref()
@@ -2335,6 +2580,7 @@ fn boot_and_play(
     config: &eclipse_config::Config,
     proving: Option<&Proving>,
     attempt: &mut Option<Attempt>,
+    update: impl Fn() + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let PreparedClient {
         apks,
@@ -2364,7 +2610,7 @@ fn boot_and_play(
         Some(_) => LaunchOrigin::Link,
         None => LaunchOrigin::App,
     };
-    eclipse::session::start(&runtime_dir, config, origin)?;
+    eclipse::session::start(&runtime_dir, config, origin, update)?;
     let link = target.map(|target| (target, target.android_uri()));
     let start = match &link {
         None => ActivityStart::Launcher(&plan.launcher_activity),
@@ -3048,20 +3294,22 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_storage, finish_update, first_run_note, installed_client_note,
+        answer_refusal, clean_storage, finish_update, first_run_note, installed_client_note,
         installed_or_updated_set, lock_run_in, native_lib_dir, parse_libroblox_init_lib_dir,
         parse_storage_action, parse_update_source, record_normal_end,
-        remove_other_native_lib_versions, remove_other_version_oats, update_if_due,
-        url_handler_message, window_graphics, window_title, ClientLock, Launch, LaunchCheck,
+        remove_other_native_lib_versions, remove_other_version_oats, roblox_refuses, set_to_launch,
+        update_advice, update_if_due, url_handler_message, user_packaging, window_graphics,
+        window_title, with_update_advice, ClientLock, KeptBecause, Launch, LaunchCheck,
         LaunchCommand, LaunchCommandError, Packaging, Proving, Request, RunCheck, RunStart,
-        StorageAction, StorageLayout, Token, UpdateSource, HELP, LAUNCH_CHECK_BUDGET,
-        LAUNCH_LINK_COMMAND, LAUNCH_LINK_ENV, NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE,
+        StorageAction, StorageLayout, Token, HELP, LAUNCH_CHECK_BUDGET, LAUNCH_LINK_COMMAND,
+        LAUNCH_LINK_ENV, NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE,
     };
     use crate::desktop_integration::BROWSER_HANDLER_COMMAND;
     use eclipse::apk::store::{
         CheckOutcome, DeclaredFile, InstalledVersion, Proof, Rejections, Store, UpdateCheck,
         UpdateOutcome, VersionState,
     };
+    use eclipse::apk::update::{Problem, Source, SourceProblem, Sources, UpdateError};
     use eclipse::apk::VersionCode;
     use eclipse::links::LaunchTarget;
     use eclipse::runtime::NativeLibRoot;
@@ -3230,11 +3478,11 @@ mod tests {
     }
 
     #[test]
-    fn update_uses_apkcombo_unless_google_play_is_asked_for() {
-        assert_eq!(parse_update_source(&[]).unwrap(), UpdateSource::ApkCombo);
+    fn update_asks_every_source_unless_google_play_is_asked_for() {
+        assert_eq!(parse_update_source(&[]).unwrap(), Sources::Every);
         assert_eq!(
             parse_update_source(&["--play".into()]).unwrap(),
-            UpdateSource::GooglePlay
+            Sources::GooglePlay
         );
         for arguments in [vec!["play".into()], vec!["--play".into(), "--play".into()]] {
             assert_eq!(
@@ -3938,12 +4186,150 @@ mod tests {
     }
 
     #[test]
+    fn once_roblox_calls_the_installed_version_too_old_every_start_checks_and_waits() {
+        let root = temp_root("upgrade-required-check");
+        let store = Store::at(root.clone());
+        store
+            .record_check(&completed_check(Duration::from_secs(60)))
+            .unwrap();
+        let installed = Some(VersionCode(3212));
+        assert_eq!(checks_made(&store, installed, LaunchCheck::WhenDue), []);
+
+        store.record_upgrade_required(VersionCode(3212)).unwrap();
+        assert_eq!(
+            checks_made(&store, installed, LaunchCheck::WhenDue),
+            [None],
+            "a check not yet due runs anyway and is not cut short"
+        );
+        store
+            .record_check(&UpdateCheck {
+                at: SystemTime::now(),
+                outcome: CheckOutcome::Failed,
+            })
+            .unwrap();
+        assert_eq!(
+            checks_made(&store, installed, LaunchCheck::WhenDue),
+            [None],
+            "a failed check is retried at the next start instead of after 30 minutes"
+        );
+        assert_eq!(
+            checks_made(&store, installed, LaunchCheck::OnlyWhenMissing),
+            [],
+            "automatic updates stay off when the user turned them off"
+        );
+        assert_eq!(
+            checks_made(&store, Some(VersionCode(3222)), LaunchCheck::WhenDue),
+            [],
+            "a newer install is not the version Roblox refused"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn update_advice_names_google_play_and_install_from_files_as_installed() {
+        let flatpak = Packaging::Flatpak {
+            app_id: "io.github.kuenec.Eclipse".to_owned(),
+        };
+        let advice = update_advice(&flatpak);
+        assert_eq!(
+            advice,
+            "To update now, run `flatpak run io.github.kuenec.Eclipse update --play` after a \
+             one-time `flatpak run io.github.kuenec.Eclipse play-login` with your own Google \
+             account, or install Roblox's own files with Install from files in Eclipse Settings."
+        );
+        assert_eq!(
+            update_advice(&Packaging::Host),
+            advice.replace("flatpak run io.github.kuenec.Eclipse ", "eclipse ")
+        );
+
+        let unreachable = UpdateError::NothingInstalled(vec![SourceProblem {
+            source: Source::ApkPure,
+            problem: Problem::NoX86_64Build,
+        }]);
+        let advised = with_update_advice(Box::new(unreachable), &Packaging::Host).to_string();
+        assert_eq!(
+            advised,
+            format!(
+                "no update source could provide a newer Roblox (APKPure: it has no x86_64 build \
+                 of Roblox). {}",
+                update_advice(&Packaging::Host)
+            )
+        );
+        let other = with_update_advice("the store is locked".into(), &Packaging::Host);
+        assert_eq!(other.to_string(), "the store is locked");
+    }
+
+    #[test]
+    fn a_version_roblox_refuses_is_named_with_what_the_user_can_do() {
+        let installed = InstalledVersion {
+            version_code: VersionCode(3212),
+            version_name: Some("2.741.1061".to_owned()),
+        };
+        assert_eq!(
+            roblox_refuses(&installed, KeptBecause::NothingNewer, &Packaging::Host),
+            format!(
+                "Roblox says version 2.741.1061 (versionCode 3212) is too old to join games. \
+                 Eclipse has no newer x86_64 build of Roblox to install yet. {}",
+                update_advice(&Packaging::Host)
+            )
+        );
+        assert_eq!(
+            roblox_refuses(
+                &installed,
+                KeptBecause::AutomaticUpdatesOff,
+                &Packaging::Host
+            ),
+            "Roblox says version 2.741.1061 (versionCode 3212) is too old to join games. \
+             Automatic updates are off; run `eclipse update` to update it."
+        );
+        assert_eq!(
+            roblox_refuses(&installed, KeptBecause::CheckFailed, &Packaging::Host),
+            "Roblox says version 2.741.1061 (versionCode 3212) is too old to join games. \
+             Eclipse could not update it, so it starts this version."
+        );
+        assert_eq!(
+            roblox_refuses(
+                &installed,
+                KeptBecause::NewerFailedToStart,
+                &Packaging::Host
+            ),
+            format!(
+                "Roblox says version 2.741.1061 (versionCode 3212) is too old to join games. {}",
+                update_advice(&Packaging::Host)
+            )
+        );
+    }
+
+    #[test]
+    fn with_automatic_updates_off_a_refusal_is_recorded_and_explained_without_a_check() {
+        let root = temp_root("refused-updates-off");
+        let store = Store::at(root.clone());
+        let installed = InstalledVersion {
+            version_code: VersionCode(3212),
+            version_name: Some("2.741.1061".to_owned()),
+        };
+        let notices = std::cell::RefCell::new(Vec::new());
+        answer_refusal(&store, &installed, false, &Packaging::Host, |notice| {
+            notices.borrow_mut().push(notice)
+        });
+        assert_eq!(
+            notices.into_inner(),
+            [roblox_refuses(
+                &installed,
+                KeptBecause::AutomaticUpdatesOff,
+                &Packaging::Host
+            )]
+        );
+        assert_eq!(store.upgrade_required().unwrap(), Some(VersionCode(3212)));
+        assert_eq!(store.last_check().unwrap(), None, "no update check ran");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn a_completed_check_keeps_every_rejection() {
         let root = temp_root("completed-check-rejections");
         let store = Store::at(root.clone());
-        store
-            .reject_file(DeclaredFile::ApkComboBaseSha1([0x41; 20]))
-            .unwrap();
+        store.reject_file(DeclaredFile::Sha1([0x41; 20])).unwrap();
         let rejected = store.rejections(eclipse::VERSION).unwrap();
         assert_ne!(rejected, Rejections::default());
         let installed = InstalledVersion {
@@ -4155,6 +4541,62 @@ mod tests {
         .expect("the verified install is launched");
         assert_eq!(kept.version_code(), installed.version_code);
         drop(kept);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_version_roblox_refuses_is_explained_by_what_the_launch_check_found() {
+        let Some(paths) =
+            eclipse::apk::ApkSetPaths::from_env().expect("ECLIPSE_ROBLOX_APK must be usable")
+        else {
+            eprintln!("SKIP: set ECLIPSE_ROBLOX_APK to install the official Roblox APK set");
+            return;
+        };
+        let root = temp_root("refused-at-launch");
+        let store = Store::at(root.clone());
+        let sources: Vec<std::path::PathBuf> = std::iter::once(paths.base)
+            .chain(paths.native_split)
+            .collect();
+        let installed =
+            InstalledVersion::from(&store.install(&sources, &StatusSink::terminal()).unwrap());
+        store
+            .record_upgrade_required(installed.version_code)
+            .unwrap();
+        let warnings =
+            |check, checked: Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>>| {
+                let (sender, shown) = std::sync::mpsc::channel();
+                let set =
+                    set_to_launch(&store, check, &StatusSink::with_window(sender), |_| checked)
+                        .unwrap_or_else(|error| panic!("{error}"));
+                assert_eq!(set.version_code(), installed.version_code);
+                shown
+                    .try_iter()
+                    .filter_map(|update| match update {
+                        eclipse::status::StatusUpdate::Warning(text) => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+        let refused = |kept| roblox_refuses(&installed, kept, &user_packaging());
+
+        let unreachable = "cannot load APKPure's list of Roblox releases: io: failed to lookup \
+                           address information";
+        assert_eq!(
+            warnings(LaunchCheck::WhenDue, Err(unreachable.into())),
+            [
+                format!("could not update Roblox: {unreachable}"),
+                refused(KeptBecause::CheckFailed)
+            ],
+            "a failed check does not claim that nothing newer exists"
+        );
+        assert_eq!(
+            warnings(LaunchCheck::Now, Ok(None)),
+            [refused(KeptBecause::NothingNewer)]
+        );
+        assert_eq!(
+            warnings(LaunchCheck::OnlyWhenMissing, Ok(None)),
+            [refused(KeptBecause::AutomaticUpdatesOff)]
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

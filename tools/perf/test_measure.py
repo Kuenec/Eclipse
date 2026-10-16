@@ -231,7 +231,7 @@ class ClientOutputTest(unittest.TestCase):
     def test_update_checks_and_fatal_lines_are_flagged(self):
         output = client_output(
             [
-                (1.0, "# Checking APKCombo for the newest Roblox client…"),
+                (1.0, "# Checking APKPure for the newest Roblox client…"),
                 (2.0, "thread 'main' panicked at src/main.rs:1:1"),
             ]
         )

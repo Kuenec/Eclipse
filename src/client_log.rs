@@ -14,6 +14,11 @@ const EVENT_QUEUE: usize = 32;
 const HEADER_SEARCH: usize = 64;
 const CHANNEL_SEARCH: usize = 40;
 const TIMESTAMP_SHAPE: &[u8] = b"0000-00-00T00:00:00.000Z";
+const STARTUP_FINISHED: &str = "StartupController finished starting: ";
+const UPGRADE_STATUS: &str = "upgradeStatus = ";
+const UPGRADE_REQUIRED: &str = "2";
+const GAME_MANAGER_TAG: &str = "GameManager";
+const JOIN_BLOCKED_BY_UPGRADE: &str = "canStartGame = false: Upgrade required";
 
 static TAP: OnceLock<Tap> = OnceLock::new();
 
@@ -79,6 +84,8 @@ pub enum ClientEvent {
     Left,
     ReturnedToApp,
     AttestationRequired,
+    UpgradeRequired,
+    StorePageOpened,
     RpcPending,
 }
 
@@ -140,6 +147,7 @@ enum Channel {
     SingleSurfaceApp,
     Crash,
     CreatorOutput,
+    JniAppBridge,
 }
 
 impl Channel {
@@ -152,6 +160,7 @@ impl Channel {
             "FLog::SingleSurfaceApp" => Self::SingleSurfaceApp,
             "LOGCHANNELS + 1" => Self::Crash,
             "FLog::CreatorOutput" => Self::CreatorOutput,
+            "FLog::JNIAppBridge" => Self::JniAppBridge,
             _ => return None,
         })
     }
@@ -173,6 +182,9 @@ impl Channel {
             Self::CreatorOutput => body
                 .strip_prefix("[BloxstrapRPC] ")
                 .map(Record::BloxstrapRpc),
+            Self::JniAppBridge => {
+                upgrade_required(body).then_some(Record::Event(ClientEvent::UpgradeRequired))
+            }
         }
     }
 }
@@ -277,6 +289,26 @@ fn network(body: &str) -> Option<ClientEvent> {
         addr: addr.parse().ok()?,
         port: decimal(port)?,
     })
+}
+
+fn upgrade_required(body: &str) -> bool {
+    let Some((_, startup)) = body.split_once(STARTUP_FINISHED) else {
+        return false;
+    };
+    startup
+        .trim_end()
+        .trim_end_matches('.')
+        .split(", ")
+        .filter_map(|field| field.strip_prefix(UPGRADE_STATUS))
+        .eq([UPGRADE_REQUIRED])
+}
+
+fn join_blocked_by_upgrade(tag: &str, message: &str) -> bool {
+    tag == GAME_MANAGER_TAG
+        && message
+            .strip_prefix('[')
+            .and_then(|logged| logged.split_once("]: "))
+            .is_some_and(|(_, text)| text == JOIN_BLOCKED_BY_UPGRADE)
 }
 
 fn crash(body: &str) -> Option<CrashKind<'_>> {
@@ -416,6 +448,18 @@ pub(crate) fn offer(tag: &str, message: &str) {
         Some(Record::Crash(kind)) => explain(&kind),
         None => {}
     }
+}
+
+pub(crate) fn offer_java(tag: &str, message: &str) {
+    if join_blocked_by_upgrade(tag, message) {
+        deliver(ClientEvent::UpgradeRequired);
+    }
+}
+
+pub(crate) fn deliver(event: ClientEvent) {
+    route(|tap| {
+        tap.send(event);
+    });
 }
 
 fn route(deliver: impl Fn(&Tap)) {

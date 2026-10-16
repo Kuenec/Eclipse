@@ -178,6 +178,7 @@ extern "system" fn println_native<'local>(
         let logged = redact_urls_for_log(&msg_str);
 
         let tag_ref = tag_str.as_deref().unwrap_or("");
+        crate::client_log::offer_java(tag_ref, &msg_str);
         match priority {
             LOG_PRIORITY_VERBOSE => {
                 tracing::trace!(target: "android.util.Log", tag = tag_ref, "{logged}")
@@ -16610,6 +16611,31 @@ mod tests {
                 "priority {priority}: {log}"
             );
         }
+    }
+
+    #[test]
+    fn a_java_log_line_of_a_join_blocked_for_an_upgrade_reaches_the_session() {
+        let (tap, events) = crate::client_log::Tap::new(crate::client_log::GameRpc::Ignored);
+        crate::client_log::with_test_tap(tap, || {
+            fake_jvm::with_env(|env| {
+                let tag = env.new_string("GameManager").expect("tag");
+                let msg = env
+                    .new_string("[c.f()-14]: canStartGame = false: Upgrade required")
+                    .expect("message");
+                println_native(
+                    fake_jvm::native_env(),
+                    JClass::null(),
+                    0,
+                    LOG_PRIORITY_INFO,
+                    tag,
+                    msg,
+                );
+            });
+        });
+        assert_eq!(
+            events.try_iter().collect::<Vec<_>>(),
+            [crate::client_log::ClientEvent::UpgradeRequired]
+        );
     }
 
     #[test]
