@@ -35,6 +35,10 @@ const NO_SHARED_FILE: i32 = -1;
 
 const CONTEXT_UTILS_CLASS: &JNIStr = jni_str!("org/webrtc/ContextUtils");
 const WEBRTC_AUDIO_MANAGER_CLASS: &JNIStr = jni_str!("org/webrtc/voiceengine/WebRtcAudioManager");
+const WEBRTC_AUDIO_UTILS_CLASS: &JNIStr = jni_str!("org/webrtc/voiceengine/WebRtcAudioUtils");
+const PROCESS_CLASS: &JNIStr = jni_str!("android/os/Process");
+const RECORD_AUDIO: &str = "android.permission.RECORD_AUDIO";
+const MODE_NORMAL: jint = 0;
 const CACHE_AUDIO_PARAMETERS_NAME: &JNIStr = jni_str!("nativeCacheAudioParameters");
 const CACHE_AUDIO_PARAMETERS_SIG: &JNIStr = jni_str!("(IIIZZZZZZZIIJ)V");
 const NATIVE_AUDIO_MANAGER: jlong = 0x5eed_a0d1;
@@ -84,8 +88,11 @@ impl fmt::Display for CachedAudioParameters {
 struct WebRtcVoiceReadback {
     parameters: Option<CachedAudioParameters>,
     initialized: bool,
-    communication_mode: bool,
     open_sl_es_blacklisted: bool,
+    communication_mode_in_voice_chat: bool,
+    communication_mode_after_voice_chat: bool,
+    has_microphone: bool,
+    record_audio_permission: jint,
 }
 
 impl fmt::Display for WebRtcVoiceReadback {
@@ -100,10 +107,17 @@ impl fmt::Display for WebRtcVoiceReadback {
             "; init returned {}, OpenSL ES blacklisted {}",
             self.initialized, self.open_sl_es_blacklisted
         )?;
+        writeln!(
+            f,
+            "WebRtcAudioManager communication mode enabled {} after the client set \
+             MODE_IN_COMMUNICATION and {} after another AudioManager set MODE_NORMAL",
+            self.communication_mode_in_voice_chat, self.communication_mode_after_voice_chat
+        )?;
         write!(
             f,
-            "WebRtcAudioManager communication mode enabled {}",
-            self.communication_mode
+            "WebRtcAudioUtils.hasMicrophone() returned {}; Context.checkPermission({RECORD_AUDIO}) \
+             returned {}",
+            self.has_microphone, self.record_audio_permission
         )
     }
 }
@@ -306,6 +320,16 @@ fn webrtc_voice(env: &mut Env) -> Result<WebRtcVoiceReadback, FrameworkError> {
         )?
         .v()
     })?;
+    let has_microphone = checked(env, "WebRtcAudioUtils.hasMicrophone", |env| {
+        env.call_static_method(
+            WEBRTC_AUDIO_UTILS_CLASS,
+            jni_str!("hasMicrophone"),
+            jni_sig!("()Z"),
+            &[],
+        )?
+        .z()
+    })?;
+    let record_audio_permission = record_audio_permission(env, &context)?;
     checked(
         env,
         "RegisterNatives WebRtcAudioManager.nativeCacheAudioParameters",
@@ -338,7 +362,7 @@ fn webrtc_voice(env: &mut Env) -> Result<WebRtcVoiceReadback, FrameworkError> {
         })
     };
     let initialized = boolean(jni_str!("init"))?;
-    let communication_mode = boolean(jni_str!("isCommunicationModeEnabled"))?;
+    let communication_mode_in_voice_chat = boolean(jni_str!("isCommunicationModeEnabled"))?;
     let open_sl_es_blacklisted = boolean(jni_str!("isDeviceBlacklistedForOpenSLESUsage"))?;
     for mute in [true, false] {
         checked(env, "WebRtcAudioManager.setMicrophoneMute", |env| {
@@ -355,11 +379,72 @@ fn webrtc_voice(env: &mut Env) -> Result<WebRtcVoiceReadback, FrameworkError> {
         env.call_method(&manager, jni_str!("dispose"), jni_sig!("()V"), &[])?
             .v()
     })?;
+    restore_normal_audio_mode(env, &context)?;
+    let communication_mode_after_voice_chat = checked(
+        env,
+        "WebRtcAudioManager.isCommunicationModeEnabled after MODE_NORMAL",
+        |env| {
+            env.call_method(
+                &manager,
+                jni_str!("isCommunicationModeEnabled"),
+                jni_sig!("()Z"),
+                &[],
+            )?
+            .z()
+        },
+    )?;
     Ok(WebRtcVoiceReadback {
         parameters,
         initialized,
-        communication_mode,
         open_sl_es_blacklisted,
+        communication_mode_in_voice_chat,
+        communication_mode_after_voice_chat,
+        has_microphone,
+        record_audio_permission,
+    })
+}
+
+fn restore_normal_audio_mode(env: &mut Env, context: &JObject) -> Result<(), FrameworkError> {
+    let service = env.new_string("audio")?;
+    checked(env, "AudioManager.setMode(MODE_NORMAL)", |env| {
+        let audio_manager = env
+            .call_method(
+                context,
+                jni_str!("getSystemService"),
+                jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
+                &[JValue::Object(&service)],
+            )?
+            .l()?;
+        env.call_method(
+            &audio_manager,
+            jni_str!("setMode"),
+            jni_sig!("(I)V"),
+            &[JValue::Int(MODE_NORMAL)],
+        )?
+        .v()
+    })
+}
+
+fn record_audio_permission(env: &mut Env, context: &JObject) -> Result<jint, FrameworkError> {
+    let permission = env.new_string(RECORD_AUDIO)?;
+    checked(env, "Context.checkPermission(RECORD_AUDIO)", |env| {
+        let pid = env
+            .call_static_method(PROCESS_CLASS, jni_str!("myPid"), jni_sig!("()I"), &[])?
+            .i()?;
+        let uid = env
+            .call_static_method(PROCESS_CLASS, jni_str!("myUid"), jni_sig!("()I"), &[])?
+            .i()?;
+        env.call_method(
+            context,
+            jni_str!("checkPermission"),
+            jni_sig!("(Ljava/lang/String;II)I"),
+            &[
+                JValue::Object(&permission),
+                JValue::Int(pid),
+                JValue::Int(uid),
+            ],
+        )?
+        .i()
     })
 }
 
