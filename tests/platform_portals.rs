@@ -12,13 +12,20 @@ use std::time::Duration;
 
 use dbus::arg::{PropMap, Variant};
 use eclipse::portal::{
-    ExternalUri, IdleInhibit, Notice, NoticeId, PortalError, PortalRequest, PortalSession,
-    PortalWorker, SteamKeyboard, SteamKeyboardMode,
+    ExternalUri, IdleInhibit, LauncherChoice, Notice, NoticeId, PortalError, PortalRequest,
+    PortalSession, PortalWorker, SteamKeyboard, SteamKeyboardMode,
 };
-use mock_portal::{MockPortal, Replies, TestBus, INHIBIT_HANDLE, PORTAL_OBJECT};
+use eclipse::shortcut::{Launcher, PlaceShortcut};
+use mock_portal::{
+    Dialog, MockPortal, Replies, TestBus, INHIBIT_HANDLE, LAUNCHER_TOKEN, PORTAL_OBJECT,
+};
 
 const FLUSH_WAIT: Duration = Duration::from_secs(10);
 const PLATFORM_TEST_LIMIT: Duration = Duration::from_secs(300);
+const APP_ID: &str = "io.github.kuenec.Eclipse";
+const ICON: &[u8] = include_bytes!("fixtures/roblox-api/icon.png");
+
+type SerializedIcon = Variant<(String, Variant<Vec<u8>>)>;
 
 fn answered(replies: Replies) -> (TestBus, MockPortal, PortalSession) {
     let bus = TestBus::start();
@@ -273,6 +280,180 @@ fn notices_are_added_and_withdrawn_by_their_wire_id() {
         let removed: &str = remove.message.read1().expect("RemoveNotification args");
         assert_eq!(removed, wire_id);
     }
+    portal.assert_no_call();
+}
+
+fn game_shortcut() -> PlaceShortcut {
+    let link = "https://www.roblox.com/games/1818/Crossroads";
+    PlaceShortcut::for_link(&eclipse::links::parse(link).expect("a game link"))
+        .expect("a game link becomes a shortcut")
+}
+
+fn assert_launcher_version_asked(portal: &MockPortal) {
+    let version = portal.next_call();
+    assert_eq!(
+        (
+            version.path.as_str(),
+            version.interface.as_str(),
+            version.member.as_str()
+        ),
+        (PORTAL_OBJECT, "org.freedesktop.DBus.Properties", "Get")
+    );
+    let asked: (&str, &str) = version.message.read2().expect("Get args");
+    assert_eq!(asked, ("org.freedesktop.portal.DynamicLauncher", "version"));
+}
+
+fn assert_prepared(portal: &MockPortal, name: &str) {
+    let prepare = portal.next_call();
+    assert_eq!(
+        (
+            prepare.path.as_str(),
+            prepare.interface.as_str(),
+            prepare.member.as_str()
+        ),
+        (
+            PORTAL_OBJECT,
+            "org.freedesktop.portal.DynamicLauncher",
+            "PrepareInstall"
+        )
+    );
+    assert_eq!(prepare.signature, "ssva{sv}");
+    let (parent, sent_name, icon, options): (
+        &str,
+        &str,
+        SerializedIcon,
+        HashMap<String, Variant<String>>,
+    ) = prepare.message.read4().expect("PrepareInstall args");
+    assert_eq!((parent, sent_name), ("", name));
+    assert_eq!(icon.0, ("bytes".to_owned(), Variant(ICON.to_vec())));
+    assert_eq!(options.keys().collect::<Vec<_>>(), ["handle_token"]);
+}
+
+#[test]
+fn a_game_shortcut_sends_its_name_and_icon_and_installs_an_entry_that_opens_only_the_place() {
+    let (_bus, portal, session) = answered(Replies::Launcher(Dialog::Confirmed));
+    let shortcut = game_shortcut();
+
+    let launcher = session
+        .dynamic_launcher()
+        .expect("the mock offers DynamicLauncher");
+    let LauncherChoice::Confirmed(token) = launcher
+        .prepare("Crossroads", ICON)
+        .expect("PrepareInstall answers")
+    else {
+        panic!("the mock confirms the dialog");
+    };
+    assert_eq!(token.name(), "Crossroads");
+    launcher
+        .install(
+            token,
+            &shortcut.desktop_file_id(APP_ID),
+            &shortcut.desktop_entry(Launcher::Portal),
+        )
+        .expect("Install succeeds");
+
+    assert_launcher_version_asked(&portal);
+    assert_prepared(&portal, "Crossroads");
+    let install = portal.next_call();
+    assert_eq!(
+        (install.interface.as_str(), install.member.as_str()),
+        ("org.freedesktop.portal.DynamicLauncher", "Install")
+    );
+    assert_eq!(install.signature, "sssa{sv}");
+    let (sent_token, desktop_file_id, entry, options): (&str, &str, &str, PropMap) =
+        install.message.read4().expect("Install args");
+    assert_eq!(sent_token, LAUNCHER_TOKEN);
+    assert_eq!(
+        desktop_file_id,
+        "io.github.kuenec.Eclipse.Place1818.desktop"
+    );
+    let exec: Vec<&str> = entry
+        .lines()
+        .filter(|line| line.starts_with("Exec="))
+        .collect();
+    assert_eq!(exec, ["Exec=eclipse open roblox://placeId=1818"]);
+    assert!(
+        !entry.contains("Name=") && !entry.contains("Icon="),
+        "{entry}"
+    );
+    assert!(options.is_empty());
+    portal.assert_no_call();
+}
+
+#[test]
+fn removing_a_game_shortcut_uninstalls_its_desktop_file_id() {
+    let (_bus, portal, session) = answered(Replies::Launcher(Dialog::Confirmed));
+
+    session
+        .dynamic_launcher()
+        .expect("the mock offers DynamicLauncher")
+        .uninstall(&game_shortcut().desktop_file_id(APP_ID))
+        .expect("Uninstall succeeds");
+
+    assert_launcher_version_asked(&portal);
+    let uninstall = portal.next_call();
+    assert_eq!(
+        (
+            uninstall.path.as_str(),
+            uninstall.interface.as_str(),
+            uninstall.member.as_str()
+        ),
+        (
+            PORTAL_OBJECT,
+            "org.freedesktop.portal.DynamicLauncher",
+            "Uninstall"
+        )
+    );
+    assert_eq!(uninstall.signature, "sa{sv}");
+    let (desktop_file_id, options): (&str, PropMap) =
+        uninstall.message.read2().expect("Uninstall args");
+    assert_eq!(
+        desktop_file_id,
+        "io.github.kuenec.Eclipse.Place1818.desktop"
+    );
+    assert!(options.is_empty());
+    portal.assert_no_call();
+}
+
+#[test]
+fn a_cancelled_shortcut_dialog_installs_nothing() {
+    let (_bus, portal, session) = answered(Replies::Launcher(Dialog::Cancelled));
+
+    let launcher = session
+        .dynamic_launcher()
+        .expect("the mock offers DynamicLauncher");
+    let choice = launcher
+        .prepare("Crossroads", ICON)
+        .expect("PrepareInstall answers");
+
+    assert!(matches!(choice, LauncherChoice::Cancelled), "{choice:?}");
+    assert_launcher_version_asked(&portal);
+    assert_prepared(&portal, "Crossroads");
+    portal.assert_no_call();
+}
+
+#[test]
+fn without_the_dynamic_launcher_portal_the_desktop_does_not_offer_shortcuts() {
+    let (_bus, portal, session) = answering();
+    let bus_alone = TestBus::start();
+    let no_portal = PortalSession::open(&bus_alone.address()).expect("open the portal session");
+
+    for session in [&session, &no_portal] {
+        let refused = match session.dynamic_launcher() {
+            Ok(_) => panic!("DynamicLauncher is not offered"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(refused, PortalError::LauncherUnavailable),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "this desktop does not offer app-menu shortcuts to Flatpak apps: it has no \
+             org.freedesktop.portal.DynamicLauncher portal"
+        );
+    }
+    assert_launcher_version_asked(&portal);
     portal.assert_no_call();
 }
 

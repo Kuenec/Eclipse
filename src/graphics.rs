@@ -581,6 +581,9 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                 self.publish_engine_display_refresh_rates();
             }
 
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                crate::framework::display_metrics::note_game_window_scale(scale_factor);
+            }
             WindowEvent::Moved(_) => self.publish_engine_display_refresh_rates(),
             WindowEvent::RedrawRequested => {
                 if self.handed_off {
@@ -8261,6 +8264,9 @@ mod tests {
     fn publish_engine_window_geometry_registers_real_wsi_mapping() {
         use crate::loader::ndk_registry;
 
+        let _windows = ndk_registry::WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let ptr = 0xECC1_0613_usize;
         ndk_registry::unregister_wsi_window(ptr);
 

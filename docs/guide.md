@@ -41,6 +41,10 @@ Controllers need Flatpak 1.16 or newer. On older Flatpak, run `flatpak override 
 
 On Wayland, Eclipse marks its game window as a game, which compositors such as Hyprland (`misc:vrr = 3`) use to turn on variable refresh rate in fullscreen.
 
+## Display scale
+
+Roblox's interface follows the scale your desktop gives Eclipse's launch window. After you move Eclipse to a monitor with another scale, the interface changes size at its next launch.
+
 ## Settings
 
 | Key | Default | Effect |

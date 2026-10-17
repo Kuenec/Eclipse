@@ -313,8 +313,12 @@ unsafe fn acquire_like_android(
             if let (Some(index), Some(slot)) = (engine_index, unsafe { p_image_index.as_mut() }) {
                 *slot = index;
             }
-            if failed == vk::Result::ERROR_OUT_OF_DATE_KHR {
-                note_host_report(swapchain, HostReport::OutOfDate);
+            match failed {
+                vk::Result::ERROR_OUT_OF_DATE_KHR => {
+                    note_host_report(swapchain, HostReport::OutOfDate);
+                }
+                vk::Result::ERROR_DEVICE_LOST => crate::client_log::explain_device_loss(),
+                _ => {}
             }
             failed
         }
@@ -2002,6 +2006,10 @@ unsafe fn present_engine_frame(
         vk::Result::SUCCESS => Some(HostReport::FramePresented),
         vk::Result::SUBOPTIMAL_KHR => Some(HostReport::Suboptimal),
         vk::Result::ERROR_OUT_OF_DATE_KHR => Some(HostReport::OutOfDate),
+        vk::Result::ERROR_DEVICE_LOST => {
+            crate::client_log::explain_device_loss();
+            None
+        }
         _ => None,
     };
     if let Some(report) = report {
@@ -3046,6 +3054,144 @@ mod tests {
              once, so the host can allocate buffers that fit the surface, and never again while \
              the engine keeps it, even after more optimal frames, so the engine cannot rebuild \
              in a loop"
+        );
+    }
+
+    const DEVICE_LOSS_CHILD: &str = "ECLIPSE_TEST_VK_OVERLAY_DEVICE_LOSS_CHILD";
+    const DEVICE_LOSS_CHILD_LIMIT: Duration = Duration::from_secs(60);
+    const SEAM_REPORTS_FIRST: &str = "seam";
+    const CLIENT_REPORTS_FIRST: &str = "client";
+    const CLIENT_DEVICE_LOSS_CRASH: &str =
+        "[LOGCHANNELS + 1] RBXCRASH: FatalRuntimeError (VK_ERROR_DEVICE_LOST)";
+    const DRIVER_REPORTED_LOSS: (tracing::Level, &str) = (
+        tracing::Level::WARN,
+        "The GPU driver lost Roblox's graphics device. If Roblox stops now, start it again.",
+    );
+    const ROBLOX_GAVE_UP: (tracing::Level, &str) = (
+        tracing::Level::ERROR,
+        "The GPU driver lost Roblox's graphics device, so Roblox must be restarted.",
+    );
+
+    fn device_loss_leads(notices: &[(tracing::Level, String)]) -> Vec<(tracing::Level, &str)> {
+        notices
+            .iter()
+            .map(|(level, message)| {
+                let lead = [DRIVER_REPORTED_LOSS.1, ROBLOX_GAVE_UP.1]
+                    .into_iter()
+                    .find(|lead| message.starts_with(lead));
+                (*level, lead.unwrap_or(message))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_lost_device_reaches_the_engine_and_is_explained_once_per_process() {
+        let Some(order) = std::env::var_os(DEVICE_LOSS_CHILD) else {
+            for order in [SEAM_REPORTS_FIRST, CLIENT_REPORTS_FIRST] {
+                let child = crate::bounded_child::output(
+                    std::process::Command::new(
+                        std::env::current_exe()
+                            .expect("the test harness executable must have a path"),
+                    )
+                    .args([
+                        "--exact",
+                        "loader::vk_overlay::tests::\
+                         a_lost_device_reaches_the_engine_and_is_explained_once_per_process",
+                        "--test-threads=1",
+                    ])
+                    .env(DEVICE_LOSS_CHILD, order),
+                    DEVICE_LOSS_CHILD_LIMIT,
+                );
+                let stdout = String::from_utf8_lossy(&child.stdout);
+                assert!(
+                    child.status.success() && stdout.contains("1 passed"),
+                    "order={order}, status={:?}, stdout={stdout}, stderr={}",
+                    child.status,
+                    String::from_utf8_lossy(&child.stderr)
+                );
+            }
+            return;
+        };
+        let dir = temp_dir("device-loss");
+        let path = dir.join("records");
+        crate::diagnostics::init(crate::diagnostics::LogSink::Supervisor(
+            std::fs::File::create(&path).expect("create the record file"),
+        ));
+        let (tap, _events) = crate::client_log::Tap::new(crate::client_log::GameRpc::Ignored);
+        assert!(
+            crate::client_log::install(tap).is_ok(),
+            "the child installs the only tap"
+        );
+        let notices = || {
+            let log = std::fs::read_to_string(&path).expect("read the run log");
+            log.lines()
+                .filter_map(crate::diagnostics::record_head)
+                .filter(|head| head.target == crate::diagnostics::STATUS_TARGET)
+                .map(|head| (head.level, head.message.to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let host = ScriptedHost::install();
+        let swapchain = engine_swapchain_on(ENGINE_SURFACE);
+
+        host.reports(
+            vk::Result::ERROR_SURFACE_LOST_KHR,
+            vk::Result::ERROR_OUT_OF_DATE_KHR,
+        );
+        let other_failures = engine_frame_on(swapchain);
+        let noticed_before_the_loss = notices();
+        host.reports(vk::Result::ERROR_DEVICE_LOST, vk::Result::ERROR_DEVICE_LOST);
+        let lost_frames = || [engine_frame_on(swapchain), engine_frame_on(swapchain)];
+        let client_crash = || crate::client_log::offer("Roblox", CLIENT_DEVICE_LOSS_CRASH);
+        let (lost, noticed_first, expected) = match order.to_str() {
+            Some(SEAM_REPORTS_FIRST) => {
+                let lost = lost_frames();
+                let noticed_first = notices();
+                client_crash();
+                (
+                    lost,
+                    noticed_first,
+                    vec![DRIVER_REPORTED_LOSS, ROBLOX_GAVE_UP],
+                )
+            }
+            Some(CLIENT_REPORTS_FIRST) => {
+                client_crash();
+                let noticed_first = notices();
+                (lost_frames(), noticed_first, vec![ROBLOX_GAVE_UP])
+            }
+            _ => panic!("unknown report order {order:?}"),
+        };
+        let noticed = notices();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            other_failures,
+            (
+                [(vk::Result::ERROR_SURFACE_LOST_KHR, u32::MAX); 2],
+                vk::Result::ERROR_OUT_OF_DATE_KHR
+            )
+        );
+        assert!(
+            noticed_before_the_loss.is_empty(),
+            "{noticed_before_the_loss:?}"
+        );
+        assert_eq!(
+            lost,
+            [(
+                [(vk::Result::ERROR_DEVICE_LOST, u32::MAX); 2],
+                vk::Result::ERROR_DEVICE_LOST
+            ); 2],
+            "the engine sees the lost device, because only Roblox can recreate its own device"
+        );
+        assert_eq!(
+            device_loss_leads(&noticed_first),
+            expected[..1],
+            "the first report notes the loss at once: {noticed_first:?}"
+        );
+        assert_eq!(
+            device_loss_leads(&noticed),
+            expected,
+            "only Roblox's own crash says it must be restarted, and nothing repeats: {noticed:?}"
         );
     }
 

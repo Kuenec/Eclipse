@@ -84,6 +84,12 @@ impl PlaceId {
     }
 }
 
+impl fmt::Display for PlaceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserId(NonZeroU64);
 

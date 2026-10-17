@@ -27,9 +27,11 @@ mod mutation;
 mod on_screen_keyboard;
 pub mod performance;
 pub mod portal;
+pub mod roblox_api;
 pub mod runtime;
 mod server_location;
 pub mod session;
+pub mod shortcut;
 pub mod status;
 pub mod storage;
 #[cfg(test)]

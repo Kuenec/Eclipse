@@ -4,12 +4,14 @@ use std::mem;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileTypeExt as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use dbus::arg::{AppendAll, Dict, PropMap, ReadAll, Variant};
+use dbus::arg::{prop_cast, AppendAll, Dict, PropMap, ReadAll, Variant};
 use dbus::blocking::Connection;
+use dbus::message::MatchRule;
 
 const QUEUED_REQUESTS: usize = 32;
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,6 +26,23 @@ const GAME_MODE_UNREACHABLE: i32 = -2;
 const INHIBIT: &str = "org.freedesktop.portal.Inhibit";
 const NOTIFICATION: &str = "org.freedesktop.portal.Notification";
 const REQUEST: &str = "org.freedesktop.portal.Request";
+const REQUEST_OBJECTS: &str = "/org/freedesktop/portal/desktop/request";
+const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
+const DYNAMIC_LAUNCHER: &str = "org.freedesktop.portal.DynamicLauncher";
+const BUS: &str = "org.freedesktop.DBus";
+const NOT_OFFERED: [&str; 6] = [
+    "org.freedesktop.DBus.Error.ServiceUnknown",
+    "org.freedesktop.DBus.Error.InvalidArgs",
+    "org.freedesktop.DBus.Error.UnknownInterface",
+    "org.freedesktop.DBus.Error.UnknownProperty",
+    "org.freedesktop.DBus.Error.UnknownMethod",
+    "org.freedesktop.DBus.Error.UnknownObject",
+];
+const RESPONSE_SUCCESS: u32 = 0;
+const RESPONSE_CANCELLED: u32 = 1;
+const LAUNCHER_DIALOG_LIMIT: Duration = Duration::from_secs(5 * 60);
+
+static LAUNCHER_REQUESTS: AtomicU32 = AtomicU32::new(0);
 
 const INHIBIT_IDLE: u32 = 8;
 const INHIBIT_REASON: &str = "Playing Roblox";
@@ -221,6 +240,11 @@ pub enum PortalError {
     Receive(dbus::Error),
     OwnPidfd(std::io::Error),
     GameModeRejected(i32),
+    LauncherUnavailable,
+    LauncherRequestPath(String),
+    LauncherDialog(u32),
+    LauncherAnswerIncomplete,
+    LauncherTimeout,
 }
 
 impl fmt::Display for PortalError {
@@ -268,6 +292,27 @@ impl fmt::Display for PortalError {
                 f,
                 "{GAME_MODE}.{REGISTER_GAME} refused to register Eclipse (result {result})"
             ),
+            Self::LauncherUnavailable => write!(
+                f,
+                "this desktop does not offer app-menu shortcuts to Flatpak apps: it has no \
+                 {DYNAMIC_LAUNCHER} portal"
+            ),
+            Self::LauncherRequestPath(path) => write!(
+                f,
+                "the desktop portal request {path} is not the one Eclipse waits on"
+            ),
+            Self::LauncherDialog(response) => write!(
+                f,
+                "the desktop's shortcut dialog failed (portal response {response})"
+            ),
+            Self::LauncherAnswerIncomplete => f.write_str(
+                "the desktop's shortcut dialog answered without a name or an install token",
+            ),
+            Self::LauncherTimeout => write!(
+                f,
+                "the desktop's shortcut dialog got no answer within {} minutes",
+                LAUNCHER_DIALOG_LIMIT.as_secs() / 60
+            ),
         }
     }
 }
@@ -284,7 +329,12 @@ impl std::error::Error for PortalError {
             | Self::NoSessionBus
             | Self::NonUtf8BusAddress
             | Self::Autolaunch(_)
-            | Self::GameModeRejected(_) => None,
+            | Self::GameModeRejected(_)
+            | Self::LauncherUnavailable
+            | Self::LauncherRequestPath(_)
+            | Self::LauncherDialog(_)
+            | Self::LauncherAnswerIncomplete
+            | Self::LauncherTimeout => None,
         }
     }
 }
@@ -371,13 +421,16 @@ pub fn submit(request: PortalRequest) -> Result<(), PortalError> {
         .submit(request)
 }
 
-fn spawn_session_worker() -> Option<PortalWorker> {
+pub fn environment_bus_address() -> Result<BusAddress, PortalError> {
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
-    let address = session_bus_address(
+    session_bus_address(
         std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
         runtime_dir.as_deref().map(Path::new),
-    );
-    PortalWorker::spawn(address)
+    )
+}
+
+fn spawn_session_worker() -> Option<PortalWorker> {
+    PortalWorker::spawn(environment_bus_address())
         .inspect_err(|error| tracing::warn!(%error, "desktop portals are unavailable"))
         .ok()
 }
@@ -596,6 +649,157 @@ impl PortalSession {
         {}
         Ok(())
     }
+
+    pub fn dynamic_launcher(&self) -> Result<DynamicLauncher<'_>, PortalError> {
+        let version: Result<(Variant<u32>,), PortalError> = self.call(
+            PORTAL_OBJECT,
+            PROPERTIES,
+            "Get",
+            (DYNAMIC_LAUNCHER, "version"),
+        );
+        match version {
+            Ok(_) => Ok(DynamicLauncher { session: self }),
+            Err(PortalError::Call { cause, .. })
+                if cause.name().is_some_and(|name| NOT_OFFERED.contains(&name)) =>
+            {
+                Err(PortalError::LauncherUnavailable)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+pub struct DynamicLauncher<'a> {
+    session: &'a PortalSession,
+}
+
+#[derive(Debug)]
+pub enum LauncherChoice {
+    Confirmed(InstallToken),
+    Cancelled,
+}
+
+#[derive(Debug)]
+pub struct InstallToken {
+    token: String,
+    name: String,
+}
+
+impl InstallToken {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl DynamicLauncher<'_> {
+    pub fn prepare(&self, name: &str, png: &[u8]) -> Result<LauncherChoice, PortalError> {
+        let connection = &self.session.connection;
+        let handle_token = format!(
+            "eclipse_launcher_{}",
+            LAUNCHER_REQUESTS.fetch_add(1, Ordering::Relaxed)
+        );
+        let expected = request_path(&connection.unique_name(), &handle_token);
+        let request = dbus::Path::new(expected.clone())
+            .map_err(|_| PortalError::LauncherRequestPath(expected.clone()))?;
+        let (answered, answers) = mpsc::channel();
+        connection
+            .add_match(
+                MatchRule::new_signal(REQUEST, "Response")
+                    .with_sender(PORTAL_BUS_NAME)
+                    .with_path(request),
+                move |answer: (u32, PropMap), _: &Connection, _: &dbus::Message| {
+                    answered.send(answer).ok();
+                    false
+                },
+            )
+            .map_err(|cause| PortalError::Call {
+                interface: BUS,
+                method: "AddMatch",
+                cause,
+            })?;
+        let (opened,): (dbus::Path<'static>,) = self.session.call(
+            PORTAL_OBJECT,
+            DYNAMIC_LAUNCHER,
+            "PrepareInstall",
+            (
+                "",
+                name,
+                Variant(("bytes", Variant(png))),
+                Dict::new([("handle_token", Variant(handle_token.as_str()))]),
+            ),
+        )?;
+        if *opened != *expected {
+            return Err(PortalError::LauncherRequestPath(opened.to_string()));
+        }
+        let (response, results) = self.await_answer(&opened, &answers)?;
+        match response {
+            RESPONSE_SUCCESS => {
+                let token = prop_cast::<String>(&results, "token");
+                let chosen = prop_cast::<String>(&results, "name");
+                let (Some(token), Some(chosen)) = (token, chosen) else {
+                    return Err(PortalError::LauncherAnswerIncomplete);
+                };
+                Ok(LauncherChoice::Confirmed(InstallToken {
+                    token: token.clone(),
+                    name: chosen.clone(),
+                }))
+            }
+            RESPONSE_CANCELLED => Ok(LauncherChoice::Cancelled),
+            failed => Err(PortalError::LauncherDialog(failed)),
+        }
+    }
+
+    fn await_answer(
+        &self,
+        request: &dbus::Path<'_>,
+        answers: &Receiver<(u32, PropMap)>,
+    ) -> Result<(u32, PropMap), PortalError> {
+        let deadline = Instant::now() + LAUNCHER_DIALOG_LIMIT;
+        loop {
+            if let Ok(answer) = answers.try_recv() {
+                return Ok(answer);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return self
+                    .session
+                    .call::<(), _>(request, REQUEST, "Close", ())
+                    .and(Err(PortalError::LauncherTimeout));
+            }
+            self.session
+                .connection
+                .process(left)
+                .map_err(PortalError::Receive)?;
+        }
+    }
+
+    pub fn install(
+        &self,
+        token: InstallToken,
+        desktop_file_id: &str,
+        desktop_entry: &str,
+    ) -> Result<(), PortalError> {
+        self.session.call(
+            PORTAL_OBJECT,
+            DYNAMIC_LAUNCHER,
+            "Install",
+            (token.token, desktop_file_id, desktop_entry, PropMap::new()),
+        )
+    }
+
+    pub fn uninstall(&self, desktop_file_id: &str) -> Result<(), PortalError> {
+        self.session.call(
+            PORTAL_OBJECT,
+            DYNAMIC_LAUNCHER,
+            "Uninstall",
+            (desktop_file_id, PropMap::new()),
+        )
+    }
+}
+
+fn request_path(unique_name: &str, handle_token: &str) -> String {
+    let sender = unique_name.trim_start_matches(':').replace('.', "_");
+    format!("{REQUEST_OBJECTS}/{sender}/{handle_token}")
 }
 
 #[cfg(test)]

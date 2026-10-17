@@ -1,7 +1,11 @@
 use directories::BaseDirs;
 use eclipse::flatpak;
+use eclipse::portal::{self, LauncherChoice, PortalSession};
+use eclipse::roblox_api::{self, Png};
+use eclipse::shortcut::{Launcher, PlaceShortcut};
 use eclipse_config::temp_file::TempFile;
 use std::ffi::OsStr;
+use std::fmt;
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -172,26 +176,231 @@ pub(super) fn make_default_handler_command(desktop_path: &Path) -> String {
     )
 }
 
-fn install_host_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
+#[derive(Debug)]
+pub(super) enum ShortcutInstall {
+    Portal { name: String },
+    Written { name: String, desktop_path: PathBuf },
+}
+
+impl fmt::Display for ShortcutInstall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Portal { name } => write!(f, "Added {name} to the app menu"),
+            Self::Written { name, desktop_path } => write!(
+                f,
+                "Added {name} to the app menu: {}",
+                desktop_path.display()
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum ShortcutRemoval {
+    Portal { desktop_file_id: String },
+    Deleted { paths: Vec<PathBuf> },
+}
+
+impl fmt::Display for ShortcutRemoval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Portal { desktop_file_id } => {
+                write!(f, "Removed {desktop_file_id} from the app menu")
+            }
+            Self::Deleted { paths } => {
+                f.write_str("Removed the app-menu entry:")?;
+                for path in paths {
+                    write!(f, " {}", path.display())?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+pub(super) fn remove_shortcut(
+    shortcut: PlaceShortcut,
+) -> Result<ShortcutRemoval, Box<dyn std::error::Error>> {
+    match Packaging::detect()? {
+        Packaging::Flatpak { app_id } => {
+            let desktop_file_id = shortcut.desktop_file_id(&app_id);
+            PortalSession::open(&portal::environment_bus_address()?)?
+                .dynamic_launcher()?
+                .uninstall(&desktop_file_id)?;
+            Ok(ShortcutRemoval::Portal { desktop_file_id })
+        }
+        Packaging::Host => Ok(ShortcutRemoval::Deleted {
+            paths: delete_shortcut(&user_data_dir("the shortcut")?, shortcut)?,
+        }),
+    }
+}
+
+fn delete_shortcut(data_dir: &Path, shortcut: PlaceShortcut) -> io::Result<Vec<PathBuf>> {
+    let desktop_file_id = shortcut.desktop_file_id(eclipse::APP_ID);
+    let desktop_path = data_dir.join("applications").join(&desktop_file_id);
+    remove_file(&desktop_path)?;
+    let mut removed = vec![desktop_path];
+    let icon_name = Path::new(&desktop_file_id).with_extension("png");
+    let icons = data_dir.join("icons/hicolor");
+    let sizes = match std::fs::read_dir(&icons) {
+        Ok(sizes) => sizes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(removed),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("cannot read {}: {error}", icons.display()),
+            ))
+        }
+    };
+    for size in sizes {
+        let size = size.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot read {}: {error}", icons.display()),
+            )
+        })?;
+        let icon = size.path().join("apps").join(&icon_name);
+        match remove_file(&icon) {
+            Ok(()) => removed.push(icon),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
+}
+
+fn remove_file(path: &Path) -> io::Result<()> {
+    std::fs::remove_file(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot remove {}: {error}", path.display()),
+        )
+    })
+}
+
+pub(super) fn install_shortcut(
+    shortcut: PlaceShortcut,
+) -> Result<ShortcutInstall, Box<dyn std::error::Error>> {
+    match Packaging::detect()? {
+        Packaging::Flatpak { app_id } => install_portal_shortcut(&app_id, shortcut),
+        Packaging::Host => install_host_shortcut(shortcut),
+    }
+}
+
+fn install_portal_shortcut(
+    app_id: &str,
+    shortcut: PlaceShortcut,
+) -> Result<ShortcutInstall, Box<dyn std::error::Error>> {
+    let session = PortalSession::open(&portal::environment_bus_address()?)?;
+    let launcher = session.dynamic_launcher()?;
+    let experience = roblox_api::look_up(shortcut.place())?;
+    let LauncherChoice::Confirmed(token) =
+        launcher.prepare(experience.name(), experience.icon().bytes())?
+    else {
+        return Err("the shortcut dialog was cancelled, so nothing was added".into());
+    };
+    let name = token.name().to_owned();
+    launcher.install(
+        token,
+        &shortcut.desktop_file_id(app_id),
+        &shortcut.desktop_entry(Launcher::Portal),
+    )?;
+    Ok(ShortcutInstall::Portal { name })
+}
+
+fn install_host_shortcut(
+    shortcut: PlaceShortcut,
+) -> Result<ShortcutInstall, Box<dyn std::error::Error>> {
+    let executable = eclipse_executable("the shortcut")?;
+    let data_dir = user_data_dir("the shortcut")?;
+    let experience = roblox_api::look_up(shortcut.place())?;
+    let desktop_path = write_shortcut(
+        &data_dir,
+        &executable,
+        shortcut,
+        experience.name(),
+        experience.icon(),
+    )?;
+    if let Some(validator) = find_on_path("desktop-file-validate") {
+        run_checked(
+            Command::new(validator).arg(&desktop_path),
+            "validate the shortcut",
+        )?;
+    }
+    Ok(ShortcutInstall::Written {
+        name: experience.name().to_owned(),
+        desktop_path,
+    })
+}
+
+fn write_shortcut(
+    data_dir: &Path,
+    executable: &Path,
+    shortcut: PlaceShortcut,
+    name: &str,
+    icon: &Png,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let desktop_file_id = shortcut.desktop_file_id(eclipse::APP_ID);
+    let (width, height) = icon.dimensions();
+    let icons = data_dir
+        .join("icons/hicolor")
+        .join(format!("{width}x{height}"))
+        .join("apps");
+    let icon_name = Path::new(&desktop_file_id).with_extension("png");
+    let icon_path = persist_file(&icons, &icon_name.to_string_lossy(), icon.bytes())?;
+    let icon_value = icon_path
+        .to_str()
+        .filter(|icon| !icon.chars().any(char::is_control))
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "the icon path {} is not printable UTF-8, so a desktop entry cannot name it",
+                    icon_path.display()
+                ),
+            )
+        })?;
+    let quoted_program = desktop_exec_argument(executable.as_os_str())?;
+    let entry = shortcut.desktop_entry(Launcher::Host {
+        quoted_program: &quoted_program,
+        name,
+        icon: icon_value,
+    });
+    Ok(persist_file(
+        &data_dir.join("applications"),
+        &desktop_file_id,
+        entry.as_bytes(),
+    )?)
+}
+
+fn eclipse_executable(purpose: &str) -> io::Result<PathBuf> {
     let executable = std::env::current_exe().map_err(|error| {
         io::Error::new(
             error.kind(),
-            format!("cannot locate the Eclipse executable for the URL handler: {error}"),
+            format!("cannot locate the Eclipse executable for {purpose}: {error}"),
         )
     })?;
-    let handler = executable.canonicalize().map_err(|error| {
+    executable.canonicalize().map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("cannot resolve {}: {error}", executable.display()),
         )
-    })?;
+    })
+}
+
+fn user_data_dir(purpose: &str) -> io::Result<PathBuf> {
     let base_dirs = BaseDirs::new().ok_or_else(|| {
         io::Error::new(
             ErrorKind::NotFound,
-            "cannot resolve the user data directory for the URL handler",
+            format!("cannot resolve the user data directory for {purpose}"),
         )
     })?;
-    let applications = base_dirs.data_dir().join("applications");
+    Ok(base_dirs.data_dir().to_path_buf())
+}
+
+fn install_host_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let handler = eclipse_executable("the URL handler")?;
+    let applications = user_data_dir("the URL handler")?.join("applications");
     let desktop_path = write_desktop_file(&applications, &handler)?;
 
     if let Some(validator) = find_on_path("desktop-file-validate") {
@@ -306,27 +515,34 @@ fn write_desktop_file(
     applications: &Path,
     handler: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(applications).map_err(|error| {
+    let entry = desktop_entry(handler)?;
+    Ok(persist_file(
+        applications,
+        DESKTOP_FILE_ID,
+        entry.as_bytes(),
+    )?)
+}
+
+fn persist_file(dir: &Path, name: &str, contents: &[u8]) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(dir).map_err(|error| {
         io::Error::new(
             error.kind(),
-            format!("cannot create {}: {error}", applications.display()),
+            format!("cannot create {}: {error}", dir.display()),
         )
     })?;
-    let desktop_path = applications.join(DESKTOP_FILE_ID);
+    let path = dir.join(name);
     let write_error = |error: io::Error| {
         io::Error::new(
             error.kind(),
-            format!("cannot write {}: {error}", desktop_path.display()),
+            format!("cannot write {}: {error}", path.display()),
         )
     };
-    let mut temporary = TempFile::create(applications, DESKTOP_FILE_ID).map_err(write_error)?;
-    temporary
-        .write_all(desktop_entry(handler)?.as_bytes())
-        .map_err(write_error)?;
+    let mut temporary = TempFile::create(dir, name).map_err(write_error)?;
+    temporary.write_all(contents).map_err(write_error)?;
     std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o644))
         .map_err(write_error)?;
-    temporary.persist(&desktop_path).map_err(write_error)?;
-    Ok(desktop_path)
+    temporary.persist(&path).map_err(write_error)?;
+    Ok(path)
 }
 
 fn select_kde_config_writer(
@@ -568,6 +784,113 @@ mod tests {
             }
         }
         commands
+    }
+
+    #[test]
+    fn a_shortcut_entry_runs_open_with_only_the_place_link() {
+        let shortcut = PlaceShortcut::for_link(
+            &eclipse::links::parse("https://www.roblox.com/games/1818/Crossroads").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            launch_commands(&shortcut.desktop_entry(Launcher::Portal)),
+            [(
+                "Desktop Entry",
+                Ok(Some(LaunchCommand::Link(
+                    eclipse::links::parse("1818").unwrap()
+                )))
+            )]
+        );
+    }
+
+    #[test]
+    fn a_host_shortcut_writes_its_icon_and_an_entry_that_names_it() {
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-shortcut-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        let icon = include_bytes!("../tests/fixtures/roblox-api/icon.png");
+        let shortcut = PlaceShortcut::for_link(&eclipse::links::parse("1818").unwrap()).unwrap();
+
+        let written = write_shortcut(
+            &root,
+            Path::new("/opt/eclipse dev/eclipse"),
+            shortcut,
+            "Crossroads",
+            &Png::parse(icon.to_vec()).unwrap(),
+        );
+        let icon_path =
+            root.join("icons/hicolor/256x256/apps/io.github.kuenec.Eclipse.Place1818.png");
+        let desktop_path = root.join("applications/io.github.kuenec.Eclipse.Place1818.desktop");
+        let saved_icon = std::fs::read(&icon_path);
+        let entry = std::fs::read_to_string(&desktop_path);
+        let mode = std::fs::metadata(&desktop_path).map(|metadata| metadata.permissions().mode());
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(written.unwrap(), desktop_path);
+        assert_eq!(saved_icon.unwrap(), icon);
+        assert_eq!(
+            entry.unwrap(),
+            format!(
+                "[Desktop Entry]\n\
+                 Version=1.5\n\
+                 Type=Application\n\
+                 Name=Crossroads\n\
+                 Icon={}\n\
+                 Exec=\"/opt/eclipse dev/eclipse\" open roblox://placeId=1818\n\
+                 Terminal=false\n\
+                 StartupNotify=true\n\
+                 Categories=Game;\n",
+                icon_path.display()
+            )
+        );
+        assert_eq!(mode.unwrap() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn removing_a_host_shortcut_deletes_only_its_entry_and_icon() {
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-shortcut-removal-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        let icon =
+            Png::parse(include_bytes!("../tests/fixtures/roblox-api/icon.png").to_vec()).unwrap();
+        let place = |id| PlaceShortcut::for_link(&eclipse::links::parse(id).unwrap()).unwrap();
+        let program = Path::new("/opt/eclipse/eclipse");
+        let kept = write_shortcut(&root, program, place("1819"), "Kept", &icon);
+        let added = write_shortcut(&root, program, place("1818"), "Crossroads", &icon);
+        let removed = delete_shortcut(&root, place("1818"));
+        let again = delete_shortcut(&root, place("1818"));
+        let icons = root.join("icons/hicolor/256x256/apps");
+        let left = [
+            "applications/io.github.kuenec.Eclipse.Place1818.desktop",
+            "icons/hicolor/256x256/apps/io.github.kuenec.Eclipse.Place1818.png",
+            "applications/io.github.kuenec.Eclipse.Place1819.desktop",
+            "icons/hicolor/256x256/apps/io.github.kuenec.Eclipse.Place1819.png",
+        ]
+        .map(|path| root.join(path).exists());
+        std::fs::remove_dir_all(&root).ok();
+
+        let desktop_path = added.unwrap();
+        kept.unwrap();
+        assert_eq!(
+            removed.unwrap(),
+            [
+                desktop_path.clone(),
+                icons.join("io.github.kuenec.Eclipse.Place1818.png")
+            ]
+        );
+        assert_eq!(left, [false, false, true, true]);
+        let again = again.expect_err("a removed shortcut is gone");
+        assert_eq!(again.kind(), ErrorKind::NotFound);
+        assert!(
+            again
+                .to_string()
+                .starts_with(&format!("cannot remove {}: ", desktop_path.display())),
+            "{again}"
+        );
     }
 
     #[test]

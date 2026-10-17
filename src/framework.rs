@@ -30,6 +30,7 @@ pub mod bitmap_registry;
 pub mod canvas_registry;
 mod captures;
 pub mod dialogs;
+pub mod display_metrics;
 pub(crate) mod engine_input;
 mod external_intents;
 #[cfg(test)]
@@ -58,9 +59,6 @@ static CANVAS_DRAW_SUPPORTED: std::sync::atomic::AtomicBool =
 
 static APK_PATH: OnceLock<String> = OnceLock::new();
 
-const DEFAULT_SCREEN_WIDTH_DP: i32 = 1280;
-const DEFAULT_SCREEN_HEIGHT_DP: i32 = 720;
-
 const NATIVE_GET_APK_PATH_NAME: &JNIStr = jni_str!("native_get_apk_path");
 const NATIVE_GET_APK_PATH_SIG: &JNIStr = jni_str!("()Ljava/lang/String;");
 const NATIVE_UPDATE_CONFIG_NAME: &JNIStr = jni_str!("native_updateConfig");
@@ -84,28 +82,10 @@ extern "system" fn native_update_config<'local>(
     _class: JClass<'local>,
     config: JObject<'local>,
 ) {
-    env.with_env(|env| -> jni::errors::Result<()> {
-        let int_sig =
-            unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
-        env.set_field(
-            &config,
-            SCREEN_WIDTH_DP_FIELD,
-            &int_sig,
-            DEFAULT_SCREEN_WIDTH_DP.into(),
-        )?;
-        env.set_field(
-            &config,
-            SCREEN_HEIGHT_DP_FIELD,
-            &int_sig,
-            DEFAULT_SCREEN_HEIGHT_DP.into(),
-        )?;
-        Ok(())
-    })
-    .resolve::<LogErrorAndDefault>()
+    env.with_env(|env| display_metrics::write_configuration(env, &config))
+        .resolve::<LogErrorAndDefault>()
 }
 
-const SCREEN_WIDTH_DP_FIELD: &JNIStr = jni_str!("screenWidthDp");
-const SCREEN_HEIGHT_DP_FIELD: &JNIStr = jni_str!("screenHeightDp");
 const INT_SIG: &JNIStr = jni_str!("I");
 
 const CHAR_SEQUENCE_SIG: &JNIStr = jni_str!("Ljava/lang/CharSequence;");
@@ -14655,6 +14635,8 @@ pub enum FrameworkError {
     DialogItemOutOfRange(usize),
 
     DialogViewGone(view_registry::ViewHandle),
+
+    DisplayAlreadyApplied,
 }
 
 impl fmt::Display for FrameworkError {
@@ -14713,6 +14695,9 @@ impl fmt::Display for FrameworkError {
             Self::DialogViewGone(view) => {
                 write!(f, "the dialog view {view} no longer has a Java object")
             }
+            Self::DisplayAlreadyApplied => {
+                f.write_str("the screen Roblox sees was already set for this process")
+            }
         }
     }
 }
@@ -14736,7 +14721,8 @@ impl std::error::Error for FrameworkError {
             | Self::DialogNotShowing(_)
             | Self::DialogHasNoItems(_)
             | Self::DialogItemOutOfRange(_)
-            | Self::DialogViewGone(_) => None,
+            | Self::DialogViewGone(_)
+            | Self::DisplayAlreadyApplied => None,
         }
     }
 }
@@ -16796,8 +16782,6 @@ mod tests {
             "(Landroid/content/res/Configuration;)V"
         );
 
-        assert_eq!(SCREEN_WIDTH_DP_FIELD.to_str(), "screenWidthDp");
-        assert_eq!(SCREEN_HEIGHT_DP_FIELD.to_str(), "screenHeightDp");
         assert_eq!(INT_SIG.to_str(), "I");
     }
 

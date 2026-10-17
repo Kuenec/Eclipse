@@ -12,6 +12,7 @@ use super::ndk_registry::{
 };
 use super::resolve::{ResolvedSym, SymbolProvider};
 use crate::client_log;
+use crate::framework::display_metrics::{self, DisplayModel};
 
 pub struct EclipseNativeProvider {
     natives: HashMap<&'static str, u64>,
@@ -2106,19 +2107,7 @@ unsafe extern "C" fn eclipse_getnameinfo(
     bionic_eai_from_glibc(rc)
 }
 
-const ACONFIGURATION_DENSITY_BASELINE: i32 = 160;
-
-const ACONFIGURATION_DENSITY_XHIGH: i32 = 320;
-
-const ACONFIGURATION_ORIENTATION_PORT: i32 = 1;
-
-const ACONFIGURATION_SCREENSIZE_NORMAL: i32 = 2;
-
 const ACONFIGURATION_NAVHIDDEN_YES: i32 = 2;
-
-const DEFAULT_DISPLAY_WIDTH_PX: i32 = 1080;
-
-const DEFAULT_DISPLAY_HEIGHT_PX: i32 = 1920;
 
 const WINDOW_FORMAT_RGBA_8888: i32 = 1;
 
@@ -2129,14 +2118,22 @@ const DEFAULT_CONFIGURATION_LOCALE: ndk_registry::ConfigurationLocale =
     };
 
 fn default_configuration() -> ConfigurationState {
-    let to_dp = |px: i32| px * ACONFIGURATION_DENSITY_BASELINE / ACONFIGURATION_DENSITY_XHIGH;
+    let display = display_metrics::current();
+    let screen = ndk_registry::engine_window_geometry().map_or(display, |(width, height)| {
+        display.with_window(width.unsigned_abs(), height.unsigned_abs())
+    });
     let locale = ndk_registry::configuration_locale().unwrap_or(DEFAULT_CONFIGURATION_LOCALE);
+    screen_configuration(screen, locale)
+}
+
+fn screen_configuration(
+    screen: DisplayModel,
+    locale: ndk_registry::ConfigurationLocale,
+) -> ConfigurationState {
     ConfigurationState {
-        density: ACONFIGURATION_DENSITY_XHIGH,
-        screen_width_dp: to_dp(DEFAULT_DISPLAY_WIDTH_PX),
-        screen_height_dp: to_dp(DEFAULT_DISPLAY_HEIGHT_PX),
-        screen_size: ACONFIGURATION_SCREENSIZE_NORMAL,
-        orientation: ACONFIGURATION_ORIENTATION_PORT,
+        screen_width_dp: screen.width_dp(),
+        screen_height_dp: screen.height_dp(),
+        screen_size: screen.size_class().configuration_value(),
         nav_hidden: ACONFIGURATION_NAVHIDDEN_YES,
         language: locale.language,
         country: locale.country,
@@ -2185,7 +2182,7 @@ fn configuration_snapshot(config: *const c_void) -> Option<ConfigurationState> {
 
 fn default_native_window() -> NativeWindowState {
     let (width, height) = ndk_registry::engine_window_geometry()
-        .unwrap_or((DEFAULT_DISPLAY_WIDTH_PX, DEFAULT_DISPLAY_HEIGHT_PX));
+        .unwrap_or_else(|| display_metrics::current().window_px());
     NativeWindowState {
         width,
         height,
@@ -2974,9 +2971,6 @@ mod tests {
     use super::*;
     use crate::loader::reloc::{apply_one, Rela, SliceImage, SymbolResolver, R_X86_64_GLOB_DAT};
     use std::cell::RefCell;
-    use std::sync::Mutex;
-
-    static ANW_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     thread_local! {
         static EMIT_CAPTURE: RefCell<Option<Vec<(c_int, String, String)>>> = const { RefCell::new(None) };
@@ -5459,21 +5453,27 @@ mod tests {
     }
 
     #[test]
-    fn aconfiguration_getters_return_device_values() {
+    fn aconfiguration_getters_follow_the_live_game_window() {
+        let _windows = ndk_registry::WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ndk_registry::set_engine_window_geometry(600, 900);
         let cfg = eclipse_aconfiguration_new();
         assert!(!cfg.is_null(), "AConfiguration_new must allocate");
-        let def = default_configuration();
+        let def = ndk_registry::configurations()
+            .with(ptr_to_handle(cfg), |state| *state)
+            .expect("AConfiguration_new stores its configuration");
 
         unsafe {
             assert_eq!(
-                eclipse_aconfiguration_getscreenwidthdp(cfg),
-                def.screen_width_dp
+                (
+                    eclipse_aconfiguration_getscreenwidthdp(cfg),
+                    eclipse_aconfiguration_getscreenheightdp(cfg),
+                    eclipse_aconfiguration_getscreensize(cfg)
+                ),
+                (600, 900, 3),
+                "a 600x900 px window at density 160 is 600x900 dp and large"
             );
-            assert_eq!(
-                eclipse_aconfiguration_getscreenheightdp(cfg),
-                def.screen_height_dp
-            );
-            assert_eq!(eclipse_aconfiguration_getscreensize(cfg), def.screen_size);
             assert_eq!(eclipse_aconfiguration_getnavhidden(cfg), def.nav_hidden);
 
             let mut country = [0u8; 2];
@@ -5483,16 +5483,52 @@ mod tests {
             eclipse_aconfiguration_getlanguage(cfg, language.as_mut_ptr().cast());
             assert_eq!(&language, &def.language);
 
+            ndk_registry::set_engine_window_geometry(1000, 1600);
             eclipse_aconfiguration_fromassetmanager(cfg, std::ptr::null_mut());
             assert_eq!(
-                eclipse_aconfiguration_getscreenwidthdp(cfg),
-                def.screen_width_dp
+                (
+                    eclipse_aconfiguration_getscreenwidthdp(cfg),
+                    eclipse_aconfiguration_getscreenheightdp(cfg),
+                    eclipse_aconfiguration_getscreensize(cfg)
+                ),
+                (1000, 1600, 4),
+                "fromAssetManager reads the resized window: 1000x1600 dp is xlarge"
             );
 
             eclipse_aconfiguration_delete(cfg);
         }
 
         assert_eq!(unsafe { eclipse_aconfiguration_getscreenwidthdp(cfg) }, 0);
+    }
+
+    #[test]
+    fn aconfiguration_reports_the_window_in_dp_at_the_display_density() {
+        let locale = ndk_registry::ConfigurationLocale {
+            language: *b"en",
+            country: *b"US",
+        };
+        let display = DisplayModel::new(1280, 720, 2.0);
+        let handle = ndk_registry::configurations()
+            .insert(screen_configuration(
+                display.with_window(2560, 1440),
+                locale,
+            ))
+            .expect("store the configuration");
+        let cfg = handle_to_ptr::<c_void>(handle);
+
+        unsafe {
+            assert_eq!(eclipse_aconfiguration_getscreenwidthdp(cfg), 1280);
+            assert_eq!(eclipse_aconfiguration_getscreenheightdp(cfg), 720);
+            assert_eq!(eclipse_aconfiguration_getscreensize(cfg), 4);
+            eclipse_aconfiguration_delete(cfg);
+        }
+
+        let resized = screen_configuration(display.with_window(1000, 1600), locale);
+        assert_eq!(
+            (resized.screen_width_dp, resized.screen_height_dp),
+            (500, 800)
+        );
+        assert_eq!(resized.screen_size, 3);
     }
 
     #[test]
@@ -5543,7 +5579,9 @@ mod tests {
 
     #[test]
     fn anativewindow_getters_return_real_geometry_and_stale_is_negative() {
-        let _guard = ANW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ndk_registry::WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let win = unsafe {
             eclipse_anativewindow_fromsurface(std::ptr::null_mut(), std::ptr::null_mut())
@@ -5572,7 +5610,9 @@ mod tests {
 
     #[test]
     fn anativewindow_fromsurface_reports_published_live_window_geometry() {
-        let _guard = ANW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ndk_registry::WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         ndk_registry::set_engine_window_geometry(1600, 900);
 
@@ -5589,7 +5629,9 @@ mod tests {
 
     #[test]
     fn anativewindow_fromsurface_returns_the_real_wsi_handle_when_registered() {
-        let _guard = ANW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ndk_registry::WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let fake_wsi: usize = 0x7F00_1234_5670;
         ndk_registry::register_wsi_window(fake_wsi, 1280, 720);

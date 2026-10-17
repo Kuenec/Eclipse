@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use dbus::arg::{ArgType, PropMap};
+use dbus::arg::{prop_cast, ArgType, PropMap, RefArg, Variant};
 use dbus::blocking::stdintf::org_freedesktop_dbus::RequestNameReply;
 use dbus::blocking::Connection;
 use dbus::channel::{MatchingReceiver as _, Sender as _};
@@ -18,8 +18,11 @@ use dbus::Message;
 pub(crate) const PORTAL_OBJECT: &str = "/org/freedesktop/portal/desktop";
 pub(crate) const OPEN_URI_HANDLE: &str = "/org/freedesktop/portal/desktop/request/mock/open_uri";
 pub(crate) const INHIBIT_HANDLE: &str = "/org/freedesktop/portal/desktop/request/mock/inhibit";
+pub(crate) const LAUNCHER_TOKEN: &str = "mock-launcher-token";
 
 const PORTAL_NAME: &str = "org.freedesktop.portal.Desktop";
+const REQUEST_OBJECTS: &str = "/org/freedesktop/portal/desktop/request";
+const DYNAMIC_LAUNCHER: &str = "org.freedesktop.portal.DynamicLauncher";
 const CALL_WAIT: Duration = Duration::from_secs(10);
 const QUIET_WAIT: Duration = Duration::from_millis(300);
 const SERVE_POLL: Duration = Duration::from_millis(20);
@@ -42,11 +45,12 @@ pub(crate) struct TestBus {
 
 impl TestBus {
     pub(crate) fn start() -> Self {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        let name = format!(
             "bus{}-{}",
             STARTED.fetch_add(1, Ordering::Relaxed),
             std::process::id()
-        ));
+        );
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(&name);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("create the test bus directory");
         let dir = BusDir(dir);
@@ -54,12 +58,12 @@ impl TestBus {
         std::fs::write(
             &config,
             format!(
-                "<busconfig>\n  <type>session</type>\n  <listen>unix:dir={}</listen>\n  \
+                "<busconfig>\n  <type>session</type>\n  \
+                 <listen>unix:abstract=eclipse-test-{name}</listen>\n  \
                  <auth>EXTERNAL</auth>\n  <policy context=\"default\">\n    \
                  <allow send_destination=\"*\" eavesdrop=\"true\"/>\n    \
                  <allow eavesdrop=\"true\"/>\n    <allow own=\"*\"/>\n  </policy>\n\
-                 </busconfig>\n",
-                dir.0.display()
+                 </busconfig>\n"
             ),
         )
         .expect("write the test bus configuration");
@@ -107,7 +111,14 @@ impl Drop for TestBus {
 #[derive(Clone, Copy)]
 pub(crate) enum Replies {
     Answer { game_mode: i32 },
+    Launcher(Dialog),
     Never,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Dialog {
+    Confirmed,
+    Cancelled,
 }
 
 pub(crate) struct PortalCall {
@@ -222,53 +233,106 @@ fn answer(
     replies: Replies,
     recorded: &mpsc::Sender<PortalCall>,
 ) {
-    let reply = match replies {
-        Replies::Never => None,
-        Replies::Answer { game_mode } => Some(reply_to(&call, game_mode)),
+    let answers = match replies {
+        Replies::Never => Vec::new(),
+        Replies::Answer { game_mode } => answers_to(&call, game_mode, None),
+        Replies::Launcher(dialog) => answers_to(&call, 0, Some(dialog)),
     };
-    let response = (reply.is_some() && call.member().as_deref() == Some("OpenURI")).then(|| {
-        let mut signal = Message::new_signal(
-            OPEN_URI_HANDLE,
-            "org.freedesktop.portal.Request",
-            "Response",
-        )
-        .expect("build the Response signal")
-        .append2(0_u32, PropMap::new());
-        signal.set_destination(call.sender());
-        signal
-    });
     recorded
         .send(PortalCall::record(call))
         .expect("record the portal call");
-    for message in reply.into_iter().chain(response) {
+    for message in answers {
         connection
             .send(message)
             .expect("send the mock portal's answer");
     }
 }
 
-fn reply_to(call: &Message, game_mode: i32) -> Message {
+fn answers_to(call: &Message, game_mode: i32, launcher: Option<Dialog>) -> Vec<Message> {
     let interface = call.interface().map(|interface| interface.to_string());
     let member = call.member().map(|member| member.to_string());
-    match (interface.as_deref(), member.as_deref()) {
-        (Some("org.freedesktop.portal.OpenURI"), Some("OpenURI")) => {
-            call.return_with_args((dbus::Path::from(OPEN_URI_HANDLE),))
+    match (interface.as_deref(), member.as_deref(), launcher) {
+        (Some("org.freedesktop.portal.OpenURI"), Some("OpenURI"), _) => vec![
+            call.return_with_args((dbus::Path::from(OPEN_URI_HANDLE),)),
+            response(call, OPEN_URI_HANDLE, 0, PropMap::new()),
+        ],
+        (Some("org.freedesktop.portal.GameMode"), Some("RegisterGameByPIDFd"), _) => {
+            vec![call.return_with_args((game_mode,))]
         }
-        (Some("org.freedesktop.portal.GameMode"), Some("RegisterGameByPIDFd")) => {
-            call.return_with_args((game_mode,))
-        }
-        (Some("org.freedesktop.portal.Inhibit"), Some("Inhibit")) => {
-            call.return_with_args((dbus::Path::from(INHIBIT_HANDLE),))
+        (Some("org.freedesktop.portal.Inhibit"), Some("Inhibit"), _) => {
+            vec![call.return_with_args((dbus::Path::from(INHIBIT_HANDLE),))]
         }
         (
             Some("org.freedesktop.portal.Notification"),
             Some("AddNotification" | "RemoveNotification"),
+            _,
         )
-        | (Some("org.freedesktop.portal.Request"), Some("Close")) => call.method_return(),
-        _ => call.error(
-            &"org.freedesktop.DBus.Error.UnknownMethod".into(),
-            &CString::new("the mock portal does not implement this method")
-                .expect("a C string without NUL"),
-        ),
+        | (Some("org.freedesktop.portal.Request"), Some("Close"), _)
+        | (Some(DYNAMIC_LAUNCHER), Some("Install" | "Uninstall"), Some(_)) => {
+            vec![call.method_return()]
+        }
+        (Some("org.freedesktop.DBus.Properties"), Some("Get"), Some(_))
+            if call.read2::<&str, &str>().ok() == Some((DYNAMIC_LAUNCHER, "version")) =>
+        {
+            vec![call.return_with_args((Variant(1_u32),))]
+        }
+        (Some("org.freedesktop.DBus.Properties"), Some("Get"), _) => {
+            vec![error(
+                call,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "No such interface",
+            )]
+        }
+        (Some(DYNAMIC_LAUNCHER), Some("PrepareInstall"), Some(dialog)) => {
+            let (_, name, _, options): (&str, &str, Variant<Box<dyn RefArg>>, PropMap) =
+                call.read4().expect("PrepareInstall args");
+            let token = prop_cast::<String>(&options, "handle_token")
+                .expect("PrepareInstall names a handle_token");
+            let sender = call.sender().expect("the call has a sender");
+            let handle = format!(
+                "{REQUEST_OBJECTS}/{}/{token}",
+                sender.trim_start_matches(':').replace('.', "_")
+            );
+            let (code, results) = match dialog {
+                Dialog::Confirmed => (
+                    0,
+                    PropMap::from([
+                        (
+                            "name".to_owned(),
+                            Variant(Box::new(name.to_owned()) as Box<dyn RefArg>),
+                        ),
+                        (
+                            "token".to_owned(),
+                            Variant(Box::new(LAUNCHER_TOKEN.to_owned()) as Box<dyn RefArg>),
+                        ),
+                    ]),
+                ),
+                Dialog::Cancelled => (1, PropMap::new()),
+            };
+            vec![
+                call.return_with_args((dbus::Path::from(handle.clone()),)),
+                response(call, &handle, code, results),
+            ]
+        }
+        _ => vec![error(
+            call,
+            "org.freedesktop.DBus.Error.UnknownMethod",
+            "the mock portal does not implement this method",
+        )],
     }
+}
+
+fn response(call: &Message, handle: &str, code: u32, results: PropMap) -> Message {
+    let mut signal = Message::new_signal(handle, "org.freedesktop.portal.Request", "Response")
+        .expect("build the Response signal")
+        .append2(code, results);
+    signal.set_destination(call.sender());
+    signal
+}
+
+fn error(call: &Message, name: &'static str, text: &str) -> Message {
+    call.error(
+        &name.into(),
+        &CString::new(text).expect("a C string without NUL"),
+    )
 }

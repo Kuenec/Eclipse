@@ -946,6 +946,10 @@ impl ChosenDevice {
         }
     }
 
+    pub(crate) fn is_nvidia(&self) -> bool {
+        self.vendor_id == NVIDIA
+    }
+
     pub(crate) fn is(&self, properties: &vk::PhysicalDeviceProperties) -> bool {
         properties.vendor_id == self.vendor_id
             && properties.device_id == self.device_id
