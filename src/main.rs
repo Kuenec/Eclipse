@@ -10,7 +10,7 @@ use eclipse::apk::store::{
     UpdateOutcome,
 };
 use eclipse::apk::update::{Sources, UpdateError};
-use eclipse::apk::{ApkSet, VersionCode};
+use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode};
 use eclipse::framework::lifecycle::{
     exit_without_vm_teardown, finish_android_process, record_normal_close_at_client_exit,
     ClientEnd, Stage,
@@ -2331,9 +2331,10 @@ fn play_file(
     let runtime_dir = eclipse::framework::app_data_dir()
         .ok_or(NO_APP_DATA_DIR)?
         .join(RUNTIME_DIR);
+    let given = ApkSetPaths::locate(path)?;
     eclipse::runtime::prepare_art_boot_environment()?;
     status.step(VERIFYING_SIGNATURE);
-    let copy = eclipse::apk::store::copy_for_run(path, &runtime_dir)?;
+    let copy = eclipse::apk::store::copy_for_run(given, &runtime_dir)?;
     let prepared = prepare_client(copy, &status)?;
     let installed = InstalledVersion::from(&prepared.apks);
     boot_and_play(

@@ -1298,8 +1298,8 @@ fn write_staged(
     }
 }
 
-pub fn copy_for_run(source: &Path, runtime_dir: &Path) -> Result<ApkSet, StoreError> {
-    let copied = copy_given_set(source, &runtime_dir.join(RUN_COPY_DIR))?;
+pub fn copy_for_run(given: ApkSetPaths, runtime_dir: &Path) -> Result<ApkSet, StoreError> {
+    let copied = copy_given_set(given, &runtime_dir.join(RUN_COPY_DIR))?;
     Ok(ApkSet::open(copied)?)
 }
 
@@ -1307,8 +1307,7 @@ pub fn remove_run_copy(runtime_dir: &Path) -> Result<(), StoreError> {
     remove_dir_if_present(&runtime_dir.join(RUN_COPY_DIR))
 }
 
-fn copy_given_set(source: &Path, dir: &Path) -> Result<ApkSetPaths, StoreError> {
-    let given = ApkSetPaths::locate(source)?;
+fn copy_given_set(given: ApkSetPaths, dir: &Path) -> Result<ApkSetPaths, StoreError> {
     remove_dir_if_present(dir)?;
     create_dir_all(dir)?;
     copy_in(dir, &given.base, StagedFile::Base, Durability::Unsynced)?;
@@ -2248,7 +2247,9 @@ mod tests {
         fs::create_dir_all(&run_dir).unwrap();
         fs::write(run_dir.join("left-by-an-earlier-run.apk"), b"stale").unwrap();
 
-        let set = open_unsigned(copy_given_set(&sources, &run_dir).unwrap());
+        let set = open_unsigned(
+            copy_given_set(ApkSetPaths::locate(&sources).unwrap(), &run_dir).unwrap(),
+        );
 
         let replacement = axml::fixture::Manifest {
             package: ROBLOX_PACKAGE,
@@ -2296,7 +2297,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = copy_for_run(&sources, &runtime)
+        let err = copy_for_run(ApkSetPaths::locate(&sources).unwrap(), &runtime)
             .err()
             .expect("an unsigned set is refused");
         let run_dir = runtime.join(RUN_COPY_DIR);
@@ -2326,7 +2327,8 @@ mod tests {
         };
         let given = PathBuf::from(given);
         let runtime = temp_root("run-copy-official");
-        let set = copy_for_run(&given, &runtime).expect("the copy of the official set verifies");
+        let set = copy_for_run(ApkSetPaths::locate(&given).unwrap(), &runtime)
+            .expect("the copy of the official set verifies");
         let run_dir = runtime.join(RUN_COPY_DIR);
         assert_eq!(set.base_path(), run_dir.join(BASE_APK));
         assert!(set.native_libs_path().starts_with(&run_dir));
