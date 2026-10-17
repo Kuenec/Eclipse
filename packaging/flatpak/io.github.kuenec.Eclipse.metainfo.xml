@@ -24,7 +24,7 @@
   <screenshots>
     <screenshot type="default">
       <caption>The launch window downloading the official Roblox client</caption>
-      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.15/packaging/flatpak/screenshots/first-launch.png</image>
+      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.16/packaging/flatpak/screenshots/first-launch.png</image>
     </screenshot>
   </screenshots>
   <url type="homepage">https://github.com/Kuenec/Eclipse</url>
@@ -57,6 +57,30 @@
     <color type="primary" scheme_preference="dark">#9e391b</color>
   </branding>
   <releases>
+    <release version="0.1.16" date="2026-10-17">
+      <description>
+        <ul>
+          <li>
+            Roblox sees the real window size, and its interface follows the display scale on HiDPI
+            monitors.
+          </li>
+          <li>
+            The run log says which microphone Roblox records from and whether it hears sound.
+          </li>
+          <li>
+            When the GPU driver loses the graphics device, for example after suspend, Eclipse says
+            so, and on NVIDIA how to keep video memory across suspend.
+          </li>
+          <li>
+            eclipse shortcut adds a game to the app menu.
+          </li>
+          <li>
+            Fixed an error each time the game window went fullscreen, and a crash when a
+            software-rendered window closed.
+          </li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.15" date="2026-10-16">
       <description>
         <ul>
