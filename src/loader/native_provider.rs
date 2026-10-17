@@ -7,8 +7,8 @@ use std::sync::OnceLock;
 
 use super::init_run::{write_bytes, write_dec, write_hex};
 use super::ndk_registry::{
-    self, AssetFileSpan, AssetManagerState, AssetState, ConfigurationState, LooperState,
-    NativeWindowState,
+    self, handle_to_ptr, ptr_to_handle, AssetFileSpan, AssetManagerState, AssetState,
+    ConfigurationState, LooperState, NativeWindowState,
 };
 use super::resolve::{ResolvedSym, SymbolProvider};
 use crate::client_log;
@@ -2106,14 +2106,6 @@ unsafe extern "C" fn eclipse_getnameinfo(
     bionic_eai_from_glibc(rc)
 }
 
-fn handle_to_ptr<T>(h: ndk_registry::NdkHandle) -> *mut T {
-    h as usize as *mut T
-}
-
-fn ptr_to_handle<T>(p: *const T) -> ndk_registry::NdkHandle {
-    p as usize as ndk_registry::NdkHandle
-}
-
 const ACONFIGURATION_DENSITY_BASELINE: i32 = 160;
 
 const ACONFIGURATION_DENSITY_XHIGH: i32 = 320;
@@ -2892,25 +2884,30 @@ unsafe extern "C" fn eclipse_anativewindow_fromsurface(
     ndk_registry::register_fallback_native_window(default_native_window()) as *mut c_void
 }
 
+fn native_window_state(window: *mut c_void) -> Option<NativeWindowState> {
+    ndk_registry::fallback_native_window_state(window as usize)
+        .or_else(|| ndk_registry::reader_window(window as usize).map(|reader| reader.state))
+}
+
 unsafe extern "C" fn eclipse_anativewindow_getwidth(window: *mut c_void) -> i32 {
     if let Some((w, _)) = ndk_registry::wsi_window_geometry(window as usize) {
         return w;
     }
-    ndk_registry::fallback_native_window_state(window as usize).map_or(-1, |w| w.width)
+    native_window_state(window).map_or(-1, |w| w.width)
 }
 
 unsafe extern "C" fn eclipse_anativewindow_getheight(window: *mut c_void) -> i32 {
     if let Some((_, h)) = ndk_registry::wsi_window_geometry(window as usize) {
         return h;
     }
-    ndk_registry::fallback_native_window_state(window as usize).map_or(-1, |w| w.height)
+    native_window_state(window).map_or(-1, |w| w.height)
 }
 
 unsafe extern "C" fn eclipse_anativewindow_getformat(window: *mut c_void) -> i32 {
     if ndk_registry::wsi_window_geometry(window as usize).is_some() {
         return WINDOW_FORMAT_RGBA_8888;
     }
-    ndk_registry::fallback_native_window_state(window as usize).map_or(-1, |w| w.format)
+    native_window_state(window).map_or(-1, |w| w.format)
 }
 
 unsafe extern "C" fn eclipse_anativewindow_acquire(_window: *mut c_void) {}
@@ -3059,7 +3056,7 @@ mod tests {
                 + super::super::aaudio::AAUDIO_NATIVE_COUNT,
             "6 liblog + 18 bionic-libc + 25 bionic-stdio + 8 bionic-signal + 2 link-map \
              introspection + 4 netdb resolver-ABI + 2 EGL display and swap interception + 3 \
-             Vulkan WSI interception + 4 dlfcn + 28 ndk-android + 33 media-ndk + 8 OpenSL ES + \
+             Vulkan WSI interception + 4 dlfcn + 28 ndk-android + 54 media-ndk + 8 OpenSL ES + \
              26 AAudio + 53 pthread + 6 sysconf system-query + 1 locale natives registered"
         );
         for name in [

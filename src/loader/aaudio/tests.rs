@@ -182,6 +182,7 @@ fn routed_renderer<A: cpal::SizedSample>(
         }),
         route,
         0x1234_0000_0007,
+        Direction::Output,
         StreamFormat {
             channels: 2,
             sample_rate: 48_000,
@@ -205,10 +206,10 @@ fn register_natives_count_matches() {
 }
 
 #[test]
-fn unspecified_format_reports_the_device_default_rate_channels_and_format() {
+fn unspecified_format_takes_the_device_default_format_at_the_app_rate_and_channels() {
     let format = negotiate_format(
         None,
-        &device_default(2, 48_000, cpal::SampleFormat::F32),
+        &device_default(2, 44_100, cpal::SampleFormat::F32),
         [
             range(2, cpal::SampleFormat::F32),
             range(2, cpal::SampleFormat::I16),
@@ -220,6 +221,73 @@ fn unspecified_format_reports_the_device_default_rate_channels_and_format() {
         Ok(StreamFormat {
             channels: 2,
             sample_rate: 48_000,
+            app: SampleFormat::Float,
+            device: DeviceFormat::Float,
+        })
+    );
+}
+
+#[test]
+fn a_mono_16_khz_default_device_still_opens_at_48_khz_stereo() {
+    let format = negotiate_format(
+        None,
+        &device_default(1, 16_000, cpal::SampleFormat::F32),
+        [
+            range(1, cpal::SampleFormat::F32),
+            range(2, cpal::SampleFormat::F32),
+        ],
+    );
+    assert_eq!(
+        format,
+        Ok(StreamFormat {
+            channels: 2,
+            sample_rate: 48_000,
+            app: SampleFormat::Float,
+            device: DeviceFormat::Float,
+        })
+    );
+}
+
+#[test]
+fn a_device_without_48_khz_stereo_keeps_its_default_rate_and_channels() {
+    let cd_only = cpal::SupportedStreamConfigRange::new(
+        2,
+        44_100,
+        44_100,
+        cpal::SupportedBufferSize::Unknown,
+        cpal::SampleFormat::F32,
+    );
+    let format = negotiate_format(
+        None,
+        &device_default(2, 44_100, cpal::SampleFormat::F32),
+        [cd_only],
+    );
+    assert_eq!(
+        format,
+        Ok(StreamFormat {
+            channels: 2,
+            sample_rate: 44_100,
+            app: SampleFormat::Float,
+            device: DeviceFormat::Float,
+        })
+    );
+}
+
+#[test]
+fn a_48_khz_stereo_range_without_a_convertible_format_falls_back_to_the_device_default() {
+    let format = negotiate_format(
+        None,
+        &device_default(1, 44_100, cpal::SampleFormat::F32),
+        [
+            range(2, cpal::SampleFormat::U8),
+            range(1, cpal::SampleFormat::F32),
+        ],
+    );
+    assert_eq!(
+        format,
+        Ok(StreamFormat {
+            channels: 1,
+            sample_rate: 44_100,
             app: SampleFormat::Float,
             device: DeviceFormat::Float,
         })
@@ -241,7 +309,7 @@ fn requested_i16_is_honoured_natively_when_the_device_supports_it() {
         (format.app, format.device),
         (SampleFormat::I16, DeviceFormat::I16)
     );
-    assert_eq!((format.channels, format.sample_rate), (2, 44_100));
+    assert_eq!((format.channels, format.sample_rate), (2, 48_000));
 }
 
 #[test]
@@ -703,12 +771,12 @@ fn output_renders_silence_until_started_then_converts_app_samples() {
     let mut renderer = renderer::<i16>(&shared, write_i16_ramp, &probe);
 
     let mut out = [9.0f32; 16];
-    renderer.render_output(&mut out);
+    renderer.render_output(&mut out, Instant::now());
     assert_eq!(out, [0.0; 16], "an unstarted stream is silent");
     assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
 
     shared.state.swap(StreamState::Started);
-    renderer.render_output(&mut out);
+    renderer.render_output(&mut out, Instant::now());
     assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     assert_eq!(*probe.frames.lock().unwrap(), [8]);
     for (i, sample) in out.iter().enumerate() {
@@ -725,7 +793,7 @@ fn output_larger_than_scratch_is_delivered_in_whole_frame_chunks() {
     let mut renderer = renderer::<i16>(&shared, write_i16_ramp, &probe);
 
     let mut out = [0.0f32; 40];
-    renderer.render_output(&mut out);
+    renderer.render_output(&mut out, Instant::now());
     assert_eq!(*probe.frames.lock().unwrap(), [8, 8, 4]);
     assert_eq!(
         shared.frames_per_burst.load(Ordering::Relaxed),
@@ -743,7 +811,7 @@ fn stop_result_stops_the_stream_and_silences_the_rest() {
     let mut renderer = renderer::<i16>(&shared, write_i16_ramp, &probe);
 
     let mut out = [7.0f32; 40];
-    renderer.render_output(&mut out);
+    renderer.render_output(&mut out, Instant::now());
     assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     assert_eq!(shared.state.load(), StreamState::Stopped);
     assert!(out[16..].iter().all(|&s| s == 0.0));
@@ -757,7 +825,7 @@ fn control_calls_from_the_data_callback_are_rejected() {
     let mut renderer = renderer::<i16>(&shared, control_from_callback, &probe);
 
     let mut out = [0.0f32; 16];
-    renderer.render_output(&mut out);
+    renderer.render_output(&mut out, Instant::now());
     assert_eq!(
         *probe.collision_results.lock().unwrap(),
         [AAUDIO_ERROR_INVALID_STATE; 4]
@@ -771,11 +839,11 @@ fn input_capture_converts_device_samples_for_the_app() {
     let probe = CallbackProbe::default();
     let mut renderer = renderer::<i16>(&shared, record_i16_input, &probe);
 
-    renderer.capture_input(&[0.5f32, -0.5, 1.0, -1.0]);
+    renderer.capture_input(&[0.5f32, -0.5, 1.0, -1.0], Instant::now());
     assert_eq!(probe.calls.load(Ordering::SeqCst), 0, "not started");
 
     shared.state.swap(StreamState::Started);
-    renderer.capture_input(&[0.5f32, -0.5, 1.0, -1.0]);
+    renderer.capture_input(&[0.5f32, -0.5, 1.0, -1.0], Instant::now());
     let expected: Vec<i16> = [0.5f32, -0.5, 1.0, -1.0]
         .iter()
         .map(|&s| cpal::Sample::from_sample(s))
@@ -803,7 +871,7 @@ fn server_lost() -> cpal::Error {
 }
 
 #[test]
-fn host_errors_count_xruns_and_disconnect_once() {
+fn host_errors_flag_xruns_and_disconnect_once() {
     let shared = Arc::new(StreamShared::new(4));
     shared.state.swap(StreamState::Started);
     let probe = CallbackProbe::default();
@@ -814,7 +882,12 @@ fn host_errors_count_xruns_and_disconnect_once() {
     reporter.report(cpal::ErrorKind::Xrun.into(), start);
     reporter.report(cpal::ErrorKind::DeviceChanged.into(), start);
     reporter.report(cpal::ErrorKind::RealtimeDenied.into(), start);
-    assert_eq!(shared.xrun_count.load(Ordering::Relaxed), 2);
+    assert!(shared.host_xrun.load(Ordering::Relaxed));
+    assert_eq!(
+        shared.xrun_count.load(Ordering::Relaxed),
+        0,
+        "the next callback counts the flagged xrun"
+    );
     assert_eq!(shared.state.load(), StreamState::Started);
     assert!(probe.errors.lock().unwrap().is_empty());
 
@@ -897,7 +970,7 @@ fn a_host_error_followed_by_a_host_callback_keeps_the_stream_started() {
     let start = Instant::now();
 
     reporter.report(server_lost(), start);
-    renderer.render_output(&mut [0.0f32; 16]);
+    renderer.render_output(&mut [0.0f32; 16], Instant::now());
     reporter.report(server_lost(), start + HOST_ERROR_STREAK_LIMIT);
     assert_eq!(shared.state.load(), StreamState::Started);
     assert!(probe.errors.lock().unwrap().is_empty());
@@ -920,18 +993,320 @@ fn a_route_change_disconnects_a_running_stream_once() {
     let probe = CallbackProbe::default();
     let mut renderer = routed_renderer::<i16>(&shared, write_i16_ramp, &probe, Route::on(&ROUTE));
 
-    renderer.render_output(&mut [0.0f32; 16]);
+    renderer.render_output(&mut [0.0f32; 16], Instant::now());
     assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     assert!(probe.errors.lock().unwrap().is_empty());
 
     ROUTE.fetch_add(1, Ordering::AcqRel);
     let mut out = [1.0f32; 16];
-    renderer.render_output(&mut out);
-    renderer.render_output(&mut out);
+    renderer.render_output(&mut out, Instant::now());
+    renderer.render_output(&mut out, Instant::now());
     assert_eq!(shared.state.load(), StreamState::Disconnected);
     assert_eq!(*probe.errors.lock().unwrap(), [AAUDIO_ERROR_DISCONNECTED]);
     assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     assert_eq!(out, [0.0f32; 16]);
+}
+
+const LOW_LATENCY_BURST: Duration = Duration::from_nanos(10_666_667);
+
+const SERVER_QUANTUM: Duration = Duration::from_nanos(21_333_333);
+
+const RUNNING: Option<Run> = Some(Run(1));
+
+const SECOND: Duration = Duration::from_secs(1);
+
+const LOW_LATENCY_FRAMES: usize = 512;
+
+const CAPACITY_FRAMES: u32 = 1024;
+
+const PIPEWIRE_PULSE_FRAMES: usize = 341;
+
+struct CallbackClock {
+    detector: LateCallbackDetector,
+    frames: usize,
+    at: Instant,
+    host_xrun: AtomicBool,
+}
+
+impl CallbackClock {
+    fn new() -> Self {
+        Self::with_frames(LOW_LATENCY_FRAMES)
+    }
+
+    fn with_frames(frames: usize) -> Self {
+        Self {
+            detector: LateCallbackDetector::new(CAPACITY_FRAMES, 48_000),
+            frames,
+            at: Instant::now(),
+            host_xrun: AtomicBool::new(false),
+        }
+    }
+
+    fn tick(&mut self, gap: Duration, run: Option<Run>) -> bool {
+        self.at += gap;
+        self.detector
+            .underrun(self.at, self.frames, run, &self.host_xrun)
+    }
+
+    fn run(&mut self, gaps: impl IntoIterator<Item = Duration>, run: Option<Run>) -> usize {
+        gaps.into_iter().filter(|gap| self.tick(*gap, run)).count()
+    }
+}
+
+fn steady(gap: Duration, length: Duration) -> impl Iterator<Item = Duration> + Clone {
+    std::iter::repeat_n(gap, length.as_nanos().div_ceil(gap.as_nanos()) as usize)
+}
+
+fn past_the_start() -> impl Iterator<Item = Duration> + Clone {
+    steady(LOW_LATENCY_BURST, START_GRACE + LOW_LATENCY_BURST)
+}
+
+#[test]
+fn steady_low_latency_callbacks_are_never_late() {
+    let mut clock = CallbackClock::new();
+    assert_eq!(
+        clock.run(steady(LOW_LATENCY_BURST, 10 * SECOND), RUNNING),
+        0
+    );
+}
+
+#[test]
+fn back_to_back_pairs_every_server_quantum_are_never_late() {
+    let pair = [
+        Duration::from_micros(50),
+        SERVER_QUANTUM - Duration::from_micros(50),
+    ];
+    let mut clock = CallbackClock::new();
+    assert_eq!(clock.run(pair.into_iter().cycle().take(1_000), RUNNING), 0);
+}
+
+#[test]
+fn one_60_ms_gap_is_one_underrun() {
+    let gaps = past_the_start()
+        .chain([Duration::from_millis(60)])
+        .chain(steady(LOW_LATENCY_BURST, SECOND));
+    assert_eq!(CallbackClock::new().run(gaps, RUNNING), 1);
+}
+
+#[test]
+fn a_callback_is_late_after_twice_the_buffer_of_a_low_latency_stream() {
+    let mut clock = CallbackClock::new();
+    assert_eq!(clock.run(past_the_start(), RUNNING), 0);
+    assert!(!clock.tick(Duration::from_micros(42_600), RUNNING));
+    assert!(
+        clock.tick(Duration::from_micros(42_700), RUNNING),
+        "1024 frames last 21.3 ms at 48 kHz"
+    );
+}
+
+#[test]
+fn the_first_second_of_a_run_is_not_judged() {
+    let gaps = [
+        LOW_LATENCY_BURST,
+        Duration::from_millis(60),
+        LOW_LATENCY_BURST,
+    ];
+    assert_eq!(CallbackClock::new().run(gaps, RUNNING), 0);
+}
+
+#[test]
+fn the_audio_a_burst_delivered_covers_the_wait_after_it() {
+    let spacing = Duration::from_micros(50);
+    let rest_of_burst = [spacing; 5];
+    let cycles = (0..100).flat_map(|index| {
+        let wait = if index % 7 == 0 { 46_200 } else { 42_400 };
+        rest_of_burst
+            .into_iter()
+            .chain([Duration::from_micros(wait)])
+    });
+    let mut clock = CallbackClock::with_frames(PIPEWIRE_PULSE_FRAMES);
+    assert_eq!(clock.run(cycles, RUNNING), 0, "2048-frame quantum");
+
+    let callback = Duration::from_secs(PIPEWIRE_PULSE_FRAMES as u64) / 48_000;
+    let buffer = Duration::from_secs(u64::from(CAPACITY_FRAMES)) / 48_000;
+    let still_ahead = 6 * callback - 5 * spacing;
+    assert_eq!(clock.run(rest_of_burst, RUNNING), 0);
+    assert!(!clock.tick(still_ahead + buffer, RUNNING));
+    assert_eq!(clock.run(rest_of_burst, RUNNING), 0);
+    assert!(
+        clock.tick(still_ahead + buffer + Duration::from_micros(1), RUNNING),
+        "a buffer beyond the audio the server still had"
+    );
+}
+
+#[test]
+fn an_isolated_stall_does_not_raise_the_limit() {
+    let stall = [Duration::from_millis(60)];
+    let gaps = past_the_start()
+        .chain(stall)
+        .chain(steady(LOW_LATENCY_BURST, SECOND * 3 / 2))
+        .chain(stall)
+        .chain(steady(LOW_LATENCY_BURST, SECOND));
+    assert_eq!(CallbackClock::new().run(gaps, RUNNING), 2);
+}
+
+#[test]
+fn a_stall_in_every_second_is_counted_every_time() {
+    let cycle = steady(LOW_LATENCY_BURST, SECOND / 2).chain([Duration::from_millis(60)]);
+    let gaps = past_the_start().chain(std::iter::repeat_n(cycle, 20).flatten());
+    assert_eq!(CallbackClock::new().run(gaps, RUNNING), 20);
+}
+
+#[test]
+fn a_device_clock_running_fast_never_raises_the_limit() {
+    let fast = LOW_LATENCY_BURST - LOW_LATENCY_BURST / 1000;
+    let gaps = steady(fast, 600 * SECOND).chain([Duration::from_millis(60)]);
+    assert_eq!(CallbackClock::new().run(gaps, RUNNING), 1);
+}
+
+#[test]
+fn a_gap_across_a_stop_and_start_is_not_an_underrun() {
+    let mut paused_host = CallbackClock::new();
+    assert_eq!(paused_host.run(past_the_start(), Some(Run(1))), 0);
+    assert!(!paused_host.tick(SECOND, Some(Run(2))));
+
+    let mut running_host = CallbackClock::new();
+    assert_eq!(running_host.run(past_the_start(), Some(Run(1))), 0);
+    assert!(!running_host.tick(Duration::from_millis(200), None));
+    assert!(!running_host.tick(SECOND, Some(Run(1))));
+}
+
+#[test]
+fn a_cpal_xrun_and_the_late_callback_after_it_count_once() {
+    let mut clock = CallbackClock::new();
+    assert_eq!(clock.run(past_the_start(), RUNNING), 0);
+    clock.host_xrun.store(true, Ordering::Relaxed);
+    let after = [Duration::from_millis(80), LOW_LATENCY_BURST];
+    assert_eq!(clock.run(after, RUNNING), 1);
+    assert!(
+        !clock.host_xrun.load(Ordering::Relaxed),
+        "the report is consumed"
+    );
+}
+
+#[test]
+fn a_cpal_xrun_counts_in_the_first_second() {
+    let mut clock = CallbackClock::new();
+    assert!(!clock.tick(LOW_LATENCY_BURST, RUNNING));
+    clock.host_xrun.store(true, Ordering::Relaxed);
+    assert!(clock.tick(LOW_LATENCY_BURST, RUNNING));
+}
+
+#[test]
+fn a_cpal_xrun_while_stopped_is_not_counted_after_the_restart() {
+    let mut clock = CallbackClock::new();
+    clock.host_xrun.store(true, Ordering::Relaxed);
+    assert!(!clock.tick(LOW_LATENCY_BURST, None));
+    assert!(!clock.tick(LOW_LATENCY_BURST, Some(Run(2))));
+}
+
+#[test]
+fn late_callback_warnings_wait_ten_seconds_and_need_a_new_count() {
+    let start = Instant::now();
+    let mut log = LateCallbackLog::default();
+    assert!(!log.due(0, start), "nothing to report");
+    assert!(log.due(1, start));
+    assert!(!log.due(2, start + SECOND));
+    assert!(log.due(3, start + 12 * SECOND));
+    assert!(
+        !log.due(3, start + 30 * SECOND),
+        "the count has not changed"
+    );
+}
+
+fn render_at(renderer: &mut Renderer<i16>, start: Instant, millis: impl IntoIterator<Item = u64>) {
+    for millis in millis {
+        renderer.render_output(&mut [0.0f32; 16], start + Duration::from_millis(millis));
+    }
+}
+
+#[test]
+fn late_callbacks_raise_the_xrun_count_until_a_restart() {
+    let (stream, shared) = detached_stream(Direction::Output);
+    let probe = CallbackProbe::default();
+    let mut renderer = renderer::<i16>(&shared, write_i16_ramp, &probe);
+    let mut reporter = error_reporter(&shared, &probe);
+    let start = Instant::now();
+    unsafe {
+        assert_eq!(stream_request_start(stream), AAUDIO_OK);
+        render_at(&mut renderer, start, (0..=1_000).step_by(5));
+        assert_eq!(stream_get_xrun_count(stream), 0);
+        render_at(&mut renderer, start, [1_030]);
+        assert_eq!(
+            stream_get_xrun_count(stream),
+            1,
+            "a 30 ms gap on a 512-frame buffer"
+        );
+        reporter.report(cpal::ErrorKind::Xrun.into(), start);
+        render_at(&mut renderer, start, [1_100]);
+        assert_eq!(
+            stream_get_xrun_count(stream),
+            2,
+            "the xrun and its gap count once"
+        );
+        assert_eq!(stream_request_stop(stream), AAUDIO_OK);
+        assert_eq!(stream_request_start(stream), AAUDIO_OK);
+        render_at(&mut renderer, start, [3_000, 3_005]);
+        assert_eq!(
+            stream_get_xrun_count(stream),
+            2,
+            "the restart is not an underrun"
+        );
+        assert_eq!(stream_close(stream), AAUDIO_OK);
+    }
+}
+
+#[test]
+fn late_input_callbacks_raise_the_xrun_count() {
+    let shared = Arc::new(StreamShared::new(256));
+    shared.state.swap(StreamState::Started);
+    let probe = CallbackProbe::default();
+    let mut renderer = renderer::<i16>(&shared, record_i16_input, &probe);
+    let start = Instant::now();
+    for millis in (0..=1_000).step_by(5).chain([1_030]) {
+        renderer.capture_input(&[0.0f32; 4], start + Duration::from_millis(millis));
+    }
+    assert_eq!(shared.xrun_count.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn late_callbacks_warn_at_most_every_ten_seconds_and_the_close_line_has_the_total() {
+    let (stream, shared) = detached_stream(Direction::Output);
+    let probe = CallbackProbe::default();
+    let mut renderer = renderer::<i16>(&shared, write_i16_ramp, &probe);
+    let start = Instant::now();
+    let log = formatted_log("eclipse::audio=info", || unsafe {
+        assert_eq!(stream_request_start(stream), AAUDIO_OK);
+        render_at(&mut renderer, start, (0..=1_000).step_by(10));
+        render_at(
+            &mut renderer,
+            start,
+            [1_060, 1_070, 2_070, 2_080, 13_080, 13_090],
+        );
+        assert_eq!(stream_close(stream), AAUDIO_OK);
+    });
+    let warnings: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("AAudio: late callbacks; audio likely dropped out"))
+        .collect();
+    assert_eq!(warnings.len(), 2, "{log}");
+    for (line, xruns) in warnings.iter().zip(["xruns=1", "xruns=3"]) {
+        for field in ["WARN eclipse::audio:", "direction=Output", xruns] {
+            assert!(line.contains(field), "{field} missing from {line}");
+        }
+    }
+    let closed: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("AAudio: stream closed"))
+        .collect();
+    assert_eq!(closed.len(), 1, "{log}");
+    for field in ["INFO eclipse::audio:", "direction=Output", "xruns=3"] {
+        assert!(
+            closed[0].contains(field),
+            "{field} missing from {}",
+            closed[0]
+        );
+    }
 }
 
 type DlopenFn = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
@@ -1048,6 +1423,24 @@ fn fmod_driver_probe(api: &FmodView, direction: i32) -> Result<(i32, i32), i32> 
     }
 }
 
+fn offers_48_khz_stereo(direction: Direction) -> bool {
+    let host = cpal::default_host();
+    let ranges = match direction {
+        Direction::Output => host
+            .default_output_device()
+            .and_then(|device| device.supported_output_configs().ok())
+            .map(Iterator::collect::<Vec<_>>),
+        Direction::Input => host
+            .default_input_device()
+            .and_then(|device| device.supported_input_configs().ok())
+            .map(Iterator::collect::<Vec<_>>),
+    };
+    ranges
+        .unwrap_or_default()
+        .iter()
+        .any(|range| range.channels() == APP_CHANNELS && range.contains_rate(APP_SAMPLE_RATE))
+}
+
 #[test]
 fn fmod_driver_probe_opens_callback_less_streams_in_both_directions() {
     let api = fmod_view();
@@ -1059,10 +1452,15 @@ fn fmod_driver_probe_opens_callback_less_streams_in_both_directions() {
             eprintln!("fmod_driver_probe_opens_callback_less_streams_in_both_directions: no {direction:?} device");
             continue;
         };
+        let expected = if offers_48_khz_stereo(direction) {
+            (APP_SAMPLE_RATE as i32, i32::from(APP_CHANNELS))
+        } else {
+            (config.sample_rate() as i32, i32::from(config.channels()))
+        };
         assert_eq!(
             fmod_driver_probe(&api, raw),
-            Ok((config.sample_rate() as i32, i32::from(config.channels()))),
-            "{direction:?} probe reports the device's own rate and channels"
+            Ok(expected),
+            "{direction:?} probe reports 48 kHz stereo when the device offers it"
         );
     }
 }
@@ -1219,6 +1617,11 @@ fn started_stream(
         );
         assert_eq!((api.open)(builder, &mut stream), AAUDIO_OK);
         assert_eq!((api.delete)(builder), AAUDIO_OK);
+        assert_eq!(
+            ((api.get[1])(stream), (api.get[5])(stream)),
+            (APP_SAMPLE_RATE as i32, i32::from(APP_CHANNELS)),
+            "streams on the PulseAudio plug-in open at 48 kHz stereo"
+        );
         let sample_bytes = match (api.get[4])(stream) {
             AAUDIO_FORMAT_PCM_I16 => 2,
             AAUDIO_FORMAT_PCM_FLOAT => 4,

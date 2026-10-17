@@ -635,6 +635,37 @@ fn the_log_directory_is_printed_for_the_settings_window() {
 }
 
 #[test]
+fn the_media_self_test_reports_each_committed_fixture_and_passes() {
+    let root = sandbox("media-test");
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/media");
+
+    let output = eclipse(
+        &root,
+        &root.join("app-data"),
+        &[OsStr::new("__media-test"), fixtures.as_os_str()],
+    );
+    std::fs::remove_dir_all(&root).ok();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 4, "{stdout}");
+    assert!(lines[0].starts_with("__media-test: backend: "), "{stdout}");
+    for (line, mime) in lines[1..]
+        .iter()
+        .zip(["audio/mp4a-latm", "video/avc", "video/hevc"])
+    {
+        let result = line
+            .strip_prefix(&format!("__media-test: {mime}: "))
+            .unwrap_or_else(|| panic!("no {mime} line in {stdout}"));
+        assert!(
+            result.starts_with("ok (") || result.starts_with("no decoder: "),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn controller_access_is_one_line_and_fails_when_controllers_cannot_work() {
     let root = sandbox("controller-access");
 

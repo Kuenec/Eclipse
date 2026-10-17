@@ -1,3 +1,5 @@
+use std::ffi::c_void;
+
 use super::*;
 
 use crate::loader::log_capture::formatted_log;
@@ -5,6 +7,7 @@ use crate::loader::native_provider::EclipseNativeProvider;
 use crate::loader::resolve::SymbolProvider;
 
 type CreateCodecFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+type DeleteCodecFn = unsafe extern "C" fn(*mut c_void) -> MediaStatus;
 type QueueInputFn =
     unsafe extern "C" fn(*mut c_void, usize, libc::off_t, usize, u64, u32) -> MediaStatus;
 type SetBufferFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_void, usize);
@@ -39,67 +42,13 @@ fn register_natives_count_matches_and_every_name_resolves_through_the_provider()
 }
 
 #[test]
-fn media_ndk_natives_return_unavailable_sentinels() {
-    assert!(unsafe { eclipse_amediacodec_createdecoderbytype(std::ptr::null()) }.is_null());
-
-    assert!(unsafe { eclipse_amediacodec_createencoderbytype(std::ptr::null()) }.is_null());
-    assert!(eclipse_amediaformat_new().is_null());
-
-    assert!(unsafe { eclipse_amediacodec_getoutputformat(std::ptr::null_mut()) }.is_null());
-
-    unsafe {
-        assert_eq!(
-            eclipse_amediacodec_start(std::ptr::null_mut()),
-            AMEDIA_ERROR_UNSUPPORTED
-        );
-        assert_eq!(
-            eclipse_amediacodec_stop(std::ptr::null_mut()),
-            AMEDIA_ERROR_UNSUPPORTED
-        );
-        assert_eq!(
-            eclipse_amediacodec_flush(std::ptr::null_mut()),
-            AMEDIA_ERROR_UNSUPPORTED
-        );
-        assert_eq!(
-            eclipse_amediacodec_configure(
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0
-            ),
-            AMEDIA_ERROR_UNSUPPORTED
-        );
-    }
-
+fn media_status_codes_match_the_ndk() {
+    assert_eq!(AMEDIA_OK, 0);
+    assert_eq!(AMEDIA_ERROR_UNKNOWN, -10000);
     assert_eq!(AMEDIA_ERROR_UNSUPPORTED, -10002);
-
-    unsafe {
-        assert!(eclipse_amediacodec_dequeueinputbuffer(std::ptr::null_mut(), 0) < 0);
-        assert!(
-            eclipse_amediacodec_dequeueoutputbuffer(std::ptr::null_mut(), std::ptr::null_mut(), 0)
-                < 0
-        );
-    }
-
-    unsafe {
-        assert!(!eclipse_amediaformat_getint32(
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null_mut()
-        ));
-        assert!(!eclipse_amediaformat_getbuffer(
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut()
-        ));
-    }
-
-    let s = unsafe { eclipse_amediaformat_tostring(std::ptr::null_mut()) };
-    assert!(!s.is_null(), "toString must never return NULL");
-
-    assert_eq!(unsafe { *s }, 0, "toString returns an empty string");
+    assert_eq!(AMEDIA_ERROR_INVALID_OBJECT, -10003);
+    assert_eq!(AMEDIA_ERROR_INVALID_PARAMETER, -10004);
+    assert_eq!(AMEDIA_ERROR_INVALID_OPERATION, -10005);
 }
 
 #[test]
@@ -132,16 +81,23 @@ fn create_decoder_by_type_logs_the_requested_mime_under_mediandk() {
             "AMediaCodec_createDecoderByType",
         ))
     };
+    let delete = unsafe {
+        std::mem::transmute::<*const (), DeleteCodecFn>(provider_function("AMediaCodec_delete"))
+    };
+    let mut codec = std::ptr::null_mut();
     let log = formatted_log("mediandk=debug", || {
-        assert!(unsafe { create(c"video/avc".as_ptr()) }.is_null());
+        codec = unsafe { create(c"video/avc".as_ptr()) };
     });
+    if !codec.is_null() {
+        assert_eq!(unsafe { delete(codec) }, AMEDIA_OK);
+    }
     let line = log
         .lines()
         .find(|line| line.contains("AMediaCodec_createDecoderByType"))
         .unwrap_or_else(|| panic!("no createDecoderByType line in {log:?}"));
     assert!(line.contains("DEBUG mediandk:"), "{line}");
     assert!(line.contains("mime=Some(\"video/avc\")"), "{line}");
-    assert!(line.contains("codec=0x0"), "{line}");
+    assert!(line.contains(&format!("codec={codec:?}")), "{line}");
 }
 
 #[test]
@@ -153,7 +109,7 @@ fn per_buffer_calls_log_index_size_pts_and_flags_only_at_trace() {
     };
     let call = || {
         let status = unsafe { queue(std::ptr::null_mut(), 3, 0, 4096, 33_366, 1) };
-        assert_eq!(status, AMEDIA_ERROR_UNSUPPORTED);
+        assert_eq!(status, AMEDIA_ERROR_INVALID_OBJECT);
     };
 
     let trace = formatted_log("mediandk=trace", call);
@@ -167,7 +123,7 @@ fn per_buffer_calls_log_index_size_pts_and_flags_only_at_trace() {
         "size=4096",
         "pts_us=33366",
         "flags=1",
-        "status=-10002",
+        "status=-10003",
     ] {
         assert!(line.contains(field), "{field} missing from {line}");
     }
@@ -193,4 +149,28 @@ fn format_setters_log_the_key_and_a_buffer_length_but_never_its_bytes() {
     assert!(log.contains("key=Some(\"csd-0\")"), "{log}");
     assert!(log.contains("size=19"), "{log}");
     assert!(!log.contains("codec-private"), "{log}");
+}
+
+#[test]
+fn missing_video_decoders_are_a_problem_with_their_fix() {
+    use avcodec::{BackendUnavailable, Codec};
+
+    assert_eq!(video_problem(Ok(&Codec::ALL)), None);
+    assert_eq!(
+        video_problem(Ok(&[Codec::Aac, Codec::Mp3, Codec::Opus])),
+        Some(
+            "H.264 and HEVC videos in games will not play: H.264/HEVC need \
+             org.freedesktop.Platform.codecs-extra//26.08-extra; install it with flatpak install \
+             flathub org.freedesktop.Platform.codecs-extra//26.08-extra."
+                .to_owned()
+        )
+    );
+    let missing = BackendUnavailable::NotFound {
+        tried: vec!["libavcodec.so.62", "libavcodec.so.63"],
+    };
+    assert_eq!(
+        video_problem(Err(&missing)),
+        Some(format!("{missing}.")),
+        "without FFmpeg the reason names the fix"
+    );
 }

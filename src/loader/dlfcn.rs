@@ -71,16 +71,21 @@ fn forget_refusal() {
 enum PlatformLibrary {
     OpenSles,
     AAudio,
+    MediaNdk,
 }
 
-static PLATFORM_LIBRARIES: [PlatformLibrary; 2] =
-    [PlatformLibrary::OpenSles, PlatformLibrary::AAudio];
+static PLATFORM_LIBRARIES: [PlatformLibrary; 3] = [
+    PlatformLibrary::OpenSles,
+    PlatformLibrary::AAudio,
+    PlatformLibrary::MediaNdk,
+];
 
 impl PlatformLibrary {
     fn from_path(path: &CStr) -> Option<Self> {
         match file_name(path) {
             b"libOpenSLES.so" => Some(Self::OpenSles),
             b"libaaudio.so" => Some(Self::AAudio),
+            b"libmediandk.so" => Some(Self::MediaNdk),
             _ => None,
         }
     }
@@ -102,21 +107,35 @@ impl PlatformLibrary {
         match self {
             Self::OpenSles => name.starts_with("sl") || name.starts_with("SL_IID_"),
             Self::AAudio => name.starts_with("AAudio"),
+            Self::MediaNdk => ["AMedia", "AMEDIA", "AImage", "AHardwareBuffer_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix)),
         }
     }
 
     fn symbol(self, name: &CStr) -> *mut c_void {
         static NATIVES: OnceLock<EclipseNativeProvider> = OnceLock::new();
-        let Ok(name) = name.to_str() else {
-            return std::ptr::null_mut();
-        };
-        if !self.exports(name) {
-            return std::ptr::null_mut();
+        let found = name
+            .to_str()
+            .ok()
+            .filter(|name| self.exports(name))
+            .and_then(|name| {
+                NATIVES
+                    .get_or_init(EclipseNativeProvider::with_bionic_natives)
+                    .resolve(name)
+            });
+        match found {
+            Some(sym) => sym.addr as *mut c_void,
+            None => {
+                tracing::debug!(
+                    target: "dlfcn",
+                    library = ?self,
+                    ?name,
+                    "the platform library has no such symbol"
+                );
+                std::ptr::null_mut()
+            }
         }
-        NATIVES
-            .get_or_init(EclipseNativeProvider::with_bionic_natives)
-            .resolve(name)
-            .map_or(std::ptr::null_mut(), |sym| sym.addr as *mut c_void)
     }
 }
 
@@ -334,6 +353,40 @@ mod tests {
         assert!(
             unsafe { (dl.sym)(handle, c"slCreateEngine".as_ptr()) }.is_null(),
             "libaaudio.so does not export OpenSL ES"
+        );
+        assert_eq!(unsafe { (dl.close)(handle) }, 0);
+    }
+
+    #[test]
+    fn mediandk_soname_serves_every_media_native_and_nothing_else() {
+        let dl = dl_through_provider();
+        let handle = unsafe { (dl.open)(c"libmediandk.so".as_ptr(), libc::RTLD_LAZY) };
+        assert!(
+            !handle.is_null(),
+            "libmediandk.so must open without a host library"
+        );
+        assert_eq!(
+            handle,
+            unsafe { (dl.open)(c"/system/lib64/libmediandk.so".as_ptr(), libc::RTLD_NOW) },
+            "a full path opens the same library"
+        );
+
+        let mut names = Vec::new();
+        super::super::mediacodec::register_natives(|name, _| names.push(name));
+        assert_eq!(names.len(), 54);
+        for name in names {
+            let name = CString::new(name).expect("a C symbol name");
+            let found = unsafe { (dl.sym)(handle, name.as_ptr()) };
+            assert!(!found.is_null(), "{name:?} must resolve");
+            assert_eq!(found, provider_addr(&dl, &name), "{name:?} is Eclipse's");
+        }
+        assert!(
+            unsafe { (dl.sym)(handle, c"slCreateEngine".as_ptr()) }.is_null(),
+            "libmediandk.so does not export OpenSL ES"
+        );
+        assert!(
+            unsafe { (dl.sym)(handle, c"AMediaExtractor_new".as_ptr()) }.is_null(),
+            "names Eclipse does not implement stay missing"
         );
         assert_eq!(unsafe { (dl.close)(handle) }, 0);
     }

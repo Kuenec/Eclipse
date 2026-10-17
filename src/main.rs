@@ -23,6 +23,7 @@ use eclipse::graphics::launch_window::{
 };
 use eclipse::graphics::window_state::WindowStateFile;
 use eclipse::links::LaunchTarget;
+use eclipse::loader::aaudio::harness;
 use eclipse::runtime::{ClientCacheDir, NativeLibRoot};
 use eclipse::session::LaunchOrigin;
 use eclipse::status::{StatusSink, StatusUpdate};
@@ -303,6 +304,8 @@ fn main() -> ExitCode {
             }
         },
 
+        Some("__media-test") => media_test_command(&args[1..]),
+
         Some("__audio-test") => match eclipse::loader::opensl::run_audio_test() {
             Ok(report) => {
                 println!("__audio-test: {report}");
@@ -313,6 +316,8 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("__audio-sine") => audio_sine_command(&args[1..]),
+        Some("__audio-loopback") => audio_loopback_command(&args[1..]),
         None | Some("help") | Some("--help") | Some("-h") => {
             print!("{HELP}");
             ExitCode::SUCCESS
@@ -1133,6 +1138,59 @@ fn audio_devices_command(arguments: &[OsString]) -> ExitCode {
     }
 }
 
+fn media_test_command(arguments: &[OsString]) -> ExitCode {
+    let [dir] = arguments else {
+        eprintln!("{MEDIA_TEST_USAGE}");
+        return ExitCode::FAILURE;
+    };
+    match eclipse::loader::mediacodec::self_test::run(Path::new(dir)) {
+        Ok(report) => {
+            for line in report.to_string().lines() {
+                println!("__media-test: {line}");
+            }
+            if report.passed() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("__media-test: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn audio_sine_command(arguments: &[OsString]) -> ExitCode {
+    let played = harness::SineRequest::parse(arguments).and_then(harness::run_sine);
+    audio_harness_outcome("__audio-sine", played)
+}
+
+fn audio_loopback_command(arguments: &[OsString]) -> ExitCode {
+    if !arguments.is_empty() {
+        eprintln!("{}", harness::LOOPBACK_USAGE);
+        return ExitCode::FAILURE;
+    }
+    let heard = harness::run_loopback(|phase| println!("{phase}"));
+    audio_harness_outcome("__audio-loopback", heard)
+}
+
+fn audio_harness_outcome(
+    command: &str,
+    report: Result<impl std::fmt::Display, String>,
+) -> ExitCode {
+    match report {
+        Ok(report) => {
+            println!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{command}: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn exit_when_stdin_closes() -> Result<(), String> {
     std::thread::Builder::new()
         .name("eclipse-stdin".to_owned())
@@ -1285,6 +1343,8 @@ const DOCTOR_USAGE: &str = "usage: eclipse doctor [--report [RUN_LOG]]";
 const AUDIO_DEVICES_WATCH: &str = "--watch";
 
 const AUDIO_DEVICES_USAGE: &str = "usage: eclipse __audio-devices [--watch]";
+
+const MEDIA_TEST_USAGE: &str = "usage: eclipse __media-test <fixture directory>";
 
 const VERIFYING_SIGNATURE: &str = "Verifying the Roblox client's signature…";
 

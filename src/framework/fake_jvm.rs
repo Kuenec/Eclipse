@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use jni::objects::JObject;
 use jni::sys::{
-    jboolean, jclass, jfieldID, jint, jlong, jmethodID, jobject, jstring, jthrowable, jvalue,
-    jweak, JNIEnv, JNIInvokeInterface_, JNIInvokeInterface__1_2, JNINativeInterface_,
-    JNINativeInterface__1_6, JNINativeMethod, JavaVM, JNI_OK, JNI_VERSION_1_6,
+    jboolean, jclass, jfieldID, jint, jlong, jmethodID, jobject, jobjectArray, jsize, jstring,
+    jthrowable, jvalue, jweak, JNIEnv, JNIInvokeInterface_, JNIInvokeInterface__1_2,
+    JNINativeInterface_, JNINativeInterface__1_6, JNINativeMethod, JavaVM, JNI_OK, JNI_VERSION_1_6,
 };
 use jni::{Env, EnvUnowned, Outcome};
 
@@ -28,6 +28,7 @@ struct RefEntry {
 
 struct ObjectEntry {
     text: Option<String>,
+    elements: Vec<Option<usize>>,
     collected: bool,
 }
 
@@ -49,6 +50,7 @@ impl Heap {
     fn new_local(&mut self, text: Option<String>) -> jobject {
         self.objects.push(ObjectEntry {
             text,
+            elements: Vec::new(),
             collected: false,
         });
         self.add_ref(self.objects.len() - 1, RefKind::Local)
@@ -147,6 +149,40 @@ unsafe extern "system" fn new_string_utf(_env: *mut JNIEnv, utf: *const c_char) 
         .to_string_lossy()
         .into_owned();
     heap().new_local(Some(text))
+}
+
+unsafe extern "system" fn new_object_array(
+    _env: *mut JNIEnv,
+    length: jsize,
+    _class: jclass,
+    initial: jobject,
+) -> jobjectArray {
+    let mut heap = heap();
+    let initial = heap.live_object(initial);
+    let array = heap.new_local(None);
+    let object = heap
+        .live_object(array)
+        .expect("fake JVM: a new array is live");
+    heap.objects[object].elements = vec![initial; usize::try_from(length).unwrap_or(0)];
+    array
+}
+
+unsafe extern "system" fn set_object_array_element(
+    _env: *mut JNIEnv,
+    array: jobjectArray,
+    index: jsize,
+    value: jobject,
+) {
+    let mut heap = heap();
+    let value = heap.live_object(value);
+    let array = heap
+        .live_object(array)
+        .expect("fake JVM: the array is live");
+    let slot = usize::try_from(index)
+        .ok()
+        .and_then(|index| heap.objects[array].elements.get_mut(index))
+        .expect("fake JVM: the array index is in bounds");
+    *slot = value;
 }
 
 unsafe extern "system" fn get_string_utf_chars(
@@ -499,6 +535,14 @@ fn env_ptr() -> *mut JNIEnv {
             ),
             (offset_of!(Table, NewStringUTF), new_string_utf as *const ()),
             (
+                offset_of!(Table, NewObjectArray),
+                new_object_array as *const (),
+            ),
+            (
+                offset_of!(Table, SetObjectArrayElement),
+                set_object_array_element as *const (),
+            ),
+            (
                 offset_of!(Table, GetStringUTFChars),
                 get_string_utf_chars as *const (),
             ),
@@ -582,6 +626,16 @@ pub(super) fn set_boolean_field(obj: &JObject, field: &str, value: jboolean) {
     heap()
         .boolean_fields
         .insert((object, field.to_owned()), value);
+}
+
+pub(super) fn array_texts(array: &JObject) -> Vec<Option<String>> {
+    let array = object_of(array);
+    let heap = heap();
+    heap.objects[array]
+        .elements
+        .iter()
+        .map(|element| element.and_then(|object| heap.objects[object].text.clone()))
+        .collect()
 }
 
 pub(super) fn strong_refs(obj: &JObject) -> usize {

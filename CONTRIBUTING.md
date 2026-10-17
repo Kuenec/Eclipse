@@ -39,6 +39,10 @@ A hidden or minimized window draws at most 5 frames a second; set `ECLIPSE_HIDDE
 
 To list the Android framework classes, methods and fields a Roblox build references that Eclipse's framework lacks, run `tools/framework-coverage/scan.py --framework build/flatpak-app/files/lib/eclipse/framework --json gaps.json base.apk split_config.x86_64.apk`. The `startup` flag is a heuristic that can miss or overstate gaps: it follows code from the Application, the content providers, the launcher Activity, the classes the native libraries name and the views of layouts that code reads.
 
+To check H.264, HEVC and AAC decoding in the Flatpak, run `flatpak run --filesystem=$PWD/tests/fixtures/media:ro --command=eclipse io.github.kuenec.Eclipse __media-test $PWD/tests/fixtures/media` from the repository; it exits 1 only when a decoder gives a wrong result. `tools/media/make-fixtures.sh` regenerates the fixtures; with `--bench` it also writes a 1080p clip to `build/media-bench/`, and `__media-test` on that directory prints per-frame decode times.
+
+To check audio after a cargo build, run `tools/audio-harness/session.sh --server pipewire -- tools/audio-harness/check.py --eclipse target/debug/eclipse`. It plays and records only on a private PipeWire or PulseAudio server with null sinks, never on your devices, and appends its results to `build/perf/audio-baseline.jsonl`; add `--quantum 512` to force PipeWire's quantum. `--scenarios all` adds the stress baseline, about 30 minutes more.
+
 ## Layout
 
 | Path | Contents |
@@ -56,6 +60,8 @@ To list the Android framework classes, methods and fields a Roblox build referen
 | `tools/framework-overlay/` | Android framework patches and probes |
 | `tools/framework-coverage/` | Scanner for framework APIs the client references that Eclipse lacks |
 | `tools/perf/` | Performance measurement harness |
+| `tools/audio-harness/` | Private sound server and audio checks |
+| `tools/media/`, `tests/fixtures/media/` | Media decoder fixtures and their generator |
 | `packaging/flatpak/` | Flatpak manifest and metadata |
 
 ## Releases

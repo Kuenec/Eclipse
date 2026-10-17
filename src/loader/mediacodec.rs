@@ -1,13 +1,36 @@
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, CStr};
+use std::fmt;
 use std::sync::OnceLock;
 
-pub const MEDIA_NDK_NATIVE_COUNT: usize = 33;
+pub(crate) mod avcodec;
+mod codec;
+mod fixture;
+mod format;
+mod image_reader;
+pub mod self_test;
+
+pub const MEDIA_NDK_NATIVE_COUNT: usize = 54;
 
 type MediaStatus = c_int;
 
+const AMEDIA_OK: MediaStatus = 0;
 const AMEDIA_ERROR_BASE: MediaStatus = -10000;
-
+const AMEDIA_ERROR_UNKNOWN: MediaStatus = AMEDIA_ERROR_BASE;
 const AMEDIA_ERROR_UNSUPPORTED: MediaStatus = AMEDIA_ERROR_BASE - 2;
+const AMEDIA_ERROR_INVALID_OBJECT: MediaStatus = AMEDIA_ERROR_BASE - 3;
+const AMEDIA_ERROR_INVALID_PARAMETER: MediaStatus = AMEDIA_ERROR_BASE - 4;
+const AMEDIA_ERROR_INVALID_OPERATION: MediaStatus = AMEDIA_ERROR_BASE - 5;
+
+const KEY_BIT_RATE: &CStr = c"bitrate";
+const KEY_CHANNEL_COUNT: &CStr = c"channel-count";
+const KEY_COLOR_FORMAT: &CStr = c"color-format";
+const KEY_FRAME_RATE: &CStr = c"frame-rate";
+const KEY_HEIGHT: &CStr = c"height";
+const KEY_I_FRAME_INTERVAL: &CStr = c"i-frame-interval";
+const KEY_MIME: &CStr = c"mime";
+const KEY_SAMPLE_RATE: &CStr = c"sample-rate";
+const KEY_STRIDE: &CStr = c"stride";
+const KEY_WIDTH: &CStr = c"width";
 
 unsafe fn c_text<'a>(text: *const c_char) -> Option<&'a CStr> {
     if text.is_null() {
@@ -16,306 +39,17 @@ unsafe fn c_text<'a>(text: *const c_char) -> Option<&'a CStr> {
     Some(unsafe { CStr::from_ptr(text) })
 }
 
-unsafe extern "C" fn eclipse_amediacodec_configure(
-    codec: *mut c_void,
-    format: *const c_void,
-    surface: *mut c_void,
-    crypto: *mut c_void,
-    flags: u32,
-) -> MediaStatus {
-    let status = AMEDIA_ERROR_UNSUPPORTED;
-    tracing::debug!(
-        target: "mediandk",
-        ?codec,
-        ?format,
-        ?surface,
-        ?crypto,
-        flags,
-        status,
-        "AMediaCodec_configure"
-    );
-    status
-}
-
-unsafe extern "C" fn eclipse_amediacodec_createdecoderbytype(
-    mime_type: *const c_char,
-) -> *mut c_void {
-    let codec: *mut c_void = std::ptr::null_mut();
-    tracing::debug!(
-        target: "mediandk",
-        mime = ?unsafe { c_text(mime_type) },
-        ?codec,
-        "AMediaCodec_createDecoderByType"
-    );
-    codec
-}
-
-unsafe extern "C" fn eclipse_amediacodec_createencoderbytype(
-    mime_type: *const c_char,
-) -> *mut c_void {
-    let codec: *mut c_void = std::ptr::null_mut();
-    tracing::debug!(
-        target: "mediandk",
-        mime = ?unsafe { c_text(mime_type) },
-        ?codec,
-        "AMediaCodec_createEncoderByType"
-    );
-    codec
-}
-
-unsafe extern "C" fn eclipse_amediacodec_delete(codec: *mut c_void) -> MediaStatus {
-    let status = AMEDIA_ERROR_UNSUPPORTED;
-    tracing::debug!(target: "mediandk", ?codec, status, "AMediaCodec_delete");
-    status
-}
-
-unsafe extern "C" fn eclipse_amediacodec_dequeueinputbuffer(
-    codec: *mut c_void,
-    timeout_us: i64,
-) -> isize {
-    let index = AMEDIA_ERROR_UNSUPPORTED as isize;
-    tracing::trace!(
-        target: "mediandk",
-        ?codec,
-        timeout_us,
-        index,
-        "AMediaCodec_dequeueInputBuffer"
-    );
-    index
-}
-
-unsafe extern "C" fn eclipse_amediacodec_dequeueoutputbuffer(
-    codec: *mut c_void,
-    _info: *mut c_void,
-    timeout_us: i64,
-) -> isize {
-    let index = AMEDIA_ERROR_UNSUPPORTED as isize;
-    tracing::trace!(
-        target: "mediandk",
-        ?codec,
-        timeout_us,
-        index,
-        "AMediaCodec_dequeueOutputBuffer"
-    );
-    index
-}
-
-unsafe extern "C" fn eclipse_amediacodec_flush(codec: *mut c_void) -> MediaStatus {
-    let status = AMEDIA_ERROR_UNSUPPORTED;
-    tracing::debug!(target: "mediandk", ?codec, status, "AMediaCodec_flush");
-    status
-}
-
-unsafe extern "C" fn eclipse_amediacodec_getinputbuffer(
-    codec: *mut c_void,
-    index: usize,
-    _out_size: *mut usize,
-) -> *mut u8 {
-    let buffer: *mut u8 = std::ptr::null_mut();
-    tracing::trace!(
-        target: "mediandk",
-        ?codec,
-        index,
-        ?buffer,
-        "AMediaCodec_getInputBuffer"
-    );
-    buffer
-}
-
-unsafe extern "C" fn eclipse_amediacodec_getoutputbuffer(
-    codec: *mut c_void,
-    index: usize,
-    _out_size: *mut usize,
-) -> *mut u8 {
-    let buffer: *mut u8 = std::ptr::null_mut();
-    tracing::trace!(
-        target: "mediandk",
-        ?codec,
-        index,
-        ?buffer,
-        "AMediaCodec_getOutputBuffer"
-    );
-    buffer
-}
-
-unsafe extern "C" fn eclipse_amediacodec_getoutputformat(codec: *mut c_void) -> *mut c_void {
-    let format: *mut c_void = std::ptr::null_mut();
-    tracing::debug!(target: "mediandk", ?codec, ?format, "AMediaCodec_getOutputFormat");
-    format
-}
-
-unsafe extern "C" fn eclipse_amediacodec_queueinputbuffer(
-    codec: *mut c_void,
-    index: usize,
-    offset: libc::off_t,
-    size: usize,
-    pts_us: u64,
-    flags: u32,
-) -> MediaStatus {
-    let status = AMEDIA_ERROR_UNSUPPORTED;
-    tracing::trace!(
-        target: "mediandk",
-        ?codec,
-        index,
-        offset,
-        size,
-        pts_us,
-        flags,
-        status,
-        "AMediaCodec_queueInputBuffer"
-    );
-    status
-}
-
-unsafe extern "C" fn eclipse_amediacodec_releaseoutputbuffer(
-    codec: *mut c_void,
-    index: usize,
-    render: bool,
-) -> MediaStatus {
-    let status = AMEDIA_ERROR_UNSUPPORTED;
-    tracing::trace!(
-        target: "mediandk",
-        ?codec,
-        index,
-        render,
-        status,
-        "AMediaCodec_releaseOutputBuffer"
-    );
-    status
-}
-
-unsafe extern "C" fn eclipse_amediacodec_start(codec: *mut c_void) -> MediaStatus {
-    let status = AMEDIA_ERROR_UNSUPPORTED;
-    tracing::debug!(target: "mediandk", ?codec, status, "AMediaCodec_start");
-    status
-}
-
-unsafe extern "C" fn eclipse_amediacodec_stop(codec: *mut c_void) -> MediaStatus {
-    let status = AMEDIA_ERROR_UNSUPPORTED;
-    tracing::debug!(target: "mediandk", ?codec, status, "AMediaCodec_stop");
-    status
-}
-
-extern "C" fn eclipse_amediaformat_new() -> *mut c_void {
-    let format: *mut c_void = std::ptr::null_mut();
-    tracing::debug!(target: "mediandk", ?format, "AMediaFormat_new");
-    format
-}
-
-unsafe extern "C" fn eclipse_amediaformat_delete(format: *mut c_void) -> MediaStatus {
-    let status = AMEDIA_ERROR_UNSUPPORTED;
-    tracing::debug!(target: "mediandk", ?format, status, "AMediaFormat_delete");
-    status
-}
-
-unsafe extern "C" fn eclipse_amediaformat_getint32(
-    format: *mut c_void,
-    name: *const c_char,
-    _out: *mut i32,
-) -> bool {
-    let found = false;
-    tracing::debug!(
-        target: "mediandk",
-        ?format,
-        key = ?unsafe { c_text(name) },
-        found,
-        "AMediaFormat_getInt32"
-    );
-    found
-}
-
-unsafe extern "C" fn eclipse_amediaformat_getbuffer(
-    format: *mut c_void,
-    name: *const c_char,
-    _data: *mut *mut c_void,
-    _size: *mut usize,
-) -> bool {
-    let found = false;
-    tracing::debug!(
-        target: "mediandk",
-        ?format,
-        key = ?unsafe { c_text(name) },
-        found,
-        "AMediaFormat_getBuffer"
-    );
-    found
-}
-
-unsafe extern "C" fn eclipse_amediaformat_setint32(
-    format: *mut c_void,
-    name: *const c_char,
-    value: i32,
-) {
-    tracing::debug!(
-        target: "mediandk",
-        ?format,
-        key = ?unsafe { c_text(name) },
-        value,
-        "AMediaFormat_setInt32"
-    );
-}
-
-unsafe extern "C" fn eclipse_amediaformat_setfloat(
-    format: *mut c_void,
-    name: *const c_char,
-    value: f32,
-) {
-    tracing::debug!(
-        target: "mediandk",
-        ?format,
-        key = ?unsafe { c_text(name) },
-        value,
-        "AMediaFormat_setFloat"
-    );
-}
-
-unsafe extern "C" fn eclipse_amediaformat_setstring(
-    format: *mut c_void,
-    name: *const c_char,
-    value: *const c_char,
-) {
-    tracing::debug!(
-        target: "mediandk",
-        ?format,
-        key = ?unsafe { c_text(name) },
-        value = ?unsafe { c_text(value) },
-        "AMediaFormat_setString"
-    );
-}
-
-unsafe extern "C" fn eclipse_amediaformat_setbuffer(
-    format: *mut c_void,
-    name: *const c_char,
-    _data: *const c_void,
-    size: usize,
-) {
-    tracing::debug!(
-        target: "mediandk",
-        ?format,
-        key = ?unsafe { c_text(name) },
-        size,
-        "AMediaFormat_setBuffer"
-    );
-}
-
-static EMPTY_CSTR: [u8; 1] = [0];
-
-unsafe extern "C" fn eclipse_amediaformat_tostring(format: *mut c_void) -> *const c_char {
-    tracing::debug!(target: "mediandk", ?format, "AMediaFormat_toString");
-    EMPTY_CSTR.as_ptr() as *const c_char
-}
-
-static AMEDIAFORMAT_KEY_STRINGS: [&[u8]; 10] = [
-    b"bitrate\0",
-    b"channel-count\0",
-    b"color-format\0",
-    b"frame-rate\0",
-    b"height\0",
-    b"i-frame-interval\0",
-    b"mime\0",
-    b"sample-rate\0",
-    b"stride\0",
-    b"width\0",
+static AMEDIAFORMAT_KEYS: [(&str, &CStr); 10] = [
+    ("AMEDIAFORMAT_KEY_BIT_RATE", KEY_BIT_RATE),
+    ("AMEDIAFORMAT_KEY_CHANNEL_COUNT", KEY_CHANNEL_COUNT),
+    ("AMEDIAFORMAT_KEY_COLOR_FORMAT", KEY_COLOR_FORMAT),
+    ("AMEDIAFORMAT_KEY_FRAME_RATE", KEY_FRAME_RATE),
+    ("AMEDIAFORMAT_KEY_HEIGHT", KEY_HEIGHT),
+    ("AMEDIAFORMAT_KEY_I_FRAME_INTERVAL", KEY_I_FRAME_INTERVAL),
+    ("AMEDIAFORMAT_KEY_MIME", KEY_MIME),
+    ("AMEDIAFORMAT_KEY_SAMPLE_RATE", KEY_SAMPLE_RATE),
+    ("AMEDIAFORMAT_KEY_STRIDE", KEY_STRIDE),
+    ("AMEDIAFORMAT_KEY_WIDTH", KEY_WIDTH),
 ];
 
 struct KeyPtrTable([*const c_char; 10]);
@@ -327,13 +61,8 @@ unsafe impl Send for KeyPtrTable {}
 static AMEDIAFORMAT_KEY_PTRS: OnceLock<KeyPtrTable> = OnceLock::new();
 
 fn amediaformat_key_addr(idx: usize) -> u64 {
-    let t = AMEDIAFORMAT_KEY_PTRS.get_or_init(|| {
-        let mut ptrs = [std::ptr::null::<c_char>(); 10];
-        for (slot, s) in ptrs.iter_mut().zip(AMEDIAFORMAT_KEY_STRINGS.iter()) {
-            *slot = s.as_ptr() as *const c_char;
-        }
-        KeyPtrTable(ptrs)
-    });
+    let t = AMEDIAFORMAT_KEY_PTRS
+        .get_or_init(|| KeyPtrTable(AMEDIAFORMAT_KEYS.map(|(_, key)| key.as_ptr())));
     std::ptr::addr_of!(t.0[idx]) as u64
 }
 
@@ -344,71 +73,195 @@ pub(crate) fn register_natives(mut register: impl FnMut(&'static str, u64)) {
         };
     }
 
-    reg!("AMediaCodec_configure", eclipse_amediacodec_configure);
+    reg!(
+        "AMediaCodec_configure",
+        codec::eclipse_amediacodec_configure
+    );
     reg!(
         "AMediaCodec_createDecoderByType",
-        eclipse_amediacodec_createdecoderbytype
+        codec::eclipse_amediacodec_createdecoderbytype
     );
     reg!(
         "AMediaCodec_createEncoderByType",
-        eclipse_amediacodec_createencoderbytype
+        codec::eclipse_amediacodec_createencoderbytype
     );
-    reg!("AMediaCodec_delete", eclipse_amediacodec_delete);
+    reg!(
+        "AMediaCodec_createInputSurface",
+        codec::eclipse_amediacodec_createinputsurface
+    );
+    reg!("AMediaCodec_delete", codec::eclipse_amediacodec_delete);
     reg!(
         "AMediaCodec_dequeueInputBuffer",
-        eclipse_amediacodec_dequeueinputbuffer
+        codec::eclipse_amediacodec_dequeueinputbuffer
     );
     reg!(
         "AMediaCodec_dequeueOutputBuffer",
-        eclipse_amediacodec_dequeueoutputbuffer
+        codec::eclipse_amediacodec_dequeueoutputbuffer
     );
-    reg!("AMediaCodec_flush", eclipse_amediacodec_flush);
+    reg!("AMediaCodec_flush", codec::eclipse_amediacodec_flush);
     reg!(
         "AMediaCodec_getInputBuffer",
-        eclipse_amediacodec_getinputbuffer
+        codec::eclipse_amediacodec_getinputbuffer
     );
     reg!(
         "AMediaCodec_getOutputBuffer",
-        eclipse_amediacodec_getoutputbuffer
+        codec::eclipse_amediacodec_getoutputbuffer
     );
     reg!(
         "AMediaCodec_getOutputFormat",
-        eclipse_amediacodec_getoutputformat
+        codec::eclipse_amediacodec_getoutputformat
     );
     reg!(
         "AMediaCodec_queueInputBuffer",
-        eclipse_amediacodec_queueinputbuffer
+        codec::eclipse_amediacodec_queueinputbuffer
     );
     reg!(
         "AMediaCodec_releaseOutputBuffer",
-        eclipse_amediacodec_releaseoutputbuffer
+        codec::eclipse_amediacodec_releaseoutputbuffer
     );
-    reg!("AMediaCodec_start", eclipse_amediacodec_start);
-    reg!("AMediaCodec_stop", eclipse_amediacodec_stop);
-
-    reg!("AMediaFormat_delete", eclipse_amediaformat_delete);
-    reg!("AMediaFormat_getBuffer", eclipse_amediaformat_getbuffer);
-    reg!("AMediaFormat_getInt32", eclipse_amediaformat_getint32);
-    reg!("AMediaFormat_new", eclipse_amediaformat_new);
-    reg!("AMediaFormat_setBuffer", eclipse_amediaformat_setbuffer);
-    reg!("AMediaFormat_setFloat", eclipse_amediaformat_setfloat);
-    reg!("AMediaFormat_setInt32", eclipse_amediaformat_setint32);
-    reg!("AMediaFormat_setString", eclipse_amediaformat_setstring);
-    reg!("AMediaFormat_toString", eclipse_amediaformat_tostring);
-
-    register("AMEDIAFORMAT_KEY_BIT_RATE", amediaformat_key_addr(0));
-    register("AMEDIAFORMAT_KEY_CHANNEL_COUNT", amediaformat_key_addr(1));
-    register("AMEDIAFORMAT_KEY_COLOR_FORMAT", amediaformat_key_addr(2));
-    register("AMEDIAFORMAT_KEY_FRAME_RATE", amediaformat_key_addr(3));
-    register("AMEDIAFORMAT_KEY_HEIGHT", amediaformat_key_addr(4));
-    register(
-        "AMEDIAFORMAT_KEY_I_FRAME_INTERVAL",
-        amediaformat_key_addr(5),
+    reg!(
+        "AMediaCodec_signalEndOfInputStream",
+        codec::eclipse_amediacodec_signalendofinputstream
     );
-    register("AMEDIAFORMAT_KEY_MIME", amediaformat_key_addr(6));
-    register("AMEDIAFORMAT_KEY_SAMPLE_RATE", amediaformat_key_addr(7));
-    register("AMEDIAFORMAT_KEY_STRIDE", amediaformat_key_addr(8));
-    register("AMEDIAFORMAT_KEY_WIDTH", amediaformat_key_addr(9));
+    reg!("AMediaCodec_start", codec::eclipse_amediacodec_start);
+    reg!("AMediaCodec_stop", codec::eclipse_amediacodec_stop);
+
+    reg!("AMediaFormat_delete", format::eclipse_amediaformat_delete);
+    reg!(
+        "AMediaFormat_getBuffer",
+        format::eclipse_amediaformat_getbuffer
+    );
+    reg!(
+        "AMediaFormat_getInt32",
+        format::eclipse_amediaformat_getint32
+    );
+    reg!("AMediaFormat_new", format::eclipse_amediaformat_new);
+    reg!(
+        "AMediaFormat_setBuffer",
+        format::eclipse_amediaformat_setbuffer
+    );
+    reg!(
+        "AMediaFormat_setFloat",
+        format::eclipse_amediaformat_setfloat
+    );
+    reg!(
+        "AMediaFormat_setInt32",
+        format::eclipse_amediaformat_setint32
+    );
+    reg!(
+        "AMediaFormat_setString",
+        format::eclipse_amediaformat_setstring
+    );
+    reg!(
+        "AMediaFormat_toString",
+        format::eclipse_amediaformat_tostring
+    );
+
+    for (index, (name, _)) in AMEDIAFORMAT_KEYS.iter().enumerate() {
+        register(name, amediaformat_key_addr(index));
+    }
+
+    reg!("AImageReader_new", image_reader::eclipse_aimagereader_new);
+    reg!(
+        "AImageReader_newWithUsage",
+        image_reader::eclipse_aimagereader_newwithusage
+    );
+    reg!(
+        "AImageReader_getWindow",
+        image_reader::eclipse_aimagereader_getwindow
+    );
+    reg!(
+        "AImageReader_acquireLatestImage",
+        image_reader::eclipse_aimagereader_acquirelatestimage
+    );
+    reg!(
+        "AImageReader_setImageListener",
+        image_reader::eclipse_aimagereader_setimagelistener
+    );
+    reg!(
+        "AImageReader_setBufferRemovedListener",
+        image_reader::eclipse_aimagereader_setbufferremovedlistener
+    );
+    reg!(
+        "AImageReader_delete",
+        image_reader::eclipse_aimagereader_delete
+    );
+
+    reg!(
+        "AImage_getPlaneData",
+        image_reader::eclipse_aimage_getplanedata
+    );
+    reg!(
+        "AImage_getPlaneRowStride",
+        image_reader::eclipse_aimage_getplanerowstride
+    );
+    reg!(
+        "AImage_getPlanePixelStride",
+        image_reader::eclipse_aimage_getplanepixelstride
+    );
+    reg!(
+        "AImage_getCropRect",
+        image_reader::eclipse_aimage_getcroprect
+    );
+    reg!(
+        "AImage_getTimestamp",
+        image_reader::eclipse_aimage_gettimestamp
+    );
+    reg!("AImage_getFormat", image_reader::eclipse_aimage_getformat);
+    reg!(
+        "AImage_getHardwareBuffer",
+        image_reader::eclipse_aimage_gethardwarebuffer
+    );
+    reg!("AImage_delete", image_reader::eclipse_aimage_delete);
+    reg!(
+        "AImage_deleteAsync",
+        image_reader::eclipse_aimage_deleteasync
+    );
+
+    reg!(
+        "AHardwareBuffer_acquire",
+        image_reader::eclipse_ahardwarebuffer_acquire
+    );
+    reg!(
+        "AHardwareBuffer_describe",
+        image_reader::eclipse_ahardwarebuffer_describe
+    );
+    reg!(
+        "AHardwareBuffer_release",
+        image_reader::eclipse_ahardwarebuffer_release
+    );
+}
+
+pub struct Diagnosis(avcodec::Backend);
+
+#[must_use]
+pub fn diagnose() -> Diagnosis {
+    Diagnosis(avcodec::Backend::load(&avcodec::RUNTIME_LIBRARIES))
+}
+
+impl Diagnosis {
+    pub fn problem(&self) -> Option<String> {
+        video_problem(self.0.library().map(|_| self.0.decoders()))
+    }
+}
+
+impl fmt::Display for Diagnosis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+fn video_problem(
+    decoders: Result<&[avcodec::Codec], &avcodec::BackendUnavailable>,
+) -> Option<String> {
+    match decoders {
+        Err(reason) => Some(format!("{reason}.")),
+        Ok(decoders) if !avcodec::missing_codecs_extra(decoders).is_empty() => Some(format!(
+            "H.264 and HEVC videos in games will not play: {}.",
+            avcodec::CODECS_EXTRA_ADVICE
+        )),
+        Ok(_) => None,
+    }
 }
 
 #[cfg(test)]

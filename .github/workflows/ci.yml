@@ -102,6 +102,9 @@ jobs:
       - name: Test the framework coverage scanner
         run: python3 -m unittest discover --start-directory tools/framework-coverage --pattern 'test_*.py'
 
+      - name: Test the audio harness
+        run: python3 -m unittest discover --start-directory tools/audio-harness --pattern 'test_*.py'
+
   msrv:
     name: MSRV / Rust 1.95
     runs-on: ubuntu-latest
