@@ -1,9 +1,10 @@
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use eclipse_config::audio::{DeviceList, DeviceName, Direction};
 use serde::Deserialize;
 
+use super::private_server::refuse_unless_private;
 use super::{pactl, parse_json, query};
 
 const PACTL_LIMIT: Duration = Duration::from_secs(10);
@@ -40,11 +41,7 @@ struct Node {
 }
 
 impl NullDevices {
-    pub(crate) fn create(tag: &str) -> Option<Self> {
-        if let Err(error) = pactl(&["info"]) {
-            eprintln!("no PulseAudio or PipeWire server to test against: {error}");
-            return None;
-        }
+    pub(crate) fn create(tag: &str) -> Self {
         let id = format!("eclipse_test_{tag}_{}", std::process::id());
         let sink = format!("{id}_sink");
         let source = format!("{id}_source");
@@ -87,14 +84,11 @@ impl NullDevices {
             );
             std::thread::sleep(POLL);
         }
-        Some(devices)
+        devices
     }
 
     fn load(&mut self, arguments: &[&str]) -> bool {
-        let output = crate::bounded_child::output(
-            Command::new("pactl").arg("load-module").args(arguments),
-            PACTL_LIMIT,
-        );
+        let output = change(&[&["load-module"], arguments].concat());
         if !output.status.success() {
             return false;
         }
@@ -119,20 +113,23 @@ impl NullDevices {
     }
 
     pub(crate) fn make_system_default(&self) {
+        let deadline = Instant::now() + APPEAR_LIMIT;
         for (command, name) in [
             ("set-default-sink", &self.sink),
             ("set-default-source", &self.source),
         ] {
-            let output = crate::bounded_child::output(
-                Command::new("pactl").args([command, name.as_str()]),
-                PACTL_LIMIT,
-            );
-            assert!(
-                output.status.success(),
-                "pactl {command} {name}: {output:?}"
-            );
+            loop {
+                let output = change(&[command, name.as_str()]);
+                if output.status.success() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pactl {command} {name} still failed after {APPEAR_LIMIT:?}: {output:?}"
+                );
+                std::thread::sleep(POLL);
+            }
         }
-        let deadline = Instant::now() + APPEAR_LIMIT;
         while !query().is_ok_and(|server| {
             server.devices.outputs.system_default.as_ref() == Some(&self.sink)
                 && server.devices.inputs.system_default.as_ref() == Some(&self.source)
@@ -146,6 +143,11 @@ impl NullDevices {
             std::thread::sleep(POLL);
         }
     }
+}
+
+fn change(arguments: &[&str]) -> Output {
+    refuse_unless_private();
+    crate::bounded_child::output(Command::new("pactl").args(arguments), PACTL_LIMIT)
 }
 
 pub(crate) fn stream_device(direction: Direction, process: u32) -> Option<String> {
