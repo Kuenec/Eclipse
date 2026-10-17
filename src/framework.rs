@@ -13865,12 +13865,11 @@ fn destroy_engine_surface(env: &mut Env) -> Result<bool, FrameworkError> {
             return Ok(false);
         }
     };
-    let callbacks = surface_callbacks(env, &surface_view)?;
-    let snapshot_object = checked(env, "SurfaceView.mCallbacks.toArray", |env| {
+    let snapshot_object = checked(env, "SurfaceView.getSurfaceCallbacks", |env| {
         env.call_method(
-            &callbacks,
-            jni_str!("toArray"),
-            jni_sig!("()[Ljava/lang/Object;"),
+            &surface_view,
+            jni_str!("getSurfaceCallbacks"),
+            jni_sig!("()[Landroid/view/SurfaceHolder$Callback;"),
             &[],
         )?
         .l()

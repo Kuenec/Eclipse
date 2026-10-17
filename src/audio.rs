@@ -1,3 +1,5 @@
+use std::ffi::OsStr;
+use std::fmt;
 use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt as _;
@@ -62,13 +64,18 @@ pub fn query() -> Result<SoundServer, String> {
 }
 
 fn pactl_command(arguments: &[&str]) -> Command {
+    let mut command = unforked_pactl_command(arguments);
+    end_with_this_process(&mut command);
+    command
+}
+
+fn unforked_pactl_command(arguments: &[&str]) -> Command {
     let mut command = Command::new(PACTL);
     command
         .arg("--format=json")
         .args(arguments)
         .env_remove("LC_ALL")
         .env("LC_NUMERIC", "C");
-    end_with_this_process(&mut command);
     command
 }
 
@@ -90,8 +97,15 @@ fn end_with(parent: Pid, cutoff: InheritanceCutoff) -> io::Result<()> {
 }
 
 fn pactl(arguments: &[&str]) -> Result<Vec<u8>, String> {
+    bounded_pactl(pactl_command(arguments), arguments)
+}
+
+fn unforked_pactl(arguments: &[&str]) -> Result<Vec<u8>, String> {
+    bounded_pactl(unforked_pactl_command(arguments), arguments)
+}
+
+fn bounded_pactl(mut command: Command, arguments: &[&str]) -> Result<Vec<u8>, String> {
     let shown = format!("{PACTL} {}", arguments.join(" "));
-    let mut command = pactl_command(arguments);
     let (outcome, output) = match bounded_child::run(&mut command, PACTL_LIMIT) {
         Ok(Bounded::Finished(output)) if output.status.success() => return Ok(output.stdout),
         Ok(Bounded::Finished(output)) => (format!("failed ({})", output.status), output),
@@ -124,6 +138,60 @@ struct ListedDevice {
 struct DeviceProperties {
     #[serde(rename = "device.class")]
     device_class: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListedStream {
+    sink: Option<u32>,
+    source: Option<u32>,
+    properties: StreamProperties,
+}
+
+#[derive(Deserialize)]
+struct StreamProperties {
+    #[serde(rename = "application.process.id")]
+    process_id: Option<String>,
+    #[serde(rename = "application.process.binary")]
+    process_binary: Option<String>,
+    #[serde(rename = "pipewire.access.portal.app_id")]
+    portal_app_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StreamOwner {
+    process_id: String,
+    binary: String,
+}
+
+impl StreamOwner {
+    pub(crate) fn process(id: u32) -> Result<Self, String> {
+        let link = format!("/proc/{id}/exe");
+        let executable =
+            std::fs::read_link(&link).map_err(|error| format!("cannot read {link}: {error}"))?;
+        let binary = executable
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| format!("{link} names no executable: {}", executable.display()))?;
+        Ok(Self {
+            process_id: id.to_string(),
+            binary: binary.to_owned(),
+        })
+    }
+
+    fn owns(&self, stream: &StreamProperties) -> bool {
+        stream.process_id.as_deref() == Some(self.process_id.as_str())
+            && stream.process_binary.as_deref() == Some(self.binary.as_str())
+            && stream
+                .portal_app_id
+                .as_deref()
+                .is_none_or(|app_id| app_id == crate::APP_ID)
+    }
+}
+
+#[derive(Deserialize)]
+struct ShortDevice {
+    index: u32,
+    name: String,
 }
 
 fn parse_server(info: &[u8], sinks: &[u8], sources: &[u8]) -> Result<SoundServer, String> {
@@ -276,6 +344,139 @@ const fn noun(direction: Direction) -> &'static str {
         Direction::Output => "output device",
         Direction::Input => "microphone",
     }
+}
+
+fn chosen_target(direction: Direction) -> Option<DeviceName> {
+    DeviceName::parse(&std::env::var(pulse_variable(direction)).ok()?)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InputSource {
+    Chosen(DeviceName),
+    SystemDefault(Option<DeviceName>),
+}
+
+impl InputSource {
+    pub(crate) fn requested() -> Self {
+        chosen_target(Direction::Input).map_or(Self::SystemDefault(None), Self::Chosen)
+    }
+
+    pub(crate) fn with_default_named(self) -> Self {
+        let Self::SystemDefault(None) = self else {
+            return self;
+        };
+        match unforked_pactl(&["info"]).and_then(|info| parse_json::<ServerInfo>(&info, "info")) {
+            Ok(info) => Self::SystemDefault(
+                info.default_source_name
+                    .as_deref()
+                    .and_then(DeviceName::parse),
+            ),
+            Err(error) => {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    "Eclipse cannot name the system default microphone: {error}"
+                );
+                Self::SystemDefault(None)
+            }
+        }
+    }
+}
+
+impl fmt::Display for InputSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let key = SettingKey::audio_device(Direction::Input).name();
+        match self {
+            Self::Chosen(name) => write!(f, "{name} ({key})"),
+            Self::SystemDefault(Some(name)) => write!(f, "{name} (system default)"),
+            Self::SystemDefault(None) => f.write_str("system default"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecordingSource {
+    Listed(Vec<DeviceName>),
+    Unknown(String),
+}
+
+impl RecordingSource {
+    pub(crate) fn of_this_process() -> Self {
+        match StreamOwner::process(std::process::id())
+            .and_then(|owner| stream_devices(Direction::Input, &owner))
+        {
+            Ok(sources) => Self::Listed(sources),
+            Err(error) => Self::Unknown(error),
+        }
+    }
+}
+
+impl fmt::Display for RecordingSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Listed(sources) if sources.is_empty() => f.write_str("none listed"),
+            Self::Listed(sources) => {
+                let names: Vec<&str> = sources.iter().map(DeviceName::as_str).collect();
+                f.write_str(&names.join(", "))
+            }
+            Self::Unknown(error) => write!(f, "unknown ({error})"),
+        }
+    }
+}
+
+pub(crate) fn stream_devices(
+    direction: Direction,
+    owner: &StreamOwner,
+) -> Result<Vec<DeviceName>, String> {
+    let (streams, devices) = match direction {
+        Direction::Output => ("sink-inputs", "sinks"),
+        Direction::Input => ("source-outputs", "sources"),
+    };
+    let indices = owned_stream_devices(
+        &unforked_pactl(&["list", streams])?,
+        &format!("list {streams}"),
+        direction,
+        owner,
+    )?;
+    if indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let command = format!("list short {devices}");
+    let listed: Vec<ShortDevice> =
+        parse_json(&unforked_pactl(&["list", "short", devices])?, &command)?;
+    let mut names = Vec::new();
+    for index in indices {
+        let device = listed
+            .iter()
+            .find(|device| device.index == index)
+            .ok_or_else(|| format!("`{PACTL} {command}` does not list device {index}"))?;
+        let name = DeviceName::parse(&device.name).ok_or_else(|| {
+            format!(
+                "`{PACTL} {command}` names device {index} {:?}, which is no device name",
+                device.name
+            )
+        })?;
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+fn owned_stream_devices(
+    listing: &[u8],
+    command: &str,
+    direction: Direction,
+    owner: &StreamOwner,
+) -> Result<Vec<u32>, String> {
+    let listed: Vec<ListedStream> = parse_json(listing, command)?;
+    Ok(listed
+        .into_iter()
+        .filter(|stream| owner.owns(&stream.properties))
+        .filter_map(|stream| match direction {
+            Direction::Output => stream.sink,
+            Direction::Input => stream.source,
+        })
+        .collect())
 }
 
 pub(crate) fn host_device(direction: Direction) -> Option<cpal::Device> {

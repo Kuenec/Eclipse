@@ -3,7 +3,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use eclipse::diagnostics::{self, record_head, STATUS_TARGET, SUPERVISOR_TARGET};
+use eclipse::diagnostics::{
+    self, record_head, EXCERPT_RECORD_BYTES, MICROPHONE_TARGET, STATUS_TARGET, SUPERVISOR_TARGET,
+};
 use eclipse::webview::redact::{url_scheme_and_host_for_log, url_spans, Schemes};
 use tracing::Level;
 
@@ -11,7 +13,6 @@ use crate::desktop_integration::Packaging;
 use crate::doctor::Doctor;
 
 const REPORT_BYTES: usize = 60_000;
-const RECORD_BYTES: usize = 400;
 const HEAD_RECORDS: usize = 40;
 const MIDDLE_RECORDS: usize = 60;
 const TAIL_RECORDS: usize = 200;
@@ -505,10 +506,11 @@ impl Excerpt {
             head.level == Level::ERROR
                 || head.target == STATUS_TARGET
                 || head.target == SUPERVISOR_TARGET
+                || head.target == MICROPHONE_TARGET
         });
         let mut text = redactor.text(record);
-        if text.len() > RECORD_BYTES {
-            text.truncate(text.floor_char_boundary(RECORD_BYTES - CUT.len()));
+        if text.len() > EXCERPT_RECORD_BYTES {
+            text.truncate(text.floor_char_boundary(EXCERPT_RECORD_BYTES - CUT.len()));
             text.push_str(CUT);
         }
         let kept = Kept {
@@ -867,6 +869,7 @@ mod tests {
             .map(|index| match index {
                 100 | 200 => record(index, "ERROR", "liblog"),
                 300 => record(index, "WARN", STATUS_TARGET),
+                350 => record(index, "INFO", MICROPHONE_TARGET),
                 400 => record(index, "INFO", SUPERVISOR_TARGET),
                 450 => record(index, "WARN", "liblog"),
                 _ => record(index, "INFO", "liblog"),
@@ -875,11 +878,11 @@ mod tests {
         let excerpt = excerpt_of(&records);
 
         let expected: Vec<usize> = (0..40)
-            .chain([100, 200, 300, 400])
+            .chain([100, 200, 300, 350, 400])
             .chain(800..1_000)
             .collect();
         assert_eq!(kept_indices(&excerpt), expected);
-        assert_eq!(excerpt.heading(), "Log excerpt: 244 of 1000 records");
+        assert_eq!(excerpt.heading(), "Log excerpt: 245 of 1000 records");
         let mut text = String::new();
         excerpt.write_records(&mut text).unwrap();
         assert!(
@@ -913,7 +916,7 @@ mod tests {
         let excerpt = excerpt_of(&[trace.clone(), long]);
         let texts: Vec<&str> = excerpt.kept().map(|kept| kept.text.as_str()).collect();
         assert_eq!(texts[0], trace);
-        assert!(texts[1].len() <= RECORD_BYTES, "{}", texts[1].len());
+        assert!(texts[1].len() <= EXCERPT_RECORD_BYTES, "{}", texts[1].len());
         assert!(texts[1].ends_with("é…"), "{}", texts[1]);
     }
 

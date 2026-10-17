@@ -1896,6 +1896,21 @@ perl -0777 -ne 'exit(/\.method final releaseTheme\(J\)V(?:(?!\.end method).)*->d
 mkdir -p "$work/smali-view/android/content/res"
 cp "$amsm" "$work/smali-view/android/content/res/AssetManager.smali"
 
+svsm="$work/smali/android/view/SurfaceView.smali"
+svhsm="$work/smali/android/view/SurfaceView\$1.smali"
+[ -f "$svsm" ] || fail "SurfaceView.smali not found after baksmali"
+[ -f "$svhsm" ] || fail "SurfaceView\$1.smali not found after baksmali"
+! grep -qF 'getSurfaceCallbacks' "$svsm" || fail "SurfaceView.smali already declares getSurfaceCallbacks — installed SurfaceView drifted; update patch-framework.sh"
+UPSTREAM_REMOVE_SURFACE_CALLBACK=$'.method public removeCallback(Landroid/view/SurfaceHolder$Callback;)V\n    .registers 2\n\n    return-void\n.end method\n'
+REMOVE_SURFACE_CALLBACK=$'.method public removeCallback(Landroid/view/SurfaceHolder$Callback;)V\n    .registers 4\n\n    iget-object v0, p0, Landroid/view/SurfaceView$1;->this$0:Landroid/view/SurfaceView;\n\n    iget-object v0, v0, Landroid/view/SurfaceView;->mCallbacks:Ljava/util/ArrayList;\n\n    monitor-enter v0\n\n    :try_start_remove\n    invoke-virtual {v0, p1}, Ljava/util/ArrayList;->remove(Ljava/lang/Object;)Z\n\n    monitor-exit v0\n    :try_end_remove\n    .catchall {:try_start_remove .. :try_end_remove} :catchall_remove\n\n    return-void\n\n    :catchall_remove\n    move-exception v1\n\n    monitor-exit v0\n\n    throw v1\n.end method\n'
+replace_upstream_method "$svhsm" "$UPSTREAM_REMOVE_SURFACE_CALLBACK" "$REMOVE_SURFACE_CALLBACK" 'removeCallback'
+UPSTREAM_SURFACE_CHANGED=$'.method private surfaceChanged(III)V\n    .registers 7\n\n    iget-object v1, p0, Landroid/view/SurfaceView;->mCallbacks:Ljava/util/ArrayList;\n\n    invoke-virtual {v1}, Ljava/util/ArrayList;->iterator()Ljava/util/Iterator;\n\n    move-result-object v1\n\n    :goto_6\n    invoke-interface {v1}, Ljava/util/Iterator;->hasNext()Z\n\n    move-result v2\n\n    if-eqz v2, :cond_18\n\n    invoke-interface {v1}, Ljava/util/Iterator;->next()Ljava/lang/Object;\n\n    move-result-object v0\n\n    check-cast v0, Landroid/view/SurfaceHolder$Callback;\n\n    iget-object v2, p0, Landroid/view/SurfaceView;->mSurfaceHolder:Landroid/view/SurfaceHolder;\n\n    invoke-interface {v0, v2, p1, p2, p3}, Landroid/view/SurfaceHolder$Callback;->surfaceChanged(Landroid/view/SurfaceHolder;III)V\n\n    goto :goto_6\n\n    :cond_18\n    return-void\n.end method\n'
+SURFACE_CHANGED=$'.method private getSurfaceCallbacks()[Landroid/view/SurfaceHolder$Callback;\n    .registers 4\n\n    iget-object v0, p0, Landroid/view/SurfaceView;->mCallbacks:Ljava/util/ArrayList;\n\n    monitor-enter v0\n\n    :try_start_snapshot\n    invoke-virtual {v0}, Ljava/util/ArrayList;->size()I\n\n    move-result v1\n\n    new-array v1, v1, [Landroid/view/SurfaceHolder$Callback;\n\n    invoke-virtual {v0, v1}, Ljava/util/ArrayList;->toArray([Ljava/lang/Object;)[Ljava/lang/Object;\n\n    monitor-exit v0\n    :try_end_snapshot\n    .catchall {:try_start_snapshot .. :try_end_snapshot} :catchall_snapshot\n\n    return-object v1\n\n    :catchall_snapshot\n    move-exception v2\n\n    monitor-exit v0\n\n    throw v2\n.end method\n\n.method private surfaceChanged(III)V\n    .registers 9\n\n    invoke-direct {p0}, Landroid/view/SurfaceView;->getSurfaceCallbacks()[Landroid/view/SurfaceHolder$Callback;\n\n    move-result-object v0\n\n    array-length v1, v0\n\n    const/4 v2, 0x0\n\n    :eclipse_next_callback\n    if-ge v2, v1, :eclipse_callbacks_done\n\n    aget-object v3, v0, v2\n\n    iget-object v4, p0, Landroid/view/SurfaceView;->mSurfaceHolder:Landroid/view/SurfaceHolder;\n\n    invoke-interface {v3, v4, p1, p2, p3}, Landroid/view/SurfaceHolder$Callback;->surfaceChanged(Landroid/view/SurfaceHolder;III)V\n\n    add-int/lit8 v2, v2, 0x1\n\n    goto :eclipse_next_callback\n\n    :eclipse_callbacks_done\n    return-void\n.end method\n'
+replace_upstream_method "$svsm" "$UPSTREAM_SURFACE_CHANGED" "$SURFACE_CHANGED" 'surfaceChanged'
+UPSTREAM_SURFACE_CREATED=$'.method private surfaceCreated()V\n    .registers 4\n\n    iget-object v1, p0, Landroid/view/SurfaceView;->mCallbacks:Ljava/util/ArrayList;\n\n    invoke-virtual {v1}, Ljava/util/ArrayList;->iterator()Ljava/util/Iterator;\n\n    move-result-object v1\n\n    :goto_6\n    invoke-interface {v1}, Ljava/util/Iterator;->hasNext()Z\n\n    move-result v2\n\n    if-eqz v2, :cond_18\n\n    invoke-interface {v1}, Ljava/util/Iterator;->next()Ljava/lang/Object;\n\n    move-result-object v0\n\n    check-cast v0, Landroid/view/SurfaceHolder$Callback;\n\n    iget-object v2, p0, Landroid/view/SurfaceView;->mSurfaceHolder:Landroid/view/SurfaceHolder;\n\n    invoke-interface {v0, v2}, Landroid/view/SurfaceHolder$Callback;->surfaceCreated(Landroid/view/SurfaceHolder;)V\n\n    goto :goto_6\n\n    :cond_18\n    return-void\n.end method\n'
+SURFACE_CREATED=$'.method private surfaceCreated()V\n    .registers 6\n\n    invoke-direct {p0}, Landroid/view/SurfaceView;->getSurfaceCallbacks()[Landroid/view/SurfaceHolder$Callback;\n\n    move-result-object v0\n\n    array-length v1, v0\n\n    const/4 v2, 0x0\n\n    :eclipse_next_callback\n    if-ge v2, v1, :eclipse_callbacks_done\n\n    aget-object v3, v0, v2\n\n    iget-object v4, p0, Landroid/view/SurfaceView;->mSurfaceHolder:Landroid/view/SurfaceHolder;\n\n    invoke-interface {v3, v4}, Landroid/view/SurfaceHolder$Callback;->surfaceCreated(Landroid/view/SurfaceHolder;)V\n\n    add-int/lit8 v2, v2, 0x1\n\n    goto :eclipse_next_callback\n\n    :eclipse_callbacks_done\n    return-void\n.end method\n'
+replace_upstream_method "$svsm" "$UPSTREAM_SURFACE_CREATED" "$SURFACE_CREATED" 'surfaceCreated'
+
 mkdir -p "$work/smali-view/android/atl" "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/content" "$work/smali-view/android/content/pm" "$work/smali-view/android/net" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics" "$work/smali-view/android/media"
 cp "$crsm" "$work/smali-view/android/content/ContentResolver.smali"
 cp "$connectivity_sm" "$work/smali-view/android/net/ConnectivityManager.smali"
@@ -1903,6 +1918,8 @@ cp "$here/smali/android/net/LinkProperties.smali" "$work/smali-view/android/net/
 cp "$here/smali/android/net/LinkAddress.smali" "$work/smali-view/android/net/"
 cp "$vsm" "$work/smali-view/android/view/View.smali"
 cp "$dsm" "$work/smali-view/android/view/Display.smali"
+cp "$svsm" "$work/smali-view/android/view/SurfaceView.smali"
+cp "$svhsm" "$work/smali-view/android/view/SurfaceView\$1.smali"
 cp "$mesm" "$work/smali-view/android/view/MotionEvent.smali"
 cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
 cp "$here/smali/android/view/Display\$Mode.smali" "$work/smali-view/android/view/"
@@ -2177,6 +2194,27 @@ display_output="$(env \
 [ "$display_output" = 'display-refresh-rates-ok' ] \
     || fail "display refresh-rate regression probe returned '$display_output'"
 
+surface_view_probe="$here/tests/SurfaceViewCallbacksProbe.java"
+[ -f "$surface_view_probe" ] || fail "SurfaceView callback regression probe missing at $surface_view_probe"
+mkdir -p "$work/surface-view-probe/classes" "$work/surface-view-probe/cache" "$work/surface-view-probe/data"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/surface-view-probe/classes" "$surface_view_probe"
+"$DX" --dex --output="$work/surface-view-probe/probe.jar" "$work/surface-view-probe/classes"
+surface_view_boot_class_path="$boot_class_path:$work/jar/api-impl.jar:$work/surface-view-probe/probe.jar"
+surface_view_boot_class_path_locations="$boot_class_path_locations:/system/framework/api-impl.jar:/system/framework/probe.jar"
+surface_view_output="$(env \
+    ANDROID_DATA="$work/surface-view-probe/data" \
+    XDG_CACHE_HOME="$work/surface-view-probe/cache" \
+    BOOTCLASSPATH="$surface_view_boot_class_path" \
+    "$DALVIKVM" \
+    -Ximage:"$work/art/oat/boot.art" \
+    -Xbootclasspath:"$surface_view_boot_class_path" \
+    -Xbootclasspath-locations:"$surface_view_boot_class_path_locations" \
+    -Ximage-compiler-option --no-generate-debug-info \
+    -Ximage-compiler-option --no-generate-mini-debug-info \
+    SurfaceViewCallbacksProbe)"
+[ "$surface_view_output" = 'surface-view-callbacks-ok' ] \
+    || fail "SurfaceView callback regression probe returned '$surface_view_output'"
+
 client_apis_probe="$here/tests/ClientFrameworkApisProbe.java"
 [ -f "$client_apis_probe" ] || fail "client framework API regression probe missing at $client_apis_probe"
 mkdir -p "$work/client-apis-probe/classes" "$work/client-apis-probe/cache" "$work/client-apis-probe/data"
@@ -2307,5 +2345,5 @@ classes_dex_size="$(stat -c '%s' "$work/jar/classes.dex")"
 classes2_dex_size="$(stat -c '%s' "$work/jar/classes2.dex")"
 classes3_dex_size="$(stat -c '%s' "$work/jar/classes3.dex")"
 echo "    classes.dex (javac-patched): $classes_dex_size bytes; classes2.dex (smali Android API gaps, including LocationManager): $classes2_dex_size bytes; classes3.dex (stock): $classes3_dex_size bytes"
-echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, media codec list, date-time, display refresh-rate, MotionEvent pointer, voice chat, audio properties, WebView callback, and wolfSSL contracts verified"
+echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, media codec list, date-time, display refresh-rate, SurfaceView callback, MotionEvent pointer, voice chat, audio properties, WebView callback, and wolfSSL contracts verified"
 echo "    use it with: export ECLIPSE_ANDROID_FRAMEWORK_DIR=\"$OUT\""

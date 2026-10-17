@@ -27,7 +27,7 @@ xdg-mime default io.github.kuenec.Eclipse.UrlHandler.desktop x-scheme-handler/ro
 
 ## Voice chat
 
-Voice chat uses the microphone chosen under **Audio** in Settings, or your system's default one. Roblox's own audio settings always call it Default.
+Voice chat uses the microphone chosen under **Audio** in Settings, or your system's default one. Roblox's own audio settings list it as Android audio output.
 
 ## Robux
 
