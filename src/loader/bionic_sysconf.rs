@@ -275,17 +275,14 @@ mod tests {
         let scope =
             super::super::bionic_env::BionicEnv::with_host_baseline(false, true).into_scope();
         let addr = scope.resolve("mallinfo").expect("mallinfo resolves").addr;
-        let fill: unsafe extern "C" fn(*mut [usize; 10]) =
+        let mallinfo: unsafe extern "C" fn() -> super::BionicMallinfo =
             unsafe { std::mem::transmute(addr as usize) };
         let live = std::hint::black_box(vec![1u8; 16 * 1024]);
-        let mut out = [usize::MAX; 10];
-        unsafe { fill(&mut out) };
-        let [_, _, _, _, _, usmblks, _, uordblks, fordblks, keepcost] = out;
-        assert_ne!(usmblks, usize::MAX);
-        assert_ne!(fordblks, usize::MAX);
-        assert_ne!(keepcost, usize::MAX);
-        assert!(uordblks >= live.len());
-        assert_eq!(usmblks, uordblks + fordblks);
+        let info = unsafe { mallinfo() };
+        assert_eq!(size_of::<super::BionicMallinfo>(), 10 * size_of::<usize>());
+        assert!(info.uordblks >= live.len());
+        assert_eq!(info.usmblks, info.uordblks + info.fordblks);
+        assert!(info.keepcost <= info.fordblks);
     }
 
     #[test]

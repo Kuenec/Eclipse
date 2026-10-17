@@ -343,7 +343,8 @@ mod tests {
 
     #[test]
     fn tpoff64_applied_through_reloc_writes_tp_offset_plus_addend() {
-        use crate::loader::reloc::{apply_one, Rela, SliceImage, R_X86_64_TPOFF64};
+        use crate::abi::Abi;
+        use crate::loader::reloc::{apply_one, Rela, RelocKind, SliceImage};
 
         let file = vec![0u8; 0x20];
         let dynsyms = vec![tls_undef(""), tls_undef("tlsvar")];
@@ -359,11 +360,11 @@ mod tests {
 
         const BASE: u64 = 0x5555_5000_0000;
         let mut buf = vec![0u8; 8];
-        let mut img = SliceImage::new(BASE, 0, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, 0, &mut buf);
         let rela = Rela {
             offset: 0,
             sym_index: 1,
-            r_type: R_X86_64_TPOFF64,
+            kind: RelocKind::TpOff64,
             addend: 8,
         };
         apply_one(&mut img, &resolver, &rela).unwrap();
@@ -376,7 +377,8 @@ mod tests {
 
     #[test]
     fn tpoff64_sym0_resolves_own_module_block() {
-        use crate::loader::reloc::{apply_one, Rela, SliceImage, R_X86_64_TPOFF64};
+        use crate::abi::Abi;
+        use crate::loader::reloc::{apply_one, Rela, RelocKind, SliceImage};
 
         let dynsyms = vec![tls_undef("")];
         let layout = TlsLayout::new();
@@ -386,11 +388,11 @@ mod tests {
 
         const BASE: u64 = 0x5555_5000_0000;
         let mut buf = vec![0u8; 8];
-        let mut img = SliceImage::new(BASE, 0, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, 0, &mut buf);
         let rela = Rela {
             offset: 0,
             sym_index: 0,
-            r_type: R_X86_64_TPOFF64,
+            kind: RelocKind::TpOff64,
             addend: 0x40,
         };
         apply_one(&mut img, &resolver, &rela).unwrap();

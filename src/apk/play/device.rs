@@ -1,3 +1,4 @@
+use crate::abi::Abi;
 use crate::apk::proto::Encoder;
 
 const MANUFACTURER: &str = "Google";
@@ -21,7 +22,14 @@ pub(super) const LANGUAGE: &str = "en";
 pub(super) const COUNTRY: &str = "us";
 const TIME_ZONE: &str = "America/New_York";
 
-const NATIVE_PLATFORMS: [&str; 5] = ["x86_64", "x86", "arm64-v8a", "armeabi-v7a", "armeabi"];
+const X86_64_DEVICE_ABIS: [&str; 5] = [
+    Abi::X86_64.android_name(),
+    "x86",
+    Abi::Arm64V8a.android_name(),
+    "armeabi-v7a",
+    "armeabi",
+];
+const ARM64_DEVICE_ABIS: [&str; 3] = [Abi::Arm64V8a.android_name(), "armeabi-v7a", "armeabi"];
 const GLES_3_2: i32 = 0x0003_0002;
 const TOUCHSCREEN_FINGER: i32 = 3;
 const KEYBOARD_QWERTY: i32 = 2;
@@ -138,13 +146,20 @@ pub(super) fn auth_user_agent() -> String {
     format!("GoogleAuth/1.4 ({DEVICE} {BUILD_ID})")
 }
 
+fn native_platforms(abi: Abi) -> &'static [&'static str] {
+    match abi {
+        Abi::X86_64 => &X86_64_DEVICE_ABIS,
+        Abi::Arm64V8a => &ARM64_DEVICE_ABIS,
+    }
+}
+
 pub(super) fn store_user_agent() -> String {
     format!(
         "Android-Finsky/{PLAY_STORE_VERSION_NAME} (api=3,versionCode={PLAY_STORE_VERSION_CODE},\
          sdk={SDK_INT},device={DEVICE},hardware={HARDWARE},product={PRODUCT},\
          platformVersionRelease={RELEASE},model={MODEL},buildId={BUILD_ID},isWideScreen=0,\
          supportedAbis={})",
-        NATIVE_PLATFORMS.join(";")
+        native_platforms(Abi::HOST).join(";")
     )
 }
 
@@ -172,7 +187,7 @@ fn configuration() -> Encoder {
     for (feature, _) in VERSIONED_FEATURES {
         config.string(10, feature);
     }
-    for platform in NATIVE_PLATFORMS {
+    for platform in native_platforms(Abi::HOST) {
         config.string(11, platform);
     }
     config.int32(12, SCREEN_WIDTH).int32(13, SCREEN_HEIGHT);
@@ -260,17 +275,32 @@ mod tests {
     }
 
     #[test]
-    fn device_prefers_x86_64_and_reports_gles_3_2() {
+    fn device_offers_the_host_abis_and_reports_gles_3_2() {
         let config = configuration().into_bytes();
-        assert_eq!(
-            strings(&config, 11),
-            ["x86_64", "x86", "arm64-v8a", "armeabi-v7a", "armeabi"]
-        );
+        assert_eq!(strings(&config, 11), native_platforms(Abi::HOST));
         assert_eq!(varint_field(&config, 8).unwrap(), Some(0x0003_0002));
         assert!(strings(&config, 10).contains(&"android.hardware.type.pc"));
         let declared = repeated_bytes(&config, 26).unwrap().len();
         assert_eq!(declared, strings(&config, 10).len());
-        assert!(store_user_agent().contains("supportedAbis=x86_64;x86;arm64-v8a"));
+        assert!(store_user_agent().contains(&format!(
+            "supportedAbis={})",
+            native_platforms(Abi::HOST).join(";")
+        )));
+    }
+
+    #[test]
+    fn play_device_lists_the_host_abi_first() {
+        assert_eq!(
+            native_platforms(Abi::X86_64),
+            ["x86_64", "x86", "arm64-v8a", "armeabi-v7a", "armeabi"]
+        );
+        assert_eq!(
+            native_platforms(Abi::Arm64V8a),
+            ["arm64-v8a", "armeabi-v7a", "armeabi"]
+        );
+        for abi in [Abi::X86_64, Abi::Arm64V8a] {
+            assert_eq!(native_platforms(abi)[0], abi.android_name(), "{abi:?}");
+        }
     }
 
     #[test]

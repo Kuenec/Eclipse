@@ -131,6 +131,7 @@ mod tests {
         assert_eq!(p.resolve("bad\0name"), None);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn dlopen_provider_maps_long_double_names_its_dependencies_export_to_binary128() {
         let p = DlopenLibProvider::open("libm.so.6").expect("glibc's libm must open");

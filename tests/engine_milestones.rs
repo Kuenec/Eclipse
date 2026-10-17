@@ -109,7 +109,8 @@ fn run_libroblox_init_runs_every_constructor() {
     if !roblox_apk_present() {
         eprintln!(
             "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK to an APK file or to a directory \
-             holding base.apk and split_config.x86_64.apk)"
+             holding base.apk and {})",
+            eclipse::abi::Abi::HOST.split_apk()
         );
         return;
     }
@@ -263,7 +264,8 @@ fn webview_test_drives_load_upcalls_the_bridge_and_cookies() {
     if !roblox_apk_present() {
         eprintln!(
             "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK to an APK file or to a directory \
-             holding base.apk and split_config.x86_64.apk)"
+             holding base.apk and {})",
+            eclipse::abi::Abi::HOST.split_apk()
         );
         return;
     }
@@ -370,6 +372,54 @@ fn root_lockfile_stays_free_of_the_web_engine() {
             !lock.contains(package),
             "the root Cargo.lock gained a web engine package entry ({package}) — the engine must \
              stay confined to the workspace-detached crates/eclipse-webview helper"
+        );
+    }
+}
+
+#[test]
+fn framework_overlay_derives_build_abis_from_the_host_contract() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    let generated = |field: &str| {
+        let declaration = format!("public static final String[] {field} = ");
+        let mut lines = generator.lines().filter(|line| line.contains(&declaration));
+        let line = lines
+            .next()
+            .unwrap_or_else(|| panic!("framework overlay no longer generates Build.{field}"));
+        assert!(
+            lines.next().is_none(),
+            "framework overlay generates Build.{field} more than once"
+        );
+        line
+    };
+    let abis_64 = generated("SUPPORTED_64_BIT_ABIS");
+    let abis_32 = generated("SUPPORTED_32_BIT_ABIS");
+    assert!(
+        abis_64.contains(r#"SystemProperties.get(\"ro.product.cpu.abilist64\", CPU_ABI)"#),
+        "Build.SUPPORTED_64_BIT_ABIS must default to ATL's host CPU_ABI; Roblox reads it in \
+         RobloxApplication.onCreate: {abis_64}"
+    );
+    assert!(
+        abis_32.contains(
+            r#"UNKNOWN.equals(CPU_ABI2) ? new String[0] : SystemProperties.get(\"ro.product.cpu.abilist32\", CPU_ABI2)"#
+        ),
+        "Build.SUPPORTED_32_BIT_ABIS must default to ATL's CPU_ABI2 and be empty where ATL \
+         reports none, as on ARM64: {abis_32}"
+    );
+    for line in [abis_64, abis_32] {
+        assert!(
+            !line.contains("x86"),
+            "the generated split-ABI list must not default to an x86 ABI: {line}"
+        );
+    }
+    for needle in [
+        r#"'properties.put("ro.product.cpu.abi", "x86_64");'"#,
+        r#"'properties.put("ro.product.cpu.abi2", "x86");'"#,
+        r#"'properties.put("ro.product.cpu.abi", "arm64-v8a");'"#,
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost its ATL host-ABI drift check {needle}; the split-ABI lists \
+             would follow whatever ATL's CPU_ABI became"
         );
     }
 }
@@ -1320,7 +1370,8 @@ fn platform_test_can_boot() -> bool {
     if !roblox_apk_present() {
         eprintln!(
             "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK to an APK file or to a directory \
-             holding base.apk and split_config.x86_64.apk)"
+             holding base.apk and {})",
+            eclipse::abi::Abi::HOST.split_apk()
         );
         return false;
     }

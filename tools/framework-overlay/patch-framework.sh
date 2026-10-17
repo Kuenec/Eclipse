@@ -100,12 +100,19 @@ mkdir -p "$work/gen/android/os" "$work/classes" "$work/stage" "$work/jar" "$work
 anchor='public static final String[] SUPPORTED_ABIS'
 hits="$(grep -cF "$anchor" "$ATL_SRC/android/os/Build.java")" || true
 [ "$hits" = "1" ] || fail "Build.java anchor 'SUPPORTED_ABIS' found $hits times (expected 1) — ATL source drifted; update this script"
+for host_abi_property in \
+    'properties.put("ro.product.cpu.abi", "x86_64");' \
+    'properties.put("ro.product.cpu.abi2", "x86");' \
+    'properties.put("ro.product.cpu.abi", "arm64-v8a");'
+do
+    grep -qF "$host_abi_property" "$ATL_SRC/android/os/SystemProperties.java" || fail "ATL's SystemProperties.java lost '$host_abi_property' — Build's split-ABI lists derive from CPU_ABI and CPU_ABI2; update this script"
+done
 awk -v anchor="$anchor" '
     { print }
     index($0, anchor) {
         print ""
-        print "\tpublic static final String[] SUPPORTED_32_BIT_ABIS = SystemProperties.get(\"ro.product.cpu.abilist32\", \"x86\").split(\",\");"
-        print "\tpublic static final String[] SUPPORTED_64_BIT_ABIS = SystemProperties.get(\"ro.product.cpu.abilist64\", \"x86_64\").split(\",\");"
+        print "\tpublic static final String[] SUPPORTED_32_BIT_ABIS = UNKNOWN.equals(CPU_ABI2) ? new String[0] : SystemProperties.get(\"ro.product.cpu.abilist32\", CPU_ABI2).split(\",\");"
+        print "\tpublic static final String[] SUPPORTED_64_BIT_ABIS = SystemProperties.get(\"ro.product.cpu.abilist64\", CPU_ABI).split(\",\");"
     }
 ' "$ATL_SRC/android/os/Build.java" > "$work/gen/android/os/Build.java"
 

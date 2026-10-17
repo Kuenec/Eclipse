@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
+use eclipse::abi::Abi;
 use eclipse::apk::store::{
     Attempt, CheckMode, CheckOutcome, InstalledVersion, Proof, Rollback, Store, UpdateCheck,
     UpdateOutcome,
 };
 use eclipse::apk::update::{Sources, UpdateError};
-use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode, TARGET_ABI};
+use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode};
 use eclipse::framework::lifecycle::{
     exit_without_vm_teardown, finish_android_process, record_normal_close_at_client_exit,
     ClientEnd, Stage,
@@ -76,7 +77,10 @@ const LAUNCH_CHECK_BUDGET: Duration = Duration::from_secs(3);
 const BUG_REPORT_LIMIT: Duration = Duration::from_secs(10);
 const SETTINGS_APP: &str = "eclipse-settings";
 
-const HELP: &str = "\
+fn help() -> String {
+    let split = Abi::HOST.split_apk();
+    format!(
+        "\
 eclipse — run the Android Roblox build on Linux (open-source, Rust)
 
 USAGE:
@@ -95,7 +99,7 @@ COMMANDS:
                 `run --check-update` and a first install download Roblox.
                 A new Roblox that fails to start twice is replaced by the version kept before it.
                 PATH may be an APK file or a directory holding base.apk and
-                split_config.x86_64.apk. Only one Roblox client runs at a time; running it
+                {split}. Only one Roblox client runs at a time; running it
                 again asks its window to come to the front.
     open <LINK>
                 Start Roblox as `run` does and open a Roblox link or place ID: a game, server,
@@ -107,7 +111,7 @@ COMMANDS:
                 server, private-server, friend and share links are refused. In Flatpak the
                 desktop asks first. --remove takes the game's entry out of the app menu.
     install <PATH>...
-                Verify and install the Roblox client: base.apk plus split_config.x86_64.apk,
+                Verify and install the Roblox client: base.apk plus {split},
                 a directory holding them, or an .apks/.xapk/.apkm bundle.
     update [--play]
                 Download and install the newest Roblox client. Eclipse asks APKPure, without
@@ -141,7 +145,9 @@ NOTE: Eclipse runs only the official, unmodified Roblox client signed by Roblox 
     It never hosts or modifies it. `eclipse update` downloads Roblox's own release files from
     APKPure or Google Play and installs them only when Roblox's signature verifies; anything
     else is discarded.
-";
+"
+    )
+}
 
 fn main() -> ExitCode {
     let supervision = match supervisor::adopt() {
@@ -333,11 +339,11 @@ fn main() -> ExitCode {
         Some("__audio-sine") => audio_sine_command(&args[1..]),
         Some("__audio-loopback") => audio_loopback_command(&args[1..]),
         None | Some("help") | Some("--help") | Some("-h") => {
-            print!("{HELP}");
+            print!("{}", help());
             ExitCode::SUCCESS
         }
         Some(_) => {
-            eprintln!("unknown command\n\n{HELP}");
+            eprintln!("unknown command\n\n{}", help());
             ExitCode::FAILURE
         }
     }
@@ -1381,7 +1387,7 @@ that uses one. Use a secondary Google account, not your main one.
 ";
 
 fn install_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
-    eclipse::runtime::android_cpu_baseline()?;
+    eclipse::runtime::host_requirements()?;
     if arguments.is_empty() {
         return Err("usage: eclipse install <APK | DIRECTORY | BUNDLE>...".into());
     }
@@ -1527,7 +1533,7 @@ fn parse_update_source(arguments: &[OsString]) -> Result<Sources, String> {
 }
 
 fn update_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
-    eclipse::runtime::android_cpu_baseline()?;
+    eclipse::runtime::host_requirements()?;
     let sources = parse_update_source(arguments)?;
     let _client = lock_out_clients()?;
     let store = Store::open()?;
@@ -1599,7 +1605,8 @@ fn too_old(installed: &InstalledVersion) -> String {
 
 fn nothing_newer(packaging: &Packaging) -> String {
     format!(
-        "Eclipse has no newer {TARGET_ABI} build of Roblox to install yet. {}",
+        "Eclipse has no newer {} build of Roblox to install yet. {}",
+        Abi::HOST.android_name(),
         update_advice(packaging)
     )
 }
@@ -2619,14 +2626,13 @@ fn extract_client(
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let app_lib_dir = native_lib_dir(eclipse::runtime::native_lib_root()?, apks.version_code())?;
     status.step(format!(
-        "Extracting native libs (lib/x86_64/) to {}…",
+        "Extracting native libs (lib/{}/) to {}…",
+        Abi::HOST.android_name(),
         app_lib_dir.display()
     ));
-    let lib_count = apks.native_libs_mut().extract_native_libs(
-        eclipse::apk::TARGET_ABI,
-        &app_lib_dir,
-        status,
-    )?;
+    let lib_count = apks
+        .native_libs_mut()
+        .extract_native_libs(Abi::HOST, &app_lib_dir, status)?;
     println!("extracted {lib_count} native lib(s) ✓");
 
     let assets_dir = eclipse::storage::extracted_assets_dir(
@@ -2827,7 +2833,7 @@ fn preload_app_native_libs(
     apk: &eclipse::apk::Apk,
     app_lib_dir: &std::path::Path,
 ) -> Result<Vec<eclipse::loader::engine::PreloadedLib>, Box<dyn std::error::Error>> {
-    use eclipse::apk::{ENGINE_LIB, TARGET_ABI};
+    use eclipse::apk::ENGINE_LIB;
 
     let mut log = std::io::stdout();
     let mut loaded: Vec<eclipse::loader::engine::PreloadedLib> = Vec::new();
@@ -2838,10 +2844,11 @@ fn preload_app_native_libs(
     report_preloaded(&engine);
     loaded.push(engine);
 
-    let filenames = apk.native_lib_filenames(TARGET_ABI)?;
+    let filenames = apk.native_lib_filenames(Abi::HOST)?;
     println!(
-        "# Pre-loading {} other x86_64 JNI lib(s) via the Rust loader (tolerant of per-lib failure)…",
-        filenames.iter().filter(|f| *f != ENGINE_LIB).count()
+        "# Pre-loading {} other {} JNI lib(s) via the Rust loader (tolerant of per-lib failure)…",
+        filenames.iter().filter(|f| *f != ENGINE_LIB).count(),
+        Abi::HOST.android_name()
     );
     for filename in &filenames {
         if filename == ENGINE_LIB {
@@ -2860,8 +2867,9 @@ fn preload_app_native_libs(
     }
 
     println!(
-        "engine pre-load complete: {} x86_64 JNI lib(s) loaded via the Rust loader ✓",
-        loaded.len()
+        "engine pre-load complete: {} {} JNI lib(s) loaded via the Rust loader ✓",
+        loaded.len(),
+        Abi::HOST.android_name()
     );
     Ok(loaded)
 }
@@ -2984,7 +2992,7 @@ fn run_platform_test(
              __platform-test boots ART with the installed framework on the classpath",
             eclipse::apk::DEV_APK_ENV,
             eclipse::apk::BASE_APK,
-            eclipse::apk::NATIVE_SPLIT_APK
+            Abi::HOST.split_apk()
         )
     })?;
     let apks = eclipse::apk::ApkSet::open(paths)?;
@@ -3051,7 +3059,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
              __webview-test boots ART with the installed framework on the classpath",
             eclipse::apk::DEV_APK_ENV,
             eclipse::apk::BASE_APK,
-            eclipse::apk::NATIVE_SPLIT_APK
+            Abi::HOST.split_apk()
         )
     })?;
     let apks = eclipse::apk::ApkSet::open(paths)?;
@@ -3402,18 +3410,18 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 #[cfg(test)]
 mod tests {
     use super::{
-        answer_refusal, clean_storage, finish_update, first_run_note, installed_client_note,
+        answer_refusal, clean_storage, finish_update, first_run_note, help, installed_client_note,
         installed_or_updated_set, lock_run_in, native_lib_dir, parse_libroblox_init_lib_dir,
         parse_storage_action, parse_update_source, record_normal_end,
         remove_other_native_lib_versions, remove_other_version_oats, roblox_refuses, set_to_launch,
         shortcut_command, update_advice, update_if_due, url_handler_message, user_packaging,
         window_graphics, window_title, with_update_advice, ClientLock, KeptBecause, Launch,
         LaunchCheck, LaunchCommand, LaunchCommandError, Packaging, Proving, Request, RunCheck,
-        RunStart, StorageAction, StorageLayout, Token, HELP, LAUNCH_CHECK_BUDGET,
-        LAUNCH_LINK_COMMAND, LAUNCH_LINK_ENV, NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE,
-        SHORTCUT_USAGE,
+        RunStart, StorageAction, StorageLayout, Token, LAUNCH_CHECK_BUDGET, LAUNCH_LINK_COMMAND,
+        LAUNCH_LINK_ENV, NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE, SHORTCUT_USAGE,
     };
     use crate::desktop_integration::BROWSER_HANDLER_COMMAND;
+    use eclipse::abi::Abi;
     use eclipse::apk::store::{
         CheckOutcome, DeclaredFile, InstalledVersion, Proof, Rejections, Store, UpdateCheck,
         UpdateOutcome, VersionState,
@@ -4320,9 +4328,10 @@ mod tests {
             Some(CheckOutcome::Failed),
             "a check that ran out of time is retried after 30 minutes, like any failed check"
         );
+        let help = help();
         assert!(
-            HELP.contains(&format!("within {} seconds", LAUNCH_CHECK_BUDGET.as_secs())),
-            "{HELP}"
+            help.contains(&format!("within {} seconds", LAUNCH_CHECK_BUDGET.as_secs())),
+            "{help}"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4386,14 +4395,15 @@ mod tests {
 
         let unreachable = UpdateError::NothingInstalled(vec![SourceProblem {
             source: Source::ApkPure,
-            problem: Problem::NoX86_64Build,
+            problem: Problem::NoHostBuild,
         }]);
         let advised = with_update_advice(Box::new(unreachable), &Packaging::Host).to_string();
         assert_eq!(
             advised,
             format!(
-                "no update source could provide a newer Roblox (APKPure: it has no x86_64 build \
-                 of Roblox). {}",
+                "no update source could provide a newer Roblox (APKPure: it has no {} build of \
+                 Roblox). {}",
+                Abi::HOST.android_name(),
                 update_advice(&Packaging::Host)
             )
         );
@@ -4411,7 +4421,8 @@ mod tests {
             roblox_refuses(&installed, KeptBecause::NothingNewer, &Packaging::Host),
             format!(
                 "Roblox says version 2.741.1061 (versionCode 3212) is too old to join games. \
-                 Eclipse has no newer x86_64 build of Roblox to install yet. {}",
+                 Eclipse has no newer {} build of Roblox to install yet. {}",
+                Abi::HOST.android_name(),
                 update_advice(&Packaging::Host)
             )
         );

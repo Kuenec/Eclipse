@@ -4,6 +4,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/loader/native_load_shim.cpp");
     println!("cargo:rerun-if-changed=src/loader/stdio_shim.c");
     println!("cargo:rerun-if-changed=src/loader/sigaltstack_shim.c");
+    println!("cargo:rerun-if-changed=src/loader/icache_shim.c");
 
     cc::Build::new()
         .file("src/loader/liblog_shim.c")
@@ -22,9 +23,17 @@ fn main() {
         .compile("eclipse_sigaltstack_shim");
 
     cc::Build::new()
+        .file("src/loader/icache_shim.c")
+        .compile("eclipse_icache_shim");
+
+    cc::Build::new()
         .cpp(true)
         .file("src/loader/native_load_shim.cpp")
         .compile("eclipse_native_load_shim");
+
+    if std::env::var_os("CARGO_CFG_TARGET_ARCH").is_some_and(|arch| arch == "aarch64") {
+        build_bionic_tls_slots();
+    }
 
     build_libm_shim();
     build_preload_library(
@@ -36,6 +45,24 @@ fn main() {
         "tests/fixtures/next_interposer.c",
         "libeclipse_next_interposer_fixture.so",
         "ECLIPSE_NEXT_INTERPOSER_FIXTURE_SO",
+    );
+}
+
+fn build_bionic_tls_slots() {
+    let source = "src/loader/bionic_tls_slots.c";
+    let script = "src/loader/bionic_tls_slots.ld";
+    println!("cargo:rerun-if-changed={source}");
+    println!("cargo:rerun-if-changed={script}");
+
+    cc::Build::new()
+        .file(source)
+        .compile("eclipse_bionic_tls_slots");
+
+    let manifest_dir =
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
+    println!(
+        "cargo:rustc-link-arg=-T{}",
+        std::path::Path::new(&manifest_dir).join(script).display()
     );
 }
 

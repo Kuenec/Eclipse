@@ -2,17 +2,108 @@
 
 use std::fmt;
 
-pub const R_X86_64_NONE: u32 = 0;
+use crate::abi::Abi;
 
-pub const R_X86_64_64: u32 = 1;
+const R_X86_64_NONE: u16 = 0;
 
-pub const R_X86_64_GLOB_DAT: u32 = 6;
+const R_X86_64_64: u16 = 1;
 
-pub const R_X86_64_JUMP_SLOT: u32 = 7;
+const R_X86_64_GLOB_DAT: u16 = 6;
 
-pub const R_X86_64_RELATIVE: u32 = 8;
+const R_X86_64_JUMP_SLOT: u16 = 7;
 
-pub const R_X86_64_TPOFF64: u32 = 18;
+const R_X86_64_RELATIVE: u16 = 8;
+
+const R_X86_64_TPOFF64: u16 = 18;
+
+const R_X86_64_IRELATIVE: u16 = 37;
+
+const R_AARCH64_NONE: u16 = 0;
+
+const R_AARCH64_ABS64: u16 = 257;
+
+const R_AARCH64_GLOB_DAT: u16 = 1025;
+
+const R_AARCH64_JUMP_SLOT: u16 = 1026;
+
+const R_AARCH64_RELATIVE: u16 = 1027;
+
+const R_AARCH64_IRELATIVE: u16 = 1032;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocKind {
+    None,
+
+    Relative,
+
+    GlobDat,
+
+    JumpSlot,
+
+    Abs64,
+
+    TpOff64,
+
+    IRelative,
+
+    Unsupported(u16),
+}
+
+impl RelocKind {
+    pub fn decode(abi: Abi, raw: u32) -> Option<Self> {
+        let raw = u16::try_from(raw).ok()?;
+        Some(match abi {
+            Abi::X86_64 => match raw {
+                R_X86_64_NONE => Self::None,
+                R_X86_64_RELATIVE => Self::Relative,
+                R_X86_64_GLOB_DAT => Self::GlobDat,
+                R_X86_64_JUMP_SLOT => Self::JumpSlot,
+                R_X86_64_64 => Self::Abs64,
+                R_X86_64_TPOFF64 => Self::TpOff64,
+                R_X86_64_IRELATIVE => Self::IRelative,
+                _ => Self::Unsupported(raw),
+            },
+            Abi::Arm64V8a => match raw {
+                R_AARCH64_NONE => Self::None,
+                R_AARCH64_RELATIVE => Self::Relative,
+                R_AARCH64_GLOB_DAT => Self::GlobDat,
+                R_AARCH64_JUMP_SLOT => Self::JumpSlot,
+                R_AARCH64_ABS64 => Self::Abs64,
+                R_AARCH64_IRELATIVE => Self::IRelative,
+                _ => Self::Unsupported(raw),
+            },
+        })
+    }
+
+    pub fn writes_symbol_address(self) -> bool {
+        matches!(self, Self::GlobDat | Self::JumpSlot | Self::Abs64)
+    }
+
+    #[cfg(test)]
+    pub fn encode(self, abi: Abi) -> u32 {
+        if let Self::Unsupported(raw) = self {
+            return raw.into();
+        }
+        (0..=u32::from(u16::MAX))
+            .find(|&raw| Self::decode(abi, raw) == Some(self))
+            .unwrap_or_else(|| panic!("{} code has no {self} relocation", abi.label()))
+    }
+}
+
+impl fmt::Display for RelocKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "NONE"),
+            Self::Relative => write!(f, "RELATIVE"),
+            Self::GlobDat => write!(f, "GLOB_DAT"),
+            Self::JumpSlot => write!(f, "JUMP_SLOT"),
+            Self::Abs64 => write!(f, "ABS64"),
+            Self::TpOff64 => write!(f, "TPOFF64"),
+            Self::IRelative => write!(f, "IRELATIVE"),
+            Self::Unsupported(raw) => write!(f, "type {raw}"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rela {
@@ -20,7 +111,7 @@ pub struct Rela {
 
     pub sym_index: u32,
 
-    pub r_type: u32,
+    pub kind: RelocKind,
 
     pub addend: i64,
 }
@@ -32,6 +123,8 @@ pub trait SymbolResolver {
 }
 
 pub trait RelocImage {
+    fn abi(&self) -> Abi;
+
     fn base(&self) -> u64;
 
     fn static_tls_offset(&self) -> i64;
@@ -49,7 +142,7 @@ pub trait RelocImage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelocError {
-    UnsupportedType(u32),
+    UnsupportedType { abi: Abi, kind: RelocKind },
 
     UnresolvedSymbol(u32),
 
@@ -61,8 +154,8 @@ pub enum RelocError {
 impl fmt::Display for RelocError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedType(t) => {
-                write!(f, "unsupported x86-64 relocation type {t}")
+            Self::UnsupportedType { abi, kind } => {
+                write!(f, "unsupported {} relocation {kind}", abi.label())
             }
             Self::UnresolvedSymbol(i) => {
                 write!(f, "unresolved symbol at dynamic-symtab index {i}")
@@ -86,14 +179,16 @@ impl fmt::Display for RelocError {
 impl std::error::Error for RelocError {}
 
 pub struct SliceImage<'a> {
+    abi: Abi,
     base: u64,
     static_tls_offset: i64,
     bytes: &'a mut [u8],
 }
 
 impl<'a> SliceImage<'a> {
-    pub fn new(base: u64, static_tls_offset: i64, bytes: &'a mut [u8]) -> Self {
+    pub fn new(abi: Abi, base: u64, static_tls_offset: i64, bytes: &'a mut [u8]) -> Self {
         Self {
+            abi,
             base,
             static_tls_offset,
             bytes,
@@ -102,6 +197,10 @@ impl<'a> SliceImage<'a> {
 }
 
 impl RelocImage for SliceImage<'_> {
+    fn abi(&self) -> Abi {
+        self.abi
+    }
+
     fn base(&self) -> u64 {
         self.base
     }
@@ -154,18 +253,24 @@ pub fn apply_one(
     let base = image.base();
     let target_off = image_offset_of(image, base.wrapping_add(rela.offset))?;
 
-    let value = match rela.r_type {
-        R_X86_64_RELATIVE => base.wrapping_add(rela.addend as u64),
-        R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => resolver
-            .resolve_symbol(rela.sym_index)
-            .ok_or(RelocError::UnresolvedSymbol(rela.sym_index))?,
-        R_X86_64_64 => {
+    let value = match rela.kind {
+        RelocKind::Relative => base.wrapping_add(rela.addend as u64),
+        RelocKind::GlobDat | RelocKind::JumpSlot => {
+            let sym = resolver
+                .resolve_symbol(rela.sym_index)
+                .ok_or(RelocError::UnresolvedSymbol(rela.sym_index))?;
+            match image.abi() {
+                Abi::X86_64 => sym,
+                Abi::Arm64V8a => sym.wrapping_add(rela.addend as u64),
+            }
+        }
+        RelocKind::Abs64 => {
             let sym = resolver
                 .resolve_symbol(rela.sym_index)
                 .ok_or(RelocError::UnresolvedSymbol(rela.sym_index))?;
             sym.wrapping_add(rela.addend as u64)
         }
-        R_X86_64_TPOFF64 => {
+        RelocKind::TpOff64 => {
             let sym_tls = resolver
                 .resolve_tls_offset(rela.sym_index)
                 .ok_or(RelocError::UnresolvedSymbol(rela.sym_index))?;
@@ -174,7 +279,12 @@ pub fn apply_one(
                 .wrapping_add(sym_tls)
                 .wrapping_add(rela.addend as u64)
         }
-        other => return Err(RelocError::UnsupportedType(other)),
+        kind @ (RelocKind::None | RelocKind::IRelative | RelocKind::Unsupported(_)) => {
+            return Err(RelocError::UnsupportedType {
+                abi: image.abi(),
+                kind,
+            })
+        }
     };
 
     image.write_u64(target_off, value)
@@ -259,12 +369,12 @@ mod tests {
     #[test]
     fn relative_writes_base_plus_addend() {
         let mut buf = image_bytes(4);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
 
         let rela = Rela {
             offset: 16,
             sym_index: 0,
-            r_type: R_X86_64_RELATIVE,
+            kind: RelocKind::Relative,
             addend: 0x1234,
         };
         apply_one(&mut img, &FixedResolver, &rela).unwrap();
@@ -278,17 +388,17 @@ mod tests {
     #[test]
     fn glob_dat_and_jump_slot_write_symbol_address() {
         let mut buf = image_bytes(2);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
         let glob = Rela {
             offset: 0,
             sym_index: 1,
-            r_type: R_X86_64_GLOB_DAT,
+            kind: RelocKind::GlobDat,
             addend: 999,
         };
         let jump = Rela {
             offset: 8,
             sym_index: 2,
-            r_type: R_X86_64_JUMP_SLOT,
+            kind: RelocKind::JumpSlot,
             addend: 0,
         };
         apply_rela(&mut img, &FixedResolver, &[glob, jump]).unwrap();
@@ -297,13 +407,115 @@ mod tests {
     }
 
     #[test]
+    fn reloc_kind_decodes_every_listed_number_for_both_abis() {
+        let table = [
+            (
+                Abi::X86_64,
+                [
+                    (0, RelocKind::None),
+                    (8, RelocKind::Relative),
+                    (6, RelocKind::GlobDat),
+                    (7, RelocKind::JumpSlot),
+                    (1, RelocKind::Abs64),
+                    (18, RelocKind::TpOff64),
+                    (37, RelocKind::IRelative),
+                ]
+                .as_slice(),
+            ),
+            (
+                Abi::Arm64V8a,
+                [
+                    (0, RelocKind::None),
+                    (1027, RelocKind::Relative),
+                    (1025, RelocKind::GlobDat),
+                    (1026, RelocKind::JumpSlot),
+                    (257, RelocKind::Abs64),
+                    (1032, RelocKind::IRelative),
+                ]
+                .as_slice(),
+            ),
+        ];
+        for (abi, numbers) in table {
+            for &(raw, kind) in numbers {
+                assert_eq!(
+                    RelocKind::decode(abi, raw),
+                    Some(kind),
+                    "{abi:?} type {raw}"
+                );
+                assert_eq!(kind.encode(abi), raw, "{abi:?} {kind}");
+            }
+        }
+
+        for (abi, raw) in [
+            (Abi::X86_64, 1027),
+            (Abi::X86_64, 16),
+            (Abi::Arm64V8a, 8),
+            (Abi::Arm64V8a, 1028),
+            (Abi::Arm64V8a, 1029),
+            (Abi::Arm64V8a, 1030),
+            (Abi::Arm64V8a, 1031),
+        ] {
+            assert_eq!(
+                RelocKind::decode(abi, raw),
+                Some(RelocKind::Unsupported(raw as u16)),
+                "{abi:?} type {raw}"
+            );
+        }
+        for abi in [Abi::X86_64, Abi::Arm64V8a] {
+            assert_eq!(RelocKind::decode(abi, 0x1_0000), None, "{abi:?}");
+        }
+
+        let mut buf = image_bytes(1);
+        let mut img = SliceImage::new(Abi::Arm64V8a, BASE, 0, &mut buf);
+        let tlsdesc = Rela {
+            offset: 0,
+            sym_index: 1,
+            kind: RelocKind::Unsupported(1031),
+            addend: 0,
+        };
+        assert_eq!(
+            apply_one(&mut img, &FixedResolver, &tlsdesc)
+                .unwrap_err()
+                .to_string(),
+            "unsupported ARM64 relocation type 1031"
+        );
+        assert_eq!(word(&buf, 0), 0);
+    }
+
+    #[test]
+    fn decoded_relocations_stay_as_small_as_raw_elf64_rela_entries() {
+        assert_eq!(std::mem::size_of::<Rela>(), 24);
+    }
+
+    #[test]
+    fn glob_dat_adds_the_addend_only_on_aarch64() {
+        for (abi, expected) in [
+            (Abi::X86_64, 0x7fff_aaaa_0000),
+            (Abi::Arm64V8a, 0x7fff_aaaa_0008),
+        ] {
+            for kind in [RelocKind::GlobDat, RelocKind::JumpSlot] {
+                let mut buf = image_bytes(1);
+                let mut img = SliceImage::new(abi, BASE, 0, &mut buf);
+                let rela = Rela {
+                    offset: 0,
+                    sym_index: 1,
+                    kind,
+                    addend: 8,
+                };
+                apply_one(&mut img, &FixedResolver, &rela).unwrap();
+                assert_eq!(word(&buf, 0), expected, "{abi:?} {kind}");
+            }
+        }
+    }
+
+    #[test]
     fn abs64_writes_symbol_plus_addend() {
         let mut buf = image_bytes(1);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
         let rela = Rela {
             offset: 0,
             sym_index: 1,
-            r_type: R_X86_64_64,
+            kind: RelocKind::Abs64,
             addend: 0x20,
         };
         apply_one(&mut img, &FixedResolver, &rela).unwrap();
@@ -313,11 +525,11 @@ mod tests {
     #[test]
     fn tpoff64_writes_tls_base_plus_sym_offset_plus_addend() {
         let mut buf = image_bytes(1);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
         let rela = Rela {
             offset: 0,
             sym_index: 3,
-            r_type: R_X86_64_TPOFF64,
+            kind: RelocKind::TpOff64,
             addend: 8,
         };
         apply_one(&mut img, &FixedResolver, &rela).unwrap();
@@ -330,27 +542,34 @@ mod tests {
     #[test]
     fn unsupported_type_is_typed_err_not_panic() {
         let mut buf = image_bytes(1);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
 
         let rela = Rela {
             offset: 0,
             sym_index: 0,
-            r_type: 4,
+            kind: RelocKind::Unsupported(4),
             addend: 0,
         };
         let err = apply_one(&mut img, &FixedResolver, &rela).unwrap_err();
-        assert_eq!(err, RelocError::UnsupportedType(4));
+        assert_eq!(
+            err,
+            RelocError::UnsupportedType {
+                abi: Abi::X86_64,
+                kind: RelocKind::Unsupported(4)
+            }
+        );
+        assert_eq!(err.to_string(), "unsupported x86-64 relocation type 4");
         assert_eq!(word(&buf, 0), 0);
     }
 
     #[test]
     fn unresolved_symbol_is_typed_err() {
         let mut buf = image_bytes(1);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
         let rela = Rela {
             offset: 0,
             sym_index: 42,
-            r_type: R_X86_64_GLOB_DAT,
+            kind: RelocKind::GlobDat,
             addend: 0,
         };
         assert_eq!(
@@ -363,12 +582,12 @@ mod tests {
     #[test]
     fn out_of_bounds_offset_is_typed_err_no_write() {
         let mut buf = image_bytes(1);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
 
         let rela = Rela {
             offset: 8,
             sym_index: 0,
-            r_type: R_X86_64_RELATIVE,
+            kind: RelocKind::Relative,
             addend: 0,
         };
         assert_eq!(
@@ -382,11 +601,11 @@ mod tests {
     #[test]
     fn out_of_bounds_straddling_end_is_rejected() {
         let mut buf = vec![0u8; 12];
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
         let rela = Rela {
             offset: 8,
             sym_index: 0,
-            r_type: R_X86_64_RELATIVE,
+            kind: RelocKind::Relative,
             addend: 0,
         };
         assert_eq!(
@@ -401,7 +620,7 @@ mod tests {
         let mut buf = image_bytes(4);
 
         buf[8..16].copy_from_slice(&0x40u64.to_le_bytes());
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
 
         let entries = [BASE + 8];
         apply_relr(&mut img, &entries).unwrap();
@@ -417,7 +636,7 @@ mod tests {
         buf[0..8].copy_from_slice(&0x100u64.to_le_bytes());
         buf[8..16].copy_from_slice(&0x200u64.to_le_bytes());
         buf[24..32].copy_from_slice(&0x300u64.to_le_bytes());
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
 
         let data_bits = 0b101u64;
         let bitmap = (data_bits << 1) | 1;
@@ -437,7 +656,7 @@ mod tests {
         buf[0..8].copy_from_slice(&0x11u64.to_le_bytes());
         buf[8..16].copy_from_slice(&0x22u64.to_le_bytes());
         buf[(65 * 8)..(65 * 8 + 8)].copy_from_slice(&0x33u64.to_le_bytes());
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
 
         let data_bits = 0b1u64;
         let bitmap = (data_bits << 1) | 1;
@@ -453,7 +672,7 @@ mod tests {
     #[test]
     fn relr_out_of_bounds_address_is_typed_err() {
         let mut buf = image_bytes(2);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
 
         let entries = [BASE + 100];
         let err = apply_relr(&mut img, &entries).unwrap_err();
@@ -463,7 +682,7 @@ mod tests {
     #[test]
     fn relr_address_below_base_is_typed_err() {
         let mut buf = image_bytes(2);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
 
         let entries = [BASE - 8];
         let err = apply_relr(&mut img, &entries).unwrap_err();
@@ -473,21 +692,27 @@ mod tests {
     #[test]
     fn rela_stops_at_first_error() {
         let mut buf = image_bytes(2);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
         let good = Rela {
             offset: 0,
             sym_index: 0,
-            r_type: R_X86_64_RELATIVE,
+            kind: RelocKind::Relative,
             addend: 0x10,
         };
         let bad = Rela {
             offset: 8,
             sym_index: 0,
-            r_type: 0xff,
+            kind: RelocKind::Unsupported(0xff),
             addend: 0,
         };
         let err = apply_rela(&mut img, &FixedResolver, &[good, bad]).unwrap_err();
-        assert_eq!(err, RelocError::UnsupportedType(0xff));
+        assert_eq!(
+            err,
+            RelocError::UnsupportedType {
+                abi: Abi::X86_64,
+                kind: RelocKind::Unsupported(0xff)
+            }
+        );
         assert_eq!(word(&buf, 0), BASE + 0x10);
         assert_eq!(word(&buf, 1), 0);
     }
@@ -495,56 +720,65 @@ mod tests {
     #[test]
     fn dispatch_is_exhaustive_over_supported_types() {
         let supported = [
-            R_X86_64_64,
-            R_X86_64_GLOB_DAT,
-            R_X86_64_JUMP_SLOT,
-            R_X86_64_RELATIVE,
-            R_X86_64_TPOFF64,
+            RelocKind::Abs64,
+            RelocKind::GlobDat,
+            RelocKind::JumpSlot,
+            RelocKind::Relative,
+            RelocKind::TpOff64,
         ];
-        for &t in &supported {
+        for kind in supported {
             let mut buf = image_bytes(1);
-            let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+            let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
 
-            let sym = match t {
-                R_X86_64_TPOFF64 => 3,
-                R_X86_64_RELATIVE => 0,
+            let sym = match kind {
+                RelocKind::TpOff64 => 3,
+                RelocKind::Relative => 0,
                 _ => 1,
             };
             let rela = Rela {
                 offset: 0,
                 sym_index: sym,
-                r_type: t,
+                kind,
                 addend: 0,
             };
             let res = apply_one(&mut img, &FixedResolver, &rela);
             assert!(
-                !matches!(res, Err(RelocError::UnsupportedType(_))),
-                "type {t} must be dispatched, not rejected as unsupported"
+                !matches!(res, Err(RelocError::UnsupportedType { .. })),
+                "{kind} must be dispatched, not rejected as unsupported"
             );
         }
 
-        let mut buf = image_bytes(1);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
-        let rela = Rela {
-            offset: 0,
-            sym_index: 0,
-            r_type: 9,
-            addend: 0,
-        };
-        assert_eq!(
-            apply_one(&mut img, &FixedResolver, &rela).unwrap_err(),
-            RelocError::UnsupportedType(9)
-        );
+        for kind in [
+            RelocKind::None,
+            RelocKind::IRelative,
+            RelocKind::Unsupported(9),
+        ] {
+            let mut buf = image_bytes(1);
+            let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
+            let rela = Rela {
+                offset: 0,
+                sym_index: 0,
+                kind,
+                addend: 0,
+            };
+            assert_eq!(
+                apply_one(&mut img, &FixedResolver, &rela).unwrap_err(),
+                RelocError::UnsupportedType {
+                    abi: Abi::X86_64,
+                    kind
+                }
+            );
+        }
     }
 
     #[test]
     fn write_at_exact_end_boundary_succeeds() {
         let mut buf = image_bytes(2);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
         let rela = Rela {
             offset: 8,
             sym_index: 0,
-            r_type: R_X86_64_RELATIVE,
+            kind: RelocKind::Relative,
             addend: 0x7,
         };
         apply_one(&mut img, &FixedResolver, &rela).unwrap();
@@ -554,11 +788,11 @@ mod tests {
     #[test]
     fn offset_near_usize_max_is_out_of_bounds_no_overflow() {
         let mut buf = image_bytes(1);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
         let rela = Rela {
             offset: u64::MAX - BASE,
             sym_index: 0,
-            r_type: R_X86_64_RELATIVE,
+            kind: RelocKind::Relative,
             addend: 0,
         };
         let err = apply_one(&mut img, &FixedResolver, &rela).unwrap_err();
@@ -575,11 +809,11 @@ mod tests {
     #[test]
     fn relative_addend_overflow_wraps_then_bounds_checks_write() {
         let mut buf = image_bytes(1);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
         let rela = Rela {
             offset: 0,
             sym_index: 0,
-            r_type: R_X86_64_RELATIVE,
+            kind: RelocKind::Relative,
             addend: -1,
         };
         apply_one(&mut img, &FixedResolver, &rela).unwrap();
@@ -589,11 +823,11 @@ mod tests {
     #[test]
     fn abs64_symbol_plus_addend_overflow_wraps_no_panic() {
         let mut buf = image_bytes(1);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
         let rela = Rela {
             offset: 0,
             sym_index: 1,
-            r_type: R_X86_64_64,
+            kind: RelocKind::Abs64,
             addend: i64::MAX,
         };
         apply_one(&mut img, &FixedResolver, &rela).unwrap();
@@ -604,7 +838,7 @@ mod tests {
     #[test]
     fn relr_bitmap_address_overflow_is_typed_err_not_panic() {
         let mut buf = image_bytes(2);
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
 
         let addr_word = u64::MAX - 1;
         let bitmap = (1u64 << 1) | 1;
@@ -622,12 +856,12 @@ mod tests {
     #[test]
     fn empty_image_rejects_any_write() {
         let mut buf: Vec<u8> = Vec::new();
-        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let mut img = SliceImage::new(Abi::X86_64, BASE, TLS_BASE_OFF, &mut buf);
         assert!(img.is_empty());
         let rela = Rela {
             offset: 0,
             sym_index: 0,
-            r_type: R_X86_64_RELATIVE,
+            kind: RelocKind::Relative,
             addend: 0,
         };
         assert!(matches!(

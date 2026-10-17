@@ -12,10 +12,9 @@ use super::proto::{
     bytes_field, message_at, repeated_bytes, string_field, varint_field, ProtoError,
 };
 use super::signature::ROBLOX_CERTIFICATE_SHA1;
-use super::store::{DeclaredFile, Staging, StoreError};
-use super::{
-    ApkSet, ApkSetError, VersionCode, BASE_APK, MAX_APK_BYTES, ROBLOX_PACKAGE, TARGET_ABI,
-};
+use super::store::{bundle_directory_names_only_other_abis, DeclaredFile, Staging, StoreError};
+use super::{ApkSet, ApkSetError, VersionCode, BASE_APK, MAX_APK_BYTES, ROBLOX_PACKAGE};
+use crate::abi::Abi;
 use crate::https::{self, Download, DownloadError, Extent, Host, Resume};
 use crate::status::{mebibytes, StatusSink};
 
@@ -24,7 +23,6 @@ const VERSIONS_PATH: &str = "/m/v3/cms/app_version";
 const API_VERSION_HEADER: &str = "x-sv";
 const API_VERSION: &str = "29";
 const ABIS_HEADER: &str = "x-abis";
-const OTHER_ABI: &str = "arm64-v8a";
 const VERSION_LIST: &str = "version_list";
 const DOWNLOAD_HOSTS: &[Host] = &[
     Host::Exact("download.pureapk.com"),
@@ -33,6 +31,7 @@ const DOWNLOAD_HOSTS: &[Host] = &[
 ];
 const MAX_LISTING_BYTES: u64 = 4 * 1024 * 1024;
 const BUNDLE_FILE: &str = "apkpure.xapk";
+const DIRECTORY_TAIL_BYTES: u64 = 64 * 1024;
 const EXPIRED_LINK_STATUSES: [u16; 3] = [403, 404, 410];
 const REFUSING_STATUSES: [u16; 3] = [403, 429, 503];
 
@@ -121,7 +120,7 @@ impl fmt::Display for Offer {
 pub struct Listing {
     pub offers: Vec<Offer>,
 
-    pub newer_without_x86_64: Option<Release>,
+    pub newer_without_build: Option<Release>,
 }
 
 pub fn list(
@@ -129,42 +128,45 @@ pub fn list(
     deadline: Option<Instant>,
 ) -> Result<Listing, ApkPureError> {
     let agent = https::request_agent();
-    list_from(installed, |abi| {
+    list_from(Abi::HOST, installed, |abi| {
         fetch_versions(&agent, &versions_url(API), abi, deadline)
     })
 }
 
 fn list_from(
+    abi: Abi,
     installed: Option<VersionCode>,
-    mut fetch: impl FnMut(&str) -> Result<Vec<u8>, ApkPureError>,
+    mut fetch: impl FnMut(Abi) -> Result<Vec<u8>, ApkPureError>,
 ) -> Result<Listing, ApkPureError> {
-    let offers = offers(&fetch(TARGET_ABI)?)?;
+    let offers = offers(&fetch(abi)?)?;
     let newest_offer = offers.first().map(Offer::version);
     let newer = |version: VersionCode| installed.is_none_or(|installed| version > installed);
     if newest_offer.is_some_and(newer) {
         return Ok(Listing {
             offers,
-            newer_without_x86_64: None,
+            newer_without_build: None,
         });
     }
-    let newest = match fetch(OTHER_ABI).and_then(|body| newest_release(&body)) {
+    let other = abi.other();
+    let newest = match fetch(other).and_then(|body| newest_release(&body)) {
         Ok(newest) => newest,
         Err(error) => {
             tracing::warn!(
                 %error,
-                "APKPure's list of {OTHER_ABI} builds could not be read, so the check does not \
-                 name the newest Roblox release"
+                "APKPure's list of {} builds could not be read, so the check does not name the \
+                 newest Roblox release",
+                other.android_name()
             );
             None
         }
     };
-    let newer_without_x86_64 = newest.filter(|release| {
+    let newer_without_build = newest.filter(|release| {
         newer(release.version_code)
             && newest_offer.is_none_or(|offered| release.version_code > offered)
     });
     Ok(Listing {
         offers,
-        newer_without_x86_64,
+        newer_without_build,
     })
 }
 
@@ -172,11 +174,11 @@ fn versions_url(api: &str) -> String {
     format!("{api}{VERSIONS_PATH}?hl=en-US&package_name={ROBLOX_PACKAGE}")
 }
 
-fn versions_request(url: &str, abi: &str) -> Request<()> {
+fn versions_request(url: &str, abi: Abi) -> Request<()> {
     Request::get(url)
         .header(USER_AGENT, format!("Eclipse/{}", crate::VERSION))
         .header(API_VERSION_HEADER, API_VERSION)
-        .header(ABIS_HEADER, abi)
+        .header(ABIS_HEADER, abi.android_name())
         .body(())
         .expect("a GET of APKPure's version list with ASCII headers is a valid request")
 }
@@ -184,7 +186,7 @@ fn versions_request(url: &str, abi: &str) -> Request<()> {
 fn fetch_versions(
     agent: &ureq::Agent,
     url: &str,
-    abi: &str,
+    abi: Abi,
     deadline: Option<Instant>,
 ) -> Result<Vec<u8>, ApkPureError> {
     let request = match deadline {
@@ -379,7 +381,7 @@ pub fn install(
             |url, resume| {
                 https::open_download(&downloads, &url.to_string(), DOWNLOAD_HOSTS, resume)
             },
-            || offers(&fetch_versions(&api, &versions_url(API), TARGET_ABI, None)?),
+            || offers(&fetch_versions(&api, &versions_url(API), Abi::HOST, None)?),
         )
     })
 }
@@ -410,11 +412,14 @@ fn install_with<R: Read>(
     offer: &Offer,
     staging: Staging<'_>,
     status: &StatusSink,
-    open: impl FnMut(Option<&Resume>) -> Result<Download<R>, ApkPureError>,
+    mut open: impl FnMut(Option<&Resume>) -> Result<Download<R>, ApkPureError>,
 ) -> Result<ApkSet, ApkPureError> {
     match offer.packaging {
         Packaging::Apk => save_verified(open, offer, &staging.dir().join(BASE_APK), status)?,
         Packaging::Xapk => {
+            if is_for_other_abis(&mut open, offer)? {
+                return Err(ApkPureError::NoHostSplit);
+            }
             let bundle = staging.dir().join(BUNDLE_FILE);
             save_verified(open, offer, &bundle, status)?;
             staging.add_source(&bundle).map_err(store_failure)?;
@@ -426,6 +431,29 @@ fn install_with<R: Read>(
     }
     status.step("Checking Roblox's signature and installing it…");
     staging.commit(Some(offer.version())).map_err(store_failure)
+}
+
+fn is_for_other_abis<R: Read>(
+    open: &mut impl FnMut(Option<&Resume>) -> Result<Download<R>, ApkPureError>,
+    offer: &Offer,
+) -> Result<bool, ApkPureError> {
+    let start = offer.size.saturating_sub(DIRECTORY_TAIL_BYTES);
+    let tail = open(Some(&Resume {
+        offset: start,
+        validator: None,
+    }))?;
+    let Extent::Partial(range) = tail.extent else {
+        return Ok(false);
+    };
+    if range.start != start || range.total != Some(offer.size) {
+        return Ok(false);
+    }
+    let mut bytes = Vec::new();
+    tail.body
+        .take(DIRECTORY_TAIL_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(DownloadError::Interrupted)?;
+    Ok(bundle_directory_names_only_other_abis(start, bytes))
 }
 
 fn save_verified<R: Read>(
@@ -509,6 +537,8 @@ pub enum ApkPureError {
 
     HashMismatch,
 
+    NoHostSplit,
+
     Io { path: PathBuf, source: io::Error },
 
     Rejected(StoreError),
@@ -580,6 +610,12 @@ impl fmt::Display for ApkPureError {
                 "the Roblox download from APKPure does not match the SHA-1 APKPure listed; it was \
                  discarded",
             ),
+            Self::NoHostSplit => write!(
+                f,
+                "this APKPure bundle has no {}, so it holds no {} build of Roblox",
+                Abi::HOST.xapk_split_entry(),
+                Abi::HOST.android_name()
+            ),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Rejected(StoreError::Set(error @ ApkSetError::Signature { .. })) => write!(
                 f,
@@ -609,7 +645,8 @@ impl std::error::Error for ApkPureError {
             | Self::UntrustedLink { .. }
             | Self::Superseded { .. }
             | Self::SizeMismatch { .. }
-            | Self::HashMismatch => None,
+            | Self::HashMismatch
+            | Self::NoHostSplit => None,
         }
     }
 }
@@ -625,9 +662,10 @@ mod tests {
     use super::*;
     use crate::apk::proto::Encoder;
     use crate::apk::store::Store;
-    use crate::apk::{ApkSetPaths, NATIVE_SPLIT_APK};
+    use crate::apk::ApkSetPaths;
+    use std::cell::RefCell;
     use std::fs::File;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
     use std::net::TcpListener;
     use std::time::Duration;
     use zip::write::SimpleFileOptions;
@@ -711,7 +749,7 @@ mod tests {
 
     #[test]
     fn the_version_list_request_is_an_anonymous_get_with_an_honest_user_agent() {
-        let request = versions_request(&versions_url(API), TARGET_ABI);
+        let request = versions_request(&versions_url(API), Abi::X86_64);
         assert_eq!(request.method(), "GET");
         assert_eq!(
             request.uri().to_string(),
@@ -944,11 +982,11 @@ mod tests {
     }
 
     fn listed_by<'a>(
-        answers: &'a [(&'a str, Result<&'a [u8], u16>)],
-        asked: &'a mut Vec<String>,
-    ) -> impl FnMut(&str) -> Result<Vec<u8>, ApkPureError> + 'a {
+        answers: &'a [(Abi, Result<&'a [u8], u16>)],
+        asked: &'a mut Vec<Abi>,
+    ) -> impl FnMut(Abi) -> Result<Vec<u8>, ApkPureError> + 'a {
         move |abi| {
-            asked.push(abi.to_owned());
+            asked.push(abi);
             let (_, answer) = answers
                 .iter()
                 .find(|(listed, _)| *listed == abi)
@@ -959,44 +997,75 @@ mod tests {
 
     #[test]
     fn a_newer_x86_64_build_is_offered_without_asking_for_other_abis() {
-        let answers = [(TARGET_ABI, Ok(X86_64_LIST))];
+        let answers = [(Abi::X86_64, Ok(X86_64_LIST))];
         for installed in [None, Some(VersionCode(3212))] {
             let mut asked = Vec::new();
-            let listing = list_from(installed, listed_by(&answers, &mut asked)).unwrap();
+            let listing =
+                list_from(Abi::X86_64, installed, listed_by(&answers, &mut asked)).unwrap();
             assert_eq!(listing.offers[0].version(), VersionCode(3222));
-            assert_eq!(listing.newer_without_x86_64, None);
-            assert_eq!(asked, [TARGET_ABI]);
+            assert_eq!(listing.newer_without_build, None);
+            assert_eq!(asked, [Abi::X86_64]);
+        }
+    }
+
+    #[test]
+    fn apkpure_offers_the_newest_release_directly_to_arm64() {
+        let answers = [(Abi::Arm64V8a, Ok(ARM64_LIST))];
+        for installed in [None, Some(VersionCode(3222))] {
+            let mut asked = Vec::new();
+            let listing =
+                list_from(Abi::Arm64V8a, installed, listed_by(&answers, &mut asked)).unwrap();
+            assert_eq!(listing.offers[0].release, release("2.743.1136", 18934));
+            assert_eq!(listing.newer_without_build, None);
+            assert_eq!(asked, [Abi::Arm64V8a]);
         }
     }
 
     #[test]
     fn a_newer_release_without_an_x86_64_build_is_named() {
-        let answers = [(TARGET_ABI, Ok(X86_64_LIST)), (OTHER_ABI, Ok(ARM64_LIST))];
+        let answers = [
+            (Abi::X86_64, Ok(X86_64_LIST)),
+            (Abi::Arm64V8a, Ok(ARM64_LIST)),
+        ];
         let mut asked = Vec::new();
-        let listing = list_from(Some(VersionCode(3222)), listed_by(&answers, &mut asked)).unwrap();
+        let listing = list_from(
+            Abi::X86_64,
+            Some(VersionCode(3222)),
+            listed_by(&answers, &mut asked),
+        )
+        .unwrap();
         assert_eq!(
-            listing.newer_without_x86_64,
+            listing.newer_without_build,
             Some(release("2.743.1136", 18934))
         );
-        assert_eq!(asked, [TARGET_ABI, OTHER_ABI]);
+        assert_eq!(asked, [Abi::X86_64, Abi::Arm64V8a]);
 
         let mut asked = Vec::new();
-        let listing = list_from(Some(VersionCode(18934)), listed_by(&answers, &mut asked)).unwrap();
-        assert_eq!(listing.newer_without_x86_64, None, "nothing is newer");
+        let listing = list_from(
+            Abi::X86_64,
+            Some(VersionCode(18934)),
+            listed_by(&answers, &mut asked),
+        )
+        .unwrap();
+        assert_eq!(listing.newer_without_build, None, "nothing is newer");
 
-        let unanswered = [(TARGET_ABI, Ok(X86_64_LIST)), (OTHER_ABI, Err(503))];
+        let unanswered = [(Abi::X86_64, Ok(X86_64_LIST)), (Abi::Arm64V8a, Err(503))];
         let mut asked = Vec::new();
-        let listing =
-            list_from(Some(VersionCode(3222)), listed_by(&unanswered, &mut asked)).unwrap();
+        let listing = list_from(
+            Abi::X86_64,
+            Some(VersionCode(3222)),
+            listed_by(&unanswered, &mut asked),
+        )
+        .unwrap();
         assert_eq!(
-            listing.newer_without_x86_64, None,
+            listing.newer_without_build, None,
             "the x86_64 answer stands when the other list is unavailable"
         );
         assert_eq!(listing.offers.len(), 3);
 
-        let down = [(TARGET_ABI, Err(503))];
+        let down = [(Abi::X86_64, Err(503))];
         let mut asked = Vec::new();
-        let err = list_from(None, listed_by(&down, &mut asked)).unwrap_err();
+        let err = list_from(Abi::X86_64, None, listed_by(&down, &mut asked)).unwrap_err();
         assert_eq!(
             err.to_string(),
             "APKPure answered HTTP 503; it may be refusing automated requests right now"
@@ -1068,7 +1137,7 @@ mod tests {
         let agent = plain_http_agent();
         let url = versions_url(&server.url);
 
-        let body = fetch_versions(&agent, &url, TARGET_ABI, None).unwrap();
+        let body = fetch_versions(&agent, &url, Abi::X86_64, None).unwrap();
         assert_eq!(offers(&body).unwrap(), offers(X86_64_LIST).unwrap());
         let head = server.requests.recv().unwrap().to_ascii_lowercase();
         assert!(
@@ -1086,7 +1155,7 @@ mod tests {
         }
         assert!(!head.contains("cookie"), "{head}");
 
-        let err = fetch_versions(&agent, &url, OTHER_ABI, None).unwrap_err();
+        let err = fetch_versions(&agent, &url, Abi::Arm64V8a, None).unwrap_err();
         assert!(matches!(err, ApkPureError::Status(404)), "{err:?}");
         assert!(server
             .requests
@@ -1094,12 +1163,12 @@ mod tests {
             .unwrap()
             .to_ascii_lowercase()
             .contains("x-abis: arm64-v8a\r\n"));
-        let err = fetch_versions(&agent, &url, TARGET_ABI, None).unwrap_err();
+        let err = fetch_versions(&agent, &url, Abi::X86_64, None).unwrap_err();
         assert!(
             err.to_string().contains("refusing automated requests"),
             "{err}"
         );
-        let err = fetch_versions(&agent, &url, TARGET_ABI, None).unwrap_err();
+        let err = fetch_versions(&agent, &url, Abi::X86_64, None).unwrap_err();
         assert!(matches!(err, ApkPureError::Listing { .. }), "{err:?}");
         server.thread.join().unwrap();
     }
@@ -1122,7 +1191,7 @@ mod tests {
         let err = fetch_versions(
             &agent,
             &url,
-            TARGET_ABI,
+            Abi::X86_64,
             Some(started + Duration::from_millis(300)),
         )
         .expect_err("the proxy never answers");
@@ -1134,7 +1203,7 @@ mod tests {
         );
         assert!(err.to_string().contains("`eclipse update`"), "{err}");
 
-        let passed = fetch_versions(&agent, &url, OTHER_ABI, Some(Instant::now()));
+        let passed = fetch_versions(&agent, &url, Abi::Arm64V8a, Some(Instant::now()));
         assert!(matches!(passed, Err(ApkPureError::OutOfTime)), "{passed:?}");
         proxy.set_nonblocking(true).unwrap();
         assert!(
@@ -1391,15 +1460,189 @@ mod tests {
         }
     }
 
-    fn install_file(offer: &Offer, store: &Store, download: &Path) -> Result<ApkSet, ApkPureError> {
+    fn ranged<'a>(
+        download: &'a Path,
+        opened: &'a RefCell<Vec<Option<u64>>>,
+    ) -> impl FnMut(Option<&Resume>) -> Result<Download<File>, ApkPureError> + 'a {
         let length = fs::metadata(download).unwrap().len();
+        move |resume| {
+            opened.borrow_mut().push(resume.map(|resume| resume.offset));
+            let mut file = File::open(download).unwrap();
+            Ok(match resume {
+                None => whole(file, Some(length)),
+                Some(resume) => {
+                    file.seek(SeekFrom::Start(resume.offset)).unwrap();
+                    Download {
+                        body: file,
+                        extent: Extent::Partial(https::ContentRange {
+                            start: resume.offset,
+                            total: Some(length),
+                        }),
+                        validator: None,
+                    }
+                }
+            })
+        }
+    }
+
+    fn install_file(
+        offer: &Offer,
+        store: &Store,
+        download: &Path,
+    ) -> (Result<ApkSet, ApkPureError>, Vec<Option<u64>>) {
+        let opened = RefCell::new(Vec::new());
         let status = StatusSink::terminal();
-        install_with(
+        let installed = install_with(
             offer,
             store.begin(&status).unwrap(),
             &status,
-            served(File::open(download).unwrap(), Some(length)),
+            ranged(download, &opened),
+        );
+        (installed, opened.into_inner())
+    }
+
+    fn directory_offset(bundle: &Path) -> Option<u64> {
+        let length = fs::metadata(bundle).unwrap().len();
+        Some(length.saturating_sub(DIRECTORY_TAIL_BYTES))
+    }
+
+    #[test]
+    fn an_xapk_without_the_host_split_is_skipped_after_reading_only_its_directory() {
+        let listed: Vec<_> = offers(ARM64_LIST).unwrap().into_iter().take(2).collect();
+        assert!(
+            listed
+                .iter()
+                .all(|offer| offer.version() == VersionCode(18934)
+                    && offer.packaging == Packaging::Xapk),
+            "APKPure's arm64-v8a list carries two bundles of 2.743.1136 and names neither one's \
+             ABI: {listed:?}"
+        );
+        let dir = temp_dir("xapk-abi");
+        let base = dir.join("base.apk");
+        let mut writer = ZipWriter::new(File::create(&base).unwrap());
+        writer
+            .start_file(
+                "classes.dex",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer
+            .write_all(&vec![0u8; 2 * DIRECTORY_TAIL_BYTES as usize])
+            .unwrap();
+        writer.finish().unwrap();
+        let split = dir.join("split.apk");
+        fs::write(&split, b"native code").unwrap();
+        let armeabi = dir.join("armeabi-v7a.xapk");
+        write_bundle(
+            &armeabi,
+            &[
+                ("com.roblox.client.apk", &base),
+                ("config.armeabi_v7a.apk", &split),
+            ],
+        );
+        let host = dir.join("host.xapk");
+        write_bundle(
+            &host,
+            &[
+                ("com.roblox.client.apk", &base),
+                (Abi::HOST.xapk_split_entry(), &split),
+            ],
+        );
+        let as_listed = |listed: &Offer, bundle: &Path| {
+            let file = offer_of(&fs::read(bundle).unwrap());
+            Offer {
+                size: file.size,
+                sha1: file.sha1,
+                ..listed.clone()
+            }
+        };
+        let store = Store::at(dir.join("store"));
+
+        let (installed, opened) = install_file(&as_listed(&listed[0], &armeabi), &store, &armeabi);
+        let err = installed.err().expect("an armeabi-v7a bundle is skipped");
+        assert!(matches!(err, ApkPureError::NoHostSplit), "{err:?}");
+        assert!(
+            !err.rejects_offer(),
+            "a skipped bundle is not remembered as a rejected download"
+        );
+        assert_eq!(
+            opened,
+            [directory_offset(&armeabi)],
+            "only the directory at the end of the bundle was fetched"
+        );
+
+        let (installed, opened) = install_file(&as_listed(&listed[1], &host), &store, &host);
+        let err = installed
+            .err()
+            .expect("the placeholder APKs fail verification");
+        assert!(matches!(err, ApkPureError::Rejected(_)), "{err:?}");
+        assert_eq!(
+            opened,
+            [directory_offset(&host), None],
+            "a bundle with the host split is downloaded"
+        );
+
+        let fat_base = dir.join("fat-base.apk");
+        let mut writer = ZipWriter::new(File::create(&fat_base).unwrap());
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        writer.start_file("classes.dex", stored).unwrap();
+        writer
+            .write_all(&vec![0u8; 2 * DIRECTORY_TAIL_BYTES as usize])
+            .unwrap();
+        let engine = format!(
+            "lib/{}/{}",
+            Abi::HOST.android_name(),
+            crate::apk::ENGINE_LIB
+        );
+        writer.start_file(engine, stored).unwrap();
+        writer.write_all(b"native code").unwrap();
+        writer.finish().unwrap();
+        let universal = dir.join("universal.xapk");
+        write_bundle(
+            &universal,
+            &[
+                ("com.roblox.client.apk", &fat_base),
+                ("config.xxhdpi.apk", &split),
+                ("config.en.apk", &split),
+            ],
+        );
+        let (installed, opened) =
+            install_file(&as_listed(&listed[1], &universal), &store, &universal);
+        let err = installed
+            .err()
+            .expect("the placeholder base fails verification");
+        assert!(
+            matches!(err, ApkPureError::Rejected(ref rejected)
+                if !matches!(rejected, StoreError::NoNativeSplitGiven)),
+            "the store finds the engine in the base APK: {err:?}"
+        );
+        assert_eq!(
+            opened,
+            [directory_offset(&universal), None],
+            "a bundle that names no ABI's split is downloaded"
+        );
+
+        let length = fs::metadata(&armeabi).unwrap().len();
+        let mut ignored = Vec::new();
+        let status = StatusSink::terminal();
+        let err = install_with(
+            &as_listed(&listed[0], &armeabi),
+            store.begin(&status).unwrap(),
+            &status,
+            |resume| {
+                ignored.push(resume.map(|resume| resume.offset));
+                Ok(whole(File::open(&armeabi).unwrap(), Some(length)))
+            },
         )
+        .err()
+        .expect("the store refuses a bundle without the host split");
+        assert!(
+            matches!(err, ApkPureError::Rejected(StoreError::NoNativeSplitGiven)),
+            "a server that ignores the range leaves the decision to the store: {err:?}"
+        );
+        assert_eq!(ignored, [directory_offset(&armeabi), None]);
+        assert_eq!(store.current().unwrap(), None);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1422,7 +1665,7 @@ mod tests {
             &bundle,
             &[
                 ("com.roblox.client.apk", &paths.base),
-                ("config.x86_64.apk", &split),
+                (Abi::HOST.xapk_split_entry(), &split),
             ],
         );
         let offer = local_offer(&official, Packaging::Xapk, &bundle);
@@ -1430,6 +1673,7 @@ mod tests {
         let mut wrong_version = offer.clone();
         wrong_version.release.version_code = VersionCode(offer.version().0 + 1);
         let err = install_file(&wrong_version, &store, &bundle)
+            .0
             .err()
             .expect("a release with another versionCode is refused");
         assert!(
@@ -1450,7 +1694,7 @@ mod tests {
             &tampered,
             &[
                 ("com.roblox.client.apk", &tampered_base),
-                ("config.x86_64.apk", &split),
+                (Abi::HOST.xapk_split_entry(), &split),
             ],
         );
         let err = install_file(
@@ -1458,6 +1702,7 @@ mod tests {
             &store,
             &tampered,
         )
+        .0
         .err()
         .expect("a modified base APK is refused");
         assert!(
@@ -1479,19 +1724,44 @@ mod tests {
             &store,
             &paths.base,
         )
+        .0
         .err()
-        .expect("a base APK without x86_64 code is refused");
+        .expect("a base APK without native code is refused");
         assert!(
             matches!(err, ApkPureError::Rejected(StoreError::NoNativeSplitGiven)),
             "{err:?}"
         );
         assert_eq!(store.current().unwrap(), None);
 
-        let set = install_file(&offer, &store, &bundle).expect("the official bundle installs");
+        let other_abi = dir.join("armeabi-v7a.xapk");
+        write_bundle(
+            &other_abi,
+            &[
+                ("com.roblox.client.apk", &paths.base),
+                ("config.armeabi_v7a.apk", &split),
+            ],
+        );
+        let (installed, opened) = install_file(
+            &local_offer(&official, Packaging::Xapk, &other_abi),
+            &store,
+            &other_abi,
+        );
+        assert!(
+            matches!(installed, Err(ApkPureError::NoHostSplit)),
+            "a bundle of another ABI is skipped"
+        );
+        assert_eq!(opened, [directory_offset(&other_abi)]);
+
+        let (installed, opened) = install_file(&offer, &store, &bundle);
+        let set = installed.expect("the official bundle installs");
+        assert_eq!(opened, [directory_offset(&bundle), None]);
         let version_dir = root.join(offer.version().to_string());
         assert_eq!(set.version_code(), official.version_code());
         assert_eq!(set.base_path(), version_dir.join(BASE_APK));
-        assert_eq!(set.native_libs_path(), version_dir.join(NATIVE_SPLIT_APK));
+        assert_eq!(
+            set.native_libs_path(),
+            version_dir.join(Abi::HOST.split_apk())
+        );
         assert!(
             !version_dir.join(BUNDLE_FILE).exists() && !root.join(BUNDLE_FILE).exists(),
             "the downloaded bundle is not kept"

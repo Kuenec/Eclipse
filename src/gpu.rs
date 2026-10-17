@@ -1,12 +1,13 @@
 use std::borrow::Cow;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::{fmt, fs, io};
 
 use ash::{khr, vk};
 use eclipse_config::PciId;
 
+use crate::abi::Abi;
 use crate::portal::{Notice, NoticeId, PortalError, PortalRequest};
 use crate::status::StatusSink;
 
@@ -21,8 +22,6 @@ const OLDEST_USABLE_VULKAN: (u32, u32) = (1, 1);
 const NVIDIA_KERNEL_DRIVER: &str = "/proc/driver/nvidia/version";
 
 const NVIDIA_VERSION_LINE: &str = "NVRM version:";
-
-const FLATPAK_GL_EXTENSIONS: &str = "/usr/lib/x86_64-linux-gnu/GL";
 
 const FLATPAK_DEFAULT_GL: &str = "default";
 
@@ -487,8 +486,9 @@ fn nvidia_flatpak_gap() -> Result<Option<Warning>, String> {
 }
 
 fn nvidia_kernel_module() -> Result<Option<String>, String> {
-    let Some(kernel_driver) =
-        read_if_exists(NVIDIA_KERNEL_DRIVER, |path| fs::read_to_string(path))?
+    let Some(kernel_driver) = read_if_exists(Path::new(NVIDIA_KERNEL_DRIVER), |path| {
+        fs::read_to_string(path)
+    })?
     else {
         return Ok(None);
     };
@@ -498,17 +498,21 @@ fn nvidia_kernel_module() -> Result<Option<String>, String> {
 }
 
 fn flatpak_gl_extensions() -> Result<Option<Vec<String>>, String> {
-    read_if_exists(FLATPAK_GL_EXTENSIONS, directory_names)
+    read_if_exists(&flatpak_gl_extensions_dir(Abi::HOST), directory_names)
+}
+
+fn flatpak_gl_extensions_dir(abi: Abi) -> PathBuf {
+    Path::new("/usr/lib").join(abi.gnu_triple()).join("GL")
 }
 
 fn read_if_exists<T>(
-    path: &'static str,
+    path: &Path,
     read: impl FnOnce(&Path) -> io::Result<T>,
 ) -> Result<Option<T>, String> {
-    match read(Path::new(path)) {
+    match read(path) {
         Ok(contents) => Ok(Some(contents)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot read {path}: {error}")),
+        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
     }
 }
 
@@ -1927,6 +1931,18 @@ mod tests {
         assert_eq!(shown.len(), 3);
         assert_eq!(notices, []);
         assert_eq!(report_of(&[]), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn flatpak_gl_extensions_are_read_from_the_abis_multiarch_directory() {
+        assert_eq!(
+            flatpak_gl_extensions_dir(Abi::X86_64),
+            Path::new("/usr/lib/x86_64-linux-gnu/GL")
+        );
+        assert_eq!(
+            flatpak_gl_extensions_dir(Abi::Arm64V8a),
+            Path::new("/usr/lib/aarch64-linux-gnu/GL")
+        );
     }
 
     #[test]

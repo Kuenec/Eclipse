@@ -4,6 +4,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
+use eclipse::abi::Abi;
 use eclipse::apk::store::{
     CheckOutcome, InstalledVersion, LeftBecause, Store, StoreError, StoredVersion, UpdateCheck,
 };
@@ -127,6 +128,7 @@ impl fmt::Display for WindowSystem {
 }
 
 struct Cpu {
+    abi: Abi,
     info: Fact<CpuInfo>,
     features: String,
     baseline: Result<(), RuntimeError>,
@@ -365,6 +367,9 @@ struct NewestRun {
 #[derive(Debug, PartialEq, Eq)]
 enum Problem {
     CpuBelowBaseline(&'static str),
+    PageSize {
+        bytes: u64,
+    },
     Graphics(String),
     Media(String),
     RuntimeDir(RuntimeDirProblem),
@@ -392,15 +397,11 @@ impl fmt::Display for Problem {
                 "This CPU lacks {feature}. Roblox's Android x86-64 client needs SSSE3, SSE4.1, \
                  SSE4.2 and POPCNT, so it cannot run on this computer."
             ),
-            Self::Graphics(problem) | Self::Media(problem) => f.write_str(problem),
-            Self::RuntimeDir(problem) => {
-                let text = problem.to_string();
-                let mut characters = text.chars();
-                if let Some(first) = characters.next() {
-                    write!(f, "{}{}.", first.to_uppercase(), characters.as_str())?;
-                }
-                Ok(())
+            Self::PageSize { bytes } => {
+                write_sentence(f, &RuntimeError::PageSize { bytes: *bytes }.to_string())
             }
+            Self::Graphics(problem) | Self::Media(problem) => f.write_str(problem),
+            Self::RuntimeDir(problem) => write_sentence(f, &problem.to_string()),
             Self::LowSpace { path, free } => write!(
                 f,
                 "Only {} is free where Roblox is stored ({}). A Roblox update downloads about \
@@ -442,6 +443,14 @@ impl fmt::Display for Problem {
             ),
         }
     }
+}
+
+fn write_sentence(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
+    let mut characters = text.chars();
+    if let Some(first) = characters.next() {
+        write!(f, "{}{}.", first.to_uppercase(), characters.as_str())?;
+    }
+    Ok(())
 }
 
 fn flag_names(fflags: &BTreeMap<String, serde_json::Value>) -> String {
@@ -514,9 +523,10 @@ impl Doctor {
                 sdl: eclipse::gamepad::sdl_version().map(|version| version.to_string()),
             },
             cpu: Cpu {
+                abi: Abi::HOST,
                 info: read_fact(CPU_INFO).map(|text| parse_cpu_info(&text)),
                 features: eclipse::runtime::instruction_set_features(),
-                baseline: eclipse::runtime::android_cpu_baseline(),
+                baseline: eclipse::runtime::host_requirements(),
             },
             memory: read_fact(MEM_INFO).and_then(|text| {
                 parse_mem_info(&text).ok_or_else(|| format!("{MEM_INFO} names no MemTotal"))
@@ -565,8 +575,12 @@ impl Doctor {
 
     fn problems(&self) -> Vec<Problem> {
         let mut problems = Vec::new();
-        if let Err(RuntimeError::CpuLacksFeature(feature)) = self.cpu.baseline {
-            problems.push(Problem::CpuBelowBaseline(feature));
+        match self.cpu.baseline {
+            Err(RuntimeError::CpuLacksFeature(feature)) => {
+                problems.push(Problem::CpuBelowBaseline(feature));
+            }
+            Err(RuntimeError::PageSize { bytes }) => problems.push(Problem::PageSize { bytes }),
+            _ => {}
         }
         problems.extend(
             self.graphics
@@ -800,9 +814,10 @@ impl Doctor {
             format!("{}, {} logical CPUs", or_unknown(&info.model), info.logical)
         })?;
         writeln!(f, "  Features for ART: {}", self.cpu.features)?;
+        let abi = self.cpu.abi.label();
         match &self.cpu.baseline {
-            Ok(()) => writeln!(f, "  Android x86-64 baseline: met"),
-            Err(error) => writeln!(f, "  Android x86-64 baseline: {error}"),
+            Ok(()) => writeln!(f, "  Android {abi} baseline: met"),
+            Err(error) => writeln!(f, "  Android {abi} baseline: {error}"),
         }
     }
 
@@ -1024,6 +1039,7 @@ mod tests {
                 sdl: Ok("3.2.24".to_owned()),
             },
             cpu: Cpu {
+                abi: Abi::X86_64,
                 info: Ok(CpuInfo {
                     model: Some("AMD Ryzen 7 5800X 8-Core Processor".to_owned()),
                     logical: 16,
@@ -1125,6 +1141,37 @@ mod tests {
         let mut doctor = healthy();
         doctor.cpu.baseline = Err(RuntimeError::CpuLacksFeature("SSE4.1"));
         assert_eq!(doctor.problems(), [Problem::CpuBelowBaseline("SSE4.1")]);
+    }
+
+    #[test]
+    fn a_kernel_with_16_kib_pages_is_named() {
+        let mut doctor = healthy();
+        doctor.cpu.abi = Abi::Arm64V8a;
+        doctor.cpu.baseline = Err(RuntimeError::PageSize { bytes: 16384 });
+        assert_eq!(doctor.problems(), [Problem::PageSize { bytes: 16384 }]);
+        let report = doctor.to_string();
+        assert!(
+            report.contains(
+                "Problems\n  - This Linux kernel uses 16 KiB memory pages, but Eclipse's Android \
+                 runtime needs 4 KiB pages; on a Raspberry Pi 5, add kernel=kernel8.img to \
+                 /boot/firmware/config.txt and reboot.\n"
+            ),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn the_cpu_baseline_line_names_the_host_abi() {
+        let mut doctor = healthy();
+        doctor.cpu.abi = Abi::Arm64V8a;
+        doctor.cpu.features = "a53,crc,-lse,-fp16,-dotprod".to_owned();
+        let report = doctor.to_string();
+        assert!(
+            report.contains(
+                "  Features for ART: a53,crc,-lse,-fp16,-dotprod\n  Android ARM64 baseline: met\n"
+            ),
+            "{report}"
+        );
     }
 
     #[test]

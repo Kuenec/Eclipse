@@ -5,10 +5,13 @@ pub mod bionic_env;
 pub mod bionic_locale;
 pub mod bionic_pthread;
 pub mod bionic_sysconf;
+#[cfg(target_arch = "aarch64")]
+mod bionic_tls_slots;
 pub mod dlfcn;
 mod egl_seam;
 pub mod elf;
 pub mod engine;
+mod fault_registers;
 pub mod frame_log;
 pub mod init_run;
 pub mod jni_mangle;

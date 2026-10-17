@@ -37,6 +37,10 @@ Roblox for Android sells Robux and Premium only through Google Play, so buying t
 
 Controllers need Flatpak 1.16 or newer. On older Flatpak, run `flatpak override --user --device=all io.github.kuenec.Eclipse`. A controller SDL does not recognize needs an [SDL mapping](https://wiki.libsdl.org/SDL3/SDL_HINT_GAMECONTROLLERCONFIG): `flatpak override --user --env=SDL_GAMECONTROLLERCONFIG="<mapping>" io.github.kuenec.Eclipse`. Eclipse can read input devices for controllers, which includes keyboards if your user is in the `input` group. To remove that access, run `flatpak override --user --nodevice=input io.github.kuenec.Eclipse`; to only turn controllers off, set `allow_gamepad_permission` to `false`.
 
+## ARM
+
+Eclipse's 64-bit ARM build is not published and has not been tested with Roblox yet. To try it, download the `eclipse-aarch64.flatpak` artifact of a release tag's [Flatpak run](https://github.com/Kuenec/Eclipse/actions/workflows/flatpak.yml) while signed in to GitHub and install it with `flatpak install --user eclipse-aarch64.flatpak`, or build it from source as [CONTRIBUTING.md](../CONTRIBUTING.md) describes. It needs a Linux kernel with 4 KiB memory pages, which Raspberry Pi 4, RK3588 boards and Snapdragon X laptops use. On a Raspberry Pi 5, add `kernel=kernel8.img` to `/boot/firmware/config.txt` and reboot. Apple Silicon kernels use 16 KiB pages, which Eclipse does not support yet. The GPU needs a Vulkan or OpenGL ES driver, such as Mesa's Turnip, V3DV or PanVK. To install from your own files, use `split_config.arm64_v8a.apk` in place of `split_config.x86_64.apk`.
+
 ## Variable refresh rate
 
 On Wayland, Eclipse marks its game window as a game, which compositors such as Hyprland (`misc:vrr = 3`) use to turn on variable refresh rate in fullscreen.

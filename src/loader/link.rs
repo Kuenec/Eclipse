@@ -3,30 +3,62 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::elf::{ElfError, ElfImage};
 use super::map::{
     host_page_size, MapError, MapStats, MappedObject, PartialSymbolStats, SymbolRelocStats,
     TlsRelocStats,
 };
-use super::reloc::{self, Rela, SymbolResolver};
+use super::reloc::{Rela, RelocKind, SymbolResolver};
 use super::resolve::{HostDlsymProvider, LoadedObjectProvider, Scope, ScopedResolver};
 use super::tls::TlsLayout;
+use crate::abi::Abi;
 use crate::mapped_file::MappedFile;
-
-const R_X86_64_IRELATIVE: u32 = 37;
 
 #[derive(Debug)]
 pub enum LinkError {
-    MissingDependency { soname: String, needed_by: String },
+    MissingDependency {
+        soname: String,
+        needed_by: String,
+    },
 
-    Io { path: PathBuf, error: String },
+    ForeignAbi {
+        object: String,
+        abi: Abi,
+        host: Abi,
+    },
 
-    Parse { object: String, error: ElfError },
+    UnsupportedTls {
+        object: String,
+        abi: Abi,
+    },
 
-    Map { object: String, error: MapError },
+    #[cfg(target_arch = "aarch64")]
+    BionicTlsLayout,
 
-    DynStrings { object: String, error: ElfError },
+    #[cfg(target_arch = "aarch64")]
+    BionicStackGuard,
+
+    Io {
+        path: PathBuf,
+        error: String,
+    },
+
+    Parse {
+        object: String,
+        error: ElfError,
+    },
+
+    Map {
+        object: String,
+        error: MapError,
+    },
+
+    DynStrings {
+        object: String,
+        error: ElfError,
+    },
 }
 
 impl fmt::Display for LinkError {
@@ -35,6 +67,28 @@ impl fmt::Display for LinkError {
             Self::MissingDependency { soname, needed_by } => write!(
                 f,
                 "dependency {soname:?} (needed by {needed_by:?}) not found on any search path"
+            ),
+            Self::ForeignAbi { object, abi, host } => write!(
+                f,
+                "{object} is built for {}; this host is {}",
+                abi.label(),
+                host.label()
+            ),
+            Self::UnsupportedTls { object, abi } => write!(
+                f,
+                "{object} has a PT_TLS segment, and Eclipse lays out static TLS only for x86-64 \
+                 code, not {}",
+                abi.label()
+            ),
+            #[cfg(target_arch = "aarch64")]
+            Self::BionicTlsLayout => f.write_str(
+                "this Eclipse build places its own thread-locals where Android code reads its \
+                 stack canary; the build is broken",
+            ),
+            #[cfg(target_arch = "aarch64")]
+            Self::BionicStackGuard => f.write_str(
+                "Eclipse could not give Android code a random stack canary on this thread, so it \
+                 runs no Android code",
             ),
             Self::Io { path, error } => write!(f, "reading {}: {error}", path.display()),
             Self::Parse { object, error } => write!(f, "decoding {object}: {error}"),
@@ -79,12 +133,15 @@ pub struct RelocStats {
     pub tpoff64_applied: usize,
 
     pub irelative_deferred: usize,
+
+    pub icache_sync: Duration,
 }
 
 impl RelocStats {
     fn accumulate(&mut self, map: MapStats, sym: SymbolRelocStats, tls: TlsRelocStats) {
         self.relative_applied += map.relative_applied;
         self.relr_applied += map.relr_applied;
+        self.icache_sync += map.icache_sync;
         self.glob_dat_applied += sym.glob_dat_applied;
         self.jump_slot_applied += sym.jump_slot_applied;
         self.abs64_applied += sym.abs64_applied;
@@ -202,6 +259,16 @@ impl Linker {
     }
 
     pub fn load(&self, root_path: impl AsRef<Path>) -> Result<LoadedImageSet, LinkError> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use super::bionic_tls_slots;
+            if !bionic_tls_slots::at_thread_pointer() {
+                return Err(LinkError::BionicTlsLayout);
+            }
+            if !bionic_tls_slots::stack_guard_seeded() {
+                return Err(LinkError::BionicStackGuard);
+            }
+        }
         let page = host_page_size();
         let root_path = root_path.as_ref().to_path_buf();
 
@@ -287,20 +354,9 @@ impl Linker {
                 object: obj.soname.clone(),
                 error,
             })?;
-            if let Some(tls) = img.tls {
-                let tdata_off = img
-                    .vaddr_to_off(tls.vaddr)
-                    .map_err(|error| LinkError::Parse {
-                        object: obj.soname.clone(),
-                        error,
-                    })?;
-                let module =
-                    MappedObjectTls::add(&mut tls_layout, &tls, &obj.bytes, tdata_off as u64, &img)
-                        .map_err(|error| LinkError::Map {
-                            object: obj.soname.clone(),
-                            error,
-                        })?;
-                own_tp_offset.insert(idx, module.tp_offset);
+            if let Some(tp_offset) = add_static_tls(&mut tls_layout, &obj.soname, &obj.bytes, &img)?
+            {
+                own_tp_offset.insert(idx, tp_offset);
             }
         }
 
@@ -330,7 +386,7 @@ impl Linker {
             })?;
             stats.irelative_deferred += relas
                 .iter()
-                .filter(|r| r.r_type == R_X86_64_IRELATIVE)
+                .filter(|r| r.kind == RelocKind::IRelative)
                 .count();
 
             let object_unresolved = enumerate_unresolved_strong(&relas, &img, &scope, &soname);
@@ -416,6 +472,13 @@ impl Linker {
             object: ident.clone(),
             error,
         })?;
+        if img.abi != Abi::HOST {
+            return Err(LinkError::ForeignAbi {
+                object: ident,
+                abi: img.abi,
+                host: Abi::HOST,
+            });
+        }
 
         let soname = img
             .soname()
@@ -485,11 +548,7 @@ fn enumerate_unresolved_strong(
     let resolver = ScopedResolver::new(scope, &img.dynsyms);
     let mut out = Vec::new();
     for r in relas {
-        let is_symbol_reloc = matches!(
-            r.r_type,
-            reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64
-        );
-        if !is_symbol_reloc {
+        if !r.kind.writes_symbol_address() {
             continue;
         }
 
@@ -507,6 +566,40 @@ fn enumerate_unresolved_strong(
         }
     }
     out
+}
+
+fn add_static_tls(
+    layout: &mut TlsLayout,
+    object: &str,
+    file: &[u8],
+    img: &ElfImage<'_>,
+) -> Result<Option<i64>, LinkError> {
+    let Some(tls) = img.tls else {
+        return Ok(None);
+    };
+    match img.abi {
+        Abi::X86_64 => {}
+        Abi::Arm64V8a => {
+            return Err(LinkError::UnsupportedTls {
+                object: object.to_string(),
+                abi: img.abi,
+            })
+        }
+    }
+    let tdata_off = img
+        .vaddr_to_off(tls.vaddr)
+        .map_err(|error| LinkError::Parse {
+            object: object.to_string(),
+            error,
+        })?;
+    let module =
+        MappedObjectTls::add(layout, &tls, file, tdata_off as u64, img).map_err(|error| {
+            LinkError::Map {
+                object: object.to_string(),
+                error,
+            }
+        })?;
+    Ok(Some(module.tp_offset))
 }
 
 struct MappedObjectTls;
@@ -538,9 +631,8 @@ fn tls_err_static(e: &super::tls::TlsError) -> &'static str {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::loader::elf::tests::{put_phdr, ProgramHeader};
+    use crate::loader::elf::tests::{host_lib_dirs, host_library, put_phdr, ProgramHeader};
     use crate::loader::elf::{PF_R, PF_W, PF_X};
-    use crate::loader::reloc::R_X86_64_GLOB_DAT;
     use std::io::Write;
 
     const PAGE: u64 = 0x1000;
@@ -560,7 +652,6 @@ pub(crate) mod tests {
     const EI_CLASS: usize = 4;
     const EI_DATA: usize = 5;
     const ET_DYN: u16 = 3;
-    const EM_X86_64: u16 = 62;
     const EHDR_SIZE: usize = 64;
     const PHDR_SIZE: usize = 56;
     const DYN_SIZE: usize = 16;
@@ -584,8 +675,10 @@ pub(crate) mod tests {
     const RELA_ENT: u64 = 24;
     const INIT_ARRAY_OFF: u64 = 0x1800;
     const INIT_STUB_OFF: u64 = 0x1900;
+    const TLS_OFF: u64 = 0x1c00;
     const MOVABS_RAX: [u8; 2] = [0x48, 0xb8];
     const JMP_RAX: [u8; 2] = [0xff, 0xe0];
+    const LDR_X16_PLUS_8_BR_X16: [u8; 8] = [0x50, 0x00, 0x00, 0x58, 0x00, 0x02, 0x1f, 0xd6];
 
     fn put_u16(buf: &mut [u8], off: usize, v: u16) {
         buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
@@ -610,7 +703,7 @@ pub(crate) mod tests {
         buf[EI_DATA] = ELFDATA2LSB;
         buf[6] = 1;
         put_u16(&mut buf, 16, ET_DYN);
-        put_u16(&mut buf, 18, EM_X86_64);
+        put_u16(&mut buf, 18, Abi::HOST.elf_machine());
         put_u32(&mut buf, 20, 1);
         put_u64(&mut buf, 32, PH_OFF as u64);
         put_u16(&mut buf, 52, EHDR_SIZE as u16);
@@ -683,7 +776,8 @@ pub(crate) mod tests {
         let rela_count = if import.is_some() { 1 } else { 0 };
         if import.is_some() {
             put_u64(&mut buf, RELA_OFF as usize, GLOB_TARGET);
-            let r_info = ((import_index as u64) << 32) | R_X86_64_GLOB_DAT as u64;
+            let r_info =
+                ((import_index as u64) << 32) | u64::from(RelocKind::GlobDat.encode(Abi::HOST));
             put_u64(&mut buf, RELA_OFF as usize + 8, r_info);
             put_u64(&mut buf, RELA_OFF as usize + 16, 0);
         }
@@ -731,6 +825,14 @@ pub(crate) mod tests {
         }
     }
 
+    fn jump_stub(abi: Abi, target: u64) -> Vec<u8> {
+        let target = target.to_le_bytes();
+        match abi {
+            Abi::X86_64 => [&MOVABS_RAX[..], &target, &JMP_RAX].concat(),
+            Abi::Arm64V8a => [&LDR_X16_PLUS_8_BR_X16[..], &target].concat(),
+        }
+    }
+
     pub(crate) fn build_so_with_constructors(
         soname: &str,
         init_target: Option<u64>,
@@ -739,10 +841,9 @@ pub(crate) mod tests {
         let mut buf = build_so(soname, &[], None, None);
         let mut dynamic = Vec::new();
         if let Some(target) = init_target {
-            let stub = INIT_STUB_OFF as usize;
-            buf[stub..stub + 2].copy_from_slice(&MOVABS_RAX);
-            put_u64(&mut buf, stub + 2, target);
-            buf[stub + 10..stub + 12].copy_from_slice(&JMP_RAX);
+            let stub = jump_stub(Abi::HOST, target);
+            let start = INIT_STUB_OFF as usize;
+            buf[start..start + stub.len()].copy_from_slice(&stub);
             dynamic.push((DT_INIT, INIT_STUB_OFF));
         }
         for (index, &entry) in init_array.iter().enumerate() {
@@ -976,35 +1077,117 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    const HOST_LIB_DIRS: &[&str] = &[
-        "/usr/lib",
-        "/usr/lib/x86_64-linux-gnu",
-        "/lib/x86_64-linux-gnu",
-        "/lib64",
-        "/usr/lib64",
-    ];
+    #[test]
+    fn linker_rejects_a_foreign_abi_image() {
+        let dir = temp_dir("foreign-abi");
+        let foreign = Abi::HOST.other();
+        let mut so = build_so("foreign.so", &[], None, None);
+        put_u16(&mut so, 18, foreign.elf_machine());
+        let path = write_so(&dir, "foreign.so", &so);
 
-    fn find_libm() -> Option<PathBuf> {
-        for d in HOST_LIB_DIRS {
-            let p = Path::new(d).join("libm.so.6");
-            if p.exists() {
-                return Some(p);
-            }
-        }
-        None
+        let err = Linker::new([dir.clone()])
+            .load(&path)
+            .err()
+            .expect("an image built for another machine must not load");
+        assert!(
+            matches!(
+                &err,
+                LinkError::ForeignAbi { object, abi, host }
+                    if object == "foreign.so" && *abi == foreign && *host == Abi::HOST
+            ),
+            "unexpected error {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "foreign.so is built for {}; this host is {}",
+                foreign.label(),
+                Abi::HOST.label()
+            )
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn build_so_with_tls(abi: Abi) -> Vec<u8> {
+        const PT_TLS: u32 = 7;
+        let mut buf = build_so("tls.so", &[], None, None);
+        put_u16(&mut buf, 18, abi.elf_machine());
+        put_u16(&mut buf, 56, 3);
+        put_phdr(
+            &mut buf,
+            2,
+            &ProgramHeader {
+                p_type: PT_TLS,
+                p_flags: PF_R,
+                p_offset: TLS_OFF,
+                p_vaddr: TLS_OFF,
+                p_filesz: 0x10,
+                p_memsz: 0x20,
+                p_align: 0x10,
+            },
+        );
+        buf
     }
 
     #[test]
+    fn aarch64_pt_tls_is_rejected() {
+        let x86_64 = build_so_with_tls(Abi::X86_64);
+        let img = ElfImage::parse(&x86_64).expect("x86-64 TLS fixture parses");
+        assert_eq!(
+            add_static_tls(&mut TlsLayout::new(), "tls.so", &x86_64, &img)
+                .expect("x86-64 static TLS is laid out"),
+            Some(-0x20)
+        );
+
+        let arm64 = build_so_with_tls(Abi::Arm64V8a);
+        let img = ElfImage::parse(&arm64).expect("ARM64 TLS fixture parses");
+        let err = add_static_tls(&mut TlsLayout::new(), "tls.so", &arm64, &img)
+            .expect_err("ARM64 static TLS must be refused");
+        assert!(
+            matches!(
+                &err,
+                LinkError::UnsupportedTls { object, abi: Abi::Arm64V8a } if object == "tls.so"
+            ),
+            "unexpected error {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "tls.so has a PT_TLS segment, and Eclipse lays out static TLS only for x86-64 code, \
+             not ARM64"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn real_libc_static_tls_is_refused_on_aarch64() {
+        let Some(libm_path) = host_library("libm.so.6") else {
+            eprintln!("real_libc_static_tls_is_refused_on_aarch64: no host libm.so.6; skipping");
+            return;
+        };
+        let search: Vec<PathBuf> = host_lib_dirs().into_iter().filter(|p| p.exists()).collect();
+
+        let err = Linker::new(search)
+            .with_host_fallback(false)
+            .load(&libm_path)
+            .err()
+            .expect("glibc's libc.so.6 carries PT_TLS");
+        assert!(
+            matches!(
+                &err,
+                LinkError::UnsupportedTls { object, abi: Abi::Arm64V8a } if object == "libc.so.6"
+            ),
+            "unexpected error {err}"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn real_libm_graph_links_and_relocates() {
-        let Some(libm_path) = find_libm() else {
+        let Some(libm_path) = host_library("libm.so.6") else {
             eprintln!("real_libm_graph_links_and_relocates: no host libm.so.6; skipping");
             return;
         };
-        let search: Vec<PathBuf> = HOST_LIB_DIRS
-            .iter()
-            .map(PathBuf::from)
-            .filter(|p| p.exists())
-            .collect();
+        let search: Vec<PathBuf> = host_lib_dirs().into_iter().filter(|p| p.exists()).collect();
 
         let linker = Linker::new(search).with_host_fallback(false);
         let set = linker
@@ -1050,12 +1233,7 @@ pub(crate) mod tests {
         let libm_relas = libm_image.relocations().expect("decode libm relocations");
         let expected_symbol_relocs = libm_relas
             .iter()
-            .filter(|rela| {
-                matches!(
-                    rela.r_type,
-                    reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64
-                )
-            })
+            .filter(|rela| rela.kind.writes_symbol_address())
             .count();
         assert!(
             expected_symbol_relocs > 0,
@@ -1070,7 +1248,7 @@ pub(crate) mod tests {
 
         let expected_tpoff64 = libm_relas
             .iter()
-            .filter(|rela| rela.r_type == reloc::R_X86_64_TPOFF64)
+            .filter(|rela| rela.kind == RelocKind::TpOff64)
             .count();
         assert_eq!(
             libm.tls_stats.tpoff64_applied, expected_tpoff64,
@@ -1092,7 +1270,7 @@ pub(crate) mod tests {
                     .relocations()
                     .expect("decode linked object relocations")
                     .iter()
-                    .filter(|rela| rela.r_type == R_X86_64_IRELATIVE)
+                    .filter(|rela| rela.kind == RelocKind::IRelative)
                     .count()
             })
             .sum::<usize>();
@@ -1114,7 +1292,7 @@ pub(crate) mod tests {
     fn staged_apk_library(apk: &mut crate::apk::Apk, filename: &str) -> (std::fs::File, PathBuf) {
         use std::os::fd::AsRawFd;
 
-        let entry = format!("lib/{}/{filename}", crate::apk::TARGET_ABI);
+        let entry = format!("lib/{}/{filename}", crate::abi::Abi::HOST.android_name());
         let bytes = apk
             .read_entry(&entry)
             .unwrap_or_else(|e| panic!("read {entry} from APK: {e}"));
@@ -1126,13 +1304,6 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| panic!("stage {filename} in a memfd: {e}"));
         let path = PathBuf::from(format!("/proc/self/fd/{}", staged.as_raw_fd()));
         (staged, path)
-    }
-
-    fn is_symbol_reloc(rela: &Rela) -> bool {
-        matches!(
-            rela.r_type,
-            reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64
-        )
     }
 
     #[test]
@@ -1199,7 +1370,7 @@ pub(crate) mod tests {
         let relas = img.relocations().expect("decode relocations");
         let relatives: Vec<&Rela> = relas
             .iter()
-            .filter(|r| r.r_type == reloc::R_X86_64_RELATIVE)
+            .filter(|r| r.kind == RelocKind::Relative)
             .collect();
         assert!(!relatives.is_empty(), "libroblox has RELATIVE relocations");
         assert_eq!(
@@ -1257,17 +1428,17 @@ pub(crate) mod tests {
             "the one PT_GNU_RELRO region was hardened read-only after relocation"
         );
 
-        let count_type = |t: u32| relas.iter().filter(|r| r.r_type == t).count();
-        let glob_dat = count_type(reloc::R_X86_64_GLOB_DAT);
-        let abs64 = count_type(reloc::R_X86_64_64);
-        let jump_slot = count_type(reloc::R_X86_64_JUMP_SLOT);
+        let count_kind = |kind: RelocKind| relas.iter().filter(|r| r.kind == kind).count();
+        let glob_dat = count_kind(RelocKind::GlobDat);
+        let abs64 = count_kind(RelocKind::Abs64);
+        let jump_slot = count_kind(RelocKind::JumpSlot);
         let symbol_relocs = glob_dat + abs64 + jump_slot;
         assert!(glob_dat > 0, "libroblox has GLOB_DAT relocs");
         assert!(jump_slot > 0, "libroblox has JUMP_SLOT relocs");
         assert_eq!(
             relatives.len() + symbol_relocs,
             relas.len(),
-            "every libroblox reloc is RELATIVE, GLOB_DAT, R_X86_64_64 or JUMP_SLOT"
+            "every libroblox reloc is RELATIVE, GLOB_DAT, ABS64 or JUMP_SLOT"
         );
 
         assert_eq!(
@@ -1276,15 +1447,18 @@ pub(crate) mod tests {
             "no symbol reloc applied in root-only mode (deps absent)"
         );
         assert!(
-            relas.iter().filter(|r| is_symbol_reloc(r)).all(|r| img
-                .dynsyms
-                .get(r.sym_index as usize)
-                .is_some_and(|s| !s.name.is_empty())),
+            relas
+                .iter()
+                .filter(|r| r.kind.writes_symbol_address())
+                .all(|r| img
+                    .dynsyms
+                    .get(r.sym_index as usize)
+                    .is_some_and(|s| !s.name.is_empty())),
             "every symbol reloc binds a decoded, named dynsym"
         );
         let mut strong_import_relocs: Vec<(u32, &str)> = relas
             .iter()
-            .filter(|r| is_symbol_reloc(r))
+            .filter(|r| r.kind.writes_symbol_address())
             .filter_map(|r| {
                 let sym = &img.dynsyms[r.sym_index as usize];
                 let strong_import = sym.shndx == 0 && sym.bind != STB_WEAK;
@@ -1457,11 +1631,7 @@ pub(crate) mod tests {
 
         let mut checked_nonnull = 0usize;
         for r in &all_relas {
-            let is_sym = matches!(
-                r.r_type,
-                reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64
-            );
-            if !is_sym {
+            if !r.kind.writes_symbol_address() {
                 continue;
             }
 
@@ -1673,7 +1843,10 @@ pub(crate) mod tests {
             "no unresolved-strong symbol relocations remain"
         );
 
-        let symbol_relocs: Vec<&Rela> = all_relas.iter().filter(|r| is_symbol_reloc(r)).collect();
+        let symbol_relocs: Vec<&Rela> = all_relas
+            .iter()
+            .filter(|r| r.kind.writes_symbol_address())
+            .collect();
         let weak_zero_relocs = symbol_relocs
             .iter()
             .filter(|r| {
@@ -1697,10 +1870,7 @@ pub(crate) mod tests {
         let obj = &set.objects[0];
         let mut checked_eclipse_slots = 0usize;
         for r in &all_relas {
-            if !matches!(
-                r.r_type,
-                reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64
-            ) {
+            if !r.kind.writes_symbol_address() {
                 continue;
             }
             let name = dynsyms
@@ -1715,10 +1885,11 @@ pub(crate) mod tests {
             if off + 8 <= obj.mapped.span() {
                 let slot = obj.mapped.read_u64(off).expect("read GOT slot");
 
-                let want = if r.r_type == reloc::R_X86_64_64 {
-                    expected.wrapping_add(r.addend as u64)
-                } else {
-                    expected
+                let want = match (r.kind, Abi::HOST) {
+                    (RelocKind::Abs64, _) | (_, Abi::Arm64V8a) => {
+                        expected.wrapping_add(r.addend as u64)
+                    }
+                    (_, Abi::X86_64) => expected,
                 };
                 assert_eq!(
                     slot, want,
@@ -1747,7 +1918,7 @@ pub(crate) mod tests {
 
         let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
         let filenames = apk
-            .native_lib_filenames(crate::apk::TARGET_ABI)
+            .native_lib_filenames(crate::abi::Abi::HOST)
             .expect("list the Roblox APK's native libs");
         let boot_path_libs: Vec<&String> = filenames
             .iter()
@@ -1819,6 +1990,111 @@ pub(crate) mod tests {
                  native(s) in the Eclipse provider tier."
             );
             drop(set);
+        }
+    }
+
+    struct EveryNameAt(u64);
+
+    impl crate::loader::resolve::SymbolProvider for EveryNameAt {
+        fn resolve(&self, _name: &str) -> Option<crate::loader::resolve::ResolvedSym> {
+            Some(crate::loader::resolve::ResolvedSym { addr: self.0 })
+        }
+    }
+
+    #[test]
+    fn arm64_split_libraries_relocate_with_four_kinds() {
+        const SYMBOL: u64 = 0x7f00_dead_0000;
+        let Some(split) = std::env::var_os("ECLIPSE_ROBLOX_ARM64_SPLIT") else {
+            eprintln!(
+                "SKIP: set ECLIPSE_ROBLOX_ARM64_SPLIT to Roblox's split_config.arm64_v8a.apk"
+            );
+            return;
+        };
+
+        let mut apk = crate::apk::Apk::open(Path::new(&split)).expect("open the ARM64 split");
+        crate::apk::signature::verify_roblox_signature(apk.file())
+            .expect("Roblox's certificate signs the ARM64 split");
+        let filenames = apk
+            .native_lib_filenames(Abi::Arm64V8a)
+            .expect("list the ARM64 libraries");
+        assert!(
+            filenames.iter().any(|f| f == "libroblox.so"),
+            "the split carries libroblox.so: {filenames:?}"
+        );
+
+        let page = host_page_size();
+        let mut scope = Scope::new();
+        scope.push(Box::new(EveryNameAt(SYMBOL)));
+        for filename in &filenames {
+            let entry = format!("lib/{}/{filename}", Abi::Arm64V8a.android_name());
+            let bytes = apk
+                .read_entry(&entry)
+                .unwrap_or_else(|e| panic!("read {entry}: {e}"));
+            let img = ElfImage::parse(&bytes).unwrap_or_else(|e| panic!("parse {filename}: {e}"));
+
+            assert_eq!(img.abi, Abi::Arm64V8a, "{filename}");
+            assert!(
+                img.loads.iter().all(|seg| seg.align >= 0x4000),
+                "{filename}: every PT_LOAD is aligned to 16 KiB or more"
+            );
+            assert!(img.tls.is_none(), "{filename}: no PT_TLS");
+            let relas = img
+                .relocations()
+                .unwrap_or_else(|e| panic!("decode {filename} relocations: {e}"));
+            if let Some(other) = relas.iter().find(|r| {
+                !matches!(
+                    r.kind,
+                    RelocKind::Relative
+                        | RelocKind::GlobDat
+                        | RelocKind::JumpSlot
+                        | RelocKind::Abs64
+                )
+            }) {
+                panic!(
+                    "{filename}: relocation {} at {:#x}",
+                    other.kind, other.offset
+                );
+            }
+
+            let (mut mapped, map_stats) = MappedObject::map_and_relocate(&img, &bytes, page)
+                .unwrap_or_else(|e| panic!("map {filename}: {e}"));
+            let sym_stats = mapped
+                .relocate_symbols(&img, &scope, page)
+                .unwrap_or_else(|e| panic!("symbol-relocate {filename}: {e}"));
+            assert_eq!(
+                map_stats.relative_applied + sym_stats.total_applied(),
+                relas.len(),
+                "{filename}: every relocation applies"
+            );
+            assert_eq!(sym_stats.resolved_nonnull, sym_stats.total_applied());
+            for rela in relas.iter().filter(|r| r.kind.writes_symbol_address()) {
+                let slot = mapped
+                    .read_u64(rela.offset as usize)
+                    .expect("read a symbol slot");
+                assert_eq!(
+                    slot,
+                    SYMBOL.wrapping_add(rela.addend as u64),
+                    "{filename}: {} slot {:#x} holds S + A",
+                    rela.kind,
+                    rela.offset
+                );
+            }
+
+            if filename == "libroblox.so" {
+                assert!(img.dyn_info.bind_now(), "libroblox.so: BIND_NOW");
+                assert!(
+                    img.dyn_info.android_rela.is_some(),
+                    "libroblox.so: DT_ANDROID_RELA"
+                );
+            }
+            eprintln!(
+                "{filename}: RELATIVE {} GLOB_DAT {} JUMP_SLOT {} ABS64 {} RELR {}",
+                map_stats.relative_applied,
+                sym_stats.glob_dat_applied,
+                sym_stats.jump_slot_applied,
+                sym_stats.abs64_applied,
+                map_stats.relr_applied
+            );
         }
     }
 

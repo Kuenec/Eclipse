@@ -5,7 +5,7 @@ version = "0.1.16"
 edition = "2021"
 
 rust-version = "1.95"
-description = "Open-source Rust runtime for running the Android x86-64 Roblox client on Linux"
+description = "Open-source Rust runtime for running the Android Roblox client on Linux"
 license = "MIT"
 publish = false
 

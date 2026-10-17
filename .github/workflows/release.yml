@@ -22,7 +22,9 @@ jobs:
     name: Linux x86-64 payload
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    steps:
+    env:
+      ARCH: x86_64
+    steps: &payload-steps
       - name: Check out repository
         uses: actions/checkout@v7
         with:
@@ -56,27 +58,35 @@ jobs:
         run: |
           cargo build --release --locked
           cargo build --release --locked --manifest-path crates/eclipse-webview/Cargo.toml
-          mkdir -p dist/eclipse-linux-x86_64
-          cp target/release/eclipse crates/eclipse-webview/target/release/eclipse-webview dist/eclipse-linux-x86_64/
+          mkdir -p "dist/eclipse-linux-$ARCH"
+          cp target/release/eclipse crates/eclipse-webview/target/release/eclipse-webview "dist/eclipse-linux-$ARCH/"
 
       - name: Create compressed release archive
         run: |
           mkdir -p release
           if [[ "$GITHUB_REF_TYPE" = tag ]]; then
-            archive_name="eclipse-${GITHUB_REF_NAME}-linux-x86_64.tar.zst"
+            archive_name="eclipse-${GITHUB_REF_NAME}-linux-$ARCH.tar.zst"
           else
-            archive_name="eclipse-${GITHUB_SHA:0:7}-linux-x86_64.tar.zst"
+            archive_name="eclipse-${GITHUB_SHA:0:7}-linux-$ARCH.tar.zst"
           fi
-          tar --zstd -cf "release/$archive_name" -C dist eclipse-linux-x86_64
+          tar --zstd -cf "release/$archive_name" -C dist "eclipse-linux-$ARCH"
           sha256sum "release/$archive_name" > release/SHA256SUMS
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: eclipse-complete-linux-x86_64
+          name: eclipse-complete-linux-${{ env.ARCH }}
           path: release/
           if-no-files-found: error
           retention-days: 30
+
+  linux-payload-aarch64:
+    name: Linux ARM64 payload
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    env:
+      ARCH: aarch64
+    steps: *payload-steps
 
   publish:
     name: Attach the payload to the GitHub release

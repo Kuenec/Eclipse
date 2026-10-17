@@ -298,7 +298,7 @@ fn a_terminal_install_prepares_the_client_for_its_next_launch() {
     let status = eclipse::status::StatusSink::terminal();
     let libs_written = set
         .native_libs_mut()
-        .extract_native_libs(eclipse::apk::TARGET_ABI, &libs, &status)
+        .extract_native_libs(eclipse::abi::Abi::HOST, &libs, &status)
         .expect("the installed native libs are checked");
     let assets_written = set
         .base_mut()
