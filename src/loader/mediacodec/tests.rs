@@ -93,9 +93,10 @@ fn create_decoder_by_type_logs_the_requested_mime_under_mediandk() {
     }
     let line = log
         .lines()
-        .find(|line| line.contains("AMediaCodec_createDecoderByType"))
-        .unwrap_or_else(|| panic!("no createDecoderByType line in {log:?}"));
-    assert!(line.contains("DEBUG mediandk:"), "{line}");
+        .find(|line| {
+            line.contains("DEBUG mediandk:") && line.contains("AMediaCodec_createDecoderByType")
+        })
+        .unwrap_or_else(|| panic!("no createDecoderByType debug line in {log:?}"));
     assert!(line.contains("mime=Some(\"video/avc\")"), "{line}");
     assert!(line.contains(&format!("codec={codec:?}")), "{line}");
 }
