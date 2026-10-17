@@ -1,13 +1,18 @@
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use eclipse_config::audio::Direction;
 
 use super::ndk_registry::{NdkHandle, Slab};
+use crate::audio::{InputSource, RecordingSource};
+use crate::diagnostics::MICROPHONE_TARGET;
 
 pub mod harness;
 
@@ -65,6 +70,10 @@ const STATE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const START_GRACE: Duration = Duration::from_secs(1);
 
 const LATE_CALLBACK_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+const LEVEL_REPORT_DELAY: Duration = Duration::from_secs(5);
+
+const LEVEL_REPORT_THREAD: &str = "eclipse-mic-level";
 
 pub(crate) const APP_SAMPLE_RATE: u32 = 48_000;
 
@@ -448,6 +457,203 @@ pub(crate) fn low_latency_burst_frames() -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Run(u64);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct BlockLevel {
+    samples: u64,
+    zero_samples: u64,
+    peak: f32,
+}
+
+impl BlockLevel {
+    fn add(&mut self, sample: f32) {
+        let level = sample.abs();
+        self.samples += 1;
+        self.zero_samples += u64::from(level == 0.0);
+        self.peak = self.peak.max(level);
+    }
+}
+
+#[derive(Default)]
+struct InputLevels {
+    samples: AtomicU64,
+    zero_samples: AtomicU64,
+    peak_bits: AtomicU32,
+}
+
+impl InputLevels {
+    fn add(&self, block: BlockLevel) {
+        self.samples.fetch_add(block.samples, Ordering::Relaxed);
+        self.zero_samples
+            .fetch_add(block.zero_samples, Ordering::Relaxed);
+        self.peak_bits
+            .fetch_max(block.peak.to_bits(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, channels: u16) -> InputLevel {
+        InputLevel {
+            channels,
+            block: BlockLevel {
+                samples: self.samples.load(Ordering::Relaxed),
+                zero_samples: self.zero_samples.load(Ordering::Relaxed),
+                peak: f32::from_bits(self.peak_bits.load(Ordering::Relaxed)),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InputLevel {
+    channels: u16,
+    block: BlockLevel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    NoAudio,
+    DigitalSilence,
+    Sound,
+}
+
+impl InputLevel {
+    fn frames(self) -> u64 {
+        self.block.samples / u64::from(self.channels)
+    }
+
+    fn verdict(self) -> Verdict {
+        match self.block {
+            BlockLevel { samples: 0, .. } => Verdict::NoAudio,
+            BlockLevel {
+                samples,
+                zero_samples,
+                ..
+            } if zero_samples == samples => Verdict::DigitalSilence,
+            BlockLevel { .. } => Verdict::Sound,
+        }
+    }
+
+    fn peak_dbfs(self) -> Dbfs {
+        Dbfs(self.block.peak)
+    }
+
+    fn zero_share(self) -> ZeroShare {
+        ZeroShare(self.block)
+    }
+}
+
+struct Dbfs(f32);
+
+impl fmt::Display for Dbfs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0 > 0.0 {
+            write!(f, "{:.1}", 20.0 * self.0.log10())
+        } else {
+            f.write_str("-inf")
+        }
+    }
+}
+
+struct ZeroShare(BlockLevel);
+
+impl fmt::Display for ZeroShare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let BlockLevel {
+            samples,
+            zero_samples,
+            ..
+        } = self.0;
+        if samples == 0 {
+            return f.write_str("none");
+        }
+        write!(f, "{:.1}%", 100.0 * zero_samples as f64 / samples as f64)
+    }
+}
+
+fn report_first_seconds(level: InputLevel, requested: InputSource) -> RecordingSource {
+    let source = RecordingSource::of_this_process();
+    log_first_seconds(level, &source, &requested.with_default_named());
+    source
+}
+
+fn log_first_seconds(level: InputLevel, source: &RecordingSource, requested: &InputSource) {
+    let seconds = LEVEL_REPORT_DELAY.as_secs();
+    match level.verdict() {
+        Verdict::NoAudio => tracing::warn!(
+            target: MICROPHONE_TARGET,
+            %source,
+            %requested,
+            "AAudio: Roblox's microphone received no audio in its first {seconds} s"
+        ),
+        Verdict::DigitalSilence => tracing::warn!(
+            target: MICROPHONE_TARGET,
+            %source,
+            %requested,
+            frames = level.frames(),
+            "{}",
+            silence_advice(source, requested)
+        ),
+        Verdict::Sound => tracing::info!(
+            target: MICROPHONE_TARGET,
+            %source,
+            %requested,
+            frames = level.frames(),
+            peak_dbfs = %level.peak_dbfs(),
+            zero_share = %level.zero_share(),
+            "AAudio: microphone level after {seconds} s"
+        ),
+    }
+}
+
+fn silence_advice(source: &RecordingSource, requested: &InputSource) -> &'static str {
+    match (source, requested) {
+        (RecordingSource::Listed(sources), InputSource::SystemDefault(Some(default)))
+            if sources.iter().any(|source| source != default) =>
+        {
+            "AAudio: Roblox's microphone hears only silence from a source set for Eclipse in the \
+             sound settings or pavucontrol: unmute it or choose one under Audio in Eclipse Settings"
+        }
+        _ => {
+            "AAudio: Roblox's microphone hears only silence: unmute it (its mute button or the \
+             system's sound settings) or choose another one under Audio in Eclipse Settings"
+        }
+    }
+}
+
+struct LevelReport {
+    cancel: mpsc::Sender<()>,
+    thread: JoinHandle<Option<RecordingSource>>,
+}
+
+impl LevelReport {
+    fn start(
+        delay: Duration,
+        report: impl FnOnce() -> RecordingSource + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let (cancel, cancelled) = mpsc::channel();
+        let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
+        let thread = std::thread::Builder::new()
+            .name(LEVEL_REPORT_THREAD.to_owned())
+            .spawn(move || {
+                let Err(RecvTimeoutError::Timeout) = cancelled.recv_timeout(delay) else {
+                    return None;
+                };
+                Some(tracing::dispatcher::with_default(&dispatch, report))
+            })?;
+        Ok(Self { cancel, thread })
+    }
+
+    fn finish(self) -> Option<RecordingSource> {
+        drop(self.cancel);
+        self.thread
+            .join()
+            .expect("the microphone level report does not panic")
+    }
+}
+
+struct Microphone {
+    requested: InputSource,
+    report: Option<LevelReport>,
+}
+
 struct StreamShared {
     state: AtomicStreamState,
     starts: AtomicU64,
@@ -455,6 +661,7 @@ struct StreamShared {
     xrun_count: AtomicI32,
     host_xrun: AtomicBool,
     host_callbacks: AtomicU64,
+    levels: InputLevels,
 }
 
 impl StreamShared {
@@ -466,6 +673,7 @@ impl StreamShared {
             xrun_count: AtomicI32::new(0),
             host_xrun: AtomicBool::new(false),
             host_callbacks: AtomicU64::new(0),
+            levels: InputLevels::default(),
         }
     }
 
@@ -575,10 +783,33 @@ struct StreamEntry {
     data_path: DataPath,
     format: StreamFormat,
     host: Option<cpal::Stream>,
+    microphone: Option<Microphone>,
     read_logged: bool,
 }
 
 impl StreamEntry {
+    fn report_levels_after_start(&mut self) {
+        let Some(microphone) = &mut self.microphone else {
+            return;
+        };
+        if microphone.report.is_some() {
+            return;
+        }
+        let shared = Arc::clone(&self.shared);
+        let channels = self.format.channels;
+        let requested = microphone.requested.clone();
+        match LevelReport::start(LEVEL_REPORT_DELAY, move || {
+            report_first_seconds(shared.levels.snapshot(channels), requested)
+        }) {
+            Ok(report) => microphone.report = Some(report),
+            Err(error) => tracing::warn!(
+                target: "eclipse::audio",
+                %error,
+                "AAudio: the microphone level report cannot start"
+            ),
+        }
+    }
+
     fn apply(&self, request: Request) -> i32 {
         if request == Request::Pause && self.direction == Direction::Input {
             return AAUDIO_ERROR_UNIMPLEMENTED;
@@ -781,6 +1012,7 @@ impl<A: cpal::SizedSample> Renderer<A> {
     where
         T: cpal::SizedSample,
         A: cpal::FromSample<T>,
+        f32: cpal::FromSample<A>,
     {
         self.follow_route();
         let frames = input.len() / self.channels;
@@ -788,10 +1020,14 @@ impl<A: cpal::SizedSample> Renderer<A> {
         self.note_timing(at, frames);
         let chunk_len = self.scratch.len();
         for chunk in input.chunks(chunk_len) {
+            let mut level = BlockLevel::default();
             for (app, sample) in self.scratch.iter_mut().zip(chunk) {
                 *app = A::from_sample(*sample);
+                level.add(cpal::Sample::from_sample(*app));
             }
-            self.invoke(chunk.len());
+            if self.invoke(chunk.len()) {
+                self.shared.levels.add(level);
+            }
         }
     }
 }
@@ -988,6 +1224,7 @@ fn build_input<T, A>(
 where
     T: cpal::SizedSample,
     A: cpal::SizedSample + cpal::FromSample<T> + Send + 'static,
+    f32: cpal::FromSample<A>,
 {
     device.build_input_stream(
         config,
@@ -1048,6 +1285,10 @@ fn open_stream(settings: &BuilderSettings) -> Result<NdkHandle, i32> {
         cpal::BufferSize::Fixed(frames) => frames,
         cpal::BufferSize::Default => unreachable!("plan_host_stream always fixes the burst"),
     };
+    let requested = match (params.direction, params.data_path) {
+        (Direction::Input, DataPath::Callback(_)) => Some(InputSource::requested()),
+        (Direction::Output, _) | (Direction::Input, DataPath::ReadWrite) => None,
+    };
     let shared = Arc::new(StreamShared::new(burst));
     let handle = streams()
         .insert(StreamEntry {
@@ -1056,6 +1297,10 @@ fn open_stream(settings: &BuilderSettings) -> Result<NdkHandle, i32> {
             data_path: params.data_path,
             format: plan.format,
             host: None,
+            microphone: requested.clone().map(|requested| Microphone {
+                requested,
+                report: None,
+            }),
             read_logged: false,
         })
         .map_err(|_| AAUDIO_ERROR_NO_MEMORY)?;
@@ -1070,6 +1315,7 @@ fn open_stream(settings: &BuilderSettings) -> Result<NdkHandle, i32> {
         sample_rate = plan.format.sample_rate,
         format = ?plan.format.app,
         frames_per_burst = burst,
+        requested = requested.as_ref().map(tracing::field::display),
         "AAudio: stream opened"
     );
     Ok(handle)
@@ -1119,7 +1365,13 @@ fn request(stream: *mut c_void, request: Request) -> i32 {
     if collides_with_callback(stream) {
         return AAUDIO_ERROR_INVALID_STATE;
     }
-    stream_value(stream, |entry| entry.apply(request))
+    stream_value(stream, |entry| {
+        let code = entry.apply(request);
+        if code == AAUDIO_OK && request == Request::Start {
+            entry.report_levels_after_start();
+        }
+        code
+    })
 }
 
 unsafe extern "C" fn create_stream_builder(builder: *mut *mut c_void) -> i32 {
@@ -1216,26 +1468,44 @@ unsafe extern "C" fn stream_close(stream: *mut c_void) -> i32 {
     if collides_with_callback(stream) {
         return AAUDIO_ERROR_INVALID_STATE;
     }
-    let (host, shared, direction) = match with_stream(stream, |entry| {
+    let (host, microphone, shared, direction, channels) = match with_stream(stream, |entry| {
         (
             entry.host.take(),
+            entry.microphone.take(),
             Arc::clone(&entry.shared),
             entry.direction,
+            entry.format.channels,
         )
     }) {
         Ok(closing) => closing,
         Err(code) => return code,
     };
     drop(host);
+    let level_report = microphone
+        .and_then(|microphone| microphone.report)
+        .map(LevelReport::finish);
     if streams().remove(handle_of(stream)).is_err() {
         return AAUDIO_ERROR_INVALID_HANDLE;
     }
-    tracing::info!(
-        target: "eclipse::audio",
-        ?direction,
-        xruns = shared.xrun_count.load(Ordering::Relaxed),
-        "AAudio: stream closed"
-    );
+    let xruns = shared.xrun_count.load(Ordering::Relaxed);
+    match level_report {
+        Some(source) => {
+            let level = shared.levels.snapshot(channels);
+            tracing::info!(
+                target: "eclipse::audio",
+                ?direction,
+                xruns,
+                source = source.as_ref().map(tracing::field::display),
+                frames = level.frames(),
+                peak_dbfs = %level.peak_dbfs(),
+                zero_share = %level.zero_share(),
+                "AAudio: stream closed"
+            );
+        }
+        None => {
+            tracing::info!(target: "eclipse::audio", ?direction, xruns, "AAudio: stream closed");
+        }
+    }
     AAUDIO_OK
 }
 

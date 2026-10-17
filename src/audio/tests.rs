@@ -7,6 +7,7 @@ use super::*;
 const INFO: &[u8] = include_bytes!("../../tests/fixtures/pactl/info.json");
 const SINKS: &[u8] = include_bytes!("../../tests/fixtures/pactl/sinks.json");
 const SOURCES: &[u8] = include_bytes!("../../tests/fixtures/pactl/sources.json");
+const SOURCE_OUTPUTS: &[u8] = include_bytes!("../../tests/fixtures/pactl/source-outputs.json");
 
 const HEADSET: &str = "alsa_output.usb-Example_Headset-00.analog-stereo";
 const HEADSET_MIC: &str = "alsa_input.usb-Example_Headset-00.mono-fallback";
@@ -90,6 +91,29 @@ fn unreadable_json_names_the_pactl_command() {
         error.starts_with("`pactl list sinks` printed unreadable JSON: "),
         "{error}"
     );
+}
+
+fn owner(process_id: &str, binary: &str) -> StreamOwner {
+    StreamOwner {
+        process_id: process_id.to_owned(),
+        binary: binary.to_owned(),
+    }
+}
+
+#[test]
+fn a_recording_belongs_to_a_process_only_with_its_pid_executable_and_app() {
+    let sources = |owner: &StreamOwner| {
+        owned_stream_devices(
+            SOURCE_OUTPUTS,
+            "list source-outputs",
+            Direction::Input,
+            owner,
+        )
+        .expect("the fixture parses")
+    };
+    assert_eq!(sources(&owner("2", "eclipse")), [50]);
+    assert_eq!(sources(&owner("41870", "eclipse")), [46]);
+    assert_eq!(sources(&owner("2", "pacat")), Vec::<u32>::new());
 }
 
 fn chosen(direction: Direction, device: &str) -> Config {

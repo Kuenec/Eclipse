@@ -1,11 +1,10 @@
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use eclipse_config::audio::{DeviceList, DeviceName, Direction};
-use serde::Deserialize;
+use eclipse_config::audio::{DeviceList, DeviceName};
 
 use super::private_server::refuse_unless_private;
-use super::{pactl, parse_json, query};
+use super::query;
 
 const PACTL_LIMIT: Duration = Duration::from_secs(10);
 
@@ -19,25 +18,6 @@ pub(crate) struct NullDevices {
     pub(crate) sink_description: String,
     pub(crate) source_description: String,
     modules: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct Stream {
-    sink: Option<u32>,
-    source: Option<u32>,
-    properties: StreamProperties,
-}
-
-#[derive(Deserialize)]
-struct StreamProperties {
-    #[serde(rename = "application.process.id")]
-    process_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Node {
-    index: u32,
-    name: String,
 }
 
 impl NullDevices {
@@ -143,32 +123,31 @@ impl NullDevices {
             std::thread::sleep(POLL);
         }
     }
+
+    pub(crate) fn take_every_recording(&self) {
+        let listed = change(&["list", "short", "source-outputs"]);
+        assert!(
+            listed.status.success(),
+            "pactl list short source-outputs: {listed:?}"
+        );
+        let recordings = String::from_utf8_lossy(&listed.stdout).into_owned();
+        for recording in recordings.lines() {
+            let (index, _) = recording
+                .split_once('\t')
+                .expect("pactl lists a recording as its index and its details");
+            let moved = change(&["move-source-output", index, self.source.as_str()]);
+            assert!(
+                moved.status.success(),
+                "pactl move-source-output {index} {}: {moved:?}",
+                self.source
+            );
+        }
+    }
 }
 
 fn change(arguments: &[&str]) -> Output {
     refuse_unless_private();
     crate::bounded_child::output(Command::new("pactl").args(arguments), PACTL_LIMIT)
-}
-
-pub(crate) fn stream_device(direction: Direction, process: u32) -> Option<String> {
-    let (streams, nodes) = match direction {
-        Direction::Output => (["list", "sink-inputs"], ["list", "sinks"]),
-        Direction::Input => (["list", "source-outputs"], ["list", "sources"]),
-    };
-    let streams: Vec<Stream> = parse_json(&pactl(&streams).ok()?, "list streams").ok()?;
-    let nodes: Vec<Node> = parse_json(&pactl(&nodes).ok()?, "list nodes").ok()?;
-    let process = process.to_string();
-    let index = streams
-        .into_iter()
-        .find(|stream| stream.properties.process_id.as_deref() == Some(process.as_str()))
-        .and_then(|stream| match direction {
-            Direction::Output => stream.sink,
-            Direction::Input => stream.source,
-        })?;
-    nodes
-        .into_iter()
-        .find(|node| node.index == index)
-        .map(|node| node.name)
 }
 
 impl Drop for NullDevices {

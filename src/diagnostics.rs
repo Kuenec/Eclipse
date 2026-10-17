@@ -37,6 +37,8 @@ const RUN_LOG_LIMITS: RunLogLimits = RunLogLimits {
 };
 pub const STATUS_TARGET: &str = "eclipse::status";
 pub const SUPERVISOR_TARGET: &str = "eclipse::supervisor";
+pub const MICROPHONE_TARGET: &str = "eclipse::microphone";
+pub const EXCERPT_RECORD_BYTES: usize = 400;
 const SECONDS_PER_DAY: u64 = 86_400;
 const DAYS_FROM_MARCH_OF_YEAR_ZERO_TO_EPOCH: u64 = 719_468;
 const DAYS_PER_400_YEARS: u64 = 146_097;

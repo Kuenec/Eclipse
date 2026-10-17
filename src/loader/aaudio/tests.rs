@@ -6,11 +6,11 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use eclipse_config::audio::AudioDevice;
+use eclipse_config::audio::{AudioDevice, DeviceName};
 
-use crate::audio::null_devices::{stream_device, NullDevices};
+use crate::audio::null_devices::NullDevices;
 use crate::audio::private_server::{assert_passed, on_private_server, outcome, test_command};
-use crate::audio::Routing;
+use crate::audio::{stream_devices, Routing, StreamOwner};
 use crate::loader::log_capture::formatted_log;
 use crate::loader::native_provider::EclipseNativeProvider;
 use crate::loader::resolve::SymbolProvider;
@@ -63,6 +63,7 @@ fn detached_stream_with(
                 device: DeviceFormat::Float,
             },
             host: None,
+            microphone: None,
             read_logged: false,
         })
         .expect("insert stream");
@@ -849,6 +850,282 @@ fn input_capture_converts_device_samples_for_the_app() {
         .map(|&s| cpal::Sample::from_sample(s))
         .collect();
     assert_eq!(*probe.received.lock().unwrap(), expected);
+}
+
+#[test]
+fn input_capture_measures_only_the_audio_handed_to_the_app() {
+    let shared = Arc::new(StreamShared::new(4));
+    let probe = CallbackProbe::default();
+    let mut renderer = renderer::<i16>(&shared, record_i16_input, &probe);
+    let mut input = [0.0f32; 20];
+    input[17] = -0.5;
+    input[18] = 0.25;
+
+    renderer.capture_input(&input, Instant::now());
+    assert_eq!(shared.levels.snapshot(2), level(0, 0, 0.0), "not started");
+
+    shared.state.swap(StreamState::Started);
+    renderer.capture_input(&input, Instant::now());
+    assert_eq!(
+        probe.calls.load(Ordering::SeqCst),
+        2,
+        "two scratch-sized chunks"
+    );
+    assert_eq!(shared.levels.snapshot(2), level(20, 18, 0.5));
+}
+
+const REPORT_LIMIT: Duration = Duration::from_secs(10);
+
+const PENDING_REPORT: Duration = Duration::from_secs(60);
+
+fn level(samples: u64, zero_samples: u64, peak: f32) -> InputLevel {
+    InputLevel {
+        channels: 2,
+        block: BlockLevel {
+            samples,
+            zero_samples,
+            peak,
+        },
+    }
+}
+
+#[test]
+fn levels_show_the_peak_in_dbfs_and_the_share_of_zero_samples() {
+    assert_eq!(level(4, 1, 0.5).frames(), 2);
+    assert_eq!(level(4, 1, 0.5).peak_dbfs().to_string(), "-6.0");
+    assert_eq!(level(4, 1, 1.0).peak_dbfs().to_string(), "0.0");
+    assert_eq!(level(4, 4, 0.0).peak_dbfs().to_string(), "-inf");
+    assert_eq!(level(4, 1, 0.5).zero_share().to_string(), "25.0%");
+    assert_eq!(level(0, 0, 0.0).zero_share().to_string(), "none");
+}
+
+const MICROPHONE_LOG: &str = "eclipse::audio=info,eclipse::microphone=info";
+
+fn name(name: &str) -> DeviceName {
+    DeviceName::parse(name).expect("a device name")
+}
+
+const UNMUTE_ADVICE: &str = "AAudio: Roblox's microphone hears only silence: unmute it (its mute \
+                             button or the system's sound settings) or choose another one under \
+                             Audio in Eclipse Settings";
+
+const SET_FOR_ECLIPSE_ADVICE: &str =
+    "AAudio: Roblox's microphone hears only silence from a source set for Eclipse in the sound \
+     settings or pavucontrol: unmute it or choose one under Audio in Eclipse Settings";
+
+#[test]
+fn the_first_seconds_report_tells_sound_from_silence_and_from_no_audio() {
+    let source = RecordingSource::Listed(vec![name("usb_mic")]);
+    let requested = InputSource::SystemDefault(Some(name("usb_mic")));
+    let log = formatted_log(MICROPHONE_LOG, || {
+        log_first_seconds(level(480_000, 1_000, 0.25), &source, &requested);
+        log_first_seconds(level(480_000, 480_000, 0.0), &source, &requested);
+        log_first_seconds(level(0, 0, 0.0), &source, &requested);
+    });
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 3, "{log}");
+    let silence = format!("WARN eclipse::microphone: {UNMUTE_ADVICE}");
+    let expected: [&[&str]; 3] = [
+        &[
+            "INFO eclipse::microphone: AAudio: microphone level after 5 s",
+            "frames=240000",
+            "peak_dbfs=-12.0",
+            "zero_share=0.2%",
+        ],
+        &[&silence, "frames=240000"],
+        &["WARN eclipse::microphone: AAudio: Roblox's microphone received no audio in its first 5 s"],
+    ];
+    for (line, fields) in lines.iter().zip(expected) {
+        for field in fields
+            .iter()
+            .chain(&["source=usb_mic", "requested=usb_mic (system default)"])
+        {
+            assert!(line.contains(field), "{field} missing from {line}");
+        }
+    }
+    assert!(!lines[1].contains("peak_dbfs"), "{}", lines[1]);
+    assert!(!lines[2].contains("mute"), "{}", lines[2]);
+}
+
+#[test]
+fn only_a_silent_source_that_replaced_the_system_default_is_called_set_for_eclipse() {
+    let usb = || RecordingSource::Listed(vec![name("usb_mic")]);
+    let desk = || RecordingSource::Listed(vec![name("desk_mic")]);
+    let usb_by_default = InputSource::SystemDefault(Some(name("usb_mic")));
+    let chosen_usb = InputSource::Chosen(name("usb_mic"));
+    assert_eq!(
+        silence_advice(&desk(), &usb_by_default),
+        SET_FOR_ECLIPSE_ADVICE
+    );
+    for (source, requested) in [
+        (usb(), &usb_by_default),
+        (usb(), &chosen_usb),
+        (desk(), &chosen_usb),
+        (RecordingSource::Listed(Vec::new()), &usb_by_default),
+        (
+            RecordingSource::Unknown("`pactl list source-outputs` failed".to_owned()),
+            &InputSource::SystemDefault(None),
+        ),
+    ] {
+        assert_eq!(
+            silence_advice(&source, requested),
+            UNMUTE_ADVICE,
+            "source={source} requested={requested}"
+        );
+    }
+}
+
+const LONG_SOURCE: &str = "alsa_input.usb-Example_Studio_Microphone_X1-00.analog-stereo";
+
+const OTHER_LONG_SOURCE: &str = "alsa_input.usb-Example_Desk_Microphone_Mk22-00.analog-stereo";
+
+#[test]
+fn microphone_reports_with_long_device_names_fit_a_bug_report_record() {
+    let recorded = RecordingSource::Listed(vec![name(LONG_SOURCE)]);
+    let replaced = RecordingSource::Listed(vec![name(OTHER_LONG_SOURCE)]);
+    let requests = [
+        InputSource::SystemDefault(Some(name(LONG_SOURCE))),
+        InputSource::Chosen(name(LONG_SOURCE)),
+    ];
+    let log = crate::diagnostics::captured_log_lines(|| {
+        for requested in &requests {
+            for source in [&recorded, &replaced] {
+                log_first_seconds(level(480_000, 480_000, 0.0), source, requested);
+                log_first_seconds(level(480_000, 1_000, 0.25), source, requested);
+            }
+        }
+    });
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 8, "{log}");
+    for line in lines {
+        assert!(
+            line.len() <= crate::diagnostics::EXCERPT_RECORD_BYTES,
+            "{} bytes: {line}",
+            line.len()
+        );
+    }
+    assert!(log.contains(SET_FOR_ECLIPSE_ADVICE), "{log}");
+}
+
+#[test]
+fn the_recording_source_lists_every_source_or_says_why_it_is_unknown() {
+    let shown = |source: RecordingSource| source.to_string();
+    assert_eq!(shown(RecordingSource::Listed(Vec::new())), "none listed");
+    assert_eq!(
+        shown(RecordingSource::Listed(vec![
+            name("usb_mic"),
+            name("desk_mic")
+        ])),
+        "usb_mic, desk_mic"
+    );
+    assert_eq!(
+        shown(RecordingSource::Unknown(
+            "`pactl list source-outputs` failed".to_owned()
+        )),
+        "unknown (`pactl list source-outputs` failed)"
+    );
+    assert_eq!(
+        InputSource::Chosen(name("headset_mic")).to_string(),
+        "headset_mic (audio_input_device)"
+    );
+    assert_eq!(
+        InputSource::SystemDefault(None).to_string(),
+        "system default"
+    );
+}
+
+#[test]
+fn a_level_report_runs_once_after_its_delay_unless_the_stream_closes_first() {
+    let headset = RecordingSource::Listed(vec![name("headset_mic")]);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let report = |runs: &Arc<AtomicUsize>| {
+        let runs = Arc::clone(runs);
+        let headset = headset.clone();
+        move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            tracing::info!(target: MICROPHONE_TARGET, "the level report ran");
+            headset
+        }
+    };
+    let log = formatted_log(MICROPHONE_LOG, || {
+        let due = LevelReport::start(Duration::ZERO, report(&runs)).expect("start the report");
+        let deadline = Instant::now() + REPORT_LIMIT;
+        while !due.thread.is_finished() {
+            assert!(Instant::now() < deadline, "the due report never ran");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(due.finish(), Some(headset.clone()));
+
+        let pending = LevelReport::start(PENDING_REPORT, report(&runs)).expect("start the report");
+        let closing = Instant::now();
+        assert_eq!(pending.finish(), None);
+        assert!(
+            closing.elapsed() < REPORT_LIMIT,
+            "closing waited for the report"
+        );
+    });
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(log.matches("the level report ran").count(), 1, "{log}");
+}
+
+fn close_line(stream: *mut c_void) -> String {
+    let log = formatted_log(MICROPHONE_LOG, || unsafe {
+        assert_eq!(stream_close(stream), AAUDIO_OK);
+    });
+    let closed: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("AAudio: stream closed"))
+        .collect();
+    assert_eq!(closed.len(), 1, "{log}");
+    closed[0].to_owned()
+}
+
+fn give_microphone(stream: *mut c_void, report: Option<LevelReport>) {
+    streams()
+        .with(handle_of(stream), |entry| {
+            entry.microphone = Some(Microphone {
+                requested: InputSource::SystemDefault(None),
+                report,
+            });
+        })
+        .expect("the stream is open");
+}
+
+#[test]
+fn a_reported_input_closes_with_the_frames_peak_and_zero_share_the_app_received() {
+    let (stream, shared) = detached_stream(Direction::Input);
+    shared.levels.add(BlockLevel {
+        samples: 960,
+        zero_samples: 96,
+        peak: 0.1,
+    });
+    let report = LevelReport::start(PENDING_REPORT, || RecordingSource::Listed(Vec::new()))
+        .expect("start the report");
+    give_microphone(stream, Some(report));
+    let closed = close_line(stream);
+    for field in [
+        "direction=Input",
+        "xruns=0",
+        "frames=480",
+        "peak_dbfs=-20.0",
+        "zero_share=10.0%",
+    ] {
+        assert!(closed.contains(field), "{field} missing from {closed}");
+    }
+}
+
+#[test]
+fn an_input_closed_before_any_level_report_logs_no_levels() {
+    let (probe, _) = detached_stream_with(Direction::Input, DataPath::ReadWrite);
+    let (unstarted, _) = detached_stream(Direction::Input);
+    give_microphone(unstarted, None);
+    for stream in [probe, unstarted] {
+        let closed = close_line(stream);
+        assert!(closed.contains("direction=Input xruns=0"), "{closed}");
+        for field in ["source=", "frames=", "peak_dbfs=", "zero_share="] {
+            assert!(!closed.contains(field), "{field} in {closed}");
+        }
+    }
 }
 
 fn error_reporter(shared: &Arc<StreamShared>, probe: &CallbackProbe) -> ErrorReporter {
@@ -1651,6 +1928,161 @@ fn started_stream(
     stream
 }
 
+fn report_finished(stream: *mut c_void) -> bool {
+    streams()
+        .with(handle_of(stream), |entry| {
+            entry
+                .microphone
+                .as_ref()
+                .and_then(|microphone| microphone.report.as_ref())
+                .is_some_and(|report| report.thread.is_finished())
+        })
+        .expect("the stream is open")
+}
+
+fn wait_for_the_recording_on(source: &DeviceName, moment: &str) {
+    let wanted = Ok(vec![source.clone()]);
+    let owner = StreamOwner::process(std::process::id()).expect("read this process's executable");
+    let deadline = Instant::now() + MOVE_LIMIT;
+    loop {
+        let seen = stream_devices(Direction::Input, &owner);
+        if seen == wanted {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{moment}: the recording is on {seen:?}, not {wanted:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn record_the_silent_default_microphone_moved_elsewhere(defaults: &NullDevices) {
+    let moved = NullDevices::create("moved");
+    let api = fmod_view();
+    let probe = CallbackProbe::default();
+    let log = formatted_log(MICROPHONE_LOG, || unsafe {
+        let stream = started_stream(&api, AAUDIO_DIRECTION_INPUT, count_input, &probe);
+        wait_for_the_recording_on(&defaults.source, "after the start");
+        moved.take_every_recording();
+        wait_for_the_recording_on(&moved.source, "after the move");
+        let deadline = Instant::now() + LEVEL_REPORT_DELAY + REPORT_LIMIT;
+        while !report_finished(stream) {
+            assert!(
+                Instant::now() < deadline,
+                "no level report after {LEVEL_REPORT_DELAY:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!((api.stop)(stream), AAUDIO_OK);
+        assert_eq!((api.close)(stream), AAUDIO_OK);
+    });
+    assert!(probe.calls.load(Ordering::SeqCst) > 0, "{log}");
+    assert!(probe.errors.lock().unwrap().is_empty(), "{log}");
+    let source = format!("source={}", moved.source);
+    let line = |needle: &str| {
+        let found: Vec<&str> = log.lines().filter(|line| line.contains(needle)).collect();
+        assert_eq!(found.len(), 1, "{needle}: {log}");
+        found[0]
+    };
+    let opened = line("AAudio: stream opened");
+    assert!(opened.contains("requested=system default"), "{opened}");
+    let silent = line(SET_FOR_ECLIPSE_ADVICE);
+    assert!(silent.contains("WARN"), "{silent}");
+    assert!(silent.contains(&source), "{silent}");
+    assert!(
+        silent.contains(&format!("requested={} (system default)", defaults.source)),
+        "{silent}"
+    );
+    let closed = line("AAudio: stream closed");
+    assert!(closed.contains(&source), "{closed}");
+    assert!(closed.contains("zero_share=100.0%"), "{closed}");
+    assert!(closed.contains("peak_dbfs=-inf"), "{closed}");
+}
+
+#[test]
+fn the_level_report_names_the_source_the_recording_was_moved_to() {
+    on_private_server(
+        "loader::aaudio::tests::the_level_report_names_the_source_the_recording_was_moved_to",
+        record_the_silent_default_microphone_moved_elsewhere,
+    );
+}
+
+const PROBED_PAGES: usize = 1024;
+
+fn thread_minor_faults() -> u64 {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").expect("read this thread's stat");
+    let (_, fields) = stat
+        .rsplit_once(") ")
+        .expect("a stat line ends its name with \") \"");
+    fields
+        .split(' ')
+        .nth(7)
+        .expect("a stat line has minflt")
+        .parse()
+        .expect("minflt is a count")
+}
+
+fn faults_rewriting_memory_after(action: impl FnOnce()) -> u64 {
+    let page = rustix::param::page_size();
+    let len = PROBED_PAGES * page;
+    let memory = unsafe {
+        rustix::mm::mmap_anonymous(
+            std::ptr::null_mut(),
+            len,
+            rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+            rustix::mm::MapFlags::PRIVATE,
+        )
+    }
+    .expect("map the probed memory");
+    unsafe { rustix::mm::madvise(memory, len, rustix::mm::Advice::LinuxNoHugepage) }
+        .expect("keep the probed memory in small pages");
+    let write_every_page = |value: u8| {
+        for offset in (0..len).step_by(page) {
+            unsafe { memory.cast::<u8>().add(offset).write_volatile(value) };
+        }
+    };
+    write_every_page(1);
+    action();
+    let before = thread_minor_faults();
+    write_every_page(2);
+    let faults = thread_minor_faults() - before;
+    unsafe { rustix::mm::munmap(memory, len) }.expect("unmap the probed memory");
+    faults
+}
+
+fn look_up_the_recording_source(_: &NullDevices) {
+    let half = PROBED_PAGES as u64 / 2;
+    let forked = faults_rewriting_memory_after(|| {
+        crate::audio::query().expect("list the private server's devices");
+    });
+    assert!(
+        forked > half,
+        "a forking pactl query made only {forked} of {PROBED_PAGES} pages fault"
+    );
+    let mut source = None;
+    let looked_up = faults_rewriting_memory_after(|| {
+        source = Some(report_first_seconds(
+            level(0, 0, 0.0),
+            InputSource::SystemDefault(None),
+        ));
+    });
+    assert_eq!(source, Some(RecordingSource::Listed(Vec::new())));
+    assert!(
+        looked_up < half,
+        "the recording source lookup made {looked_up} of {PROBED_PAGES} pages fault, so it \
+         forked the client"
+    );
+}
+
+#[test]
+fn the_recording_source_lookup_does_not_fork_the_client() {
+    on_private_server(
+        "loader::aaudio::tests::the_recording_source_lookup_does_not_fork_the_client",
+        look_up_the_recording_source,
+    );
+}
+
 fn play_silence_and_record_until(stop: &Path) {
     let pulse = cpal::DeviceId::new(cpal::HostId::Alsa, crate::audio::PULSE_PCM);
     for direction in Direction::ALL {
@@ -1908,8 +2340,8 @@ fn play_and_record_reopening_until(stop: &Path) {
 
 fn wait_for_streams_on(player: &mut ChildTest, devices: &NullDevices, moment: &str) {
     let wanted = (
-        Some(devices.sink.to_string()),
-        Some(devices.source.to_string()),
+        Ok(vec![devices.sink.clone()]),
+        Ok(vec![devices.source.clone()]),
     );
     let deadline = Instant::now() + MOVE_LIMIT;
     loop {
@@ -1918,9 +2350,13 @@ fn wait_for_streams_on(player: &mut ChildTest, devices: &NullDevices, moment: &s
                 "{moment}: the player ended before its streams reached {wanted:?}"
             ));
         }
+        let owner = match StreamOwner::process(player.id()) {
+            Ok(owner) => owner,
+            Err(error) => player.fail(&format!("{moment}: {error}")),
+        };
         let seen = (
-            stream_device(Direction::Output, player.id()),
-            stream_device(Direction::Input, player.id()),
+            stream_devices(Direction::Output, &owner),
+            stream_devices(Direction::Input, &owner),
         );
         if seen == wanted {
             return;

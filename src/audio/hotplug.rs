@@ -5,7 +5,7 @@ use eclipse_config::audio::{DeviceList, DeviceName, Direction, SoundDevices};
 use eclipse_config::SettingKey;
 use serde::Deserialize;
 
-use super::{noun, pactl_command, parse_json, pulse_variable, query, LOG_TARGET, PACTL};
+use super::{chosen_target, noun, pactl_command, parse_json, query, LOG_TARGET, PACTL};
 
 const FOLLOWER_THREAD: &str = "eclipse-sound-devices";
 
@@ -165,10 +165,7 @@ fn standings(chosen: &[(Direction, DeviceName)], devices: &SoundDevices) -> Vec<
 fn chosen_targets() -> Vec<(Direction, DeviceName)> {
     Direction::ALL
         .into_iter()
-        .filter_map(|direction| {
-            let name = std::env::var(pulse_variable(direction)).ok()?;
-            Some((direction, DeviceName::parse(&name)?))
-        })
+        .filter_map(|direction| Some((direction, chosen_target(direction)?)))
         .collect()
 }
 
