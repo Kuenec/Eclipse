@@ -448,7 +448,7 @@ impl Images {
 
     fn insert(&self, image: Image) -> Result<NdkHandle, ReaderError> {
         self.live
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
                 (live < MAX_LIVE_IMAGES).then_some(live + 1)
             })
             .map_err(|_| ReaderError::TooManyImages)?;

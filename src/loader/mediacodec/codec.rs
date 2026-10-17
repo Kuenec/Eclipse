@@ -1066,7 +1066,7 @@ impl Codecs {
     ) -> Result<NdkHandle, Refusal> {
         let (codec, library) = decoder_for(backend, mime)?;
         self.live
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
                 (live < MAX_LIVE_CODECS).then_some(live + 1)
             })
             .map_err(|_| Refusal::TooManyCodecs)?;
