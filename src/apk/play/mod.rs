@@ -17,10 +17,8 @@ use super::proto::{
     ProtoError,
 };
 use super::store::{Staging, StoreError};
-use super::{
-    ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, NATIVE_SPLIT_APK, NATIVE_SPLIT_NAME,
-    ROBLOX_PACKAGE,
-};
+use super::{ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, ROBLOX_PACKAGE};
+use crate::abi::Abi;
 use crate::https::{self, Download, DownloadError, Host, Resume};
 use crate::status::StatusSink;
 
@@ -195,7 +193,7 @@ pub fn install(
     download(
         &downloads,
         &delivery.native_split,
-        &staging.dir().join(NATIVE_SPLIT_APK),
+        &staging.dir().join(delivery.native_split.file),
         status,
     )?;
     status.step("Checking Roblox's signature and installing it…");
@@ -354,7 +352,7 @@ impl<'a> Session<'a> {
             .call()
             .map_err(|error| PlayError::http(STEP, error))?;
         let body = api_body(STEP, response)?;
-        parse_delivery(&body)
+        parse_delivery(Abi::HOST, &body)
     }
 }
 
@@ -516,7 +514,7 @@ struct Delivery {
     native_split: Artifact,
 }
 
-fn parse_delivery(body: &[u8]) -> Result<Delivery, PlayError> {
+fn parse_delivery(abi: Abi, body: &[u8]) -> Result<Delivery, PlayError> {
     const STEP: &str = "the Roblox delivery request";
     let response_error = |source| PlayError::Response { step: STEP, source };
     let delivery =
@@ -549,12 +547,12 @@ fn parse_delivery(body: &[u8]) -> Result<Delivery, PlayError> {
         let name = string_field(split, 1)
             .map_err(response_error)?
             .unwrap_or_default();
-        if name == NATIVE_SPLIT_NAME {
-            native_split = Some(artifact(NATIVE_SPLIT_APK, split, 5, 2, 9)?);
+        if name == abi.split_name() {
+            native_split = Some(artifact(abi.split_apk(), split, 5, 2, 9)?);
         }
         offered.push(name.to_owned());
     }
-    let native_split = native_split.ok_or(PlayError::MissingNativeSplit { offered })?;
+    let native_split = native_split.ok_or(PlayError::MissingNativeSplit { abi, offered })?;
     Ok(Delivery { base, native_split })
 }
 
@@ -769,6 +767,7 @@ pub enum PlayError {
     Encrypted,
 
     MissingNativeSplit {
+        abi: Abi,
         offered: Vec<String>,
     },
 
@@ -871,9 +870,10 @@ impl fmt::Display for PlayError {
                 )
             }
             Self::Encrypted => f.write_str("Google Play offered only an encrypted download"),
-            Self::MissingNativeSplit { offered } => write!(
+            Self::MissingNativeSplit { abi, offered } => write!(
                 f,
-                "Google Play offered no {NATIVE_SPLIT_NAME} split (offered: {})",
+                "Google Play offered no {} split (offered: {})",
+                abi.split_name(),
                 offered.join(", ")
             ),
             Self::BadHash { file } => {
@@ -1001,10 +1001,19 @@ mod tests {
             .message(
                 15,
                 &split_delivery(
-                    NATIVE_SPLIT_NAME,
+                    "config.x86_64",
                     "https://play.googleapis.com/download/by-token/download?token=split",
                     54_000_000,
                     &digest_text(0xbb),
+                ),
+            )
+            .message(
+                15,
+                &split_delivery(
+                    "config.arm64_v8a",
+                    "https://play.googleapis.com/download/by-token/download?token=arm64",
+                    52_000_000,
+                    &digest_text(0xcc),
                 ),
             );
         app
@@ -1080,23 +1089,37 @@ mod tests {
 
     #[test]
     fn delivery_yields_base_and_x86_64_split_with_hashes() {
-        let delivery = parse_delivery(&delivery_reply(Some(1), Some(&roblox_app_delivery())))
-            .expect("delivery parses");
+        let reply = delivery_reply(Some(1), Some(&roblox_app_delivery()));
+        let delivery = parse_delivery(Abi::X86_64, &reply).expect("delivery parses");
         assert_eq!(delivery.base.file, BASE_APK);
         assert_eq!(delivery.base.size, Some(97_000_000));
         assert_eq!(delivery.base.sha256, [0xaa; 32]);
         assert!(delivery.base.url.ends_with("token=base"));
-        assert_eq!(delivery.native_split.file, NATIVE_SPLIT_APK);
+        assert_eq!(delivery.native_split.file, "split_config.x86_64.apk");
         assert_eq!(delivery.native_split.size, Some(54_000_000));
         assert_eq!(delivery.native_split.sha256, [0xbb; 32]);
 
-        let implicit_ok = parse_delivery(&delivery_reply(None, Some(&roblox_app_delivery())));
+        let implicit_ok = parse_delivery(
+            Abi::X86_64,
+            &delivery_reply(None, Some(&roblox_app_delivery())),
+        );
         assert!(implicit_ok.is_ok(), "status defaults to 1: {implicit_ok:?}");
     }
 
     #[test]
+    fn delivery_takes_the_split_of_the_requested_abi() {
+        let reply = delivery_reply(Some(1), Some(&roblox_app_delivery()));
+        let delivery = parse_delivery(Abi::Arm64V8a, &reply).expect("delivery parses");
+        assert_eq!(delivery.base.sha256, [0xaa; 32]);
+        assert_eq!(delivery.native_split.file, "split_config.arm64_v8a.apk");
+        assert_eq!(delivery.native_split.size, Some(52_000_000));
+        assert_eq!(delivery.native_split.sha256, [0xcc; 32]);
+        assert!(delivery.native_split.url.ends_with("token=arm64"));
+    }
+
+    #[test]
     fn unusable_deliveries_are_typed_errors() {
-        let err = parse_delivery(&delivery_reply(Some(3), None)).unwrap_err();
+        let err = parse_delivery(Abi::X86_64, &delivery_reply(Some(3), None)).unwrap_err();
         assert!(matches!(err, PlayError::Delivery(3)), "{err:?}");
         assert!(err.to_string().contains("library"), "{err}");
 
@@ -1113,24 +1136,35 @@ mod tests {
                     &digest_text(2),
                 ),
             );
-        let err = parse_delivery(&delivery_reply(Some(1), Some(&arm_only))).unwrap_err();
+        let err =
+            parse_delivery(Abi::X86_64, &delivery_reply(Some(1), Some(&arm_only))).unwrap_err();
         assert!(
-            matches!(&err, PlayError::MissingNativeSplit { offered } if offered == &["config.arm64_v8a"]),
+            matches!(
+                &err,
+                PlayError::MissingNativeSplit { abi: Abi::X86_64, offered }
+                    if offered == &["config.arm64_v8a"]
+            ),
             "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Google Play offered no config.x86_64 split (offered: config.arm64_v8a)"
         );
 
         let mut encrypted = roblox_app_delivery();
         let mut params = Encoder::default();
         params.int32(1, 1);
         encrypted.message(12, &params);
-        let err = parse_delivery(&delivery_reply(Some(1), Some(&encrypted))).unwrap_err();
+        let err =
+            parse_delivery(Abi::X86_64, &delivery_reply(Some(1), Some(&encrypted))).unwrap_err();
         assert!(matches!(err, PlayError::Encrypted), "{err:?}");
 
         let mut bad_hash = Encoder::default();
         bad_hash
             .string(3, "https://play.googleapis.com/base")
             .string(19, "not base64!");
-        let err = parse_delivery(&delivery_reply(Some(1), Some(&bad_hash))).unwrap_err();
+        let err =
+            parse_delivery(Abi::X86_64, &delivery_reply(Some(1), Some(&bad_hash))).unwrap_err();
         assert!(
             matches!(err, PlayError::BadHash { file: BASE_APK }),
             "{err:?}"
@@ -1138,7 +1172,8 @@ mod tests {
 
         let mut no_hash = Encoder::default();
         no_hash.string(3, "https://play.googleapis.com/base");
-        let err = parse_delivery(&delivery_reply(Some(1), Some(&no_hash))).unwrap_err();
+        let err =
+            parse_delivery(Abi::X86_64, &delivery_reply(Some(1), Some(&no_hash))).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1157,18 +1192,19 @@ mod tests {
             .message(
                 15,
                 &split_delivery(
-                    NATIVE_SPLIT_NAME,
+                    "config.x86_64",
                     "https://play.googleapis.com/split",
                     MAX_APK_BYTES + 1,
                     &digest_text(2),
                 ),
             );
-        let err = parse_delivery(&delivery_reply(Some(1), Some(&oversized))).unwrap_err();
+        let err =
+            parse_delivery(Abi::X86_64, &delivery_reply(Some(1), Some(&oversized))).unwrap_err();
         assert!(
             matches!(
                 err,
                 PlayError::TooLarge {
-                    file: NATIVE_SPLIT_APK
+                    file: "split_config.x86_64.apk"
                 }
             ),
             "{err:?}"

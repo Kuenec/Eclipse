@@ -5,6 +5,7 @@ use std::ffi::{c_char, c_int, c_long, c_void, CStr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
+use super::fault_registers::{clear_pac_bits, FaultRegisters, RegisterValue};
 use super::init_run::{write_bytes, write_dec, write_hex};
 use super::ndk_registry::{
     self, handle_to_ptr, ptr_to_handle, AssetFileSpan, AssetManagerState, AssetState,
@@ -126,6 +127,7 @@ impl EclipseNativeProvider {
         p.register("signal", eclipse_signal as *const () as u64);
         p.register("sigemptyset", eclipse_sigemptyset as *const () as u64);
         p.register("sigaddset", eclipse_sigaddset as *const () as u64);
+        p.register("sigdelset", eclipse_sigdelset as *const () as u64);
         p.register("sigfillset", eclipse_sigfillset as *const () as u64);
         p.register("sigprocmask", eclipse_sigprocmask as *const () as u64);
         p.register(
@@ -902,6 +904,16 @@ unsafe extern "C" fn eclipse_sigaddset(set: *mut BionicSigsetT, signum: c_int) -
     0
 }
 
+unsafe extern "C" fn eclipse_sigdelset(set: *mut BionicSigsetT, signum: c_int) -> c_int {
+    let bit = signum.wrapping_sub(1);
+    if set.is_null() || !(0..64).contains(&bit) {
+        return einval();
+    }
+
+    unsafe { *set &= !(1u64 << bit) };
+    0
+}
+
 unsafe extern "C" fn eclipse_sigprocmask(
     how: c_int,
     set: *const BionicSigsetT,
@@ -1255,13 +1267,12 @@ fn tap_write_code_bytes(buf: &mut [u8], n: &mut usize, code: &[u8]) {
     }
 }
 
-fn tap_stack_walk(rip: u64, rsp: u64, rbp: u64, out: &mut [u64; 32]) -> usize {
+fn tap_stack_walk(pc: u64, sp: u64, mut fp: u64, out: &mut [u64; 32]) -> usize {
     const MAX_FRAME_STEP: u64 = 1 << 20;
-    out[0] = rip;
+    out[0] = pc;
     let mut count = 1usize;
-    let mut fp = rbp;
     while count < out.len() {
-        if fp == 0 || !fp.is_multiple_of(8) || fp <= rsp {
+        if fp == 0 || !fp.is_multiple_of(8) || fp <= sp {
             break;
         }
         let Some(ret) = tap_read_u64(fp.wrapping_add(8)) else {
@@ -1273,7 +1284,7 @@ fn tap_stack_walk(rip: u64, rsp: u64, rbp: u64, out: &mut [u64; 32]) -> usize {
         if next <= fp || next.wrapping_sub(fp) >= MAX_FRAME_STEP {
             break;
         }
-        out[count] = ret;
+        out[count] = clear_pac_bits(ret);
         count += 1;
         fp = next;
     }
@@ -1287,6 +1298,29 @@ fn tap_write_addr(buf: &mut [u8], n: &mut usize, val: u64, base: u64, span: u64)
         write_bytes(buf, n, b" (libroblox+0x");
         write_hex(buf, n, val - base);
         write_bytes(buf, n, b")");
+    }
+}
+
+fn tap_write_registers(
+    buf: &mut [u8],
+    n: &mut usize,
+    registers: &FaultRegisters,
+    base: u64,
+    span: u64,
+) {
+    for (k, (name, value)) in registers.named().into_iter().enumerate() {
+        if k > 0 {
+            write_bytes(buf, n, b" ");
+        }
+        write_bytes(buf, n, name);
+        write_bytes(buf, n, b"=");
+        match value {
+            RegisterValue::Code(address) => tap_write_addr(buf, n, address, base, span),
+            RegisterValue::Data(word) => {
+                write_bytes(buf, n, b"0x");
+                write_hex(buf, n, word);
+            }
+        }
     }
 }
 
@@ -1313,23 +1347,17 @@ unsafe extern "C" fn early_fault_tap_handler(
     } else {
         unsafe { ((*info).si_signo, (*info).si_code, (*info).si_addr() as u64) }
     };
-    let (rip, rsp, rbp, err) = if ctx.is_null() {
-        (0u64, 0u64, 0u64, 0u64)
+    let registers = if ctx.is_null() {
+        FaultRegisters::default()
     } else {
-        let uc = unsafe { &*ctx.cast::<libc::ucontext_t>() };
-        (
-            uc.uc_mcontext.gregs[libc::REG_RIP as usize] as u64,
-            uc.uc_mcontext.gregs[libc::REG_RSP as usize] as u64,
-            uc.uc_mcontext.gregs[libc::REG_RBP as usize] as u64,
-            uc.uc_mcontext.gregs[libc::REG_ERR as usize] as u64,
-        )
+        FaultRegisters::read(unsafe { &*ctx.cast::<libc::ucontext_t>() })
     };
 
     let base = ENGINE_RANGE_BASE.load(Ordering::Relaxed);
     let span = ENGINE_RANGE_SPAN.load(Ordering::Relaxed);
-    if base == 0 || (base..base.wrapping_add(span)).contains(&rip) {
+    if base == 0 || (base..base.wrapping_add(span)).contains(&registers.pc) {
         let mut frames = [0u64; 32];
-        let nframes = tap_stack_walk(rip, rsp, rbp, &mut frames);
+        let nframes = tap_stack_walk(registers.pc, registers.sp, registers.fp, &mut frames);
 
         let mut buf = [0u8; 2048];
         let mut n = 0usize;
@@ -1347,20 +1375,15 @@ unsafe extern "C" fn early_fault_tap_handler(
         write_bytes(&mut buf, &mut n, label);
         write_bytes(&mut buf, &mut n, b") addr=0x");
         write_hex(&mut buf, &mut n, si_addr);
-        write_bytes(&mut buf, &mut n, b" ***\nrip=");
-        tap_write_addr(&mut buf, &mut n, rip, base, span);
-        write_bytes(&mut buf, &mut n, b" rsp=0x");
-        write_hex(&mut buf, &mut n, rsp);
-        write_bytes(&mut buf, &mut n, b" rbp=0x");
-        write_hex(&mut buf, &mut n, rbp);
-
-        write_bytes(&mut buf, &mut n, b" err=0x");
-        write_hex(&mut buf, &mut n, err);
+        write_bytes(&mut buf, &mut n, b" ***\n");
+        tap_write_registers(&mut buf, &mut n, &registers, base, span);
         write_bytes(&mut buf, &mut n, b"\n");
         if signal == Some(FaultSignal::Ill) {
             let mut code = [0u8; TAP_CODE_BYTES];
-            let read = tap_read(rip, &mut code);
-            write_bytes(&mut buf, &mut n, b"code at rip: ");
+            let read = tap_read(registers.pc, &mut code);
+            write_bytes(&mut buf, &mut n, b"code at ");
+            write_bytes(&mut buf, &mut n, FaultRegisters::PC_NAME);
+            write_bytes(&mut buf, &mut n, b": ");
             tap_write_code_bytes(&mut buf, &mut n, &code[..read]);
             write_bytes(&mut buf, &mut n, b"\n");
         }
@@ -2969,7 +2992,7 @@ pub(crate) fn sl_iid_index(iid_value: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loader::reloc::{apply_one, Rela, SliceImage, SymbolResolver, R_X86_64_GLOB_DAT};
+    use crate::loader::reloc::{apply_one, Rela, RelocKind, SliceImage, SymbolResolver};
     use std::cell::RefCell;
 
     thread_local! {
@@ -3043,12 +3066,12 @@ mod tests {
 
         assert_eq!(
             p.len(),
-            108 + super::super::mediacodec::MEDIA_NDK_NATIVE_COUNT
+            109 + super::super::mediacodec::MEDIA_NDK_NATIVE_COUNT
                 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT
                 + super::super::bionic_locale::LOCALE_NATIVE_COUNT
                 + super::super::aaudio::AAUDIO_NATIVE_COUNT,
-            "6 liblog + 18 bionic-libc + 25 bionic-stdio + 8 bionic-signal + 2 link-map \
+            "6 liblog + 18 bionic-libc + 25 bionic-stdio + 9 bionic-signal + 2 link-map \
              introspection + 4 netdb resolver-ABI + 2 EGL display and swap interception + 3 \
              Vulkan WSI interception + 4 dlfcn + 28 ndk-android + 54 media-ndk + 8 OpenSL ES + \
              26 AAudio + 53 pthread + 6 sysconf system-query + 1 locale natives registered"
@@ -3107,6 +3130,7 @@ mod tests {
             "signal",
             "sigemptyset",
             "sigaddset",
+            "sigdelset",
             "sigfillset",
             "sigprocmask",
             "pthread_sigmask",
@@ -3521,7 +3545,7 @@ mod tests {
         let p = unsafe { eclipse_strchr_chk(s.as_ptr().cast(), b'c' as c_int, 6) };
         assert!(!p.is_null());
 
-        assert_eq!(unsafe { *p } as u8, b'c');
+        assert_eq!(unsafe { *p.cast::<u8>() }, b'c');
     }
 
     const STRNCPY_OVERREAD_CHILD: &str = "ECLIPSE_TEST_STRNCPY_OVERREAD_CHILD";
@@ -3706,9 +3730,19 @@ mod tests {
             );
             assert_eq!(eclipse_sigfillset(&mut set), 0);
             assert_eq!(set, !0u64, "sigfillset fills exactly the 64-bit word");
+            for signum in [32, 33, libc::SIGURG] {
+                assert_eq!(eclipse_sigdelset(&mut set, signum), 0, "signal {signum}");
+            }
+            assert_eq!(
+                set,
+                !((1u64 << 31) | (1u64 << 32) | (1u64 << (libc::SIGURG - 1))),
+                "sigdelset clears bit signum-1, glibc's reserved signals 32 and 33 included"
+            );
 
             assert_eq!(eclipse_sigaddset(&mut set, 0), -1);
             assert_eq!(eclipse_sigaddset(&mut set, 65), -1);
+            assert_eq!(eclipse_sigdelset(&mut set, 0), -1);
+            assert_eq!(eclipse_sigdelset(&mut set, 65), -1);
             assert_eq!(*libc::__errno_location(), libc::EINVAL);
 
             assert_eq!(eclipse_sigemptyset(std::ptr::null_mut()), -1);
@@ -4228,6 +4262,23 @@ mod tests {
 
     #[test]
     fn early_fault_tap_dumps_an_illegal_instruction_with_its_code_bytes() {
+        struct ExpectedDump {
+            header: &'static str,
+            registers: [&'static str; 4],
+            code: &'static str,
+        }
+        #[cfg(target_arch = "x86_64")]
+        const EXPECTED: ExpectedDump = ExpectedDump {
+            header: "EARLY-FAULT TAP: signal 4 code 2 (ILLOPN)",
+            registers: ["rip", "rsp", "rbp", "err"],
+            code: "code at rip: 0f 0b",
+        };
+        #[cfg(target_arch = "aarch64")]
+        const EXPECTED: ExpectedDump = ExpectedDump {
+            header: "EARLY-FAULT TAP: signal 4 code 1 (ILLOPC)",
+            registers: ["pc", "sp", "fp", "lr"],
+            code: "code at pc: c1 0e 00 00",
+        };
         if std::env::var_os(FAULT_TAP_CHILD).is_some() {
             let no_core = libc::rlimit {
                 rlim_cur: 0,
@@ -4237,7 +4288,14 @@ mod tests {
             for signal in FaultSignal::ALL {
                 install_early_fault_tap(signal).expect("tap install");
             }
-            unsafe { std::arch::asm!("ud2") };
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                std::arch::asm!("ud2")
+            };
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                std::arch::asm!("udf #0xec1")
+            };
             return;
         }
         use std::os::unix::process::ExitStatusExt as _;
@@ -4251,11 +4309,20 @@ mod tests {
             "status={:?}, stderr={dump}",
             output.status
         );
-        assert!(
-            dump.contains("EARLY-FAULT TAP: signal 4 code 2 (ILLOPN)"),
-            "stderr={dump}"
-        );
-        assert!(dump.contains("code at rip: 0f 0b"), "stderr={dump}");
+        assert!(dump.contains(EXPECTED.header), "stderr={dump}");
+        let register_names: Vec<&str> = dump
+            .lines()
+            .skip_while(|line| !line.contains(EXPECTED.header))
+            .nth(1)
+            .map(|line| {
+                line.split(' ')
+                    .filter_map(|field| field.split_once('='))
+                    .map(|(name, _)| name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(register_names, EXPECTED.registers, "stderr={dump}");
+        assert!(dump.contains(EXPECTED.code), "stderr={dump}");
     }
 
     #[test]
@@ -4729,6 +4796,27 @@ mod tests {
     }
 
     #[test]
+    fn only_code_addresses_in_the_tap_register_line_name_their_engine_offset() {
+        #[cfg(target_arch = "x86_64")]
+        const EXPECTED: &str = "rip=0x7000000010 (libroblox+0x10) rsp=0x7000000020 \
+                                rbp=0x7000000030 err=0x7000000040";
+        #[cfg(target_arch = "aarch64")]
+        const EXPECTED: &str = "pc=0x7000000010 (libroblox+0x10) sp=0x7000000020 \
+                                fp=0x7000000030 lr=0x7000000040 (libroblox+0x40)";
+        let base = 0x70_0000_0000;
+        let registers = FaultRegisters {
+            pc: base + 0x10,
+            sp: base + 0x20,
+            fp: base + 0x30,
+            extra: base + 0x40,
+        };
+        let mut buf = [0u8; 256];
+        let mut n = 0usize;
+        tap_write_registers(&mut buf, &mut n, &registers, base, 0x1000);
+        assert_eq!(std::str::from_utf8(&buf[..n]).unwrap(), EXPECTED);
+    }
+
+    #[test]
     fn tap_stack_walk_bounds_and_validates() {
         let mut mem = Box::new([0u64; 64]);
         let base = mem.as_ptr() as u64;
@@ -4740,26 +4828,26 @@ mod tests {
             };
             mem[k * 8 + 1] = 0x1000_0000 + k as u64;
         }
-        let rip = 0xdead_0000u64;
-        let rsp = base.wrapping_sub(64);
+        let pc = 0xdead_0000u64;
+        let sp = base.wrapping_sub(64);
         let mut out = [0u64; 32];
 
-        let n = tap_stack_walk(rip, rsp, base, &mut out);
+        let n = tap_stack_walk(pc, sp, base, &mut out);
         assert_eq!(n, 5);
-        assert_eq!(out[0], rip, "frame 0 is RIP itself");
+        assert_eq!(out[0], pc, "frame 0 is the pc itself");
         for k in 0..4u64 {
             assert_eq!(out[(k + 1) as usize], 0x1000_0000 + k);
         }
 
-        assert_eq!(tap_stack_walk(rip, rsp, base + 1, &mut out), 1);
+        assert_eq!(tap_stack_walk(pc, sp, base + 1, &mut out), 1);
 
-        assert_eq!(tap_stack_walk(rip, base, base, &mut out), 1);
+        assert_eq!(tap_stack_walk(pc, base, base, &mut out), 1);
 
         mem[0] = base;
-        assert_eq!(tap_stack_walk(rip, rsp, base, &mut out), 1);
+        assert_eq!(tap_stack_walk(pc, sp, base, &mut out), 1);
 
         mem[0] = base + (1 << 20);
-        assert_eq!(tap_stack_walk(rip, rsp, base, &mut out), 1);
+        assert_eq!(tap_stack_walk(pc, sp, base, &mut out), 1);
 
         let mut long = Box::new([0u64; 128]);
         let lbase = long.as_ptr() as u64;
@@ -4768,7 +4856,7 @@ mod tests {
             long[k * 2 + 1] = 0x2000_0000 + k as u64;
         }
         assert_eq!(
-            tap_stack_walk(rip, lbase.wrapping_sub(64), lbase, &mut out),
+            tap_stack_walk(pc, lbase.wrapping_sub(64), lbase, &mut out),
             32,
             "the walk caps at the 32-entry buffer"
         );
@@ -4784,6 +4872,24 @@ mod tests {
             None,
             "an unmapped address yields None, never a fault"
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn tap_stack_walk_strips_signed_return_addresses() {
+        use super::super::fault_registers::sign_return_address;
+
+        let mut frame = Box::new([0u64; 4]);
+        let base = frame.as_ptr() as u64;
+        let return_address = tap_stack_walk as *const () as usize as u64;
+        frame[0] = base + 16;
+        frame[1] = sign_return_address(return_address, base);
+        let mut out = [0u64; 32];
+        assert_eq!(
+            tap_stack_walk(0xdead_0000, base.wrapping_sub(64), base, &mut out),
+            2
+        );
+        assert_eq!(out[1], return_address);
     }
 
     extern "C" fn tap_test_dummy_restorer() {}
@@ -5106,11 +5212,11 @@ mod tests {
         assert!(eclipse_addr != 0);
 
         let mut got = vec![0u8; 8];
-        let mut image = SliceImage::new(0, 0, &mut got);
+        let mut image = SliceImage::new(crate::abi::Abi::HOST, 0, 0, &mut got);
         let rela = Rela {
             offset: 0,
             sym_index: 0,
-            r_type: R_X86_64_GLOB_DAT,
+            kind: RelocKind::GlobDat,
             addend: 0,
         };
         apply_one(&mut image, &resolver, &rela).expect("apply GLOB_DAT");

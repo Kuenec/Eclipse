@@ -2961,4 +2961,87 @@ mod tests {
             "the child recomputed its thread id"
         );
     }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn bionic_tls_slots_sit_at_the_thread_pointer_on_every_thread() {
+        use super::super::bionic_tls_slots::{at_thread_pointer, stack_guard_seeded};
+
+        const TLS_SLOT_STACK_GUARD: usize = 5;
+
+        #[derive(Debug, Default, PartialEq, Eq)]
+        struct SlotView {
+            slots_at_thread_pointer: bool,
+            seeded: bool,
+            guard_before_tid: usize,
+            tid_cached: bool,
+            guard_after_tid: usize,
+        }
+
+        fn stack_guard_slot() -> usize {
+            let thread_pointer: *const usize;
+            unsafe {
+                std::arch::asm!(
+                    "mrs {}, tpidr_el0",
+                    out(reg) thread_pointer,
+                    options(nomem, nostack, preserves_flags)
+                );
+                thread_pointer.add(TLS_SLOT_STACK_GUARD).read()
+            }
+        }
+
+        fn view() -> SlotView {
+            CACHED_TID.set(0);
+            let guard_before_tid = stack_guard_slot();
+            let tid = gettid();
+            SlotView {
+                slots_at_thread_pointer: at_thread_pointer(),
+                seeded: stack_guard_seeded(),
+                guard_before_tid,
+                tid_cached: tid != 0 && CACHED_TID.get() == tid,
+                guard_after_tid: stack_guard_slot(),
+            }
+        }
+
+        extern "C" fn record_view(out: *mut c_void) -> *mut c_void {
+            unsafe { (out as *mut SlotView).write(view()) };
+            std::ptr::null_mut()
+        }
+
+        let random = unsafe { libc::getauxval(libc::AT_RANDOM) } as *const [u8; 8];
+        assert!(!random.is_null(), "the kernel supplied AT_RANDOM");
+        let guard = usize::from_ne_bytes(unsafe { random.read_unaligned() }) & !0xff;
+        assert_ne!(guard, 0, "AT_RANDOM gives a nonzero canary");
+        let expected = SlotView {
+            slots_at_thread_pointer: true,
+            seeded: true,
+            guard_before_tid: guard,
+            tid_cached: true,
+            guard_after_tid: guard,
+        };
+
+        assert_eq!(view(), expected, "the test thread");
+        assert_eq!(
+            std::thread::spawn(view).join().unwrap(),
+            expected,
+            "a std::thread"
+        );
+
+        let mut bionic_view = SlotView::default();
+        let mut tid: usize = 0;
+        let rc = unsafe {
+            eclipse_pthread_create(
+                std::ptr::addr_of_mut!(tid) as *mut c_void,
+                std::ptr::null(),
+                Some(record_view),
+                std::ptr::addr_of_mut!(bionic_view) as *mut c_void,
+            )
+        };
+        assert_eq!(rc, 0, "pthread_create succeeds");
+        assert_eq!(
+            unsafe { eclipse_pthread_join(tid, std::ptr::null_mut()) },
+            0
+        );
+        assert_eq!(bionic_view, expected, "a thread from bionic pthread_create");
+    }
 }

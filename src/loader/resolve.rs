@@ -3,6 +3,7 @@ use std::ffi::CString;
 
 use super::elf::DynSym;
 use super::reloc::SymbolResolver;
+use crate::abi::Abi;
 
 const STB_LOCAL: u8 = 0;
 
@@ -89,7 +90,15 @@ impl SymbolProvider for LoadedObjectProvider {
 
 pub struct HostDlsymProvider;
 
-fn glibc_name_for_bionic(name: &str) -> Option<&str> {
+fn glibc_name_for_bionic(abi: Abi, name: &str) -> Option<&str> {
+    match (abi, name) {
+        (_, "sigsetjmp") => Some("__sigsetjmp"),
+        (Abi::Arm64V8a, name) => Some(name),
+        (Abi::X86_64, name) => glibc_binary128_name(name),
+    }
+}
+
+fn glibc_binary128_name(name: &str) -> Option<&str> {
     match name {
         "fmal" => Some("fmaf128"),
         "powl" => Some("powf128"),
@@ -129,7 +138,7 @@ pub(super) unsafe fn dlsym_bionic_import(
     handle: *mut libc::c_void,
     name: &str,
 ) -> Option<ResolvedSym> {
-    let cname = CString::new(glibc_name_for_bionic(name)?).ok()?;
+    let cname = CString::new(glibc_name_for_bionic(Abi::HOST, name)?).ok()?;
 
     let ptr = unsafe { libc::dlsym(handle, cname.as_ptr()) };
     if ptr.is_null() {
@@ -401,17 +410,47 @@ mod tests {
         assert_eq!(p.resolve("bad\0name"), None);
     }
 
-    fn binary128(high: u64) -> core::arch::x86_64::__m128 {
-        unsafe { std::mem::transmute::<[u64; 2], core::arch::x86_64::__m128>([0, high]) }
+    #[test]
+    fn host_dlsym_binds_sigsetjmp_to_glibcs_entry_point() {
+        let glibc = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__sigsetjmp".as_ptr()) } as u64;
+        assert_ne!(glibc, 0, "glibc exports __sigsetjmp");
+        assert_eq!(
+            HostDlsymProvider.resolve("sigsetjmp"),
+            Some(ResolvedSym { addr: glibc })
+        );
     }
 
-    fn binary128_bits(value: core::arch::x86_64::__m128) -> [u64; 2] {
-        unsafe { std::mem::transmute::<core::arch::x86_64::__m128, [u64; 2]>(value) }
+    #[test]
+    fn glibc_names_follow_each_abis_long_double_format() {
+        for (name, x86_64, arm64) in [
+            ("sigsetjmp", Some("__sigsetjmp"), Some("__sigsetjmp")),
+            ("strtold", Some("strtof128"), Some("strtold")),
+            ("powl", Some("powf128"), Some("powl")),
+            ("logl", None, Some("logl")),
+            ("nexttoward", None, Some("nexttoward")),
+            ("memcpy", Some("memcpy"), Some("memcpy")),
+        ] {
+            assert_eq!(glibc_name_for_bionic(Abi::X86_64, name), x86_64, "{name}");
+            assert_eq!(glibc_name_for_bionic(Abi::Arm64V8a, name), arm64, "{name}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    type Binary128 = core::arch::x86_64::__m128;
+
+    #[cfg(target_arch = "aarch64")]
+    type Binary128 = core::arch::aarch64::uint64x2_t;
+
+    fn binary128(high: u64) -> Binary128 {
+        unsafe { std::mem::transmute::<[u64; 2], Binary128>([0, high]) }
+    }
+
+    fn binary128_bits(value: Binary128) -> [u64; 2] {
+        unsafe { std::mem::transmute::<Binary128, [u64; 2]>(value) }
     }
 
     #[test]
     fn bionic_long_double_imports_bind_to_glibc_binary128_entry_points() {
-        use core::arch::x86_64::__m128;
         use std::ffi::{c_char, c_int};
 
         const TWO: u64 = 0x4000_0000_0000_0000;
@@ -429,19 +468,21 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} must resolve"))
                 .addr as usize
         };
-        let powl: extern "C" fn(__m128, __m128) -> __m128 =
+        let powl: extern "C" fn(Binary128, Binary128) -> Binary128 =
             unsafe { std::mem::transmute(addr("powl")) };
-        let fmal: extern "C" fn(__m128, __m128, __m128) -> __m128 =
+        let fmal: extern "C" fn(Binary128, Binary128, Binary128) -> Binary128 =
             unsafe { std::mem::transmute(addr("fmal")) };
-        let strtold: unsafe extern "C" fn(*const c_char, *mut *mut c_char) -> __m128 =
+        let strtold: unsafe extern "C" fn(*const c_char, *mut *mut c_char) -> Binary128 =
             unsafe { std::mem::transmute(addr("strtold")) };
         let strtold_l: unsafe extern "C" fn(
             *const c_char,
             *mut *mut c_char,
             libc::locale_t,
-        ) -> __m128 = unsafe { std::mem::transmute(addr("strtold_l")) };
-        let wcstold: unsafe extern "C" fn(*const libc::wchar_t, *mut *mut libc::wchar_t) -> __m128 =
-            unsafe { std::mem::transmute(addr("wcstold")) };
+        ) -> Binary128 = unsafe { std::mem::transmute(addr("strtold_l")) };
+        let wcstold: unsafe extern "C" fn(
+            *const libc::wchar_t,
+            *mut *mut libc::wchar_t,
+        ) -> Binary128 = unsafe { std::mem::transmute(addr("wcstold")) };
         let newlocale: unsafe extern "C" fn(
             c_int,
             *const c_char,
@@ -476,6 +517,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn host_dlsym_refuses_glibc_x87_long_double_functions() {
         let p = HostDlsymProvider;

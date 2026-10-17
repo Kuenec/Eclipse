@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::loader::elf::DynSym;
-use crate::loader::reloc::{self, Rela};
+use crate::loader::reloc::{Rela, RelocKind};
 use crate::loader::resolve::{ResolvedSym, Scope};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -247,11 +247,7 @@ pub(crate) fn categorize_imports(
     let mut seen: BTreeMap<String, ()> = BTreeMap::new();
 
     for r in relas {
-        let is_symbol_reloc = matches!(
-            r.r_type,
-            reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64
-        );
-        if !is_symbol_reloc {
+        if !r.kind.writes_symbol_address() {
             continue;
         }
         let Some(sym) = dynsyms.get(r.sym_index as usize) else {
@@ -325,7 +321,7 @@ mod tests {
         Rela {
             offset: 0x1000 + u64::from(sym_index) * 8,
             sym_index,
-            r_type: reloc::R_X86_64_GLOB_DAT,
+            kind: RelocKind::GlobDat,
             addend: 0,
         }
     }

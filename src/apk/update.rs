@@ -8,7 +8,8 @@ use super::store::{
     plan, Candidate, CheckMode, CheckOutcome, DeclaredFile, InstalledVersion, LeftBecause, Plan,
     Rejection, Staging, Store, StoreError, UpdateCheck, UpdateOutcome,
 };
-use super::{ApkSet, VersionCode, TARGET_ABI};
+use super::{ApkSet, VersionCode};
+use crate::abi::Abi;
 use crate::status::StatusSink;
 
 const MAX_DOWNLOADS: usize = 3;
@@ -88,7 +89,7 @@ impl fmt::Display for Offer<'_> {
 
 struct Listed<'a> {
     offers: Vec<Offer<'a>>,
-    newer_without_x86_64: Option<Release>,
+    newer_without_build: Option<Release>,
 }
 
 #[derive(Debug)]
@@ -103,6 +104,10 @@ impl SourceError {
             Self::ApkPure(error) => error.rejects_offer(),
             Self::GooglePlay(_) => false,
         }
+    }
+
+    fn lacks_host_build(&self) -> bool {
+        matches!(self, Self::ApkPure(ApkPureError::NoHostSplit))
     }
 }
 
@@ -128,7 +133,7 @@ impl std::error::Error for SourceError {
 pub enum Problem {
     Unanswered(SourceError),
 
-    NoX86_64Build,
+    NoHostBuild,
 
     Failed {
         offered: String,
@@ -144,13 +149,19 @@ pub enum Problem {
         offered: String,
         installed: InstalledVersion,
     },
+
+    NotForHost {
+        offered: String,
+    },
 }
 
 impl fmt::Display for Problem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unanswered(error) => error.fmt(f),
-            Self::NoX86_64Build => write!(f, "it has no {TARGET_ABI} build of Roblox"),
+            Self::NoHostBuild => {
+                write!(f, "it has no {} build of Roblox", Abi::HOST.android_name())
+            }
             Self::Failed { error, .. } => error.fmt(f),
             Self::RejectedBefore {
                 offered,
@@ -180,6 +191,11 @@ impl fmt::Display for Problem {
                 f,
                 "it offers {offered}, which is older than the installed Roblox {installed}; \
                  Eclipse never installs an older Roblox"
+            ),
+            Self::NotForHost { offered } => write!(
+                f,
+                "{offered} holds no {} build of Roblox, so Eclipse skips it",
+                Abi::HOST.android_name()
             ),
         }
     }
@@ -345,7 +361,7 @@ impl<'a> Asking<'a> {
             Self::ApkPure => apkpure::list(installed, deadline)
                 .map(|listing| Listed {
                     offers: listing.offers.into_iter().map(Offer::ApkPure).collect(),
-                    newer_without_x86_64: listing.newer_without_x86_64,
+                    newer_without_build: listing.newer_without_build,
                 })
                 .map_err(SourceError::ApkPure),
             Self::GooglePlay(credentials) => play::latest(credentials, deadline)
@@ -354,7 +370,7 @@ impl<'a> Asking<'a> {
                         credentials,
                         version,
                     }],
-                    newer_without_x86_64: None,
+                    newer_without_build: None,
                 })
                 .map_err(SourceError::GooglePlay),
         }
@@ -395,13 +411,13 @@ fn settle<'a>(
         status.step(summary(
             source,
             fresh.first(),
-            listed.newer_without_x86_64.as_ref(),
+            listed.newer_without_build.as_ref(),
             installed,
         ));
         if fresh.is_empty() && installed.is_none() {
             problems.push(SourceProblem {
                 source,
-                problem: Problem::NoX86_64Build,
+                problem: Problem::NoHostBuild,
             });
         }
         offers.extend(fresh);
@@ -428,7 +444,15 @@ fn settle<'a>(
                         failed_transfers.push((offer.source(), offer.version()));
                     }
                 }
-                status.warning(format!("{}: {problem}", offer.source()));
+                let line = format!("{}: {problem}", offer.source());
+                match problem {
+                    Problem::NotForHost { .. } => status.step(line),
+                    Problem::Unanswered(_)
+                    | Problem::NoHostBuild
+                    | Problem::Failed { .. }
+                    | Problem::RejectedBefore { .. }
+                    | Problem::Older { .. } => status.warning(line),
+                }
                 problems.push(SourceProblem {
                     source: offer.source(),
                     problem,
@@ -447,22 +471,23 @@ fn settle<'a>(
 fn summary(
     source: Source,
     best: Option<&Offer<'_>>,
-    newer_without_x86_64: Option<&Release>,
+    newer_without_build: Option<&Release>,
     installed: Option<&InstalledVersion>,
 ) -> String {
-    match (best, newer_without_x86_64, installed) {
+    let abi = Abi::HOST.android_name();
+    match (best, newer_without_build, installed) {
         (Some(best), _, _) => format!("{source} offers {}", best.release()),
         (None, Some(release), Some(installed)) => format!(
-            "{source} has no {TARGET_ABI} build of {release} yet, so Eclipse keeps the installed \
-             Roblox {installed} for now"
+            "{source} has no {abi} build of {release} yet, so Eclipse keeps the installed Roblox \
+             {installed} for now"
         ),
         (None, Some(release), None) => {
-            format!("{source} has no {TARGET_ABI} build of {release} or any older Roblox")
+            format!("{source} has no {abi} build of {release} or any older Roblox")
         }
-        (None, None, Some(installed)) => format!(
-            "{source} has no {TARGET_ABI} build newer than the installed Roblox {installed}"
-        ),
-        (None, None, None) => format!("{source} has no {TARGET_ABI} build of Roblox"),
+        (None, None, Some(installed)) => {
+            format!("{source} has no {abi} build newer than the installed Roblox {installed}")
+        }
+        (None, None, None) => format!("{source} has no {abi} build of Roblox"),
     }
 }
 
@@ -523,6 +548,9 @@ fn attempt<'a>(
                         previous,
                         set: Box::new(set),
                     }),
+                    Err(error) if error.lacks_host_build() => {
+                        Attempted::Problem(Problem::NotForHost { offered })
+                    }
                     Err(error) => {
                         if error.rejects_offer() {
                             remember_rejection(store, offer.file(), status);
@@ -555,6 +583,7 @@ fn remember_rejection(store: &Store, rejected_file: Option<DeclaredFile>, status
 mod tests {
     use super::*;
     use crate::apk::ApkSetPaths;
+    use crate::status::StatusUpdate;
     use std::cell::RefCell;
     use std::fs;
     use std::path::PathBuf;
@@ -609,7 +638,7 @@ mod tests {
             Source::ApkPure,
             Ok(Listed {
                 offers: apkpure_offers(),
-                newer_without_x86_64: None,
+                newer_without_build: None,
             }),
         )
     }
@@ -625,7 +654,7 @@ mod tests {
                     credentials,
                     version: VersionCode(code),
                 }],
-                newer_without_x86_64: None,
+                newer_without_build: None,
             }),
         )
     }
@@ -676,8 +705,11 @@ mod tests {
         );
         assert_eq!(
             summary(Source::ApkPure, None, None, Some(&installed)),
-            "APKPure has no x86_64 build newer than the installed Roblox 2.741.1061 \
-             (versionCode 3212)"
+            format!(
+                "APKPure has no {} build newer than the installed Roblox 2.741.1061 \
+                 (versionCode 3212)",
+                Abi::HOST.android_name()
+            )
         );
         assert_eq!(
             newest.to_string(),
@@ -833,6 +865,82 @@ mod tests {
     }
 
     #[test]
+    fn a_bundle_for_another_abi_is_passed_over_quietly_without_using_a_download() {
+        let (dir, store) = temp_store("other-abi");
+        let credentials = credentials();
+        let attempts = RefCell::new(Vec::new());
+        let (updates, shown) = std::sync::mpsc::channel();
+        let err = settle(
+            &store,
+            None,
+            CheckMode::Scheduled,
+            vec![apkpure_answer(), play_answer(&credentials, 3000)],
+            &StatusSink::with_window(updates),
+            |offer, _, _| {
+                tried(&attempts, offer);
+                match offer {
+                    Offer::ApkPure(_) => Err(SourceError::ApkPure(ApkPureError::NoHostSplit)),
+                    Offer::GooglePlay { .. } => Err(unavailable(offer)),
+                }
+            },
+        )
+        .err()
+        .expect("nothing installs");
+        assert_eq!(
+            attempts.into_inner(),
+            [
+                (Source::ApkPure, 3222),
+                (Source::ApkPure, 3092),
+                (Source::ApkPure, 3084),
+                (Source::GooglePlay, 3000)
+            ],
+            "a skipped bundle is neither a download nor a failed transfer"
+        );
+        let UpdateError::NothingInstalled(problems) = err else {
+            panic!("the skipped and failed offers are listed");
+        };
+        assert!(
+            matches!(
+                problems.as_slice(),
+                [
+                    SourceProblem {
+                        problem: Problem::NotForHost { .. },
+                        ..
+                    },
+                    SourceProblem {
+                        problem: Problem::NotForHost { .. },
+                        ..
+                    },
+                    SourceProblem {
+                        problem: Problem::NotForHost { .. },
+                        ..
+                    },
+                    SourceProblem {
+                        source: Source::GooglePlay,
+                        problem: Problem::Failed { .. },
+                    },
+                ]
+            ),
+            "{problems:?}"
+        );
+        let warnings: Vec<_> = shown
+            .try_iter()
+            .filter(|update| matches!(update, StatusUpdate::Warning(_)))
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the failed download warns: {warnings:?}"
+        );
+        assert_eq!(
+            store.last_check().unwrap(),
+            None,
+            "a skipped bundle is not remembered as rejected"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn nothing_newer_from_any_source_that_answered_keeps_the_installed_roblox() {
         let (dir, store) = temp_store("up-to-date");
         let credentials = credentials();
@@ -879,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn a_first_install_without_any_x86_64_build_says_so_for_each_source() {
+    fn a_first_install_without_any_host_build_says_so_for_each_source() {
         let (dir, store) = temp_store("no-build");
         let err = settle(
             &store,
@@ -889,7 +997,7 @@ mod tests {
                 Source::ApkPure,
                 Ok(Listed {
                     offers: Vec::new(),
-                    newer_without_x86_64: None,
+                    newer_without_build: None,
                 }),
             )],
             &StatusSink::terminal(),
@@ -899,8 +1007,11 @@ mod tests {
         .expect("nothing to install");
         assert_eq!(
             err.to_string(),
-            "no update source could provide a newer Roblox (APKPure: it has no x86_64 build of \
-             Roblox)"
+            format!(
+                "no update source could provide a newer Roblox (APKPure: it has no {} build of \
+                 Roblox)",
+                Abi::HOST.android_name()
+            )
         );
         fs::remove_dir_all(&dir).ok();
     }

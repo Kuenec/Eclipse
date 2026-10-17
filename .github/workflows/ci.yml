@@ -70,9 +70,17 @@ jobs:
           args: -color
 
   test:
-    name: Tests / stable
-    runs-on: ubuntu-latest
+    name: Tests / stable / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -84,11 +92,19 @@ jobs:
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          components: ${{ matrix.arch == 'aarch64' && 'clippy' || '' }}
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: tests-stable
+
+      - name: Lint the ARM64 build of Eclipse and the libm shim
+        if: matrix.arch == 'aarch64'
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo clippy --manifest-path crates/libm-shim/Cargo.toml --all-targets --locked -- -D warnings
 
       - name: Run every Eclipse target and test
         run: cargo test --all-targets --locked
@@ -106,9 +122,17 @@ jobs:
         run: python3 -m unittest discover --start-directory tools/audio-harness --pattern 'test_*.py'
 
   msrv:
-    name: MSRV / Rust 1.95
-    runs-on: ubuntu-latest
+    name: MSRV / Rust 1.95 / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -164,9 +188,19 @@ jobs:
           done
 
   release-build:
-    name: Release build
-    runs-on: ubuntu-latest
+    name: Release build / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      ARCHIVE: eclipse-linux-${{ matrix.arch }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -195,13 +229,13 @@ jobs:
       - name: Package standalone binary
         run: |
           mkdir -p artifacts
-          tar -C target/release -czf artifacts/eclipse-linux-x86_64.tar.gz eclipse
-          sha256sum artifacts/eclipse-linux-x86_64.tar.gz > artifacts/SHA256SUMS
+          tar -C target/release -czf "artifacts/$ARCHIVE.tar.gz" eclipse
+          sha256sum "artifacts/$ARCHIVE.tar.gz" > artifacts/SHA256SUMS
 
       - name: Upload release-build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: eclipse-linux-x86_64
+          name: ${{ env.ARCHIVE }}
           path: artifacts/
           if-no-files-found: error
           retention-days: 14

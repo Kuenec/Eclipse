@@ -21,9 +21,17 @@ env:
 
 jobs:
   engine-e2e:
-    name: Engine / headless Linux
-    runs-on: ubuntu-latest
+    name: Engine / headless Linux / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Check out repository
         uses: actions/checkout@v7

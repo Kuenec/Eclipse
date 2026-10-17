@@ -152,8 +152,8 @@ fn map_resolve_app_lib(
     let page = host_page_size();
     let _ = writeln!(
         log,
-        "engine-load: mapped {filename} RELATIVE_applied={} RELRO_applied={}",
-        set.stats.relative_applied, set.relro_applied
+        "engine-load: mapped {filename} RELATIVE_applied={} RELRO_applied={} icache_sync={:?}",
+        set.stats.relative_applied, set.relro_applied, set.stats.icache_sync
     );
 
     let LoadedObject {

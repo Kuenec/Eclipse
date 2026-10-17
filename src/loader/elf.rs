@@ -2,7 +2,8 @@
 
 use std::fmt;
 
-use super::reloc::Rela;
+use super::reloc::{Rela, RelocKind};
+use crate::abi::Abi;
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
@@ -15,8 +16,6 @@ const EI_CLASS: usize = 4;
 const EI_DATA: usize = 5;
 
 const ET_DYN: u16 = 3;
-
-const EM_X86_64: u16 = 62;
 
 const EHDR_SIZE: usize = 64;
 
@@ -118,7 +117,7 @@ pub enum ElfError {
 
     NotSharedObject(u16),
 
-    NotX86_64(u16),
+    UnsupportedMachine(u16),
 
     BadPhEntSize(u16),
 
@@ -133,6 +132,8 @@ pub enum ElfError {
     BadSleb128(usize),
 
     BadAndroidReloc(u64, u64),
+
+    BadRelocationType(u32),
 }
 
 impl fmt::Display for ElfError {
@@ -148,7 +149,10 @@ impl fmt::Display for ElfError {
             Self::NotElf64(c) => write!(f, "not ELFCLASS64 (e_ident[EI_CLASS]={c})"),
             Self::NotLittleEndian(d) => write!(f, "not ELFDATA2LSB (e_ident[EI_DATA]={d})"),
             Self::NotSharedObject(t) => write!(f, "not ET_DYN (e_type={t})"),
-            Self::NotX86_64(m) => write!(f, "not EM_X86_64 (e_machine={m})"),
+            Self::UnsupportedMachine(m) => write!(
+                f,
+                "e_machine {m} is neither x86-64 nor ARM64, the two machines Eclipse loads"
+            ),
             Self::BadPhEntSize(s) => write!(f, "unexpected e_phentsize {s} (want {PHDR_SIZE})"),
             Self::BadEntSize(tag, found, want) => {
                 write!(f, "dynamic tag {tag:#x} entry size {found} (want {want})")
@@ -178,6 +182,10 @@ impl fmt::Display for ElfError {
                     "Android-packed relocations: declared {declared} relocs, decoded {produced}"
                 )
             }
+            Self::BadRelocationType(raw) => write!(
+                f,
+                "relocation type {raw} is outside the 16-bit numbering of every supported psABI"
+            ),
         }
     }
 }
@@ -283,6 +291,8 @@ pub struct DynSym {
 pub struct ElfImage<'a> {
     bytes: &'a [u8],
 
+    pub abi: Abi,
+
     pub loads: Vec<LoadSegment>,
 
     pub dynamic: Option<(u64, u64)>,
@@ -359,7 +369,7 @@ fn read_sleb128(bytes: &[u8], cursor: &mut usize) -> Result<i64, ElfError> {
 
 impl<'a> ElfImage<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, ElfError> {
-        Self::parse_header(bytes)?;
+        let abi = Self::parse_header(bytes)?;
 
         let e_phoff = read_u64(bytes, 32)? as usize;
         let e_phentsize = read_u16(bytes, 54)?;
@@ -422,6 +432,7 @@ impl<'a> ElfImage<'a> {
 
         let mut img = ElfImage {
             bytes,
+            abi,
             loads,
             dynamic,
             tls,
@@ -438,7 +449,7 @@ impl<'a> ElfImage<'a> {
         Ok(img)
     }
 
-    fn parse_header(bytes: &[u8]) -> Result<(), ElfError> {
+    fn parse_header(bytes: &[u8]) -> Result<Abi, ElfError> {
         if bytes.len() < EHDR_SIZE {
             return Err(ElfError::Truncated {
                 offset: 0,
@@ -459,10 +470,7 @@ impl<'a> ElfImage<'a> {
             return Err(ElfError::NotSharedObject(e_type));
         }
         let e_machine = read_u16(bytes, 18)?;
-        if e_machine != EM_X86_64 {
-            return Err(ElfError::NotX86_64(e_machine));
-        }
-        Ok(())
+        Abi::from_elf_machine(e_machine).ok_or(ElfError::UnsupportedMachine(e_machine))
     }
 
     pub fn vaddr_to_off(&self, vaddr: u64) -> Result<usize, ElfError> {
@@ -770,7 +778,7 @@ impl<'a> ElfImage<'a> {
                 out.push(Rela {
                     offset: offset as u64,
                     sym_index: rela_sym(info),
-                    r_type: rela_type(info),
+                    kind: self.reloc_kind(info)?,
                     addend,
                 });
             }
@@ -790,11 +798,16 @@ impl<'a> ElfImage<'a> {
             out.push(Rela {
                 offset: r_offset,
                 sym_index: rela_sym(r_info),
-                r_type: rela_type(r_info),
+                kind: self.reloc_kind(r_info)?,
                 addend: r_addend,
             });
         }
         Ok(())
+    }
+
+    fn reloc_kind(&self, info: u64) -> Result<RelocKind, ElfError> {
+        let raw = rela_type(info);
+        RelocKind::decode(self.abi, raw).ok_or(ElfError::BadRelocationType(raw))
     }
 
     pub fn relr(&self) -> Result<Vec<u64>, ElfError> {
@@ -825,7 +838,8 @@ fn offset_after(base: usize, delta: usize) -> Result<usize, ElfError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::loader::reloc::{self, apply_rela, SliceImage, SymbolResolver, R_X86_64_RELATIVE};
+    use crate::loader::reloc::{apply_rela, SliceImage, SymbolResolver};
+    use std::path::{Path, PathBuf};
 
     const PH_OFF: usize = 0x40;
     const DYN_OFF: u64 = 0x200;
@@ -879,7 +893,29 @@ pub(crate) mod tests {
         put_u64(buf, off + 8, val);
     }
 
+    pub(crate) fn host_lib_dirs() -> Vec<PathBuf> {
+        let triple = Abi::HOST.gnu_triple();
+        vec![
+            PathBuf::from("/usr/lib"),
+            Path::new("/usr/lib").join(triple),
+            Path::new("/lib").join(triple),
+            PathBuf::from("/lib64"),
+            PathBuf::from("/usr/lib64"),
+        ]
+    }
+
+    pub(crate) fn host_library(soname: &str) -> Option<PathBuf> {
+        host_lib_dirs()
+            .into_iter()
+            .map(|dir| dir.join(soname))
+            .find(|path| path.exists())
+    }
+
     fn build_fixture() -> Vec<u8> {
+        build_fixture_for(Abi::HOST)
+    }
+
+    fn build_fixture_for(abi: Abi) -> Vec<u8> {
         let mut buf = vec![0u8; IMG_SIZE];
 
         buf[0..4].copy_from_slice(&ELF_MAGIC);
@@ -887,7 +923,7 @@ pub(crate) mod tests {
         buf[EI_DATA] = ELFDATA2LSB;
         buf[6] = 1;
         put_u16(&mut buf, 16, ET_DYN);
-        put_u16(&mut buf, 18, EM_X86_64);
+        put_u16(&mut buf, 18, abi.elf_machine());
         put_u32(&mut buf, 20, 1);
         put_u64(&mut buf, 32, PH_OFF as u64);
         put_u16(&mut buf, 52, EHDR_SIZE as u16);
@@ -961,7 +997,11 @@ pub(crate) mod tests {
         put_u32(&mut buf, HASH_OFF as usize + 8, 1);
 
         put_u64(&mut buf, RELA_OFF as usize, RELA_TARGET);
-        put_u64(&mut buf, RELA_OFF as usize + 8, R_X86_64_RELATIVE as u64);
+        put_u64(
+            &mut buf,
+            RELA_OFF as usize + 8,
+            u64::from(RelocKind::Relative.encode(abi)),
+        );
         put_u64(&mut buf, RELA_OFF as usize + 16, 0x1234);
 
         put_u64(&mut buf, RELR_OFF as usize, RELR_TARGET);
@@ -1116,7 +1156,7 @@ pub(crate) mod tests {
         assert_eq!(relas.len(), 1);
         let r = relas[0];
         assert_eq!(r.offset, RELA_TARGET);
-        assert_eq!(r.r_type, R_X86_64_RELATIVE);
+        assert_eq!(r.kind, RelocKind::Relative);
         assert_eq!(r.sym_index, 0);
         assert_eq!(r.addend, 0x1234);
     }
@@ -1155,9 +1195,46 @@ pub(crate) mod tests {
 
     #[test]
     fn wrong_machine_is_typed_err() {
+        const EM_ARM: u16 = 40;
         let mut buf = build_fixture();
-        put_u16(&mut buf, 18, 183);
-        assert_eq!(ElfImage::parse(&buf).unwrap_err(), ElfError::NotX86_64(183));
+        put_u16(&mut buf, 18, EM_ARM);
+        assert_eq!(
+            ElfImage::parse(&buf).unwrap_err(),
+            ElfError::UnsupportedMachine(EM_ARM)
+        );
+    }
+
+    #[test]
+    fn both_machines_parse_and_decode_their_own_relocation_numbers() {
+        for abi in [Abi::X86_64, Abi::Arm64V8a] {
+            let buf = build_fixture_for(abi);
+            let img = ElfImage::parse(&buf).expect("fixture parses");
+            assert_eq!(img.abi, abi);
+            let relas = img.relocations().expect("relocations decode");
+            assert_eq!(relas[0].kind, RelocKind::Relative, "{abi:?}");
+
+            let foreign = RelocKind::Relative.encode(abi.other());
+            let mut buf = build_fixture_for(abi);
+            put_u64(&mut buf, RELA_OFF as usize + 8, u64::from(foreign));
+            let img = ElfImage::parse(&buf).expect("fixture parses");
+            let kind = img.relocations().expect("relocations decode")[0].kind;
+            assert!(
+                matches!(kind, RelocKind::Unsupported(raw) if u32::from(raw) == foreign),
+                "{abi:?} must not read {}'s RELATIVE number as RELATIVE: {kind}",
+                abi.other().label()
+            );
+        }
+    }
+
+    #[test]
+    fn relocation_type_beyond_16_bits_is_typed_err() {
+        let mut buf = build_fixture();
+        put_u64(&mut buf, RELA_OFF as usize + 8, 0x1_0000);
+        let img = ElfImage::parse(&buf).expect("fixture parses");
+        assert_eq!(
+            img.relocations().unwrap_err(),
+            ElfError::BadRelocationType(0x1_0000)
+        );
     }
 
     #[test]
@@ -1189,7 +1266,7 @@ pub(crate) mod tests {
         buf[EI_CLASS] = ELFCLASS64;
         buf[EI_DATA] = ELFDATA2LSB;
         put_u16(&mut buf, 16, ET_DYN);
-        put_u16(&mut buf, 18, EM_X86_64);
+        put_u16(&mut buf, 18, Abi::HOST.elf_machine());
         put_u64(&mut buf, 32, 0x1000);
         put_u16(&mut buf, 54, PHDR_SIZE as u16);
         put_u16(&mut buf, 56, 4);
@@ -1228,7 +1305,7 @@ pub(crate) mod tests {
         let relas = img.relocations().unwrap();
 
         let mut loaded = buf.clone();
-        let mut slice_img = SliceImage::new(BASE, 0, &mut loaded);
+        let mut slice_img = SliceImage::new(img.abi, BASE, 0, &mut loaded);
         apply_rela(&mut slice_img, &NoSyms, &relas).expect("RELATIVE applies");
 
         let got = u64::from_le_bytes(
@@ -1241,19 +1318,17 @@ pub(crate) mod tests {
 
     #[test]
     fn real_shared_object_decodes_sanely() {
-        const CANDIDATES: &[&str] = &[
-            "/usr/lib/libm.so.6",
-            "/usr/lib/x86_64-linux-gnu/libm.so.6",
-            "/lib/x86_64-linux-gnu/libm.so.6",
-        ];
-        let Some(path) = CANDIDATES.iter().find(|p| std::path::Path::new(p).exists()) else {
+        let Some(path) = host_library("libm.so.6") else {
             eprintln!(
-                "real_shared_object_decodes_sanely: no host .so found in {CANDIDATES:?}; skipping"
+                "real_shared_object_decodes_sanely: no host libm.so.6 in {:?}; skipping",
+                host_lib_dirs()
             );
             return;
         };
-        let bytes = std::fs::read(path).expect("read host .so bytes");
+        let bytes = std::fs::read(&path).expect("read host .so bytes");
+        let path = path.display();
         let img = ElfImage::parse(&bytes).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+        assert_eq!(img.abi, Abi::HOST, "{path}");
 
         assert!(!img.loads.is_empty(), "{path}: expected >=1 PT_LOAD");
         assert!(img.dynamic.is_some(), "{path}: expected a PT_DYNAMIC");
@@ -1310,7 +1385,7 @@ pub(crate) mod tests {
         buf[EI_DATA] = ELFDATA2LSB;
         buf[6] = 1;
         put_u16(&mut buf, 16, ET_DYN);
-        put_u16(&mut buf, 18, EM_X86_64);
+        put_u16(&mut buf, 18, Abi::HOST.elf_machine());
         put_u32(&mut buf, 20, 1);
         put_u64(&mut buf, 32, PH_OFF as u64);
         put_u16(&mut buf, 52, EHDR_SIZE as u16);
@@ -1386,7 +1461,7 @@ pub(crate) mod tests {
         enc_sleb128(&mut s, 1);
         enc_sleb128(&mut s, GROUPED_BY_OFFSET_DELTA | GROUPED_BY_INFO);
         enc_sleb128(&mut s, 0x8);
-        enc_sleb128(&mut s, R_X86_64_RELATIVE as i64);
+        enc_sleb128(&mut s, i64::from(RelocKind::Relative.encode(Abi::HOST)));
 
         let relas = decode_aps2(&s);
         assert_eq!(relas.len(), 1);
@@ -1395,7 +1470,7 @@ pub(crate) mod tests {
             Rela {
                 offset: 0x1008,
                 sym_index: 0,
-                r_type: R_X86_64_RELATIVE,
+                kind: RelocKind::Relative,
                 addend: 0,
             }
         );
@@ -1410,13 +1485,13 @@ pub(crate) mod tests {
         enc_sleb128(&mut s, 3);
         enc_sleb128(&mut s, GROUPED_BY_OFFSET_DELTA | GROUPED_BY_INFO);
         enc_sleb128(&mut s, 0x8);
-        enc_sleb128(&mut s, R_X86_64_RELATIVE as i64);
+        enc_sleb128(&mut s, i64::from(RelocKind::Relative.encode(Abi::HOST)));
 
         let relas = decode_aps2(&s);
         assert_eq!(relas.len(), 3);
         for (i, want_off) in [0x2008u64, 0x2010, 0x2018].into_iter().enumerate() {
             assert_eq!(relas[i].offset, want_off);
-            assert_eq!(relas[i].r_type, R_X86_64_RELATIVE);
+            assert_eq!(relas[i].kind, RelocKind::Relative);
             assert_eq!(relas[i].sym_index, 0);
             assert_eq!(relas[i].addend, 0);
         }
@@ -1424,7 +1499,7 @@ pub(crate) mod tests {
 
     #[test]
     fn aps2_group_with_addend_accumulates() {
-        let info = ((5u64 << 32) | u64::from(reloc::R_X86_64_GLOB_DAT)) as i64;
+        let info = ((5u64 << 32) | u64::from(RelocKind::GlobDat.encode(Abi::HOST))) as i64;
         let mut s = Vec::new();
         s.extend_from_slice(&APS2_MAGIC);
         enc_sleb128(&mut s, 2);
@@ -1446,7 +1521,7 @@ pub(crate) mod tests {
             Rela {
                 offset: 0x10,
                 sym_index: 5,
-                r_type: reloc::R_X86_64_GLOB_DAT,
+                kind: RelocKind::GlobDat,
                 addend: 0x100,
             }
         );
@@ -1455,7 +1530,7 @@ pub(crate) mod tests {
             Rela {
                 offset: 0x20,
                 sym_index: 5,
-                r_type: reloc::R_X86_64_GLOB_DAT,
+                kind: RelocKind::GlobDat,
                 addend: 0x140,
             }
         );
@@ -1463,7 +1538,7 @@ pub(crate) mod tests {
 
     #[test]
     fn aps2_grouped_by_addend_reads_one_delta_for_group() {
-        let info = ((9u64 << 32) | u64::from(R_X86_64_RELATIVE)) as i64;
+        let info = ((9u64 << 32) | u64::from(RelocKind::Relative.encode(Abi::HOST))) as i64;
         let mut s = Vec::new();
         s.extend_from_slice(&APS2_MAGIC);
         enc_sleb128(&mut s, 2);
@@ -1488,7 +1563,7 @@ pub(crate) mod tests {
 
     #[test]
     fn aps2_mixed_groups_carry_offset_and_addend() {
-        let glob = ((3u64 << 32) | u64::from(reloc::R_X86_64_GLOB_DAT)) as i64;
+        let glob = ((3u64 << 32) | u64::from(RelocKind::GlobDat.encode(Abi::HOST))) as i64;
         let mut s = Vec::new();
         s.extend_from_slice(&APS2_MAGIC);
         enc_sleb128(&mut s, 3);
@@ -1497,7 +1572,7 @@ pub(crate) mod tests {
         enc_sleb128(&mut s, 2);
         enc_sleb128(&mut s, GROUPED_BY_OFFSET_DELTA | GROUPED_BY_INFO);
         enc_sleb128(&mut s, 0x8);
-        enc_sleb128(&mut s, R_X86_64_RELATIVE as i64);
+        enc_sleb128(&mut s, i64::from(RelocKind::Relative.encode(Abi::HOST)));
 
         enc_sleb128(&mut s, 1);
         enc_sleb128(&mut s, GROUPED_BY_INFO | GROUP_HAS_ADDEND);
@@ -1509,21 +1584,22 @@ pub(crate) mod tests {
         assert_eq!(relas.len(), 3);
 
         assert_eq!(relas[0].offset, 0x4008);
-        assert_eq!(relas[0].r_type, R_X86_64_RELATIVE);
+        assert_eq!(relas[0].kind, RelocKind::Relative);
         assert_eq!(relas[0].addend, 0);
         assert_eq!(relas[1].offset, 0x4010);
         assert_eq!(relas[1].addend, 0);
 
         assert_eq!(relas[2].offset, 0x4030);
-        assert_eq!(relas[2].r_type, reloc::R_X86_64_GLOB_DAT);
+        assert_eq!(relas[2].kind, RelocKind::GlobDat);
         assert_eq!(relas[2].sym_index, 3);
         assert_eq!(relas[2].addend, 0x77);
     }
 
     #[test]
     fn aps2_per_reloc_info_not_grouped() {
-        let r0 = R_X86_64_RELATIVE as i64;
-        let r1 = ((7u64 << 32) | u64::from(R_X86_64_RELATIVE)) as i64;
+        let relative = RelocKind::Relative.encode(Abi::HOST);
+        let r0 = i64::from(relative);
+        let r1 = ((7u64 << 32) | u64::from(relative)) as i64;
         let mut s = Vec::new();
         s.extend_from_slice(&APS2_MAGIC);
         enc_sleb128(&mut s, 2);
@@ -1580,7 +1656,7 @@ pub(crate) mod tests {
         enc_sleb128(&mut s, 4);
         enc_sleb128(&mut s, GROUPED_BY_OFFSET_DELTA | GROUPED_BY_INFO);
         enc_sleb128(&mut s, 0x8);
-        enc_sleb128(&mut s, R_X86_64_RELATIVE as i64);
+        enc_sleb128(&mut s, i64::from(RelocKind::Relative.encode(Abi::HOST)));
         let (buf, _) = build_aps2_image(&s);
         let img = ElfImage::parse(&buf).unwrap();
         assert!(matches!(
@@ -1635,9 +1711,10 @@ pub(crate) mod tests {
         };
 
         let mut apk = crate::apk::Apk::open(paths.native_libs()).expect("open Roblox APK");
+        let entry = format!("lib/{}/libroblox.so", crate::abi::Abi::HOST.android_name());
         let bytes = apk
-            .read_entry("lib/x86_64/libroblox.so")
-            .expect("read lib/x86_64/libroblox.so from APK");
+            .read_entry(&entry)
+            .unwrap_or_else(|e| panic!("read {entry} from APK: {e}"));
         let img = ElfImage::parse(&bytes).expect("parse libroblox.so as ELF");
 
         assert!(!img.loads.is_empty(), "libroblox.so: expected PT_LOAD>0");
@@ -1695,16 +1772,16 @@ pub(crate) mod tests {
             "libroblox.so: the APS2 decoder consumes the whole section apart from zero padding"
         );
         assert!(!packed.is_empty(), "libroblox.so: APS2 carries relocations");
-        let count_type = |t: u32| packed.iter().filter(|r| r.r_type == t).count();
-        let relative = count_type(R_X86_64_RELATIVE);
-        let glob_dat = count_type(reloc::R_X86_64_GLOB_DAT);
-        let abs64 = count_type(reloc::R_X86_64_64);
+        let count_kind = |kind: RelocKind| packed.iter().filter(|r| r.kind == kind).count();
+        let relative = count_kind(RelocKind::Relative);
+        let glob_dat = count_kind(RelocKind::GlobDat);
+        let abs64 = count_kind(RelocKind::Abs64);
         assert!(relative > 0, "libroblox.so: APS2 carries RELATIVE relocs");
         assert!(glob_dat > 0, "libroblox.so: APS2 carries GLOB_DAT relocs");
         assert_eq!(
             relative + glob_dat + abs64,
             packed.len(),
-            "libroblox.so: every APS2 reloc is RELATIVE, GLOB_DAT or R_X86_64_64"
+            "libroblox.so: every APS2 reloc is RELATIVE, GLOB_DAT or ABS64"
         );
 
         let (_, plt_size) = img
@@ -1716,7 +1793,7 @@ pub(crate) mod tests {
         let relas = img.relocations().expect("relocations decode");
         let jump_slots = relas
             .iter()
-            .filter(|r| r.r_type == reloc::R_X86_64_JUMP_SLOT)
+            .filter(|r| r.kind == RelocKind::JumpSlot)
             .count();
         assert!(jump_slots > 0, "libroblox.so: .rela.plt carries JUMP_SLOTs");
         assert_eq!(
@@ -1752,12 +1829,10 @@ pub(crate) mod tests {
         }
 
         let relro = img.relro.expect("libroblox.so: PT_GNU_RELRO");
-        for rela in relas.iter().filter(|rela| {
-            matches!(
-                rela.r_type,
-                reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT
-            )
-        }) {
+        for rela in relas
+            .iter()
+            .filter(|rela| matches!(rela.kind, RelocKind::GlobDat | RelocKind::JumpSlot))
+        {
             assert!(
                 rela.offset >= relro.vaddr && rela.offset + 8 <= relro.vaddr + relro.mem_size,
                 "libroblox.so: GOT slot {:#x} lies in PT_GNU_RELRO",
@@ -1765,7 +1840,7 @@ pub(crate) mod tests {
             );
         }
         eprintln!(
-            "real_libroblox_engine_decodes_headline_facts: loads={} needed={} init_arraysz={:?} APS2_decoded={} (RELATIVE {relative} + GLOB_DAT {glob_dat} + 64×{abs64}) + std_relocs={} → total {}",
+            "real_libroblox_engine_decodes_headline_facts: loads={} needed={} init_arraysz={:?} APS2_decoded={} (RELATIVE {relative} + GLOB_DAT {glob_dat} + ABS64 {abs64}) + std_relocs={} → total {}",
             img.loads.len(),
             needed.len(),
             img.dyn_info.init_array.map(|(_, sz)| sz),
@@ -1798,7 +1873,10 @@ pub(crate) mod tests {
         let mut apk = crate::apk::Apk::open(paths.native_libs()).expect("open Roblox APK");
         for name in ["libroblox.so", "libbacktrace-native.so"] {
             let bytes = apk
-                .read_entry(&format!("lib/x86_64/{name}"))
+                .read_entry(&format!(
+                    "lib/{}/{name}",
+                    crate::abi::Abi::HOST.android_name()
+                ))
                 .unwrap_or_else(|e| panic!("read {name} from the APK: {e}"));
             let img = ElfImage::parse(&bytes).unwrap_or_else(|e| panic!("parse {name}: {e}"));
             assert_eq!(img.dynsyms.len(), dynsym_section_count(&bytes), "{name}");
@@ -1811,7 +1889,7 @@ pub(crate) mod tests {
         buf[EI_CLASS] = ELFCLASS64;
         buf[EI_DATA] = ELFDATA2LSB;
         put_u16(&mut buf, 16, ET_DYN);
-        put_u16(&mut buf, 18, EM_X86_64);
+        put_u16(&mut buf, 18, Abi::HOST.elf_machine());
         put_u64(&mut buf, 32, e_phoff);
         put_u16(&mut buf, 54, e_phentsize);
         put_u16(&mut buf, 56, e_phnum);
@@ -1975,7 +2053,7 @@ pub(crate) mod tests {
         buf[EI_CLASS] = ELFCLASS64;
         buf[EI_DATA] = ELFDATA2LSB;
         put_u16(&mut buf, 16, ET_DYN);
-        put_u16(&mut buf, 18, EM_X86_64);
+        put_u16(&mut buf, 18, Abi::HOST.elf_machine());
         put_u64(&mut buf, 32, PH_OFF as u64);
         put_u16(&mut buf, 54, PHDR_SIZE as u16);
         put_u16(&mut buf, 56, 2);

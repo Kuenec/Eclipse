@@ -124,6 +124,23 @@ modules:
         commit: b36c17db296fcd252c89d650b2f9d4d3a51b1f3a
         disable-submodules: true
 
+  - name: vixl
+    only-arches:
+      - aarch64
+    buildsystem: simple
+    build-options:
+      cxxflags: -std=c++17 -fPIC -DVIXL_INCLUDE_TARGET_A32 -DVIXL_INCLUDE_TARGET_T32 -DVIXL_INCLUDE_TARGET_A64
+        -DVIXL_CODE_BUFFER_MMAP
+    sources:
+      - type: archive
+        url: https://github.com/Linaro/vixl/archive/refs/tags/7.0.0.tar.gz
+        sha256: 2abe97bfec41995e6839051951beac9fc57ef6f1a2ae10818bf2842cdc3b1de1
+    build-commands:
+      - c++ $CXXFLAGS -Isrc -shared -Wl,-soname,libvixl.so $LDFLAGS -o libvixl.so src/*.cc src/aarch32/*.cc
+        src/aarch64/*.cc
+      - install -Dm755 libvixl.so /app/lib/libvixl.so
+      - cd src && find . -name '*.h' -exec install -Dm644 {} /app/include/vixl/{} ';'
+
   - name: art_standalone
     no-autogen: true
     build-options:
@@ -173,6 +190,15 @@ modules:
       append-ld-library-path: /app/lib/art:/app/lib
       env:
         JAVA_HOME: /usr/lib/sdk/openjdk17/jvm/openjdk-17
+      arch:
+        x86_64:
+          env:
+            ART_ISA: x86_64
+            ART_ISA_FEATURES: ssse3,sse4.1,sse4.2,popcnt
+        aarch64:
+          env:
+            ART_ISA: arm64
+            ART_ISA_FEATURES: a53,-crc,-lse,-fp16,-dotprod
     sources:
       - type: dir
         path: ../../tools/framework-overlay
@@ -201,25 +227,25 @@ modules:
       - ORIG_FW=/app/lib/java/dex/android_translation_layer ART_DIR=/app/lib/java/dex/art
         WOLFSSL_SOURCE="$PWD/vendor/wolfssljni/WolfSSLImplementSSLSession.java"
         OUT=/app/lib/eclipse/framework tools/framework-overlay/patch-framework.sh
-      - mkdir -p /app/lib/eclipse/framework/art/oat/x86_64 /app/lib/eclipse/framework/oat/x86_64
+      - mkdir -p "/app/lib/eclipse/framework/art/oat/${ART_ISA:?the arch build-options name no ART ISA for $FLATPAK_ARCH}"
+        "/app/lib/eclipse/framework/oat/$ART_ISA"
       - >-
         root=/app/lib/eclipse;
         fw=$root/framework;
         art=$fw/art;
-        isa=ssse3,sse4.1,sse4.2,popcnt;
         set --;
         bcp=;
         for jar in core-oj-hostdex.jar apachehttp-hostdex.jar apache-xml-hostdex.jar
         bouncycastle-hostdex.jar core-junit-hostdex.jar core-libart-hostdex.jar
         hamcrest-hostdex.jar junit-runner-hostdex.jar okhttp-hostdex.jar wolfssljni-hostdex.jar;
         do set -- "$@" "--dex-file=$art/$jar" "--dex-location=$art/$jar"; bcp="${bcp:+$bcp:}$art/$jar"; done;
-        ANDROID_ROOT="$root" dex2oat -j1 "$@" --image="$art/oat/x86_64/boot.art"
-        --oat-file="$art/oat/x86_64/boot.oat" --base=0x60cf8000 --host
-        --instruction-set-features="$isa" &&
+        ANDROID_ROOT="$root" dex2oat -j1 "$@" --image="$art/oat/$ART_ISA/boot.art"
+        --oat-file="$art/oat/$ART_ISA/boot.oat" --base=0x60cf8000 --host
+        --instruction-set-features="$ART_ISA_FEATURES" &&
         ANDROID_ROOT="$root" BOOTCLASSPATH="$bcp" dex2oat -j1 --dex-file="$fw/api-impl.jar"
-        --oat-file="$fw/oat/x86_64/api-impl.odex" --class-loader-context='PCL[]'
-        --boot-image="$art/oat/boot.art" --host --instruction-set-features="$isa" &&
-        chmod +x "$art"/oat/x86_64/*.oat "$fw/oat/x86_64/api-impl.odex" &&
+        --oat-file="$fw/oat/$ART_ISA/api-impl.odex" --class-loader-context='PCL[]'
+        --boot-image="$art/oat/boot.art" --host --instruction-set-features="$ART_ISA_FEATURES" &&
+        chmod +x "$art/oat/$ART_ISA"/*.oat "$fw/oat/$ART_ISA/api-impl.odex" &&
         BOOTCLASSPATH="$bcp" FRAMEWORK="$fw" tools/framework-overlay/probe-app-dexopt.sh
 
   - name: eclipse

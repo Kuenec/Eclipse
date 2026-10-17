@@ -36,23 +36,18 @@ use file_reader::ApkFileReader;
 use intent_filter::{ViewHandler, ViewUri};
 use signature::{SignatureError, SigningCertificateHistory};
 
+use crate::abi::Abi;
 use crate::status::{StatusSink, WINDOW_PROGRESS_INTERVAL};
 
 const MANIFEST_ENTRY: &str = "AndroidManifest.xml";
 
 pub const ENGINE_LIB: &str = "libroblox.so";
 
-pub const TARGET_ABI: &str = "x86_64";
-
 pub const ROBLOX_PACKAGE: &str = "com.roblox.client";
 
 pub const BASE_APK: &str = "base.apk";
 
-pub const NATIVE_SPLIT_APK: &str = "split_config.x86_64.apk";
-
 pub const DEV_APK_ENV: &str = "ECLIPSE_ROBLOX_APK";
-
-const NATIVE_SPLIT_NAME: &str = "config.x86_64";
 
 const MAX_APK_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -438,7 +433,7 @@ pub struct PackageInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct X8664Engine {
+pub struct NativeEngine {
     pub entry: String,
 
     pub size: u64,
@@ -485,8 +480,8 @@ impl Apk {
         })
     }
 
-    pub fn native_lib_filenames(&self, abi: &str) -> Result<Vec<String>, ApkError> {
-        let prefix = format!("lib/{abi}/");
+    pub fn native_lib_filenames(&self, abi: Abi) -> Result<Vec<String>, ApkError> {
+        let prefix = format!("lib/{}/", abi.android_name());
         let mut names = Vec::new();
         for name in self.archive.file_names() {
             let name = name?;
@@ -501,16 +496,16 @@ impl Apk {
         Ok(names)
     }
 
-    pub fn x86_64_engine(&mut self) -> Result<X8664Engine, ApkError> {
-        let entry = format!("lib/{TARGET_ABI}/{ENGINE_LIB}");
+    pub fn native_engine(&mut self, abi: Abi) -> Result<NativeEngine, ApkError> {
+        let entry = format!("lib/{}/{ENGINE_LIB}", abi.android_name());
         let file = match self.archive.by_name(&entry) {
             Ok(f) => f,
             Err(zip::result::ZipError::FileNotFound) => {
-                return Err(ApkError::EngineMissing);
+                return Err(ApkError::EngineMissing(abi));
             }
             Err(e) => return Err(ApkError::Zip(e)),
         };
-        Ok(X8664Engine {
+        Ok(NativeEngine {
             stored: file.compression() == CompressionMethod::Stored,
             size: file.size(),
             entry,
@@ -527,11 +522,11 @@ impl Apk {
 
     pub fn extract_native_libs(
         &mut self,
-        abi: &str,
+        abi: Abi,
         dest_dir: &Path,
         status: &StatusSink,
     ) -> Result<usize, ApkError> {
-        let prefix = format!("lib/{abi}/");
+        let prefix = format!("lib/{}/", abi.android_name());
 
         let mut planned = Vec::new();
         for index in 0..self.archive.len() {
@@ -782,7 +777,7 @@ impl ApkSetPaths {
         if !regular_file_exists(&base)? {
             return Err(ApkSetError::MissingBase(path.to_path_buf()));
         }
-        let split = path.join(NATIVE_SPLIT_APK);
+        let split = path.join(Abi::HOST.split_apk());
         let native_split = regular_file_exists(&split)?.then_some(split);
         Ok(Self { base, native_split })
     }
@@ -939,7 +934,7 @@ impl ApkSetFiles {
                 let path = member.path.clone();
                 let mut split = member.into_apk()?;
                 let info = member_info(&mut split, &path)?;
-                if info.split.as_deref() != Some(NATIVE_SPLIT_NAME) {
+                if info.split.as_deref() != Some(Abi::HOST.split_name()) {
                     return Err(ApkSetError::NotNativeSplit {
                         path,
                         split: info.split,
@@ -965,9 +960,9 @@ impl ApkSetFiles {
             version_name: base_info.version_name,
             signing_certificate_history,
         };
-        match set.native_libs_mut().x86_64_engine() {
+        match set.native_libs_mut().native_engine(Abi::HOST) {
             Ok(_) => Ok(set),
-            Err(ApkError::EngineMissing) => Err(ApkSetError::EngineMissing {
+            Err(ApkError::EngineMissing(_)) => Err(ApkSetError::EngineMissing {
                 path: set.native_libs_path().to_path_buf(),
                 has_native_split: set.paths.native_split.is_some(),
             }),
@@ -1027,7 +1022,7 @@ impl ApkSet {
             (None, None) => {}
             (Some(_), None) => {
                 return Err(ApkSetError::Replaced(
-                    paths.base.with_file_name(NATIVE_SPLIT_APK),
+                    paths.base.with_file_name(Abi::HOST.split_apk()),
                 ))
             }
             (None, Some(path)) => return Err(ApkSetError::Replaced(path.to_path_buf())),
@@ -1087,7 +1082,7 @@ pub enum ApkError {
 
     EntryOffsetUnknown(String),
 
-    EngineMissing,
+    EngineMissing(Abi),
 
     ManifestTooLarge(u64),
 }
@@ -1102,10 +1097,11 @@ impl fmt::Display for ApkError {
             Self::EntryOffsetUnknown(name) => {
                 write!(f, "APK entry {name} has no resolved data offset")
             }
-            Self::EngineMissing => {
+            Self::EngineMissing(abi) => {
+                let abi = abi.android_name();
                 write!(
                     f,
-                    "APK has no x86_64 engine library (lib/{TARGET_ABI}/{ENGINE_LIB})"
+                    "APK has no {abi} engine library (lib/{abi}/{ENGINE_LIB})"
                 )
             }
             Self::ManifestTooLarge(declared) => write!(
@@ -1125,7 +1121,7 @@ impl std::error::Error for ApkError {
             Self::Axml(e) => Some(e),
             Self::EntryMissing(_)
             | Self::EntryOffsetUnknown(_)
-            | Self::EngineMissing
+            | Self::EngineMissing(_)
             | Self::ManifestTooLarge(_) => None,
         }
     }
@@ -1203,12 +1199,15 @@ pub enum ApkSetError {
 
 impl fmt::Display for ApkSetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let abi = Abi::HOST.android_name();
+        let split_apk = Abi::HOST.split_apk();
+        let split_name = Abi::HOST.split_name();
         match self {
             Self::Locate { path, source } => write!(f, "cannot read {}: {source}", path.display()),
             Self::MissingBase(dir) => write!(
                 f,
                 "{} has no {BASE_APK}; pass an APK file or a directory holding {BASE_APK} and \
-                 {NATIVE_SPLIT_APK}",
+                 {split_apk}",
                 dir.display()
             ),
             Self::Bundle(path) => write!(
@@ -1235,18 +1234,18 @@ impl fmt::Display for ApkSetError {
             Self::BaseIsSplit { path, split } => write!(
                 f,
                 "{} is the split APK {split}, not a base APK; pass the directory that holds \
-                 {BASE_APK} and {NATIVE_SPLIT_APK}",
+                 {BASE_APK} and {split_apk}",
                 path.display()
             ),
             Self::NotNativeSplit { path, split } => match split {
                 Some(split) => write!(
                     f,
-                    "{} is the split {split}, not the {NATIVE_SPLIT_NAME} split",
+                    "{} is the split {split}, not the {split_name} split",
                     path.display()
                 ),
                 None => write!(
                     f,
-                    "{} is a base APK, not the {NATIVE_SPLIT_NAME} split",
+                    "{} is a base APK, not the {split_name} split",
                     path.display()
                 ),
             },
@@ -1265,15 +1264,14 @@ impl fmt::Display for ApkSetError {
             Self::EngineMissing {
                 path,
                 has_native_split: true,
-            } => write!(f, "{} has no lib/{TARGET_ABI}/{ENGINE_LIB}", path.display()),
+            } => write!(f, "{} has no lib/{abi}/{ENGINE_LIB}", path.display()),
             Self::EngineMissing {
                 path,
                 has_native_split: false,
             } => write!(
                 f,
-                "{} has no lib/{TARGET_ABI}/{ENGINE_LIB}; Roblox ships its x86_64 code in \
-                 {NATIVE_SPLIT_APK}, so put {BASE_APK} and {NATIVE_SPLIT_APK} in one directory \
-                 and pass that directory",
+                "{} has no lib/{abi}/{ENGINE_LIB}; Roblox ships its {abi} code in {split_apk}, \
+                 so put {BASE_APK} and {split_apk} in one directory and pass that directory",
                 path.display()
             ),
             Self::Replaced(path) => write!(
@@ -1752,7 +1750,10 @@ mod tests {
         ]);
         let (apk, path) = open_apk(&bytes, "lib-filenames");
         let names = apk
-            .native_lib_filenames("x86_64")
+            .native_lib_filenames(Abi::X86_64)
+            .expect("list native libs");
+        let arm64_names = apk
+            .native_lib_filenames(Abi::Arm64V8a)
             .expect("list native libs");
         std::fs::remove_file(&path).ok();
         assert_eq!(
@@ -1763,31 +1764,51 @@ mod tests {
                 "libzstd-jni-1.5.7-6.so".to_string(),
             ]
         );
+        assert_eq!(arm64_names, ["libroblox.so"]);
 
         let java_only = build_apk(&[(MANIFEST_ENTRY, FIXTURE_MANIFEST), ("classes.dex", b"dex")]);
         let (apk2, p2) = open_apk(&java_only, "lib-filenames-empty");
         assert!(apk2
-            .native_lib_filenames("x86_64")
+            .native_lib_filenames(Abi::X86_64)
             .expect("list native libs")
             .is_empty());
         std::fs::remove_file(&p2).ok();
     }
 
     #[test]
-    fn x86_64_engine_is_missing_from_an_arm_only_apk() {
-        let bytes = build_apk(&[("lib/arm64-v8a/libroblox.so", b"engine")]);
-        let (mut apk, path) = open_apk(&bytes, "armonly");
-        let err = apk.x86_64_engine().expect_err("no x86_64 engine");
-        std::fs::remove_file(&path).ok();
-        assert!(matches!(err, ApkError::EngineMissing), "got {err:?}");
+    fn native_engine_is_missing_from_an_apk_built_for_the_other_abi() {
+        for (built, wanted, message) in [
+            (
+                "lib/arm64-v8a/libroblox.so",
+                Abi::X86_64,
+                "APK has no x86_64 engine library (lib/x86_64/libroblox.so)",
+            ),
+            (
+                "lib/x86_64/libroblox.so",
+                Abi::Arm64V8a,
+                "APK has no arm64-v8a engine library (lib/arm64-v8a/libroblox.so)",
+            ),
+        ] {
+            let bytes = build_apk(&[(built, b"engine")]);
+            let (mut apk, path) = open_apk(&bytes, "other-abi");
+            let err = apk
+                .native_engine(wanted)
+                .expect_err("no engine for this ABI");
+            std::fs::remove_file(&path).ok();
+            assert!(
+                matches!(err, ApkError::EngineMissing(abi) if abi == wanted),
+                "got {err:?}"
+            );
+            assert_eq!(err.to_string(), message);
+        }
     }
 
     #[test]
-    fn x86_64_engine_reports_stored_and_size() {
+    fn native_engine_reports_stored_and_size() {
         let payload = b"libroblox-engine-bytes";
         let bytes = build_apk(&[("lib/x86_64/libroblox.so", payload)]);
         let (mut apk, path) = open_apk(&bytes, "engine");
-        let engine = apk.x86_64_engine().expect("engine present");
+        let engine = apk.native_engine(Abi::X86_64).expect("engine present");
         std::fs::remove_file(&path).ok();
         assert_eq!(engine.entry, "lib/x86_64/libroblox.so");
         assert_eq!(engine.size, payload.len() as u64);
@@ -1795,7 +1816,7 @@ mod tests {
     }
 
     #[test]
-    fn x86_64_engine_reports_not_stored_when_deflated() {
+    fn native_engine_reports_not_stored_when_deflated() {
         let payload = b"libroblox-engine-bytes-deflated";
         let bytes = build_apk_methods(&[(
             "lib/x86_64/libroblox.so",
@@ -1803,7 +1824,7 @@ mod tests {
             CompressionMethod::Deflated,
         )]);
         let (mut apk, path) = open_apk(&bytes, "engine-deflated");
-        let engine = apk.x86_64_engine().expect("engine present");
+        let engine = apk.native_engine(Abi::X86_64).expect("engine present");
         std::fs::remove_file(&path).ok();
         assert_eq!(engine.size, payload.len() as u64);
         assert!(!engine.stored);
@@ -1865,7 +1886,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         let extracted = apk
-            .extract_native_libs("x86_64", &dir, &StatusSink::terminal())
+            .extract_native_libs(Abi::X86_64, &dir, &StatusSink::terminal())
             .expect("extract");
         assert_eq!(extracted, 2, "two x86_64 libraries written");
         assert_eq!(
@@ -1883,7 +1904,7 @@ mod tests {
         );
 
         let again = apk
-            .extract_native_libs("x86_64", &dir, &StatusSink::terminal())
+            .extract_native_libs(Abi::X86_64, &dir, &StatusSink::terminal())
             .expect("re-extract");
         assert_eq!(again, 0, "an unchanged extraction writes nothing");
 
@@ -1905,10 +1926,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         old_apk
-            .extract_native_libs("x86_64", &dir, &StatusSink::terminal())
+            .extract_native_libs(Abi::X86_64, &dir, &StatusSink::terminal())
             .expect("extract old APK");
         new_apk
-            .extract_native_libs("x86_64", &dir, &StatusSink::terminal())
+            .extract_native_libs(Abi::X86_64, &dir, &StatusSink::terminal())
             .expect("extract upgraded APK");
         assert_eq!(
             std::fs::read(dir.join("libsame.so")).unwrap(),
@@ -2225,7 +2246,7 @@ mod tests {
                         let (libs, assets, barrier) = (&libs, &assets, &barrier);
                         scope.spawn(move || {
                             barrier.wait();
-                            apk.extract_native_libs("x86_64", libs, &StatusSink::terminal())?;
+                            apk.extract_native_libs(Abi::X86_64, libs, &StatusSink::terminal())?;
                             apk.extract_assets(assets, &StatusSink::terminal())
                                 .map(drop)
                         })
@@ -2265,7 +2286,7 @@ mod tests {
         ));
         std::fs::remove_dir_all(&root).ok();
         let (libs, assets) = (root.join("libs"), root.join("assets"));
-        apk.extract_native_libs("x86_64", &libs, &StatusSink::terminal())
+        apk.extract_native_libs(Abi::X86_64, &libs, &StatusSink::terminal())
             .expect("extract libs");
         assert_eq!(
             apk.extract_assets(&assets, &StatusSink::terminal())
@@ -2273,7 +2294,7 @@ mod tests {
             1
         );
         assert_eq!(
-            apk.extract_native_libs("x86_64", &libs, &StatusSink::terminal())
+            apk.extract_native_libs(Abi::X86_64, &libs, &StatusSink::terminal())
                 .expect("stamped libs"),
             0
         );
@@ -2286,7 +2307,7 @@ mod tests {
         let unreadable = std::fs::Permissions::from_mode(0o000);
         std::fs::set_permissions(libs.join("libroblox.so"), unreadable.clone()).unwrap();
         std::fs::set_permissions(assets.join("content/fonts/a.ttf"), unreadable).unwrap();
-        let again = apk.extract_native_libs("x86_64", &libs, &StatusSink::terminal());
+        let again = apk.extract_native_libs(Abi::X86_64, &libs, &StatusSink::terminal());
         let assets_again = apk.extract_assets(&assets, &StatusSink::terminal());
         let readable = std::fs::Permissions::from_mode(0o644);
         std::fs::set_permissions(libs.join("libroblox.so"), readable.clone()).unwrap();
@@ -2315,7 +2336,7 @@ mod tests {
         ));
         std::fs::remove_dir_all(&root).ok();
         let (libs, assets) = (root.join("libs"), root.join("assets"));
-        apk.extract_native_libs("x86_64", &libs, &StatusSink::terminal())
+        apk.extract_native_libs(Abi::X86_64, &libs, &StatusSink::terminal())
             .expect("extract libs");
         apk.extract_assets(&assets, &StatusSink::terminal())
             .expect("extract assets");
@@ -2331,7 +2352,7 @@ mod tests {
         std::fs::write(libs.join(".eclipse-extract.4242.partial"), b"stale").unwrap();
 
         assert_eq!(
-            apk.extract_native_libs("x86_64", &libs, &StatusSink::terminal())
+            apk.extract_native_libs(Abi::X86_64, &libs, &StatusSink::terminal())
                 .expect("re-extract libs"),
             1
         );
@@ -2464,8 +2485,8 @@ mod tests {
 
             if let Ok(mut apk) = Apk::open(&path) {
                 let _ = apk.read_entry(MANIFEST_ENTRY);
-                let _ = apk.x86_64_engine();
-                let _ = apk.native_lib_filenames(TARGET_ABI);
+                let _ = apk.native_engine(Abi::X86_64);
+                let _ = apk.native_lib_filenames(Abi::X86_64);
             }
             std::fs::remove_file(&path).ok();
         }
@@ -2632,11 +2653,15 @@ mod tests {
         dir
     }
 
+    fn host_engine_entry() -> String {
+        format!("lib/{}/{ENGINE_LIB}", Abi::HOST.android_name())
+    }
+
     fn write_set(tag: &str, base: &[u8], split: Option<&[u8]>) -> (PathBuf, ApkSetPaths) {
         let dir = temp_set_dir(tag);
         std::fs::write(dir.join(BASE_APK), base).expect("write base.apk");
         if let Some(split) = split {
-            std::fs::write(dir.join(NATIVE_SPLIT_APK), split).expect("write split");
+            std::fs::write(dir.join(Abi::HOST.split_apk()), split).expect("write split");
         }
         let paths = ApkSetPaths::locate(&dir).expect("locate synthetic set");
         (dir, paths)
@@ -2658,13 +2683,13 @@ mod tests {
     fn split_manifest_has_package_info_but_no_launcher_manifest() {
         let bytes = build_apk(&[(
             MANIFEST_ENTRY,
-            &roblox_manifest(3056, Some(NATIVE_SPLIT_NAME)),
+            &roblox_manifest(3056, Some(Abi::HOST.split_name())),
         )]);
         let (mut apk, path) = open_apk(&bytes, "package-info-split");
         let info = apk.package_info().expect("split package info");
         let manifest = apk.manifest();
         std::fs::remove_file(&path).ok();
-        assert_eq!(info.split.as_deref(), Some(NATIVE_SPLIT_NAME));
+        assert_eq!(info.split.as_deref(), Some(Abi::HOST.split_name()));
         assert_eq!(info.version_code, Some(VersionCode(3056)));
         assert!(
             matches!(manifest, Err(ApkError::Axml(AxmlError::NoLauncher))),
@@ -2693,10 +2718,10 @@ mod tests {
         assert_eq!(base_only.native_split, None);
         assert_eq!(base_only.native_libs(), dir.join(BASE_APK));
 
-        std::fs::write(dir.join(NATIVE_SPLIT_APK), b"split").unwrap();
+        std::fs::write(dir.join(Abi::HOST.split_apk()), b"split").unwrap();
         let with_split = ApkSetPaths::locate(&dir).unwrap();
         assert_eq!(with_split.base, dir.join(BASE_APK));
-        assert_eq!(with_split.native_libs(), dir.join(NATIVE_SPLIT_APK));
+        assert_eq!(with_split.native_libs(), dir.join(Abi::HOST.split_apk()));
 
         let err = ApkSetPaths::locate(&dir.join("absent")).expect_err("missing path");
         assert!(matches!(err, ApkSetError::Locate { .. }), "got {err:?}");
@@ -2808,9 +2833,9 @@ mod tests {
         let split = build_apk(&[
             (
                 MANIFEST_ENTRY,
-                &roblox_manifest(3056, Some(NATIVE_SPLIT_NAME)),
+                &roblox_manifest(3056, Some(Abi::HOST.split_name())),
             ),
-            ("lib/x86_64/libroblox.so", b"engine"),
+            (host_engine_entry().as_str(), b"engine"),
         ]);
         let (dir, paths) = write_set("split-set", &base, Some(&split));
         let mut set = open_unsigned_set(paths).expect("consistent split set");
@@ -2821,16 +2846,16 @@ mod tests {
             "com.roblox.client.startup.ActivitySplash"
         );
         assert_eq!(set.base_path(), dir.join(BASE_APK));
-        assert_eq!(set.native_libs_path(), dir.join(NATIVE_SPLIT_APK));
+        assert_eq!(set.native_libs_path(), dir.join(Abi::HOST.split_apk()));
         assert_eq!(
             set.native_libs_mut()
-                .native_lib_filenames(TARGET_ABI)
+                .native_lib_filenames(Abi::HOST)
                 .expect("list native libs"),
             vec![ENGINE_LIB.to_string()]
         );
         assert!(set
             .base_mut()
-            .native_lib_filenames(TARGET_ABI)
+            .native_lib_filenames(Abi::HOST)
             .expect("list native libs")
             .is_empty());
         drop(set);
@@ -2846,9 +2871,9 @@ mod tests {
         let split = build_apk(&[
             (
                 MANIFEST_ENTRY,
-                &roblox_manifest(3056, Some(NATIVE_SPLIT_NAME)),
+                &roblox_manifest(3056, Some(Abi::HOST.split_name())),
             ),
-            ("lib/x86_64/libroblox.so", b"engine"),
+            (host_engine_entry().as_str(), b"engine"),
         ]);
         let (staged, paths) = write_set("relocate-staged", &base, Some(&split));
         let moved = staged.with_file_name(format!(
@@ -2862,7 +2887,7 @@ mod tests {
             .relocated(ApkSetPaths::locate(&moved).unwrap())
             .expect("the verified files moved together");
         assert_eq!(set.base_path(), moved.join(BASE_APK));
-        assert_eq!(set.native_libs_path(), moved.join(NATIVE_SPLIT_APK));
+        assert_eq!(set.native_libs_path(), moved.join(Abi::HOST.split_apk()));
         assert_eq!(set.base.path(), moved.join(BASE_APK));
 
         let (copies, copy_paths) = write_set("relocate-copies", &base, Some(&split));
@@ -2882,8 +2907,9 @@ mod tests {
             .relocated(ApkSetPaths::locate(&base_only).unwrap())
             .err()
             .expect("the verified split is missing");
+        let missing_split = base_only.join(Abi::HOST.split_apk());
         assert!(
-            matches!(&err, ApkSetError::Replaced(path) if *path == base_only.join(NATIVE_SPLIT_APK)),
+            matches!(&err, ApkSetError::Replaced(path) if *path == missing_split),
             "{err:?}"
         );
         assert!(err.to_string().contains("signature check"), "{err}");
@@ -2897,7 +2923,7 @@ mod tests {
     fn universal_base_provides_its_own_native_libs() {
         let base = build_apk(&[
             (MANIFEST_ENTRY, &roblox_manifest(3056, None)),
-            ("lib/x86_64/libroblox.so", b"engine"),
+            (host_engine_entry().as_str(), b"engine"),
         ]);
         let (dir, paths) = write_set("universal", &base, None);
         let set = open_unsigned_set(paths).expect("universal APK");
@@ -2908,7 +2934,8 @@ mod tests {
 
     #[test]
     fn inconsistent_sets_are_typed_errors() {
-        let engine = ("lib/x86_64/libroblox.so", b"engine".as_slice());
+        let engine_entry = host_engine_entry();
+        let engine = (engine_entry.as_str(), b"engine".as_slice());
         let base = build_apk(&[(MANIFEST_ENTRY, &roblox_manifest(3056, None))]);
 
         let other_app = axml::fixture::Manifest {
@@ -2931,7 +2958,7 @@ mod tests {
         let split_as_base = build_apk(&[
             (
                 MANIFEST_ENTRY,
-                &roblox_manifest(3056, Some(NATIVE_SPLIT_NAME)),
+                &roblox_manifest(3056, Some(Abi::HOST.split_name())),
             ),
             engine,
         ]);
@@ -2955,7 +2982,7 @@ mod tests {
         let older_split = build_apk(&[
             (
                 MANIFEST_ENTRY,
-                &roblox_manifest(3055, Some(NATIVE_SPLIT_NAME)),
+                &roblox_manifest(3055, Some(Abi::HOST.split_name())),
             ),
             engine,
         ]);
@@ -2976,7 +3003,7 @@ mod tests {
 
         let empty_split = build_apk(&[(
             MANIFEST_ENTRY,
-            &roblox_manifest(3056, Some(NATIVE_SPLIT_NAME)),
+            &roblox_manifest(3056, Some(Abi::HOST.split_name())),
         )]);
         let (dir, paths) = write_set("split-without-engine", &base, Some(&empty_split));
         let err = open_unsigned_set(paths).err().unwrap();
@@ -3004,7 +3031,7 @@ mod tests {
             ),
             "{err:?}"
         );
-        assert!(err.to_string().contains(NATIVE_SPLIT_APK), "{err}");
+        assert!(err.to_string().contains(Abi::HOST.split_apk()), "{err}");
         std::fs::remove_dir_all(&dir).ok();
 
         let unversioned = axml::fixture::Manifest {
@@ -3043,7 +3070,7 @@ mod tests {
         assert!(set.version_code().0 > 0);
         assert!(set
             .native_libs_mut()
-            .native_lib_filenames(TARGET_ABI)
+            .native_lib_filenames(Abi::HOST)
             .expect("list native libs")
             .iter()
             .any(|name| name == ENGINE_LIB));

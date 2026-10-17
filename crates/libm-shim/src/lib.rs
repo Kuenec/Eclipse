@@ -15,6 +15,12 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe { core::arch::asm!("udf #0", options(noreturn)) }
 }
 
+#[cfg(all(not(test), target_arch = "aarch64"))]
+#[no_mangle]
+extern "C" fn rust_eh_personality() -> ! {
+    unsafe { core::arch::asm!("udf #0", options(noreturn)) }
+}
+
 macro_rules! fwd1_f64 {
     ($($name:ident),* $(,)?) => {$(
         #[no_mangle]

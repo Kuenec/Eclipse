@@ -10,10 +10,12 @@ use directories::ProjectDirs;
 use eclipse_config::temp_file::TempFile;
 use eclipse_config::{Config, TouchMode};
 
+use crate::abi::Abi;
 use crate::apk::{Manifest, VersionCode, BASE_APK};
 use crate::host_locale::HostLocale;
 use crate::host_time_zone::HostTimeZone;
 use crate::loader::aaudio::{low_latency_burst_frames, APP_SAMPLE_RATE};
+use crate::loader::map::host_page_size;
 
 const DEFAULT_SDK_INT: u32 = 33;
 
@@ -51,8 +53,11 @@ const ART_BOOT_JARS: [&str; 10] = [
 
 const APP_DEX_COMPILER_FILTER: &str = "verify";
 
+const ART_PAGE_SIZE: u64 = 4096;
+
 const CLIENT_CACHE_SUBDIR: &str = "client-cache";
 
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HostCpu {
     ssse3: bool,
@@ -64,8 +69,8 @@ struct HostCpu {
     popcnt: bool,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl HostCpu {
-    #[cfg(target_arch = "x86_64")]
     fn detect() -> Self {
         Self {
             ssse3: is_x86_feature_detected!("ssse3"),
@@ -78,7 +83,7 @@ impl HostCpu {
         }
     }
 
-    fn missing_android_x86_64_feature(self) -> Option<&'static str> {
+    fn missing_android_feature(self) -> Option<&'static str> {
         [
             ("SSSE3", self.ssse3),
             ("SSE4.1", self.sse4_1),
@@ -90,50 +95,87 @@ impl HostCpu {
     }
 
     fn art_feature_string(self) -> String {
-        let features = [
+        art_feature_string([
             ("ssse3", self.ssse3),
             ("sse4.1", self.sse4_1),
             ("sse4.2", self.sse4_2),
             ("avx", self.avx),
             ("avx2", self.avx2 && self.bmi1),
             ("popcnt", self.popcnt),
-        ];
-        let mut out = String::with_capacity(64);
-        for (token, present) in features {
-            if !out.is_empty() {
-                out.push(',');
-            }
-            if !present {
-                out.push('-');
-            }
-            out.push_str(token);
-        }
-        out
+        ])
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostCpu {
+    crc: bool,
+    lse: bool,
+    fp16: bool,
+    dotprod: bool,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl HostCpu {
+    fn detect() -> Self {
+        Self {
+            crc: std::arch::is_aarch64_feature_detected!("crc"),
+            lse: std::arch::is_aarch64_feature_detected!("lse"),
+            fp16: std::arch::is_aarch64_feature_detected!("fp16"),
+            dotprod: std::arch::is_aarch64_feature_detected!("dotprod"),
+        }
+    }
+
+    fn art_feature_string(self) -> String {
+        art_feature_string([
+            ("a53", true),
+            ("crc", self.crc),
+            ("lse", self.lse),
+            ("fp16", self.fp16),
+            ("dotprod", self.dotprod),
+        ])
+    }
+}
+
+fn art_feature_string<const N: usize>(features: [(&str, bool); N]) -> String {
+    let mut out = String::with_capacity(64);
+    for (token, present) in features {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if !present {
+            out.push('-');
+        }
+        out.push_str(token);
+    }
+    out
+}
+
 #[must_use]
 pub fn instruction_set_features() -> String {
     HostCpu::detect().art_feature_string()
 }
 
-pub fn android_cpu_baseline() -> Result<(), RuntimeError> {
-    android_cpu_baseline_on(HostCpu::detect())
+pub fn host_requirements() -> Result<(), RuntimeError> {
+    #[cfg(target_arch = "x86_64")]
+    android_cpu_baseline_on(HostCpu::detect())?;
+    require_4k_pages(host_page_size())
 }
 
+#[cfg(target_arch = "x86_64")]
 fn android_cpu_baseline_on(cpu: HostCpu) -> Result<(), RuntimeError> {
-    match cpu.missing_android_x86_64_feature() {
+    match cpu.missing_android_feature() {
         Some(feature) => Err(RuntimeError::CpuLacksFeature(feature)),
         None => Ok(()),
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-compile_error!(
-    "Eclipse's runtime targets the Android x86-64 Roblox engine; \
-     instruction_set_features() needs an x86_64 host (no x86 ISA to detect on this arch)"
-);
+fn require_4k_pages(page_size: u64) -> Result<(), RuntimeError> {
+    if page_size != ART_PAGE_SIZE {
+        return Err(RuntimeError::PageSize { bytes: page_size });
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootPlan {
@@ -436,14 +478,14 @@ fn find_art_boot_paths(layout: &InstallLayout) -> Result<ArtBootPaths, RuntimeEr
 }
 
 pub fn prepare_art_boot_environment() -> Result<(), RuntimeError> {
-    prepare_art_boot_environment_on(HostCpu::detect(), InstallLayout::current)
+    prepare_art_boot_environment_on(host_requirements(), InstallLayout::current)
 }
 
 fn prepare_art_boot_environment_on(
-    cpu: HostCpu,
+    host: Result<(), RuntimeError>,
     layout: impl FnOnce() -> Result<&'static InstallLayout, RuntimeError>,
 ) -> Result<(), RuntimeError> {
-    android_cpu_baseline_on(cpu)?;
+    host?;
     let paths = find_art_boot_paths(layout()?)?;
     if let Some(boot_class_path) = paths.boot_class_path {
         if std::env::var_os("BOOTCLASSPATH").as_ref() != Some(&boot_class_path) {
@@ -533,10 +575,15 @@ pub fn find_framework() -> Result<FrameworkPaths, RuntimeError> {
 
 #[must_use]
 pub fn dalvik_cache_dir() -> Option<PathBuf> {
-    dalvik_cache_dir_in(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
+    dalvik_cache_dir_in(
+        Abi::HOST,
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+    )
 }
 
 fn dalvik_cache_dir_in(
+    abi: Abi,
     xdg_cache_home: Option<OsString>,
     home: Option<OsString>,
 ) -> Option<PathBuf> {
@@ -544,7 +591,7 @@ fn dalvik_cache_dir_in(
         Some(cache) => PathBuf::from(cache).join(ART_SUBDIR),
         None => PathBuf::from(home?).join(".cache").join(ART_SUBDIR),
     };
-    Some(root.join("x86_64"))
+    Some(root.join(abi.art_isa()))
 }
 
 #[must_use]
@@ -713,14 +760,13 @@ const ECLIPSE_LIBM_SONAME: &str = "libm.so";
 
 const ECLIPSE_LIBM_SHIM: &[u8] = include_bytes!(env!("ECLIPSE_LIBM_SHIM_SO"));
 
-const HOST_LIB_DIRS: &[&str] = &[
-    "/usr/lib",
-    "/lib",
-    "/usr/lib64",
-    "/lib64",
-    "/usr/lib/x86_64-linux-gnu",
-    "/lib/x86_64-linux-gnu",
-];
+fn host_lib_dirs() -> impl Iterator<Item = PathBuf> {
+    let multiarch = ["/usr/lib", "/lib"].map(|root| Path::new(root).join(Abi::HOST.gnu_triple()));
+    ["/usr/lib", "/lib", "/usr/lib64", "/lib64"]
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(multiarch)
+}
 
 pub fn provision_bionic_sonames(dir: &Path) -> Result<(), RuntimeError> {
     std::fs::create_dir_all(dir).map_err(|e| RuntimeError::ProvisionSoname(dir.to_owned(), e))?;
@@ -763,8 +809,8 @@ fn find_host_lib(entry: &BareSoname) -> Result<PathBuf, RuntimeError> {
             }
         }
 
-        for base in HOST_LIB_DIRS {
-            let p = Path::new(base).join(candidate);
+        for base in host_lib_dirs() {
+            let p = base.join(candidate);
             if is_real_elf(&p) {
                 return Ok(p);
             }
@@ -979,6 +1025,10 @@ fn make_os_option(prefix: &str, value: &OsStr) -> Result<CString, RuntimeError> 
 pub enum RuntimeError {
     CpuLacksFeature(&'static str),
 
+    PageSize {
+        bytes: u64,
+    },
+
     CurrentExe(std::io::Error),
 
     LibartNotFound(PathBuf),
@@ -1039,6 +1089,14 @@ impl fmt::Display for RuntimeError {
                 f,
                 "this CPU lacks {feature}; the Android x86-64 Roblox client and Eclipse's ART \
                  need an x86-64 CPU with SSSE3, SSE4.1, SSE4.2 and POPCNT"
+            ),
+            Self::PageSize { bytes } => write!(
+                f,
+                "this Linux kernel uses {} KiB memory pages, but Eclipse's Android runtime needs \
+                 {} KiB pages; on a Raspberry Pi 5, add kernel=kernel8.img to \
+                 /boot/firmware/config.txt and reboot",
+                bytes / 1024,
+                ART_PAGE_SIZE / 1024
             ),
             Self::CurrentExe(e) => write!(
                 f,
@@ -1181,6 +1239,7 @@ mod tests {
         ClientCacheDir::in_cache_root(Path::new("/home/u/.cache/eclipse")).unwrap()
     }
 
+    #[cfg(target_arch = "x86_64")]
     const ALL_FEATURES: HostCpu = HostCpu {
         ssse3: true,
         sse4_1: true,
@@ -1191,6 +1250,15 @@ mod tests {
         popcnt: true,
     };
 
+    #[cfg(target_arch = "aarch64")]
+    const ALL_FEATURES: HostCpu = HostCpu {
+        crc: true,
+        lse: true,
+        fp16: true,
+        dotprod: true,
+    };
+
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn feature_string_format_present_absent() {
         assert_eq!(
@@ -1213,6 +1281,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn feature_string_mixed_keeps_order_and_prefix() {
         let baseline = HostCpu {
@@ -1228,36 +1297,35 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn cpus_below_the_android_x86_64_baseline_are_named() {
-        assert_eq!(ALL_FEATURES.missing_android_x86_64_feature(), None);
+        assert_eq!(ALL_FEATURES.missing_android_feature(), None);
         let without_avx = HostCpu {
             avx: false,
             avx2: false,
             bmi1: false,
             ..ALL_FEATURES
         };
-        assert_eq!(without_avx.missing_android_x86_64_feature(), None);
+        assert_eq!(without_avx.missing_android_feature(), None);
         let without_popcnt = HostCpu {
             popcnt: false,
             ..ALL_FEATURES
         };
-        assert_eq!(
-            without_popcnt.missing_android_x86_64_feature(),
-            Some("POPCNT")
-        );
+        assert_eq!(without_popcnt.missing_android_feature(), Some("POPCNT"));
         let core2 = HostCpu {
             sse4_1: false,
             sse4_2: false,
             popcnt: false,
             ..without_avx
         };
-        assert_eq!(core2.missing_android_x86_64_feature(), Some("SSE4.1"));
+        assert_eq!(core2.missing_android_feature(), Some("SSE4.1"));
         assert!(RuntimeError::CpuLacksFeature("SSE4.1")
             .to_string()
             .contains("lacks SSE4.1"));
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn art_preparation_refuses_a_cpu_below_the_baseline_before_the_install_layout() {
         let core2 = HostCpu {
@@ -1269,7 +1337,7 @@ mod tests {
             popcnt: false,
             ..ALL_FEATURES
         };
-        let prepared = prepare_art_boot_environment_on(core2, || {
+        let prepared = prepare_art_boot_environment_on(android_cpu_baseline_on(core2), || {
             panic!("the install layout was looked up for a CPU below the baseline")
         });
         assert!(matches!(
@@ -1278,6 +1346,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_android_cpu_baseline_names_the_first_missing_feature() {
         let without_sse4_2 = HostCpu {
@@ -1293,12 +1362,12 @@ mod tests {
     }
 
     #[test]
-    fn art_preparation_on_a_baseline_cpu_continues_to_the_install_layout() {
-        let prepared =
-            prepare_art_boot_environment_on(ALL_FEATURES, || Err(RuntimeError::NoCacheDir));
+    fn art_preparation_on_a_host_that_meets_the_requirements_continues_to_the_install_layout() {
+        let prepared = prepare_art_boot_environment_on(Ok(()), || Err(RuntimeError::NoCacheDir));
         assert!(matches!(prepared, Err(RuntimeError::NoCacheDir)));
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx2_is_reported_only_with_bmi1_because_art_emits_bmi1_for_it() {
         let without_bmi1 = HostCpu {
@@ -1309,6 +1378,61 @@ mod tests {
             without_bmi1.art_feature_string(),
             "ssse3,sse4.1,sse4.2,avx,-avx2,popcnt"
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn arm64_feature_string_keeps_the_a53_workarounds_and_signs_each_extension() {
+        assert_eq!(
+            ALL_FEATURES.art_feature_string(),
+            "a53,crc,lse,fp16,dotprod"
+        );
+        let cortex_a72 = HostCpu {
+            lse: false,
+            fp16: false,
+            dotprod: false,
+            ..ALL_FEATURES
+        };
+        assert_eq!(
+            cortex_a72.art_feature_string(),
+            "a53,crc,-lse,-fp16,-dotprod"
+        );
+        let armv8_0 = HostCpu {
+            crc: false,
+            ..cortex_a72
+        };
+        assert_eq!(armv8_0.art_feature_string(), "a53,-crc,-lse,-fp16,-dotprod");
+    }
+
+    #[test]
+    fn only_4_kib_pages_pass_the_art_page_check() {
+        assert!(require_4k_pages(4096).is_ok());
+        for (bytes, kib) in [(16384, 16), (65536, 64)] {
+            let error = require_4k_pages(bytes).unwrap_err();
+            assert!(
+                matches!(error, RuntimeError::PageSize { bytes: found } if found == bytes),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "this Linux kernel uses {kib} KiB memory pages, but Eclipse's Android \
+                     runtime needs 4 KiB pages; on a Raspberry Pi 5, add kernel=kernel8.img to \
+                     /boot/firmware/config.txt and reboot"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn art_preparation_refuses_16_kib_pages_before_the_install_layout() {
+        let prepared = prepare_art_boot_environment_on(require_4k_pages(16384), || {
+            panic!("the install layout was looked up on a kernel with 16 KiB pages")
+        });
+        assert!(matches!(
+            prepared,
+            Err(RuntimeError::PageSize { bytes: 16384 })
+        ));
     }
 
     #[test]
@@ -1822,14 +1946,18 @@ mod tests {
     #[test]
     fn dalvik_cache_follows_art_xdg_then_home_rule() {
         assert_eq!(
-            dalvik_cache_dir_in(Some("/cache".into()), Some("/home/u".into())),
+            dalvik_cache_dir_in(Abi::X86_64, Some("/cache".into()), Some("/home/u".into())),
             Some(PathBuf::from("/cache/art/x86_64"))
         );
         assert_eq!(
-            dalvik_cache_dir_in(None, Some("/home/u".into())),
+            dalvik_cache_dir_in(Abi::X86_64, None, Some("/home/u".into())),
             Some(PathBuf::from("/home/u/.cache/art/x86_64"))
         );
-        assert_eq!(dalvik_cache_dir_in(None, None), None);
+        assert_eq!(
+            dalvik_cache_dir_in(Abi::Arm64V8a, None, Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.cache/art/arm64"))
+        );
+        assert_eq!(dalvik_cache_dir_in(Abi::X86_64, None, None), None);
     }
 
     #[test]
@@ -2108,10 +2236,14 @@ mod tests {
 
         let img = crate::loader::elf::ElfImage::parse(bytes).expect("decode shim ELF");
         for rela in img.relocations().expect("decode shim relocations") {
-            assert_ne!(
-                rela.r_type,
-                crate::loader::reloc::R_X86_64_TPOFF64,
-                "the libm shim regressed: an R_X86_64_TPOFF64 reloc would abort the apkenv linker"
+            assert!(
+                !matches!(
+                    rela.kind,
+                    crate::loader::reloc::RelocKind::TpOff64
+                        | crate::loader::reloc::RelocKind::Unsupported(_)
+                ),
+                "the libm shim regressed: a {} reloc would abort the apkenv linker",
+                rela.kind
             );
         }
 

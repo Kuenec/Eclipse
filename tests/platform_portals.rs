@@ -559,7 +559,8 @@ fn platform_test_can_boot() -> bool {
     if !apk {
         eprintln!(
             "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK to an APK file or to a directory \
-             holding base.apk and split_config.x86_64.apk)"
+             holding base.apk and {})",
+            eclipse::abi::Abi::HOST.split_apk()
         );
         return false;
     }

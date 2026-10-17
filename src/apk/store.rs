@@ -1,21 +1,23 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eclipse_config::temp_file::{self, TempFile};
 use ring::digest::SHA1_OUTPUT_LEN;
 use serde::{Deserialize, Serialize};
+use zip::read::{ArchiveOffset, Config};
 use zip::result::ZipError;
 use zip::ZipArchive;
 
 use super::signature::SigningCertificateHistory;
 use super::{
     is_bundle, Apk, ApkError, ApkSet, ApkSetError, ApkSetFiles, ApkSetPaths, SetIdentity,
-    VersionCode, BASE_APK, MAX_APK_BYTES, NATIVE_SPLIT_APK, NATIVE_SPLIT_NAME, ROBLOX_PACKAGE,
+    VersionCode, BASE_APK, MAX_APK_BYTES, ROBLOX_PACKAGE,
 };
+use crate::abi::Abi;
 use crate::status::StatusSink;
 
 const STORE_DIR: &str = "roblox";
@@ -29,7 +31,16 @@ const STATE_LOCK_FILE: &str = "state.lock";
 const ATTEMPT_FILE: &str = "attempt.json";
 const STAGING_DIR: &str = "incoming.partial";
 const PARTIAL_SUFFIX: &str = ".partial";
-const XAPK_NATIVE_SPLIT: &str = "config.x86_64.apk";
+const ANDROID_ABI_SPLIT_NAMES: [&str; 8] = [
+    "armeabi",
+    "armeabi_v7a",
+    "arm64_v8a",
+    "x86",
+    "x86_64",
+    "mips",
+    "mips64",
+    "riscv64",
+];
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const FAILED_CHECK_RETRY: Duration = Duration::from_secs(30 * 60);
@@ -1128,7 +1139,9 @@ impl Staging<'_> {
         if !path_exists(&self.dir.join(BASE_APK))? {
             return Err(StoreError::NoBaseGiven);
         }
-        if !path_exists(&self.dir.join(NATIVE_SPLIT_APK))? && !staged_base_has_engine(&self.dir)? {
+        if !path_exists(&self.dir.join(Abi::HOST.split_apk()))?
+            && !staged_base_has_engine(&self.dir)?
+        {
             return Err(StoreError::NoNativeSplitGiven);
         }
         let partial = self.store.root.join(format!(
@@ -1230,7 +1243,7 @@ impl Staging<'_> {
         let mut members = Vec::new();
         for index in 0..archive.len() {
             let entry = archive.by_index_data(index).map_err(unreadable)?;
-            if let Some(role) = bundle_member_role(&entry.name().map_err(unreadable)?) {
+            if let Some(role) = bundle_member_role(Abi::HOST, &entry.name().map_err(unreadable)?) {
                 members.push((index, role));
             }
         }
@@ -1266,19 +1279,99 @@ impl StagedFile {
     fn file_name(self) -> &'static str {
         match self {
             Self::Base => BASE_APK,
-            Self::NativeSplit => NATIVE_SPLIT_APK,
+            Self::NativeSplit => Abi::HOST.split_apk(),
         }
     }
 }
 
-fn bundle_member_role(name: &str) -> Option<StagedFile> {
-    let file_name = name.rsplit('/').next().unwrap_or(name);
+fn member_file_name(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+fn bundle_member_role(abi: Abi, name: &str) -> Option<StagedFile> {
+    let file_name = member_file_name(name);
     if file_name == BASE_APK || file_name == format!("{ROBLOX_PACKAGE}.apk") {
         Some(StagedFile::Base)
-    } else if file_name == NATIVE_SPLIT_APK || file_name == XAPK_NATIVE_SPLIT {
+    } else if file_name == abi.split_apk() || file_name == abi.xapk_split_entry() {
         Some(StagedFile::NativeSplit)
     } else {
         None
+    }
+}
+
+fn names_a_native_split(name: &str) -> bool {
+    let file_name = member_file_name(name);
+    file_name
+        .strip_prefix("split_")
+        .unwrap_or(file_name)
+        .strip_prefix("config.")
+        .and_then(|config| config.strip_suffix(".apk"))
+        .is_some_and(|abi| ANDROID_ABI_SPLIT_NAMES.contains(&abi))
+}
+
+pub(super) fn bundle_directory_names_only_other_abis(tail_start: u64, tail: Vec<u8>) -> bool {
+    let tail = BundleTail {
+        start: tail_start,
+        bytes: tail,
+        position: 0,
+    };
+    let at_start = Config {
+        archive_offset: ArchiveOffset::Known(0),
+    };
+    let Ok(archive) = ZipArchive::with_config(at_start, tail) else {
+        return false;
+    };
+    let mut names_another_abi = false;
+    for name in archive.file_names() {
+        let Ok(name) = name else {
+            return false;
+        };
+        if bundle_member_role(Abi::HOST, &name) == Some(StagedFile::NativeSplit) {
+            return false;
+        }
+        names_another_abi |= names_a_native_split(&name);
+    }
+    names_another_abi
+}
+
+struct BundleTail {
+    start: u64,
+    bytes: Vec<u8>,
+    position: u64,
+}
+
+impl Read for BundleTail {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let offset = self
+            .position
+            .checked_sub(self.start)
+            .ok_or_else(|| io::Error::other("this part of the bundle was not fetched"))?;
+        let rest = usize::try_from(offset)
+            .ok()
+            .and_then(|offset| self.bytes.get(offset..))
+            .unwrap_or_default();
+        let read = rest.len().min(buf.len());
+        buf[..read].copy_from_slice(&rest[..read]);
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl Seek for BundleTail {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let end = self.start + self.bytes.len() as u64;
+        let position = match to {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::End(delta) => end.checked_add_signed(delta),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+        };
+        self.position = position.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before the bundle's start",
+            )
+        })?;
+        Ok(self.position)
     }
 }
 
@@ -1293,7 +1386,7 @@ fn classify_apk(path: &Path) -> Result<StagedFile, StoreError> {
         .map_err(apk_error)?;
     match info.split.as_deref() {
         None => Ok(StagedFile::Base),
-        Some(NATIVE_SPLIT_NAME) => Ok(StagedFile::NativeSplit),
+        Some(split) if split == Abi::HOST.split_name() => Ok(StagedFile::NativeSplit),
         Some(split) => Err(StoreError::UnneededSplit {
             path: path.to_path_buf(),
             split: split.to_owned(),
@@ -1321,9 +1414,12 @@ fn staged_base_has_engine(dir: &Path) -> Result<bool, StoreError> {
         path: path.clone(),
         source,
     };
-    match Apk::open(&path).map_err(apk_error)?.x86_64_engine() {
+    match Apk::open(&path)
+        .map_err(apk_error)?
+        .native_engine(Abi::HOST)
+    {
         Ok(_) => Ok(true),
-        Err(ApkError::EngineMissing) => Ok(false),
+        Err(ApkError::EngineMissing(_)) => Ok(false),
         Err(source) => Err(apk_error(source)),
     }
 }
@@ -1511,6 +1607,8 @@ impl StoreError {
 
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let abi = Abi::HOST.android_name();
+        let split_apk = Abi::HOST.split_apk();
         match self {
             Self::NoDataDir => {
                 f.write_str("cannot determine Eclipse's data directory; set HOME or XDG_DATA_HOME")
@@ -1533,25 +1631,24 @@ impl fmt::Display for StoreError {
             Self::UnneededSplit { path, split } => write!(
                 f,
                 "{} is the split {split}, which Eclipse does not use; pass only {BASE_APK} and \
-                 {NATIVE_SPLIT_APK}",
+                 {split_apk}",
                 path.display()
             ),
             Self::Duplicate { path, file } => write!(
                 f,
                 "{} is a second {file}; pass exactly one {BASE_APK} and at most one \
-                 {NATIVE_SPLIT_APK}",
+                 {split_apk}",
                 path.display()
             ),
             Self::NoBaseGiven => write!(
                 f,
                 "none of the given files is a Roblox base APK; pass {BASE_APK} together with \
-                 {NATIVE_SPLIT_APK}"
+                 {split_apk}"
             ),
             Self::NoNativeSplitGiven => write!(
                 f,
-                "none of the given files is {NATIVE_SPLIT_APK} and {BASE_APK} has no x86_64 \
-                 code; pass {NATIVE_SPLIT_APK} too (a bundle without it has no x86_64 build of \
-                 Roblox)"
+                "none of the given files is {split_apk} and {BASE_APK} has no {abi} code; pass \
+                 {split_apk} too (a bundle without it has no {abi} build of Roblox)"
             ),
             Self::TooLarge { path } => write!(
                 f,
@@ -1561,13 +1658,13 @@ impl fmt::Display for StoreError {
             Self::UnreadableBundle { path, source } => write!(
                 f,
                 "cannot read {} as a zip bundle ({source}); encrypted bundles such as newer \
-                 .apkm files are not supported, so pass the plain {BASE_APK} and \
-                 {NATIVE_SPLIT_APK} instead",
+                 .apkm files are not supported, so pass the plain {BASE_APK} and {split_apk} \
+                 instead",
                 path.display()
             ),
             Self::EncryptedBundle(path) => write!(
                 f,
-                "{} is encrypted; pass the plain {BASE_APK} and {NATIVE_SPLIT_APK} instead",
+                "{} is encrypted; pass the plain {BASE_APK} and {split_apk} instead",
                 path.display()
             ),
             Self::BundleMissingBase(path) => {
@@ -1659,9 +1756,10 @@ mod tests {
             launcher: split.is_none().then_some(".Main"),
         }
         .encode();
+        let engine_entry = format!("lib/{}/libroblox.so", Abi::HOST.android_name());
         let mut entries: Vec<(&str, &[u8])> = vec![("AndroidManifest.xml", &manifest)];
         if engine {
-            entries.push(("lib/x86_64/libroblox.so", b"engine"));
+            entries.push((&engine_entry, b"engine"));
         }
         zip_of(&entries, stored())
     }
@@ -1995,8 +2093,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(BASE_APK), synthetic_apk(None, false)).unwrap();
         fs::write(
-            dir.join(NATIVE_SPLIT_APK),
-            synthetic_apk(Some(NATIVE_SPLIT_NAME), true),
+            dir.join(Abi::HOST.split_apk()),
+            synthetic_apk(Some(Abi::HOST.split_name()), true),
         )
         .unwrap();
         assert_eq!(
@@ -2056,7 +2154,7 @@ mod tests {
         let root = temp_root("classify");
         let sources = temp_root("classify-sources");
         let base = synthetic_apk(None, false);
-        let split = synthetic_apk(Some(NATIVE_SPLIT_NAME), true);
+        let split = synthetic_apk(Some(Abi::HOST.split_name()), true);
         fs::write(sources.join("roblox-base.apk"), &base).unwrap();
         fs::write(sources.join("roblox-x86.apk"), &split).unwrap();
         fs::write(
@@ -2073,7 +2171,7 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read(staging.dir().join(BASE_APK)).unwrap(), base);
         assert_eq!(
-            fs::read(staging.dir().join(NATIVE_SPLIT_APK)).unwrap(),
+            fs::read(staging.dir().join(Abi::HOST.split_apk())).unwrap(),
             split
         );
 
@@ -2105,8 +2203,8 @@ mod tests {
         let sources = temp_root("unsigned-sources");
         fs::write(sources.join(BASE_APK), synthetic_apk(None, false)).unwrap();
         fs::write(
-            sources.join(NATIVE_SPLIT_APK),
-            synthetic_apk(Some(NATIVE_SPLIT_NAME), true),
+            sources.join(Abi::HOST.split_apk()),
+            synthetic_apk(Some(Abi::HOST.split_name()), true),
         )
         .unwrap();
 
@@ -2132,11 +2230,11 @@ mod tests {
     }
 
     #[test]
-    fn bundles_yield_only_base_and_the_x86_64_split() {
+    fn bundles_yield_only_base_and_the_host_abi_split() {
         let root = temp_root("bundle");
         let sources = temp_root("bundle-sources");
         let base = synthetic_apk(None, false);
-        let split = synthetic_apk(Some(NATIVE_SPLIT_NAME), true);
+        let split = synthetic_apk(Some(Abi::HOST.split_name()), true);
         let density = synthetic_apk(Some("config.xxhdpi"), false);
         fs::write(
             sources.join("roblox.apkm"),
@@ -2145,7 +2243,7 @@ mod tests {
                     ("info.json", b"{}"),
                     (BASE_APK, &base),
                     ("split_config.xxhdpi.apk", &density),
-                    (NATIVE_SPLIT_APK, &split),
+                    (Abi::HOST.split_apk(), &split),
                 ],
                 stored(),
             ),
@@ -2157,7 +2255,7 @@ mod tests {
                 &[
                     ("manifest.json", b"{}"),
                     ("com.roblox.client.apk", &base),
-                    ("config.x86_64.apk", &split),
+                    (Abi::HOST.xapk_split_entry(), &split),
                 ],
                 stored(),
             ),
@@ -2170,15 +2268,47 @@ mod tests {
             staging.add_source(&sources.join(bundle)).unwrap();
             let mut staged = entries(staging.dir());
             staged.sort();
-            assert_eq!(staged, [BASE_APK, NATIVE_SPLIT_APK], "{bundle}");
+            assert_eq!(staged, [BASE_APK, Abi::HOST.split_apk()], "{bundle}");
             assert_eq!(fs::read(staging.dir().join(BASE_APK)).unwrap(), base);
             assert_eq!(
-                fs::read(staging.dir().join(NATIVE_SPLIT_APK)).unwrap(),
+                fs::read(staging.dir().join(Abi::HOST.split_apk())).unwrap(),
                 split
             );
         }
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&sources).ok();
+    }
+
+    #[test]
+    fn store_accepts_the_arm64_xapk_split_for_arm64() {
+        for (abi, name, role) in [
+            (
+                Abi::Arm64V8a,
+                "config.arm64_v8a.apk",
+                Some(StagedFile::NativeSplit),
+            ),
+            (
+                Abi::Arm64V8a,
+                "splits/split_config.arm64_v8a.apk",
+                Some(StagedFile::NativeSplit),
+            ),
+            (
+                Abi::Arm64V8a,
+                "com.roblox.client.apk",
+                Some(StagedFile::Base),
+            ),
+            (Abi::Arm64V8a, "config.x86_64.apk", None),
+            (Abi::Arm64V8a, "split_config.x86_64.apk", None),
+            (
+                Abi::X86_64,
+                "config.x86_64.apk",
+                Some(StagedFile::NativeSplit),
+            ),
+            (Abi::X86_64, "config.arm64_v8a.apk", None),
+            (Abi::X86_64, "split_config.arm64_v8a.apk", None),
+        ] {
+            assert_eq!(bundle_member_role(abi, name), role, "{abi:?} {name}");
+        }
     }
 
     #[test]
@@ -2205,17 +2335,17 @@ mod tests {
         let root = temp_root("bad-bundles");
         let sources = temp_root("bad-bundle-sources");
         let base = synthetic_apk(None, false);
-        let split = synthetic_apk(Some(NATIVE_SPLIT_NAME), true);
+        let split = synthetic_apk(Some(Abi::HOST.split_name()), true);
         fs::write(sources.join("garbage.apkm"), b"APKM encrypted payload").unwrap();
         fs::write(
             sources.join("no-base.apks"),
-            zip_of(&[(NATIVE_SPLIT_APK, &split)], stored()),
+            zip_of(&[(Abi::HOST.split_apk(), &split)], stored()),
         )
         .unwrap();
         fs::write(
-            sources.join("arm-only.apks"),
+            sources.join("foreign-only.apks"),
             zip_of(
-                &[(BASE_APK, &base), ("split_config.arm64_v8a.apk", &split)],
+                &[(BASE_APK, &base), (Abi::HOST.other().split_apk(), &split)],
                 stored(),
             ),
         )
@@ -2248,11 +2378,13 @@ mod tests {
         }
 
         let staging = store.begin(&StatusSink::terminal()).unwrap();
-        staging.add_source(&sources.join("arm-only.apks")).unwrap();
+        staging
+            .add_source(&sources.join("foreign-only.apks"))
+            .unwrap();
         let err = staging
             .commit(None)
             .err()
-            .expect("no x86_64 split was given");
+            .expect("no split for the host ABI was given");
         assert!(matches!(err, StoreError::NoNativeSplitGiven), "{err:?}");
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&sources).ok();
@@ -2272,7 +2404,7 @@ mod tests {
         let root = temp_root("official");
         let sources = temp_root("official-sources");
         fs::copy(&paths.base, sources.join(BASE_APK)).unwrap();
-        fs::copy(&split, sources.join(NATIVE_SPLIT_APK)).unwrap();
+        fs::copy(&split, sources.join(Abi::HOST.split_apk())).unwrap();
 
         let store = Store::at(root.clone());
         let committed = store
@@ -2293,20 +2425,23 @@ mod tests {
         staging.add_source(&sources).unwrap();
         let kept = staging.commit(None).expect("reinstall the same version");
         assert_eq!(kept.base_path(), version_dir.join(BASE_APK));
-        assert_eq!(kept.native_libs_path(), version_dir.join(NATIVE_SPLIT_APK));
+        assert_eq!(
+            kept.native_libs_path(),
+            version_dir.join(Abi::HOST.split_apk())
+        );
         drop(kept);
 
-        fs::remove_file(version_dir.join(NATIVE_SPLIT_APK)).unwrap();
+        fs::remove_file(version_dir.join(Abi::HOST.split_apk())).unwrap();
         assert!(store.current_set().unwrap().is_some());
         assert_eq!(
             usable_version(&store).unwrap(),
             None,
-            "an install that lost its x86_64 split is not usable"
+            "an install that lost its native split is not usable"
         );
 
         let bundle = sources.join("roblox.apks");
         let mut writer = ZipWriter::new(File::create(&bundle).unwrap());
-        for (name, path) in [(BASE_APK, &paths.base), (NATIVE_SPLIT_APK, &split)] {
+        for (name, path) in [(BASE_APK, &paths.base), (Abi::HOST.split_apk(), &split)] {
             writer.start_file(name, stored()).unwrap();
             io::copy(&mut File::open(path).unwrap(), &mut writer).unwrap();
         }
@@ -2318,11 +2453,11 @@ mod tests {
         assert_eq!(repaired.base_path(), version_dir.join(BASE_APK));
         assert_eq!(
             repaired.native_libs_path(),
-            version_dir.join(NATIVE_SPLIT_APK)
+            version_dir.join(Abi::HOST.split_apk())
         );
         assert!(repaired
             .native_libs_mut()
-            .native_lib_filenames(crate::apk::TARGET_ABI)
+            .native_lib_filenames(Abi::HOST)
             .expect("list native libs")
             .iter()
             .any(|name| name == crate::apk::ENGINE_LIB));
@@ -2352,7 +2487,7 @@ mod tests {
         };
         let sources = temp_root(tag);
         fs::copy(&paths.base, sources.join(BASE_APK)).unwrap();
-        fs::copy(&split, sources.join(NATIVE_SPLIT_APK)).unwrap();
+        fs::copy(&split, sources.join(Abi::HOST.split_apk())).unwrap();
         Some(sources)
     }
 

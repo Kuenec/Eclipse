@@ -67,7 +67,7 @@ impl std::fmt::Display for InitRunError {
                 "no Roblox APK (set {} to an APK file or to a directory holding {} and {})",
                 crate::apk::DEV_APK_ENV,
                 crate::apk::BASE_APK,
-                crate::apk::NATIVE_SPLIT_APK
+                crate::abi::Abi::HOST.split_apk()
             ),
             Self::Apk(e) => write!(f, "APK read: {e}"),
             Self::Extract(dir, e) => write!(f, "extract native libs into {}: {e}", dir.display()),
@@ -112,11 +112,12 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
     let page = host_page_size();
     let _ = writeln!(
         log,
-        "mapped: objects={} RELATIVE_applied={} RELR_applied={} RELRO_applied={}",
+        "mapped: objects={} RELATIVE_applied={} RELR_applied={} RELRO_applied={} icache_sync={:?}",
         set.objects.len(),
         set.stats.relative_applied,
         set.stats.relr_applied,
-        set.relro_applied
+        set.relro_applied,
+        set.stats.icache_sync
     );
 
     let base = set.objects[0].load_base();
@@ -241,7 +242,7 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
 
 fn extract_engine(apk: &mut crate::apk::Apk, lib_dir: &Path) -> Result<PathBuf, InitRunError> {
     let status = crate::status::StatusSink::terminal();
-    apk.extract_native_libs(crate::apk::TARGET_ABI, lib_dir, &status)
+    apk.extract_native_libs(crate::abi::Abi::HOST, lib_dir, &status)
         .map_err(|e| InitRunError::Extract(lib_dir.to_path_buf(), e.to_string()))?;
     Ok(lib_dir.join("libroblox.so"))
 }
@@ -373,7 +374,7 @@ mod tests {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         writer
             .start_file(
-                format!("lib/{}/libroblox.so", crate::apk::TARGET_ABI),
+                format!("lib/{}/libroblox.so", crate::abi::Abi::HOST.android_name()),
                 SimpleFileOptions::default(),
             )
             .expect("start the engine entry");

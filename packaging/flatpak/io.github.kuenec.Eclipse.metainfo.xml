@@ -11,8 +11,8 @@
   <description>
     <p>
       Eclipse is an open-source runtime, written in Rust, that runs the official and unmodified
-      Android x86-64 Roblox client on Linux with native Vulkan graphics, audio, and keyboard and
-      mouse input.
+      Android Roblox client on Linux with native Vulkan graphics, audio, and keyboard and mouse
+      input.
     </p>
     <p>
       Eclipse does not include or redistribute Roblox. On first launch it downloads Roblox's own
