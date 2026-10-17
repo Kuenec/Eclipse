@@ -123,6 +123,19 @@ fn failure<T>(result: &Result<T, ReaderError>) -> Option<DisplayValue<&ReaderErr
     result.as_ref().err().map(tracing::field::display)
 }
 
+unsafe fn write_output<T: Copy>(
+    out: *mut T,
+    what: &'static str,
+    value: impl FnOnce() -> Result<T, ReaderError>,
+) -> Result<T, ReaderError> {
+    if out.is_null() {
+        return Err(ReaderError::Null(what));
+    }
+    let value = value()?;
+    unsafe { out.write(value) };
+    Ok(value)
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -507,15 +520,11 @@ unsafe fn new_reader(
     max_images: i32,
     out: *mut *mut c_void,
 ) -> MediaStatus {
-    let result = if out.is_null() {
-        Err(ReaderError::Null("reader output"))
-    } else {
-        create(width, height, format, max_images)
+    let result = unsafe {
+        write_output(out, "reader output", || {
+            create(width, height, format, max_images).map(handle_to_ptr)
+        })
     };
-    let reader = result.as_ref().ok().map(|handle| handle_to_ptr(*handle));
-    if let Some(reader) = reader {
-        unsafe { out.write(reader) };
-    }
     let status = status_of(&result);
     tracing::debug!(
         target: "mediandk",
@@ -524,7 +533,7 @@ unsafe fn new_reader(
         format,
         ?usage,
         max_images,
-        ?reader,
+        reader = ?result.as_ref().ok(),
         status,
         error = failure(&result),
         "{call}"
@@ -577,14 +586,11 @@ pub(super) unsafe extern "C" fn eclipse_aimagereader_getwindow(
     handle: *mut c_void,
     window: *mut *mut c_void,
 ) -> MediaStatus {
-    let result = if window.is_null() {
-        Err(ReaderError::Null("window output"))
-    } else {
-        live_reader(handle).map(|shared| window_of(&shared) as *mut c_void)
+    let result = unsafe {
+        write_output(window, "window output", || {
+            live_reader(handle).map(|shared| window_of(&shared) as *mut c_void)
+        })
     };
-    if let Ok(found) = result {
-        unsafe { window.write(found) };
-    }
     let status = status_of(&result);
     tracing::debug!(
         target: "mediandk",
@@ -601,20 +607,16 @@ pub(super) unsafe extern "C" fn eclipse_aimagereader_acquirelatestimage(
     handle: *mut c_void,
     image: *mut *mut c_void,
 ) -> MediaStatus {
-    let result = if image.is_null() {
-        Err(ReaderError::Null("image output"))
-    } else {
-        acquire_latest(handle)
+    let result = unsafe {
+        write_output(image, "image output", || {
+            acquire_latest(handle).map(handle_to_ptr)
+        })
     };
-    let acquired = result.as_ref().ok().map(|found| handle_to_ptr(*found));
-    if let Some(acquired) = acquired {
-        unsafe { image.write(acquired) };
-    }
     let status = status_of(&result);
     tracing::trace!(
         target: "mediandk",
         reader = ?handle,
-        image = ?acquired,
+        image = ?result.as_ref().ok(),
         status,
         error = failure(&result),
         "AImageReader_acquireLatestImage"
@@ -680,14 +682,7 @@ unsafe fn image_value<T: Copy + fmt::Debug>(
     out: *mut T,
     value: impl FnOnce(&Image) -> Result<T, ReaderError>,
 ) -> MediaStatus {
-    let result = if out.is_null() {
-        Err(ReaderError::Null("output"))
-    } else {
-        images().with(image, value)
-    };
-    if let Ok(found) = result {
-        unsafe { out.write(found) };
-    }
+    let result = unsafe { write_output(out, "output", || images().with(image, value)) };
     let status = status_of(&result);
     tracing::trace!(
         target: "mediandk",
@@ -753,32 +748,39 @@ pub(super) unsafe extern "C" fn eclipse_aimage_getplanerowstride(
     }
 }
 
+unsafe fn plane_data(
+    image: *mut c_void,
+    plane: c_int,
+    data: *mut *mut u8,
+    data_length: *mut c_int,
+) -> Result<c_int, ReaderError> {
+    if data.is_null() || data_length.is_null() {
+        return Err(ReaderError::Null("plane output"));
+    }
+    let (found, length) = images().with(image, |image| {
+        let view = image.plane(plane)?;
+        Ok((view.data, int("plane length", view.len)?))
+    })?;
+    unsafe {
+        data.write(found.cast_mut());
+        data_length.write(length);
+    }
+    Ok(length)
+}
+
 pub(super) unsafe extern "C" fn eclipse_aimage_getplanedata(
     image: *mut c_void,
     plane: c_int,
     data: *mut *mut u8,
     data_length: *mut c_int,
 ) -> MediaStatus {
-    let result = if data.is_null() || data_length.is_null() {
-        Err(ReaderError::Null("plane output"))
-    } else {
-        images().with(image, |image| {
-            let view = image.plane(plane)?;
-            Ok((view.data, int("plane length", view.len)?))
-        })
-    };
-    if let Ok((found, length)) = result {
-        unsafe {
-            data.write(found.cast_mut());
-            data_length.write(length);
-        }
-    }
+    let result = unsafe { plane_data(image, plane, data, data_length) };
     let status = status_of(&result);
     tracing::trace!(
         target: "mediandk",
         ?image,
         plane,
-        length = result.as_ref().ok().map(|(_, length)| *length),
+        length = result.as_ref().ok(),
         status,
         error = failure(&result),
         "AImage_getPlaneData"
