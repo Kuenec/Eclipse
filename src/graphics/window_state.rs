@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 
 use eclipse_config::temp_file;
 use serde::{Deserialize, Serialize};
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowAttributes};
 
+use super::launch_window::LaunchWindow;
+use crate::framework::display_metrics::DisplayModel;
 use crate::framework::lifecycle::{self, UnsavedFile};
 
 const WINDOW_STATE_FILE: &str = "window.json";
@@ -99,6 +101,18 @@ impl FullscreenState {
             );
         }
         Some(Fullscreen::Borderless(found))
+    }
+
+    fn expected_monitor(&self, launch: &Window) -> Option<MonitorHandle> {
+        let FullscreenState::On { monitor } = self else {
+            return None;
+        };
+        monitor
+            .as_deref()
+            .and_then(|wanted| {
+                named_monitor(wanted, launch.available_monitors(), MonitorHandle::name)
+            })
+            .or_else(|| launch.current_monitor())
     }
 }
 
@@ -243,6 +257,18 @@ impl WindowStateFile {
             .with_fullscreen(self.state.fullscreen.restored(monitors))
     }
 
+    pub fn display_model(&self, launch: Option<&LaunchWindow>) -> DisplayModel {
+        let launch = launch.and_then(LaunchWindow::window);
+        let monitor = launch
+            .and_then(|window| self.state.fullscreen.expected_monitor(window))
+            .map(|monitor| monitor.size());
+        expected_display(
+            self.state.size,
+            launch.map_or(1.0, Window::scale_factor),
+            monitor,
+        )
+    }
+
     pub(crate) fn observe(&mut self, window: &Window, now: Instant) {
         self.record(Observed::of(window), now);
     }
@@ -298,6 +324,17 @@ impl WindowStateFile {
             ),
         }
     }
+}
+
+fn expected_display(
+    saved: WindowSize,
+    scale: f64,
+    fullscreen_monitor: Option<PhysicalSize<u32>>,
+) -> DisplayModel {
+    let size = fullscreen_monitor
+        .filter(|size| size.width > 0 && size.height > 0)
+        .unwrap_or_else(|| saved.logical().to_physical(scale));
+    DisplayModel::new(size.width, size.height, scale)
 }
 
 fn restored(dir: &Path, variable: impl FnOnce(&str) -> Option<OsString>) -> WindowState {
@@ -408,6 +445,50 @@ mod tests {
             write(&dir, &state).unwrap();
             assert_eq!(restored(&dir, DESKTOP), state);
         }
+    }
+
+    #[test]
+    fn roblox_expects_the_saved_size_at_the_launch_window_scale_or_the_fullscreen_monitor() {
+        assert_eq!(
+            expected_display(size(1280, 720), 1.0, None),
+            DisplayModel::new(1280, 720, 1.0)
+        );
+        assert_eq!(
+            expected_display(size(1280, 720), 2.0, None),
+            DisplayModel::new(2560, 1440, 2.0)
+        );
+        assert_eq!(
+            expected_display(size(1280, 720), 1.25, None),
+            DisplayModel::new(1600, 900, 1.25)
+        );
+        assert_eq!(
+            expected_display(size(1280, 720), 1.5, Some(PhysicalSize::new(3840, 2160))),
+            DisplayModel::new(3840, 2160, 1.5)
+        );
+        assert_eq!(
+            expected_display(size(1280, 720), 1.0, Some(PhysicalSize::new(0, 0))),
+            DisplayModel::new(1280, 720, 1.0),
+            "a monitor without a size leaves the saved size"
+        );
+    }
+
+    #[test]
+    fn without_a_launch_window_roblox_expects_the_saved_size_at_scale_1() {
+        let dir = scratch("display-model");
+        let fullscreen = WindowState {
+            size: size(1100, 700),
+            fullscreen: FullscreenState::On {
+                monitor: Some("DP-1".to_owned()),
+            },
+        };
+        assert_eq!(
+            file_with(&dir, windowed(1600, 900)).display_model(None),
+            DisplayModel::new(1600, 900, 1.0)
+        );
+        assert_eq!(
+            file_with(&dir, fullscreen).display_model(None),
+            DisplayModel::new(1100, 700, 1.0)
+        );
     }
 
     #[test]

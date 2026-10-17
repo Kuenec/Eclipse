@@ -191,6 +191,10 @@ impl LaunchWindow {
         }
     }
 
+    pub(crate) fn window(&self) -> Option<&Window> {
+        self.screen.window.as_ref()
+    }
+
     pub fn control(&self) -> WindowControl {
         WindowControl {
             commands: self.commands.clone(),

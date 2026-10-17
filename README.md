@@ -51,6 +51,8 @@ Start **Eclipse** from your app menu. From a terminal, use `flatpak run io.githu
 | `run` | Start Roblox (the default from the app menu) |
 | `run --check-update` | Check for a newer Roblox, then start it |
 | `open <link>` | Start Roblox at a game, server, private-server, friend or share link, or a place ID |
+| `shortcut <link>` | Add a game to your app menu, with its name and icon from Roblox |
+| `shortcut --remove <link>` | Remove that game from your app menu |
 | `update` | Check for a newer Roblox now |
 | `rollback` | Go back to the Roblox version before the current one, if Eclipse still keeps it |
 | `install <files>` | Install Roblox from your own `base.apk` + `split_config.x86_64.apk`, or an `.apks`/`.xapk` bundle |

@@ -2,11 +2,13 @@ use std::ffi::CStr;
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Mutex, OnceLock, PoisonError, TryLockError};
 
 use tracing::Level;
+
+use crate::gpu::{self, ChosenDevice};
 
 const CLIENT_TAG: &str = "Roblox";
 const LIBLOG_MESSAGE_MAX: usize = 4095;
@@ -19,8 +21,18 @@ const UPGRADE_STATUS: &str = "upgradeStatus = ";
 const UPGRADE_REQUIRED: &str = "2";
 const GAME_MANAGER_TAG: &str = "GameManager";
 const JOIN_BLOCKED_BY_UPGRADE: &str = "canStartGame = false: Upgrade required";
+const DEVICE_LOST_RESULT: &str = "VK_ERROR_DEVICE_LOST";
+const DEVICE_REMOVED_CRASH: &str = "DeviceRemovedGraphics";
+const DEVICE_LOSS: &str = "The GPU driver lost Roblox's graphics device";
+const NVIDIA_SUSPEND_REMEDY: &str = "After a suspend this usually means the NVIDIA driver is not \
+                                     preserving video memory: set the nvidia module option \
+                                     NVreg_PreserveVideoMemoryAllocations=1 and enable \
+                                     nvidia-suspend.service, nvidia-hibernate.service and \
+                                     nvidia-resume.service.";
+const DRIVER_REMEDY: &str = "If this repeats, update your GPU driver and report it with this log.";
 
 static TAP: OnceLock<Tap> = OnceLock::new();
+static DEVICE_LOSS_NOTICE: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlaceId(pub u64);
@@ -102,6 +114,7 @@ enum CrashKind<'a> {
         pool: MemoryPool,
         bytes: Option<u64>,
     },
+    DeviceLost,
     Other(&'a str),
 }
 
@@ -111,8 +124,41 @@ enum MemoryPool {
     System,
 }
 
+#[derive(Clone, Copy)]
+enum DeviceLossNotice {
+    Reported,
+    Fatal,
+}
+
+impl DeviceLossNotice {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Reported => 1,
+            Self::Fatal => 2,
+        }
+    }
+
+    fn is_news(self) -> bool {
+        DEVICE_LOSS_NOTICE.fetch_max(self.rank(), Ordering::Relaxed) < self.rank()
+    }
+
+    fn explanation(self, device: Option<&ChosenDevice>) -> String {
+        let remedy = if device.is_some_and(ChosenDevice::is_nvidia) {
+            NVIDIA_SUSPEND_REMEDY
+        } else {
+            DRIVER_REMEDY
+        };
+        match self {
+            Self::Reported => {
+                format!("{DEVICE_LOSS}. If Roblox stops now, start it again. {remedy}")
+            }
+            Self::Fatal => format!("{DEVICE_LOSS}, so Roblox must be restarted. {remedy}"),
+        }
+    }
+}
+
 impl CrashKind<'_> {
-    fn explanation(&self, graphics: crate::gpu::Graphics) -> String {
+    fn explanation(&self, graphics: gpu::Graphics, device: Option<&ChosenDevice>) -> String {
         match self {
             Self::OutOfMemory { pool, bytes } => {
                 let memory = match pool {
@@ -133,6 +179,7 @@ impl CrashKind<'_> {
                      If this repeats, {remedy}, and report it with this log."
                 )
             }
+            Self::DeviceLost => DeviceLossNotice::Fatal.explanation(device),
             Self::Other(kind) => format!("Roblox stopped with RBXCRASH: {kind}."),
         }
     }
@@ -322,6 +369,11 @@ fn crash(body: &str) -> Option<CrashKind<'_>> {
         Some((kind, detail)) => (kind, Some(detail)),
         None => (text, None),
     };
+    if kind == DEVICE_REMOVED_CRASH
+        || detail.and_then(|detail| detail.strip_suffix(')')) == Some(DEVICE_LOST_RESULT)
+    {
+        return Some(CrashKind::DeviceLost);
+    }
     let pool = match kind {
         "OutOfMemoryGraphics" => MemoryPool::Graphics,
         "OutOfMemory" => MemoryPool::System,
@@ -475,8 +527,19 @@ fn route(deliver: impl Fn(&Tap)) {
     }
 }
 
+pub(crate) fn explain_device_loss() {
+    if !DeviceLossNotice::Reported.is_news() {
+        return;
+    }
+    let explanation = DeviceLossNotice::Reported.explanation(gpu::recorded_choice().as_ref());
+    crate::diagnostics::record_status(Level::WARN, &explanation);
+}
+
 fn explain(kind: &CrashKind<'_>) {
-    let explanation = kind.explanation(crate::gpu::client_graphics());
+    if *kind == CrashKind::DeviceLost && !DeviceLossNotice::Fatal.is_news() {
+        return;
+    }
+    let explanation = kind.explanation(gpu::client_graphics(), gpu::recorded_choice().as_ref());
     #[cfg(test)]
     if TEST_TAP
         .with_borrow_mut(|test| {

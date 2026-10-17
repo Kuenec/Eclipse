@@ -10,6 +10,17 @@ const HEADER: &str = "2026-09-28T18:20:01.605Z,101.605739,7a3fc6c0,7";
 const USER_ID: &str = "987654321";
 const GRAPHICS_OOM: &str = "[LOGCHANNELS + 1] RBXCRASH: OutOfMemoryGraphics (Failed to allocate memory. size = 1399808, alignment = 1024)";
 
+const NVIDIA: u32 = 0x10de;
+const AMD: u32 = 0x1002;
+const INTEL: u32 = 0x8086;
+
+fn chosen(vendor_id: u32) -> ChosenDevice {
+    ChosenDevice::of_properties(&ash::vk::PhysicalDeviceProperties {
+        vendor_id,
+        ..Default::default()
+    })
+}
+
 fn records(log: &str) -> Vec<Record<'_>> {
     log.lines().filter_map(parse).collect()
 }
@@ -99,7 +110,7 @@ fn synthetic_lines_yield_teleport_attestation_crashes_and_rpc() {
                 pool: MemoryPool::System,
                 bytes: None,
             }),
-            Record::Crash(CrashKind::Other("FatalRuntimeError (VK_ERROR_DEVICE_LOST)")),
+            Record::Crash(CrashKind::DeviceLost),
             Record::BloxstrapRpc(
                 r#"{"command":"SetRichPresence","data":{"details":"Standard Solo","startTime":1786841923,"state":"Level 19"}}"#
             ),
@@ -296,7 +307,7 @@ fn parsed_values_never_carry_the_user_id() {
     {
         let text = match record {
             Record::Event(event) => format!("{event:?}"),
-            Record::Crash(kind) => format!("{kind:?} {}", kind.explanation(Graphics::Vulkan)),
+            Record::Crash(kind) => format!("{kind:?} {}", kind.explanation(Graphics::Vulkan, None)),
             Record::BloxstrapRpc(message) => message.to_owned(),
         };
         assert!(!text.contains(USER_ID), "{text}");
@@ -327,7 +338,7 @@ fn out_of_memory_crashes_are_explained_in_eclipse_words() {
         let Some(Record::Crash(kind)) = parse(&record) else {
             panic!("{record} is a crash record");
         };
-        let text = kind.explanation(Graphics::Vulkan);
+        let text = kind.explanation(Graphics::Vulkan, None);
         assert!(text.contains("graphics memory"), "{text}");
         assert!(text.contains("1399808"), "{text}");
         assert!(!text.contains("FFlag"), "{text}");
@@ -338,19 +349,19 @@ fn out_of_memory_crashes_are_explained_in_eclipse_words() {
         bytes: None,
     };
     assert_eq!(
-        system.explanation(Graphics::Vulkan),
+        system.explanation(Graphics::Vulkan, None),
         "Roblox stopped: it reported that it could not allocate memory. If this repeats, lower \
          the graphics quality in Roblox's settings or turn on Use OpenGL ES in Eclipse Settings, \
          and report it with this log."
     );
     assert_eq!(
-        system.explanation(Graphics::Gles(GlesReason::Configured)),
+        system.explanation(Graphics::Gles(GlesReason::Configured), None),
         "Roblox stopped: it reported that it could not allocate memory. If this repeats, lower \
          the graphics quality in Roblox's settings, and report it with this log."
     );
     assert_eq!(
         CrashKind::Other("An error occurred that wasn't supposed to.  Contact support")
-            .explanation(Graphics::Vulkan),
+            .explanation(Graphics::Vulkan, None),
         "Roblox stopped with RBXCRASH: An error occurred that wasn't supposed to.  Contact support."
     );
     assert_eq!(
@@ -361,6 +372,59 @@ fn out_of_memory_crashes_are_explained_in_eclipse_words() {
     );
     assert_eq!(parse("[LOGCHANNELS + 1] RBXCRASH: "), None);
     assert_eq!(parse("[LOGCHANNELS + 1] Crash reporter ready"), None);
+}
+
+#[test]
+fn device_loss_crashes_are_explained_with_the_driver_remedy() {
+    for crash in [
+        "FatalRuntimeError (VK_ERROR_DEVICE_LOST)",
+        "Suicide (VK_ERROR_DEVICE_LOST)",
+        "DeviceRemovedGraphics (Device recovery budget exhausted)",
+    ] {
+        let record = with_header(&format!("[LOGCHANNELS + 1] RBXCRASH: {crash}"));
+        assert_eq!(
+            parse(&record),
+            Some(Record::Crash(CrashKind::DeviceLost)),
+            "{record}"
+        );
+    }
+    assert_eq!(
+        parse("[LOGCHANNELS + 1] RBXCRASH: FatalRuntimeError (VK_ERROR_INITIALIZATION_FAILED)"),
+        Some(Record::Crash(CrashKind::Other(
+            "FatalRuntimeError (VK_ERROR_INITIALIZATION_FAILED)"
+        )))
+    );
+    assert_eq!(
+        CrashKind::DeviceLost.explanation(Graphics::Vulkan, Some(&chosen(NVIDIA))),
+        "The GPU driver lost Roblox's graphics device, so Roblox must be restarted. After a \
+         suspend this usually means the NVIDIA driver is not preserving video memory: set the \
+         nvidia module option NVreg_PreserveVideoMemoryAllocations=1 and enable \
+         nvidia-suspend.service, nvidia-hibernate.service and nvidia-resume.service."
+    );
+    for device in [Some(chosen(AMD)), Some(chosen(INTEL)), None] {
+        assert_eq!(
+            CrashKind::DeviceLost.explanation(Graphics::Vulkan, device.as_ref()),
+            "The GPU driver lost Roblox's graphics device, so Roblox must be restarted. If this \
+             repeats, update your GPU driver and report it with this log.",
+            "{device:?}"
+        );
+    }
+}
+
+#[test]
+fn a_device_loss_seen_before_roblox_gives_up_does_not_claim_it_stopped() {
+    assert_eq!(
+        DeviceLossNotice::Reported.explanation(None),
+        "The GPU driver lost Roblox's graphics device. If Roblox stops now, start it again. If \
+         this repeats, update your GPU driver and report it with this log."
+    );
+    assert_eq!(
+        DeviceLossNotice::Reported.explanation(Some(&chosen(NVIDIA))),
+        format!(
+            "The GPU driver lost Roblox's graphics device. If Roblox stops now, start it again. \
+             {NVIDIA_SUSPEND_REMEDY}"
+        )
+    );
 }
 
 #[test]

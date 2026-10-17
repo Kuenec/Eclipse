@@ -44,6 +44,7 @@ struct Heap {
     fields: Vec<String>,
     long_fields: HashMap<(usize, String), jlong>,
     boolean_fields: HashMap<(usize, String), jboolean>,
+    int_fields: HashMap<(usize, String), jint>,
 }
 
 impl Heap {
@@ -357,6 +358,19 @@ unsafe extern "system" fn get_boolean_field(
         .unwrap_or(false)
 }
 
+unsafe extern "system" fn set_int_field(
+    _env: *mut JNIEnv,
+    obj: jobject,
+    field: jfieldID,
+    value: jint,
+) {
+    let mut heap = heap();
+    let name = heap.field_name(field);
+    if let Some(object) = heap.live_object(obj) {
+        heap.int_fields.insert((object, name), value);
+    }
+}
+
 unsafe extern "system" fn call_boolean_method_a(
     _env: *mut JNIEnv,
     obj: jobject,
@@ -525,6 +539,7 @@ fn env_ptr() -> *mut JNIEnv {
                 offset_of!(Table, GetBooleanField),
                 get_boolean_field as *const (),
             ),
+            (offset_of!(Table, SetIntField), set_int_field as *const ()),
             (
                 offset_of!(Table, GetStaticMethodID),
                 get_static_method_id as *const (),
@@ -626,6 +641,11 @@ pub(super) fn set_boolean_field(obj: &JObject, field: &str, value: jboolean) {
     heap()
         .boolean_fields
         .insert((object, field.to_owned()), value);
+}
+
+pub(super) fn int_field(obj: &JObject, field: &str) -> Option<jint> {
+    let object = object_of(obj);
+    heap().int_fields.get(&(object, field.to_owned())).copied()
 }
 
 pub(super) fn array_texts(array: &JObject) -> Vec<Option<String>> {

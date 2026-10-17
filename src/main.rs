@@ -59,6 +59,8 @@ const LAUNCH_LINK_COMMAND: &str = "__launch-link";
 const LAUNCH_LINK_ENV: &str = "ECLIPSE_LAUNCH_LINK";
 const RUN_USAGE: &str = "usage: eclipse run [--check-update | APK | DIRECTORY]";
 const OPEN_USAGE: &str = "usage: eclipse open <LINK | PLACE ID>";
+const SHORTCUT_USAGE: &str = "usage: eclipse shortcut [--remove] <GAME LINK | PLACE ID>";
+const SHORTCUT_REMOVE_OPTION: &str = "--remove";
 const OPEN_CONTEXT: &str = "eclipse open";
 const HAND_OFF_CONTEXT: &str = "eclipse launch";
 const LEAVE_AND_JOIN: &str = "Leave and join";
@@ -99,6 +101,11 @@ COMMANDS:
                 Start Roblox as `run` does and open a Roblox link or place ID: a game, server,
                 private-server, friend or share link. While Roblox is starting, the link goes
                 to it instead; while it is in an experience, Eclipse asks before leaving it.
+    shortcut [--remove] <LINK>
+                Add a game to the app menu, with its name and icon from Roblox's web API, as an
+                entry that runs `open` with its place ID. LINK is a game link or place ID;
+                server, private-server, friend and share links are refused. In Flatpak the
+                desktop asks first. --remove takes the game's entry out of the app menu.
     install <PATH>...
                 Verify and install the Roblox client: base.apk plus split_config.x86_64.apk,
                 a directory holding them, or an .apks/.xapk/.apkm bundle.
@@ -183,6 +190,13 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("eclipse install-url-handler: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("shortcut") => match shortcut_command(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("eclipse shortcut: {error}");
                 ExitCode::FAILURE
             }
         },
@@ -2001,6 +2015,26 @@ fn install_url_handler_command(arguments: &[OsString]) -> Result<(), Box<dyn std
     Ok(())
 }
 
+enum ShortcutAction {
+    Add,
+    Remove,
+}
+
+fn shortcut_command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let (action, link) = match arguments {
+        [link] if link != SHORTCUT_REMOVE_OPTION => (ShortcutAction::Add, link),
+        [option, link] if option == SHORTCUT_REMOVE_OPTION => (ShortcutAction::Remove, link),
+        _ => return Err(SHORTCUT_USAGE.into()),
+    };
+    let link = link.to_str().ok_or("the Roblox link is not valid UTF-8")?;
+    let shortcut = eclipse::shortcut::PlaceShortcut::for_link(&eclipse::links::parse(link)?)?;
+    match action {
+        ShortcutAction::Add => println!("{}", desktop_integration::install_shortcut(shortcut)?),
+        ShortcutAction::Remove => println!("{}", desktop_integration::remove_shortcut(shortcut)?),
+    }
+    Ok(())
+}
+
 fn installed_client_note(store: &Store) -> Option<String> {
     match store.current() {
         Ok(Some(_)) => None,
@@ -2481,6 +2515,10 @@ impl Host<'_> {
         self.refresh()
     }
 
+    fn launch_window(&self) -> Option<&LaunchWindow> {
+        self.window.as_ref().map(|(window, _)| &**window)
+    }
+
     fn refresh(&mut self) -> Result<(), WindowClosed> {
         match &mut self.window {
             Some((window, updates)) => window.refresh(updates),
@@ -2728,6 +2766,10 @@ fn boot_and_play(
     *attempt = proving_start.and_then(|proving| begin_attempt(proving, host.status));
     let vm = eclipse::runtime::boot(&plan, Some(&base_path), Some(&app_lib_dir))?;
     println!("ART VM booted with Roblox's Java on the classpath ✓");
+    eclipse::framework::display_metrics::apply(
+        &vm,
+        window_state.display_model(host.launch_window()),
+    )?;
     host.refresh()?;
 
     println!("# Provisioning bionic sonames (libm.so → Eclipse apkenv-loadable shim) …");
@@ -3364,11 +3406,12 @@ mod tests {
         installed_or_updated_set, lock_run_in, native_lib_dir, parse_libroblox_init_lib_dir,
         parse_storage_action, parse_update_source, record_normal_end,
         remove_other_native_lib_versions, remove_other_version_oats, roblox_refuses, set_to_launch,
-        update_advice, update_if_due, url_handler_message, user_packaging, window_graphics,
-        window_title, with_update_advice, ClientLock, KeptBecause, Launch, LaunchCheck,
-        LaunchCommand, LaunchCommandError, Packaging, Proving, Request, RunCheck, RunStart,
-        StorageAction, StorageLayout, Token, HELP, LAUNCH_CHECK_BUDGET, LAUNCH_LINK_COMMAND,
-        LAUNCH_LINK_ENV, NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE,
+        shortcut_command, update_advice, update_if_due, url_handler_message, user_packaging,
+        window_graphics, window_title, with_update_advice, ClientLock, KeptBecause, Launch,
+        LaunchCheck, LaunchCommand, LaunchCommandError, Packaging, Proving, Request, RunCheck,
+        RunStart, StorageAction, StorageLayout, Token, HELP, LAUNCH_CHECK_BUDGET,
+        LAUNCH_LINK_COMMAND, LAUNCH_LINK_ENV, NOT_INSTALLED, OPEN_USAGE, RUNTIME_DIR, RUN_USAGE,
+        SHORTCUT_USAGE,
     };
     use crate::desktop_integration::BROWSER_HANDLER_COMMAND;
     use eclipse::apk::store::{
@@ -3516,6 +3559,39 @@ mod tests {
                           in a web browser."
                     .to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn shortcut_refuses_wrong_arguments_and_links_other_than_games_before_any_install() {
+        let shortcut = |arguments: &[&str]| {
+            let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+            shortcut_command(&arguments)
+                .expect_err("refused before installing")
+                .to_string()
+        };
+        for arguments in [
+            &[][..],
+            &["1818", "1819"],
+            &["--remove"],
+            &["--remove", "1818", "1819"],
+            &["--bogus", "1818"],
+        ] {
+            assert_eq!(shortcut(arguments), SHORTCUT_USAGE, "{arguments:?}");
+        }
+        assert_eq!(
+            shortcut(&["roblox://placeId=1818&linkCode=0042"]),
+            "Shortcuts open games only, not private-server links, so that no server, join code \
+             or account is stored in the app menu; give the game's page link or its place ID."
+        );
+        assert_eq!(
+            shortcut(&["https://www.roblox.com/catalog/1"]),
+            "This is a Roblox shop link; Eclipse opens experience links. Open it in a web browser."
+        );
+        assert_eq!(
+            shortcut(&["--remove", "roblox://userId=156"]),
+            "Shortcuts open games only, not friend links, so that no server, join code or \
+             account is stored in the app menu; give the game's page link or its place ID."
         );
     }
 

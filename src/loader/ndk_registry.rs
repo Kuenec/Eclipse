@@ -173,15 +173,11 @@ pub struct AssetState {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConfigurationState {
-    pub density: i32,
-
     pub screen_width_dp: i32,
 
     pub screen_height_dp: i32,
 
     pub screen_size: i32,
-
-    pub orientation: i32,
 
     pub nav_hidden: i32,
 
@@ -265,6 +261,9 @@ pub fn set_engine_window_geometry(width: i32, height: i32) {
 pub fn engine_window_geometry() -> Option<(i32, i32)> {
     unpack_geometry(ENGINE_WINDOW_GEOMETRY.load(Ordering::Acquire))
 }
+
+#[cfg(test)]
+pub(crate) static WINDOW_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 static WSI_WINDOW: AtomicUsize = AtomicUsize::new(0);
 static WSI_WINDOW_GEOMETRY: AtomicU64 = AtomicU64::new(0);
@@ -601,11 +600,9 @@ mod tests {
         );
     }
 
-    static WSI_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn wsi_window_register_lookup_unregister_round_trips() {
-        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = WINDOW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p: usize = 0x5000_1000;
         register_wsi_window(p, 1280, 720);
         assert_eq!(
@@ -635,7 +632,7 @@ mod tests {
 
     #[test]
     fn wsi_window_rejects_null_and_unknown_pointers() {
-        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = WINDOW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         register_wsi_window(0, 100, 100);
         assert_eq!(
@@ -662,7 +659,7 @@ mod tests {
 
     #[test]
     fn engine_claimed_surface_round_trips_set_and_get() {
-        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = WINDOW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_engine_claimed_surface(false);
         assert!(
             !engine_claimed_surface(),
@@ -727,7 +724,7 @@ mod tests {
             None
         );
 
-        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = WINDOW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_wsi_target(xlib);
         assert_eq!(wsi_target(), xlib);
         set_wsi_target(None);
