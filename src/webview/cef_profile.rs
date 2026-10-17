@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aes::cipher::{Array, BlockCipherDecrypt as _, KeyInit as _};
 use aes::Aes128;
 use libsqlite3_sys as ffi;
-use sha2::{Digest as _, Sha256};
+use ring::digest::{digest, SHA256};
 
 use super::proto::{CookieExpiry, SameSite, StoredCookie};
 
@@ -187,9 +187,9 @@ impl CookieRow {
             Some((OBFUSCATION_PREFIX, ciphertext)) => {
                 let plaintext =
                     decrypt_cbc(cipher, ciphertext).map_err(|problem| self.problem(problem))?;
-                let digest = Sha256::digest(self.host.as_bytes());
+                let digest = digest(&SHA256, self.host.as_bytes());
                 plaintext
-                    .strip_prefix(digest.as_slice())
+                    .strip_prefix(digest.as_ref())
                     .map(<[u8]>::to_vec)
                     .ok_or_else(|| self.problem("does not start with the digest of its host"))
             }

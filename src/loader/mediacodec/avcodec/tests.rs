@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use sha2::{Digest, Sha256};
+use ring::digest::{Context, SHA256};
 
 use super::*;
 use crate::loader::log_capture::formatted_log;
@@ -123,7 +123,7 @@ fn assert_matches_video_fixture(name: &str, fixture: &Fixture, frames: &[Decoded
     );
 
     let mut nv12 = Vec::new();
-    let mut stream = Sha256::new();
+    let mut stream = Context::new(&SHA256);
     let (frame_hashes, stream_hash) = fixture.hashes();
     for (index, video) in video_frames(frames).into_iter().enumerate() {
         let format = video.format();
@@ -139,7 +139,7 @@ fn assert_matches_video_fixture(name: &str, fixture: &Fixture, frames: &[Decoded
         stream.update(&nv12);
     }
     assert_eq!(
-        hex(&stream.finalize()),
+        hex(stream.finish().as_ref()),
         stream_hash,
         "{name} stream NV12 hash"
     );

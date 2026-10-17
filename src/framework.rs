@@ -18,9 +18,11 @@ use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::apk::arsc::{ArscError, ResTable};
+use crate::apk::cache::ApkCache;
 use crate::apk::res_config::ResConfig;
 use crate::apk::signature::SigningCertificateHistory;
-use crate::runtime::Vm;
+use crate::runtime::{RuntimeError, Vm};
 
 mod android_groups;
 mod appsflyer_statics;
@@ -35,6 +37,7 @@ pub(crate) mod engine_input;
 mod external_intents;
 #[cfg(test)]
 mod fake_jvm;
+mod in_memory_dex;
 pub(crate) mod keep_screen_on;
 pub mod lifecycle;
 pub mod matrix_registry;
@@ -398,9 +401,10 @@ fn arsc_pool_string(cookie: i32, index: u32) -> Option<String> {
         ARSC_APP_COOKIE => 0x7f00_0000,
         _ => return None,
     };
-    let bytes = arsc_bytes_for(probe_resid)?;
-    let table = crate::apk::arsc::parse_arsc(bytes).ok()?;
-    table.value_string(index).ok().flatten()
+    arsc_table_for(probe_resid)?
+        .value_string(index)
+        .ok()
+        .flatten()
 }
 
 extern "system" fn asset_manager_init<'local>(
@@ -563,7 +567,7 @@ extern "system" fn asset_manager_retrieve_attributes<'local>(
         attrs.get_region(env, start, &mut ids)?;
 
         let config = asset_configuration::of(env, &this);
-        let entries = resolve_xml_attributes(parse_state, &ids, &config);
+        let entries = retrieve_attributes(parse_state, &ids, &config);
         let changed = entries.iter().filter(|e| e.is_some()).count();
 
         fill_typed_array(out_values, out_indices, &entries);
@@ -593,6 +597,17 @@ struct TypedEntry {
     resource_id: i32,
 
     asset_cookie: i32,
+}
+
+fn retrieve_attributes(
+    parse_state: jlong,
+    ids: &[i32],
+    config: &ResConfig,
+) -> Vec<Option<TypedEntry>> {
+    resolve_xml_attributes(parse_state, ids, config)
+        .into_iter()
+        .map(|entry| entry.filter(is_typed_array_value))
+        .collect()
 }
 
 fn resolve_xml_attributes(
@@ -680,10 +695,7 @@ fn merge_theme_style(
         if current == 0 || !visited.insert(current) {
             break;
         }
-        let Some(bytes) = arsc_bytes_for(current) else {
-            break;
-        };
-        let Ok(table) = crate::apk::arsc::parse_arsc(bytes) else {
+        let Some(table) = arsc_table_for(current) else {
             break;
         };
         let Some(style) = table.resolve_style(current, config) else {
@@ -721,6 +733,34 @@ fn resolve_theme_attr(
     resolve_theme_value(attrs, *attrs.get(&attr_id)?, config)
 }
 
+fn theme_attribute(
+    attrs: &std::collections::HashMap<i32, theme_registry::ThemeAttr>,
+    attr_id: i32,
+) -> Option<theme_registry::ThemeAttr> {
+    let mut value = *attrs.get(&attr_id)?;
+    for _ in 0..MAX_ATTR_RESOLVE_DEPTH {
+        if value.type_ != TYPE_ATTRIBUTE {
+            return Some(value);
+        }
+        value = *attrs.get(&u32_to_i32(value.data))?;
+    }
+    None
+}
+
+fn theme_entry(value: theme_registry::ThemeAttr, resource_id: i32) -> TypedEntry {
+    let asset_cookie = if value.type_ == TYPE_STRING {
+        arsc_cookie_for_package(value.source_package)
+    } else {
+        0
+    };
+    TypedEntry {
+        value_type: i32::from(value.type_),
+        data: u32_to_i32(value.data),
+        resource_id,
+        asset_cookie,
+    }
+}
+
 fn resolve_theme_value(
     attrs: &std::collections::HashMap<i32, theme_registry::ThemeAttr>,
     value: theme_registry::ThemeAttr,
@@ -734,13 +774,11 @@ fn resolve_theme_value(
         0
     };
 
-    let mut string_pool_cookie = arsc_cookie_for_package(cur.source_package);
     for _ in 0..MAX_ATTR_RESOLVE_DEPTH {
         match cur.type_ {
             TYPE_ATTRIBUTE => {
                 let next_id = u32_to_i32(cur.data);
                 cur = *attrs.get(&next_id)?;
-                string_pool_cookie = arsc_cookie_for_package(cur.source_package);
                 if cur.type_ == TYPE_REFERENCE {
                     resource_id = u32_to_i32(cur.data);
                 }
@@ -752,7 +790,6 @@ fn resolve_theme_value(
                 }
                 match resolve_res_value(cur.data, config) {
                     Some(v) => {
-                        string_pool_cookie = arsc_cookie_for(cur.data);
                         cur = theme_registry::ThemeAttr {
                             type_: u8::try_from(v.type_).unwrap_or(0),
                             data: u32::from_ne_bytes(v.data.to_ne_bytes()),
@@ -771,17 +808,7 @@ fn resolve_theme_value(
             _ => break,
         }
     }
-    let asset_cookie = if cur.type_ == TYPE_STRING {
-        string_pool_cookie
-    } else {
-        0
-    };
-    Some(TypedEntry {
-        value_type: i32::from(cur.type_),
-        data: u32_to_i32(cur.data),
-        resource_id,
-        asset_cookie,
-    })
+    Some(theme_entry(cur, resource_id))
 }
 
 fn resolve_inline_theme_refs(theme: jlong, entries: &mut [Option<TypedEntry>], config: &ResConfig) {
@@ -996,6 +1023,10 @@ fn is_null_reference(entry: &TypedEntry) -> bool {
     entry.value_type == i32::from(TYPE_REFERENCE) && entry.data == 0
 }
 
+fn is_typed_array_value(entry: &TypedEntry) -> bool {
+    is_defined(entry) && !is_null_reference(entry)
+}
+
 fn xml_style_value(parser: jlong) -> Option<(u8, u32)> {
     xml_registry::with_block(parser, |block| {
         block
@@ -1074,7 +1105,7 @@ fn resolve_styled_attributes(
                         })
                     })
                     .or_else(|| resolve_theme_attr(attrs, *id, config))
-                    .filter(|entry| is_defined(entry) && !is_null_reference(entry))
+                    .filter(is_typed_array_value)
             })
             .collect()
     };
@@ -1190,10 +1221,10 @@ extern "system" fn asset_manager_get_resource_package_name<'local>(
 }
 
 fn resolve_resource_package_name(resid: u32) -> Option<String> {
-    let bytes = arsc_bytes_for(resid)?;
-    let table = crate::apk::arsc::parse_arsc(bytes).ok()?;
     let package_id = (resid >> 24) as u8;
-    table.package_name(package_id).map(str::to_owned)
+    arsc_table_for(resid)?
+        .package_name(package_id)
+        .map(str::to_owned)
 }
 
 extern "system" fn asset_manager_get_resource_identifier<'local>(
@@ -1265,10 +1296,7 @@ fn resolve_resource_identifier(name: &str, def_type: &str, def_package: &str) ->
     } else {
         0x7f00_0000
     };
-    let Some(bytes) = arsc_bytes_for(probe_id) else {
-        return 0;
-    };
-    let Ok(table) = crate::apk::arsc::parse_arsc(bytes) else {
+    let Some(table) = arsc_table_for(probe_id) else {
         return 0;
     };
     table
@@ -1677,46 +1705,72 @@ fn register_asset_stream_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-static APP_ARSC: OnceLock<Option<Vec<u8>>> = OnceLock::new();
-static FRAMEWORK_ARSC: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+const ARSC_ENTRY: &str = "resources.arsc";
 
-fn cached_arsc_bytes(
-    cache: &OnceLock<Option<Vec<u8>>>,
-    load: impl FnOnce() -> Option<Vec<u8>>,
-) -> Option<&[u8]> {
-    cache.get_or_init(load).as_deref()
+static APP_ARSC: OnceLock<Option<ResTable<'static>>> = OnceLock::new();
+static FRAMEWORK_ARSC: OnceLock<Option<ResTable<'static>>> = OnceLock::new();
+static FRAMEWORK_RES_APK_PATH: OnceLock<Result<std::path::PathBuf, RuntimeError>> = OnceLock::new();
+
+fn framework_res_apk_path() -> Result<&'static std::path::Path, &'static RuntimeError> {
+    FRAMEWORK_RES_APK_PATH
+        .get_or_init(|| crate::runtime::find_framework().map(|fw| fw.framework_res_apk))
+        .as_deref()
 }
 
-fn framework_arsc_bytes<'a>(
-    cache: &'a OnceLock<Option<Vec<u8>>>,
-    framework_res_apk: &std::path::Path,
-) -> Option<&'a [u8]> {
-    cached_arsc_bytes(cache, || {
-        let mut apk = crate::apk::cache::FRAMEWORK_RES_APK
-            .open(framework_res_apk)
-            .ok()?;
-        apk.read_entry("resources.arsc").ok()
-    })
-}
-
-fn arsc_bytes_for(resid: u32) -> Option<&'static [u8]> {
-    if (resid >> 24) as u8 == 0x01 {
-        let fw = crate::runtime::find_framework().ok()?;
-        framework_arsc_bytes(&FRAMEWORK_ARSC, &fw.framework_res_apk)
-    } else {
-        let apk_path = APK_PATH.get()?;
-        cached_arsc_bytes(&APP_ARSC, || {
-            let mut apk = crate::apk::cache::APP_APK
-                .open(std::path::Path::new(apk_path))
-                .ok()?;
-            apk.read_entry("resources.arsc").ok()
-        })
+fn arsc_table_for(resid: u32) -> Option<&'static ResTable<'static>> {
+    match (resid >> 24) as u8 {
+        0x00 => None,
+        0x01 => cached_arsc_table(
+            &FRAMEWORK_ARSC,
+            &crate::apk::cache::FRAMEWORK_RES_APK,
+            || {
+                framework_res_apk_path()
+                    .ok()
+                    .map(std::path::Path::to_path_buf)
+            },
+        ),
+        _ => {
+            let apk_path = APK_PATH.get()?;
+            cached_arsc_table(&APP_ARSC, &crate::apk::cache::APP_APK, || {
+                Some(std::path::PathBuf::from(apk_path))
+            })
+        }
     }
 }
 
+fn cached_arsc_table<'a>(
+    cache: &'a OnceLock<Option<ResTable<'static>>>,
+    apks: &ApkCache,
+    locate: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Option<&'a ResTable<'static>> {
+    cache
+        .get_or_init(|| {
+            let apk_path = locate()?;
+            map_arsc_table(apks, &apk_path)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        target: "android.content.res.AssetManager",
+                        apk = %apk_path.display(),
+                        %error,
+                        "resources.arsc could not be loaded; lookups in its table fail"
+                    );
+                })
+                .ok()
+        })
+        .as_ref()
+}
+
+fn map_arsc_table(
+    apks: &ApkCache,
+    apk_path: &std::path::Path,
+) -> Result<ResTable<'static>, AssetError> {
+    let mapped = apks.open(apk_path)?.map_stored_entry(ARSC_ENTRY)?;
+    let bytes: &'static [u8] = Box::leak(Box::new(mapped));
+    Ok(crate::apk::arsc::parse_arsc(bytes)?)
+}
+
 fn resolve_resource_name(resid: u32) -> Option<String> {
-    let bytes = arsc_bytes_for(resid)?;
-    let table = crate::apk::arsc::parse_arsc(bytes).ok()?;
+    let table = arsc_table_for(resid)?;
 
     let package_id = (resid >> 24) as u8;
     let type_id = ((resid >> 16) & 0xff) as u8;
@@ -1738,8 +1792,7 @@ struct ResolvedResValue {
 }
 
 fn resolve_res_value(resid: u32, config: &ResConfig) -> Option<ResolvedResValue> {
-    let bytes = arsc_bytes_for(resid)?;
-    let table = crate::apk::arsc::parse_arsc(bytes).ok()?;
+    let table = arsc_table_for(resid)?;
     let resolved = table.resource_value(resid, config)?;
 
     if resolved.is_complex {
@@ -1839,7 +1892,7 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
     theme: jlong,
     ident: jint,
     out_value: JObject<'local>,
-    _resolve_refs: jboolean,
+    resolve_refs: jboolean,
 ) -> jint {
     env.with_env(|env| -> jni::errors::Result<jint> {
         if out_value.is_null() {
@@ -1848,15 +1901,22 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
         }
 
         let config = asset_configuration::of(env, &this);
-        let entry =
-            theme_registry::with_theme(theme, |t| resolve_theme_attr(&t.attrs, ident, &config))
-            .ok()
-            .flatten();
+        let entry = theme_registry::with_theme(theme, |t| {
+            let value = theme_attribute(&t.attrs, ident)?;
+            if resolve_refs {
+                resolve_theme_value(&t.attrs, value, &config)
+            } else {
+                Some(theme_entry(value, 0))
+            }
+        })
+        .ok()
+        .flatten();
         let Some(entry) = entry else {
             tracing::debug!(
                 target: "android.content.res.AssetManager",
                 theme,
                 ident = format_args!("0x{:08x}", u32::from_ne_bytes(ident.to_ne_bytes())),
+                resolve = resolve_refs,
                 "AssetManager.loadThemeAttributeValue: attr not in theme → 0 (not resolved)"
             );
             return Ok(0);
@@ -1912,6 +1972,7 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
             target: "android.content.res.AssetManager",
             theme,
             ident = format_args!("0x{:08x}", u32::from_ne_bytes(ident.to_ne_bytes())),
+            resolve = resolve_refs,
             type_ = entry.value_type,
             data = entry.data,
             resource_id = entry.resource_id,
@@ -1948,8 +2009,8 @@ extern "system" fn asset_manager_get_pooled_string<'local>(
 
 fn open_xml_block(cookie: jint, name: &str) -> Result<jlong, AssetError> {
     let bytes = if cookie == ARSC_FRAMEWORK_COOKIE {
-        let fw = crate::runtime::find_framework().map_err(|_| AssetError::NoApkPath)?;
-        let mut apk = crate::apk::cache::FRAMEWORK_RES_APK.open(&fw.framework_res_apk)?;
+        let framework_res_apk = framework_res_apk_path().map_err(AssetError::Framework)?;
+        let mut apk = crate::apk::cache::FRAMEWORK_RES_APK.open(framework_res_apk)?;
         apk.read_entry(name)?
     } else {
         let apk_path = APK_PATH.get().ok_or(AssetError::NoApkPath)?;
@@ -1965,9 +2026,13 @@ fn open_xml_block(cookie: jint, name: &str) -> Result<jlong, AssetError> {
 enum AssetError {
     NoApkPath,
 
+    Framework(&'static RuntimeError),
+
     Apk(crate::apk::ApkError),
 
     Axml(crate::apk::axml::AxmlError),
+
+    Arsc(ArscError),
 
     Registry(xml_registry::XmlRegistryError),
 }
@@ -1976,8 +2041,10 @@ impl fmt::Display for AssetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoApkPath => f.write_str("no APK path was stashed for asset access"),
+            Self::Framework(e) => write!(f, "framework-res.apk could not be found: {e}"),
             Self::Apk(e) => write!(f, "APK read error: {e}"),
             Self::Axml(e) => write!(f, "binary-XML parse error: {e}"),
+            Self::Arsc(e) => write!(f, "resource table parse error: {e}"),
             Self::Registry(e) => write!(f, "xml-block registry error: {e}"),
         }
     }
@@ -1991,6 +2058,11 @@ impl From<crate::apk::ApkError> for AssetError {
 impl From<crate::apk::axml::AxmlError> for AssetError {
     fn from(e: crate::apk::axml::AxmlError) -> Self {
         Self::Axml(e)
+    }
+}
+impl From<ArscError> for AssetError {
+    fn from(e: ArscError) -> Self {
+        Self::Arsc(e)
     }
 }
 impl From<xml_registry::XmlRegistryError> for AssetError {
@@ -8292,10 +8364,127 @@ fn set_cookie_request(url: &str, header: String) -> (String, String) {
     (fixed.url, header)
 }
 
-fn bridge_arg_lens(args: &[serde_json::Value]) -> Vec<usize> {
-    args.iter()
-        .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
-        .collect()
+const MAX_JAVA_INSTANCE_METHOD_PARAMETERS: usize = 254;
+
+#[derive(serde::Deserialize)]
+struct BridgePayload {
+    iface: String,
+    method: String,
+    #[serde(default)]
+    args: BridgeArgs,
+}
+
+enum BridgeArgs {
+    Within(Vec<BridgeArg>),
+    TooMany(usize),
+}
+
+impl Default for BridgeArgs {
+    fn default() -> Self {
+        Self::Within(Vec::new())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BridgeArgs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ArgsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ArgsVisitor {
+            type Value = BridgeArgs;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an array of bridge arguments")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<BridgeArgs, A::Error> {
+                let mut args = Vec::new();
+                while args.len() < MAX_JAVA_INSTANCE_METHOD_PARAMETERS {
+                    let Some(arg) = seq.next_element()? else {
+                        return Ok(BridgeArgs::Within(args));
+                    };
+                    args.push(arg);
+                }
+                let mut count = args.len();
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    count += 1;
+                }
+                Ok(if count > MAX_JAVA_INSTANCE_METHOD_PARAMETERS {
+                    BridgeArgs::TooMany(count)
+                } else {
+                    BridgeArgs::Within(args)
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(ArgsVisitor)
+    }
+}
+
+enum BridgeArg {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Composite,
+}
+
+impl<'de> serde::Deserialize<'de> for BridgeArg {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ArgVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ArgVisitor {
+            type Value = BridgeArg;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a bridge argument")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<BridgeArg, E> {
+                Ok(BridgeArg::Null)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<BridgeArg, E> {
+                Ok(BridgeArg::Bool(value))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<BridgeArg, E> {
+                Ok(BridgeArg::Number(value as f64))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<BridgeArg, E> {
+                Ok(BridgeArg::Number(value as f64))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<BridgeArg, E> {
+                Ok(BridgeArg::Number(value))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<BridgeArg, E> {
+                Ok(BridgeArg::String(value.to_owned()))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<BridgeArg, A::Error> {
+                serde::de::Visitor::visit_seq(serde::de::IgnoredAny, seq)
+                    .map(|_| BridgeArg::Composite)
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<BridgeArg, A::Error> {
+                serde::de::Visitor::visit_map(serde::de::IgnoredAny, map)
+                    .map(|_| BridgeArg::Composite)
+            }
+        }
+
+        deserializer.deserialize_any(ArgVisitor)
+    }
 }
 
 fn bridge_identifier_for_log(s: &str) -> &str {
@@ -8336,31 +8525,30 @@ enum ArgKind {
     Reject,
 }
 
-fn plan_arg(value: &serde_json::Value, param_type: &str) -> ArgKind {
-    use serde_json::Value;
+fn plan_arg(value: &BridgeArg, param_type: &str) -> ArgKind {
     let string_ok = matches!(
         param_type,
         "java.lang.String" | "java.lang.CharSequence" | "java.lang.Object"
     );
     match value {
-        Value::Null => match param_type {
+        BridgeArg::Null => match param_type {
             "int" | "long" | "short" | "byte" | "float" | "double" | "boolean" | "char" => {
                 ArgKind::Reject
             }
             _ => ArgKind::Null,
         },
-        Value::String(_) => {
+        BridgeArg::String(_) => {
             if string_ok {
                 ArgKind::Str
             } else {
                 ArgKind::Reject
             }
         }
-        Value::Bool(_) => match param_type {
+        BridgeArg::Bool(_) => match param_type {
             "boolean" | "java.lang.Boolean" | "java.lang.Object" => ArgKind::BoolBox,
             _ => ArgKind::Reject,
         },
-        Value::Number(_) => match param_type {
+        BridgeArg::Number(_) => match param_type {
             "int" | "java.lang.Integer" => ArgKind::IntBox,
             "long" | "java.lang.Long" => ArgKind::LongBox,
             "short" | "java.lang.Short" => ArgKind::ShortBox,
@@ -8372,7 +8560,7 @@ fn plan_arg(value: &serde_json::Value, param_type: &str) -> ArgKind {
             _ => ArgKind::Reject,
         },
 
-        Value::Array(_) | Value::Object(_) => ArgKind::Reject,
+        BridgeArg::Composite => ArgKind::Reject,
     }
 }
 
@@ -8434,21 +8622,26 @@ fn fire_bridge_call_inner(
     payload_json: &str,
 ) -> (bool, String) {
     const REJECT: &str = "null";
-    let parsed: serde_json::Value = match serde_json::from_str(payload_json) {
-        Ok(v) => v,
-        Err(_) => return (false, "\"eclipse: bad bridge payload\"".to_string()),
-    };
-    let (Some(iface), Some(method)) = (
-        parsed.get("iface").and_then(|v| v.as_str()),
-        parsed.get("method").and_then(|v| v.as_str()),
-    ) else {
+    let Ok(payload) = serde_json::from_str::<BridgePayload>(payload_json) else {
         return (false, "\"eclipse: bad bridge payload\"".to_string());
     };
-    let args: Vec<serde_json::Value> = parsed
-        .get("args")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let (iface, method) = (payload.iface.as_str(), payload.method.as_str());
+    let args = match payload.args {
+        BridgeArgs::Within(args) => args,
+        BridgeArgs::TooMany(count) => {
+            tracing::warn!(
+                target: "android.webkit.WebView",
+                widget,
+                call_id,
+                iface = bridge_identifier_for_log(iface),
+                method = bridge_identifier_for_log(method),
+                args = count,
+                max = MAX_JAVA_INSTANCE_METHOD_PARAMETERS,
+                "bridge call has more arguments than a Java method can take (rejected)"
+            );
+            return (false, "\"eclipse: too many bridge arguments\"".to_string());
+        }
+    };
 
     tracing::info!(
         target: "android.webkit.WebView",
@@ -8457,7 +8650,6 @@ fn fire_bridge_call_inner(
         iface = bridge_identifier_for_log(iface),
         method = bridge_identifier_for_log(method),
         args = args.len(),
-        arg_lens = ?bridge_arg_lens(&args),
         "bridge call received (arg values not logged)"
     );
 
@@ -8565,7 +8757,7 @@ fn set_bridge_arg<'local>(
     env: &mut Env<'local>,
     array: &JObjectArray<'local>,
     idx: usize,
-    v: &serde_json::Value,
+    v: &BridgeArg,
     param_type: &str,
 ) -> Result<(), &'static str> {
     macro_rules! set {
@@ -8592,12 +8784,18 @@ fn set_bridge_arg<'local>(
             set!(&boxed);
         }};
     }
-    let num = v.as_f64();
+    let num = match v {
+        BridgeArg::Number(number) => Some(*number),
+        _ => None,
+    };
     match plan_arg(v, param_type) {
         ArgKind::Reject => return Err("unsupported-type"),
         ArgKind::Null => {}
         ArgKind::Str => {
-            let s = v.as_str().unwrap_or_default();
+            let s = match v {
+                BridgeArg::String(s) => s.as_str(),
+                _ => "",
+            };
             let js = env.new_string(s).map_err(|_| {
                 clear_pending(env);
                 "string-alloc"
@@ -8637,7 +8835,7 @@ fn set_bridge_arg<'local>(
         ArgKind::BoolBox => box_num!(
             "java/lang/Boolean",
             "(Z)Ljava/lang/Boolean;",
-            JValue::Bool(v.as_bool().unwrap_or(false))
+            JValue::Bool(matches!(v, BridgeArg::Bool(true)))
         ),
     }
     Ok(())
@@ -13448,119 +13646,6 @@ fn engine_surface_view<'local>(
     }
 }
 
-pub fn dispatch_touch_to_engine_surface(
-    vm: &Vm,
-    action: MotionAction,
-    x: f32,
-    y: f32,
-    down_time_ms: Option<i64>,
-) -> Result<Option<EngineTouchOutcome>, FrameworkError> {
-    let raw = vm.as_raw();
-    if raw.is_null() {
-        return Err(FrameworkError::NullVm);
-    }
-
-    let java_vm = unsafe { JavaVM::from_raw(raw) };
-    java_vm.attach_current_thread(|env: &mut Env| {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            touch_engine_surface(env, action, x, y, down_time_ms)
-        })) {
-            Ok(result) => result,
-            Err(_) => Err(FrameworkError::Panicked),
-        }
-    })
-}
-
-fn touch_engine_surface(
-    env: &mut Env,
-    action: MotionAction,
-    x: f32,
-    y: f32,
-    down_time_ms: Option<i64>,
-) -> Result<Option<EngineTouchOutcome>, FrameworkError> {
-    let Some(handle) = engine_surface_view_handle() else {
-        tracing::debug!(
-            ?action,
-            "engine touch: no RBXSurfaceView holds the engine surface yet (no-op)"
-        );
-        return Ok(None);
-    };
-    let Some(surface) = engine_surface_view(env, handle)? else {
-        return Ok(None);
-    };
-    let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
-    let now = checked(env, "SystemClock.uptimeMillis", |env| {
-        env.call_static_method(
-            &system_clock,
-            jni_str!("uptimeMillis"),
-            jni_sig!("()J"),
-            &[],
-        )?
-        .j()
-    })?;
-    let down_time = down_time_ms.unwrap_or(now);
-
-    if down_time_ms.is_none() {
-        let w = checked(env, "View.getWidth", |env| {
-            env.call_method(&surface, jni_str!("getWidth"), jni_sig!("()I"), &[])?
-                .i()
-        })
-        .unwrap_or(-1);
-        let h = checked(env, "View.getHeight", |env| {
-            env.call_method(&surface, jni_str!("getHeight"), jni_sig!("()I"), &[])?
-                .i()
-        })
-        .unwrap_or(-1);
-        tracing::info!(
-            handle,
-            width = w,
-            height = h,
-            x,
-            y,
-            "engine touch DOWN: RBXSurfaceView resolved (geometry = coordinate-space check)"
-        );
-    }
-
-    let motion_event_class = env.find_class(MOTION_EVENT_CLASS)?;
-    let event = checked(env, "MotionEvent.obtain", |env| {
-        env.call_static_method(
-            &motion_event_class,
-            jni_str!("obtain"),
-            jni_sig!("(JJIFFI)Landroid/view/MotionEvent;"),
-            &[
-                JValue::Long(down_time),
-                JValue::Long(now),
-                JValue::Int(action.code()),
-                JValue::Float(x),
-                JValue::Float(y),
-                JValue::Int(0),
-            ],
-        )?
-        .l()
-    })?;
-
-    let consumed = checked(env, "RBXSurfaceView.onTouchEventInternal", |env| {
-        env.call_method(
-            &surface,
-            jni_str!("onTouchEventInternal"),
-            jni_sig!("(Landroid/view/MotionEvent;Z)Z"),
-            &[JValue::Object(&event), JValue::Bool(false)],
-        )?
-        .z()
-    });
-
-    if let Err(e) = checked(env, "MotionEvent.recycle", |env| {
-        env.call_method(&event, jni_str!("recycle"), jni_sig!("()V"), &[])?
-            .v()
-    }) {
-        tracing::debug!(error = %e, "MotionEvent.recycle failed (ignored)");
-    }
-    Ok(Some(EngineTouchOutcome {
-        consumed: consumed?,
-        down_time_ms: down_time,
-    }))
-}
-
 pub fn pass_hardware_key_to_engine(
     vm: &Vm,
     action: KeyAction,
@@ -14122,6 +14207,8 @@ fn register_framework_natives(
     register_path_natives(env)?;
 
     register_canvas_natives(env)?;
+
+    in_memory_dex::register_natives(env)?;
 
     register_runtime_native_load_natives(env)?;
     Ok(())
@@ -16235,6 +16322,8 @@ mod tests {
     const ATTR_THEMED: u32 = 0x7f04_0006;
     const ATTR_THEME_LAYOUT: u32 = 0x7f04_0007;
     const ATTR_UNSET_STYLE: u32 = 0x7f04_0008;
+    const ATTR_INT_REFERENCE: u32 = 0x7f04_0009;
+    const ATTR_INT_ATTRIBUTE: u32 = 0x7f04_000a;
     const ATTR_ALERT_DIALOG_STYLE: u32 = 0x7f04_002b;
     const ATTR_LAYOUT: u32 = 0x0101_00f2;
     const STYLE_XML: u32 = 0x7f13_0000;
@@ -16243,17 +16332,19 @@ mod tests {
     const STYLE_DEFAULT_RES: u32 = 0x7f13_0003;
     const LAYOUT_ALERT_DIALOG: u32 = 0x7f0c_0009;
     const LAYOUT_DEFAULT_RES: u32 = 0x7f0c_0010;
+    const RES_INT: u32 = 0x7f13_0004;
+    const RES_INT_ALIAS: u32 = 0x7f13_0005;
 
     fn install_app_style_table() {
         let table = build_style_arsc(&[
-            TestStyle {
+            TestEntry::Style {
                 parent: 0,
                 items: &[
                     (ATTR_XML_WINS, TYPE_INT_DEC, 2),
                     (ATTR_STYLE_WINS, TYPE_INT_DEC, 2),
                 ],
             },
-            TestStyle {
+            TestEntry::Style {
                 parent: STYLE_ALERT_DIALOG_BASE,
                 items: &[
                     (ATTR_XML_WINS, TYPE_INT_DEC, 3),
@@ -16261,14 +16352,14 @@ mod tests {
                     (ATTR_DEFAULT_WINS, TYPE_INT_DEC, 3),
                 ],
             },
-            TestStyle {
+            TestEntry::Style {
                 parent: 0,
                 items: &[
                     (ATTR_DEFAULT_WINS, TYPE_INT_DEC, 30),
                     (ATTR_LAYOUT, TYPE_REFERENCE, LAYOUT_ALERT_DIALOG),
                 ],
             },
-            TestStyle {
+            TestEntry::Style {
                 parent: 0,
                 items: &[
                     (ATTR_DEFAULT_WINS, TYPE_INT_DEC, 5),
@@ -16277,11 +16368,22 @@ mod tests {
                     (ATTR_LAYOUT, TYPE_REFERENCE, LAYOUT_DEFAULT_RES),
                 ],
             },
+            TestEntry::Value {
+                value_type: TYPE_INT_DEC,
+                data: 9,
+            },
+            TestEntry::Value {
+                value_type: TYPE_REFERENCE,
+                data: RES_INT,
+            },
         ]);
-        let installed = APP_ARSC.get_or_init(|| Some(table.clone()));
+        let installed = APP_ARSC
+            .get_or_init(|| crate::apk::arsc::parse_arsc(table.leak()).ok())
+            .as_ref()
+            .and_then(|table| table.resolve_style(STYLE_ALERT_DIALOG, &ResConfig::default()));
         assert_eq!(
-            installed.as_deref(),
-            Some(table.as_slice()),
+            installed.map(|style| style.parent_id),
+            Some(STYLE_ALERT_DIALOG_BASE),
             "the app resource table is the style fixture"
         );
         APK_PATH.get_or_init(String::new);
@@ -16442,6 +16544,49 @@ mod tests {
             [None, reference(LAYOUT_ALERT_DIALOG)],
             "@null in the default style hides the theme value; its ?attr resolves against the theme"
         );
+
+        theme_registry::free(theme).expect("free theme");
+    }
+
+    fn load_theme_attribute(theme: jlong, attr: u32, resolve: bool) -> (jint, [Option<jint>; 3]) {
+        fake_jvm::with_env(|env| {
+            let value = fake_jvm::new_object(env);
+            let passed = env.new_local_ref(&value).expect("a second reference");
+            let cookie = asset_manager_load_theme_attribute_value(
+                fake_jvm::native_env(),
+                JObject::null(),
+                theme,
+                u32_to_i32(attr),
+                passed,
+                resolve,
+            );
+            let fields = ["type", "data", "resourceId"].map(|f| fake_jvm::int_field(&value, f));
+            (cookie, fields)
+        })
+    }
+
+    #[test]
+    fn load_theme_attribute_value_resolves_references_only_when_asked() {
+        install_app_style_table();
+        let theme = theme_with(&[
+            (ATTR_INT_ATTRIBUTE, TYPE_ATTRIBUTE, ATTR_INT_REFERENCE),
+            (ATTR_INT_REFERENCE, TYPE_REFERENCE, RES_INT_ALIAS),
+        ]);
+        let kept = [i32::from(TYPE_REFERENCE), u32_to_i32(RES_INT_ALIAS), 0].map(Some);
+        let resolved = [i32::from(TYPE_INT_DEC), 9, u32_to_i32(RES_INT)].map(Some);
+
+        for attr in [ATTR_INT_REFERENCE, ATTR_INT_ATTRIBUTE] {
+            assert_eq!(
+                load_theme_attribute(theme, attr, false),
+                (ECLIPSE_ASSET_COOKIE, kept),
+                "without resolve the theme's reference is returned and no resource id is set"
+            );
+            assert_eq!(
+                load_theme_attribute(theme, attr, true),
+                (ECLIPSE_ASSET_COOKIE, resolved),
+                "with resolve the references lead to the value and the last one is its resource id"
+            );
+        }
 
         theme_registry::free(theme).expect("free theme");
     }
@@ -16769,6 +16914,71 @@ mod tests {
         );
 
         xml_registry::free(handle).expect("free include block");
+    }
+
+    #[test]
+    fn retrieve_attributes_turns_null_into_an_absent_value_and_keeps_empty() {
+        use crate::apk::axml::{XmlAttribute, XmlDocument, XmlElement, XmlEventKind};
+        const ATTR_SRC: u32 = 0x0101_0119;
+        const ATTR_TEXT: u32 = 0x0101_014f;
+        const ATTR_MAX_LINES: u32 = 0x0101_0153;
+        let attribute = |name: &str, name_resource, value_type, value_data| XmlAttribute {
+            namespace: Some("http://schemas.android.com/apk/res/android".to_string()),
+            name: Some(name.to_string()),
+            name_resource,
+            value_type,
+            value_data,
+            value_string: None,
+        };
+        let element = XmlElement {
+            namespace: None,
+            name: Some("ImageView".to_string()),
+            attributes: vec![
+                attribute("src", ATTR_SRC, TYPE_REFERENCE, 0),
+                attribute("text", ATTR_TEXT, 0, 1),
+                attribute("maxLines", ATTR_MAX_LINES, TYPE_INT_DEC, 3),
+            ],
+            line: 0,
+        };
+        let parser = xml_registry::store(XmlDocument {
+            events: vec![XmlEventKind::StartTag(0), XmlEventKind::EndTag(0)],
+            elements: vec![element],
+            texts: vec![],
+            namespaces: vec![],
+            strings: vec![],
+        })
+        .expect("store element");
+        xml_registry::with_block(parser, |b| {
+            b.next_event();
+        })
+        .expect("advance to the element");
+
+        let entries = retrieve_attributes(
+            parser,
+            &[ATTR_SRC, ATTR_TEXT, ATTR_MAX_LINES].map(u32_to_i32),
+            &ResConfig::default(),
+        );
+        assert_eq!(
+            entries,
+            [
+                None,
+                Some(TypedEntry {
+                    value_type: TYPE_NULL,
+                    data: DATA_NULL_EMPTY,
+                    resource_id: 0,
+                    asset_cookie: 0,
+                }),
+                Some(TypedEntry {
+                    value_type: i32::from(TYPE_INT_DEC),
+                    data: 3,
+                    resource_id: 0,
+                    asset_cookie: 0,
+                }),
+            ],
+            "@null reads as absent, @empty stays an empty value, other values pass through"
+        );
+
+        xml_registry::free(parser).expect("free element");
     }
 
     #[test]
@@ -18561,46 +18771,161 @@ mod tests {
     #[test]
     fn bridge_args_marshal_supported_types_and_reject_unsupported() {
         use serde_json::json;
-        assert_eq!(plan_arg(&json!("hi"), "java.lang.String"), ArgKind::Str);
+        let arg = |value| serde_json::from_value::<BridgeArg>(value).unwrap();
         assert_eq!(
-            plan_arg(&json!("hi"), "java.lang.CharSequence"),
+            plan_arg(&arg(json!("hi")), "java.lang.String"),
             ArgKind::Str
         );
-        assert_eq!(plan_arg(&json!("hi"), "java.lang.Object"), ArgKind::Str);
-        assert_eq!(plan_arg(&json!("hi"), "int"), ArgKind::Reject);
-        assert_eq!(plan_arg(&json!(3), "int"), ArgKind::IntBox);
-        assert_eq!(plan_arg(&json!(3), "long"), ArgKind::LongBox);
-        assert_eq!(plan_arg(&json!(3), "double"), ArgKind::DoubleBox);
-        assert_eq!(plan_arg(&json!(3), "java.lang.Object"), ArgKind::DoubleBox);
-        assert_eq!(plan_arg(&json!(3), "java.lang.String"), ArgKind::Reject);
-        assert_eq!(plan_arg(&json!(true), "boolean"), ArgKind::BoolBox);
-        assert_eq!(plan_arg(&json!(true), "int"), ArgKind::Reject);
-        assert_eq!(plan_arg(&json!(null), "java.lang.String"), ArgKind::Null);
+        assert_eq!(
+            plan_arg(&arg(json!("hi")), "java.lang.CharSequence"),
+            ArgKind::Str
+        );
+        assert_eq!(
+            plan_arg(&arg(json!("hi")), "java.lang.Object"),
+            ArgKind::Str
+        );
+        assert_eq!(plan_arg(&arg(json!("hi")), "int"), ArgKind::Reject);
+        assert_eq!(plan_arg(&arg(json!(3)), "int"), ArgKind::IntBox);
+        assert_eq!(plan_arg(&arg(json!(3)), "long"), ArgKind::LongBox);
+        assert_eq!(plan_arg(&arg(json!(3)), "double"), ArgKind::DoubleBox);
+        assert_eq!(
+            plan_arg(&arg(json!(3)), "java.lang.Object"),
+            ArgKind::DoubleBox
+        );
+        assert_eq!(
+            plan_arg(&arg(json!(3)), "java.lang.String"),
+            ArgKind::Reject
+        );
+        assert_eq!(plan_arg(&arg(json!(true)), "boolean"), ArgKind::BoolBox);
+        assert_eq!(plan_arg(&arg(json!(true)), "int"), ArgKind::Reject);
+        assert_eq!(
+            plan_arg(&arg(json!(null)), "java.lang.String"),
+            ArgKind::Null
+        );
 
-        assert_eq!(plan_arg(&json!(null), "int"), ArgKind::Reject);
+        assert_eq!(plan_arg(&arg(json!(null)), "int"), ArgKind::Reject);
 
         assert_eq!(
-            plan_arg(&json!([1, 2]), "java.lang.Object"),
+            plan_arg(&arg(json!([1, 2])), "java.lang.Object"),
             ArgKind::Reject
         );
         assert_eq!(
-            plan_arg(&json!({"a":1}), "java.lang.Object"),
+            plan_arg(&arg(json!({"a":1})), "java.lang.Object"),
             ArgKind::Reject
         );
     }
 
     #[test]
-    fn bridge_arg_lens_returns_serialized_lengths_and_never_the_values() {
-        use serde_json::json;
-        let args = vec![json!("SECRETTOKEN"), json!(42), json!(true), json!(null)];
-        let lens = bridge_arg_lens(&args);
+    fn a_bridge_call_with_more_arguments_than_a_java_method_takes_is_refused() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let widget: jlong = 0x7e57_b41d;
+        let invocations = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&invocations);
+        fake_jvm::with_env(|env| {
+            let object = fake_jvm::new_object(env);
+            let method = fake_jvm::new_object(env);
+            fake_jvm::on_call(&method, "invoke", move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            });
+            let entry = BridgeEntry {
+                object: env.new_global_ref(&object).expect("global interface"),
+                methods: std::collections::HashMap::from([(
+                    "call".to_string(),
+                    vec![BridgeMethodMeta {
+                        method: env.new_global_ref(&method).expect("global method"),
+                        param_types: vec![
+                            "java.lang.Object".to_string();
+                            MAX_JAVA_INSTANCE_METHOD_PARAMETERS
+                        ],
+                        return_type: "void".to_string(),
+                    }],
+                )]),
+                era: 0,
+            };
+            bridge_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((widget, "iface".to_string()), entry);
+        });
+        let call = |argc: usize| {
+            let payload = serde_json::json!({
+                "iface": "iface",
+                "method": "call",
+                "args": vec![serde_json::Value::Null; argc],
+            })
+            .to_string();
+            fake_jvm::with_env(|env| fire_bridge_call_inner(env, widget, 1, &payload))
+        };
 
-        assert_eq!(lens, vec![13, 2, 4, 4]);
-        assert!(
-            !format!("{lens:?}").contains("SECRET"),
-            "arg_lens must never echo an arg value"
+        let mut refused = (true, String::new());
+        let log = crate::loader::log_capture::formatted_log("info", || {
+            refused = call(MAX_JAVA_INSTANCE_METHOD_PARAMETERS + 1);
+        });
+        assert_eq!(
+            refused,
+            (false, "\"eclipse: too many bridge arguments\"".to_string())
         );
-        assert_eq!(bridge_arg_lens(&[]), Vec::<usize>::new());
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert!(
+            log.contains(&format!("args={}", MAX_JAVA_INSTANCE_METHOD_PARAMETERS + 1)),
+            "{log}"
+        );
+        assert!(!log.contains("arg_lens"), "{log}");
+
+        assert_eq!(
+            call(MAX_JAVA_INSTANCE_METHOD_PARAMETERS),
+            (true, "null".to_string())
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        drop_bridges_for(widget);
+    }
+
+    #[test]
+    fn a_nested_bridge_argument_is_refused_without_being_built_or_reaching_the_interface() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const NESTING: usize = 1_000;
+        let widget: jlong = 0x7e57_a77a;
+        let invocations = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&invocations);
+        fake_jvm::with_env(|env| {
+            let object = fake_jvm::new_object(env);
+            let method = fake_jvm::new_object(env);
+            fake_jvm::on_call(&method, "invoke", move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            });
+            let entry = BridgeEntry {
+                object: env.new_global_ref(&object).expect("global interface"),
+                methods: std::collections::HashMap::from([(
+                    "call".to_string(),
+                    vec![BridgeMethodMeta {
+                        method: env.new_global_ref(&method).expect("global method"),
+                        param_types: vec!["java.lang.Object".to_string()],
+                        return_type: "void".to_string(),
+                    }],
+                )]),
+                era: 0,
+            };
+            bridge_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((widget, "iface".to_string()), entry);
+        });
+        let call = |arg: &str| {
+            let payload = format!(r#"{{"iface":"iface","method":"call","args":[{arg}]}}"#);
+            fake_jvm::with_env(|env| fire_bridge_call_inner(env, widget, 1, &payload))
+        };
+
+        let nested = format!("{}{}", "[".repeat(NESTING), "]".repeat(NESTING));
+        assert_eq!(call(&nested), (false, "null".to_string()));
+        assert_eq!(
+            call(r#"{"key":[1,{"inner":"value"}]}"#),
+            (false, "null".to_string())
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+
+        assert_eq!(call("null"), (true, "null".to_string()));
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        drop_bridges_for(widget);
     }
 
     #[test]
@@ -18950,28 +19275,47 @@ mod tests {
         build_arsc_table(package_id, &type_chunk)
     }
 
-    struct TestStyle {
-        parent: u32,
-        items: &'static [(u32, u8, u32)],
+    enum TestEntry {
+        Style {
+            parent: u32,
+            items: &'static [(u32, u8, u32)],
+        },
+        Value {
+            value_type: u8,
+            data: u32,
+        },
     }
 
-    fn build_style_arsc(styles: &[TestStyle]) -> Vec<u8> {
+    fn build_style_arsc(table_entries: &[TestEntry]) -> Vec<u8> {
         const HEADER: usize = 20;
         let mut offsets = Vec::new();
         let mut entries = Vec::new();
-        for style in styles {
+        for table_entry in table_entries {
             push_u32(&mut offsets, entries.len() as u32);
-            push_u16(&mut entries, 16);
-            push_u16(&mut entries, 0x0001);
-            push_u32(&mut entries, 0);
-            push_u32(&mut entries, style.parent);
-            push_u32(&mut entries, style.items.len() as u32);
-            for &(attr, value_type, data) in style.items {
-                push_u32(&mut entries, attr);
-                push_u16(&mut entries, 8);
-                entries.push(0);
-                entries.push(value_type);
-                push_u32(&mut entries, data);
+            match *table_entry {
+                TestEntry::Style { parent, items } => {
+                    push_u16(&mut entries, 16);
+                    push_u16(&mut entries, 0x0001);
+                    push_u32(&mut entries, 0);
+                    push_u32(&mut entries, parent);
+                    push_u32(&mut entries, items.len() as u32);
+                    for &(attr, value_type, data) in items {
+                        push_u32(&mut entries, attr);
+                        push_u16(&mut entries, 8);
+                        entries.push(0);
+                        entries.push(value_type);
+                        push_u32(&mut entries, data);
+                    }
+                }
+                TestEntry::Value { value_type, data } => {
+                    push_u16(&mut entries, 8);
+                    push_u16(&mut entries, 0);
+                    push_u32(&mut entries, 0);
+                    push_u16(&mut entries, 8);
+                    entries.push(0);
+                    entries.push(value_type);
+                    push_u32(&mut entries, data);
+                }
             }
         }
         let entries_start = HEADER + offsets.len();
@@ -18982,7 +19326,7 @@ mod tests {
         type_chunk.push(0x13);
         type_chunk.push(0);
         push_u16(&mut type_chunk, 0);
-        push_u32(&mut type_chunk, styles.len() as u32);
+        push_u32(&mut type_chunk, table_entries.len() as u32);
         push_u32(&mut type_chunk, entries_start as u32);
         type_chunk.extend_from_slice(&offsets);
         type_chunk.extend_from_slice(&entries);
@@ -19024,49 +19368,66 @@ mod tests {
         table
     }
 
-    #[test]
-    fn arsc_byte_cache_loads_once_and_reuses_the_backing_storage() {
-        let cache = OnceLock::new();
-        let loads = std::cell::Cell::new(0usize);
-        let first = cached_arsc_bytes(&cache, || {
-            loads.set(loads.get() + 1);
-            Some(vec![1, 2, 3, 4])
-        })
-        .expect("first load succeeds");
-        let repeated = cached_arsc_bytes(&cache, || panic!("cached table must not reload"))
-            .expect("cached load succeeds");
-
-        assert_eq!(loads.get(), 1);
-        assert!(std::ptr::eq(first.as_ptr(), repeated.as_ptr()));
-    }
-
-    #[test]
-    fn framework_arsc_bytes_serve_the_framework_res_apk_table() {
+    fn write_arsc_apk(tag: &str, arsc: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
         use std::io::Write;
 
         let dir = std::env::temp_dir().join(format!(
-            "eclipse-fwarsc-{}-{:?}",
+            "eclipse-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
-        std::fs::create_dir_all(&dir).expect("create temp framework dir");
+        std::fs::create_dir_all(&dir).expect("create the APK fixture directory");
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file(ARSC_ENTRY, opts).expect("zip entry");
+        zw.write_all(arsc).expect("write arsc");
+        let apk = dir.join("resources.apk");
+        std::fs::write(&apk, zw.finish().expect("finish zip").into_inner())
+            .expect("write the APK fixture");
+        (dir, apk)
+    }
 
-        let arsc = build_arsc_package(0x01);
-        let apk_bytes = {
-            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            zw.start_file("resources.arsc", opts).expect("zip entry");
-            zw.write_all(&arsc).expect("write arsc");
-            zw.finish().expect("finish zip").into_inner()
-        };
-        let framework_res_apk = dir.join("framework-res.apk");
-        std::fs::write(&framework_res_apk, &apk_bytes).expect("write framework-res.apk");
-
+    #[test]
+    fn arsc_table_cache_maps_the_table_once_and_returns_the_same_table() {
+        let (dir, apk) = write_arsc_apk("arsc-once", &build_arsc_package(0x7f));
         let cache = OnceLock::new();
-        let bytes =
-            framework_arsc_bytes(&cache, &framework_res_apk).expect("the framework table loads");
-        let table = crate::apk::arsc::parse_arsc(bytes).expect("framework arsc parses");
+        let locates = std::cell::Cell::new(0usize);
+        let first = cached_arsc_table(&cache, &crate::apk::cache::APP_APK, || {
+            locates.set(locates.get() + 1);
+            Some(apk.clone())
+        })
+        .expect("the table loads");
+        let repeated = cached_arsc_table(&cache, &crate::apk::cache::APP_APK, || {
+            panic!("a cached table must not be loaded again")
+        })
+        .expect("the cached table stays available");
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("read /proc/self/maps");
+        let apk_path = apk.to_str().expect("UTF-8 fixture path");
+        let mapped_read_only = maps
+            .lines()
+            .any(|line| line.ends_with(apk_path) && line.split_whitespace().nth(1) == Some("r--p"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(locates.get(), 1);
+        assert!(std::ptr::eq(first, repeated));
+        assert!(
+            mapped_read_only,
+            "the table must read a private read-only mapping of the APK, not a heap copy"
+        );
+    }
+
+    #[test]
+    fn framework_arsc_table_serves_the_framework_res_apk_table() {
+        let (dir, framework_res_apk) = write_arsc_apk("fwarsc", &build_arsc_package(0x01));
+        let cache = OnceLock::new();
+        let locate = || Some(framework_res_apk.clone());
+        let table = cached_arsc_table(&cache, &crate::apk::cache::FRAMEWORK_RES_APK, locate)
+            .expect("the framework table loads");
+        let repeated = cached_arsc_table(&cache, &crate::apk::cache::FRAMEWORK_RES_APK, locate)
+            .expect("the framework table remains available");
+        std::fs::remove_dir_all(&dir).ok();
+
         assert_eq!(
             table.package_ids(),
             vec![0x01],
@@ -19079,17 +19440,46 @@ mod tests {
             v.data, 7,
             "resolved from the framework table, not the app table"
         );
-
-        let repeated = framework_arsc_bytes(&cache, &framework_res_apk)
-            .expect("framework table remains available");
-        let reused = std::ptr::eq(bytes.as_ptr(), repeated.as_ptr());
-
-        let _ = std::fs::remove_dir_all(&dir);
-
         assert!(
-            reused,
-            "resource resolution must borrow one cached table instead of cloning megabytes per attribute"
+            std::ptr::eq(table, repeated),
+            "resource resolution must reuse one parsed table instead of parsing it per lookup"
         );
+    }
+
+    #[test]
+    fn a_resource_id_in_package_zero_has_no_table() {
+        install_app_style_table();
+        assert!(arsc_table_for(STYLE_XML).is_some());
+        assert!(arsc_table_for(STYLE_XML & 0x00ff_ffff).is_none());
+    }
+
+    #[test]
+    fn framework_xml_blocks_open_from_the_framework_res_apk_found_once() {
+        let installed = match crate::runtime::find_framework() {
+            Ok(paths) => paths.framework_res_apk,
+            Err(error) => {
+                eprintln!("SKIP: Android framework unavailable on this host ({error})");
+                return;
+            }
+        };
+        let found = framework_res_apk_path().expect("the installed framework is found");
+        let handle = open_xml_block(
+            ARSC_FRAMEWORK_COOKIE,
+            "res/color/secondary_text_material_light.xml",
+        )
+        .expect("a framework XML block opens");
+        let root = xml_registry::with_block(handle, |block| {
+            block.doc.elements.first().and_then(|e| e.name.clone())
+        })
+        .expect("the opened block is registered");
+        xml_registry::free(handle).expect("free the XML block");
+
+        assert_eq!(found, installed);
+        assert!(
+            std::ptr::eq(found, framework_res_apk_path().expect("found again")),
+            "framework-res.apk must be found once and reused by every framework lookup"
+        );
+        assert_eq!(root.as_deref(), Some("selector"));
     }
 
     #[test]

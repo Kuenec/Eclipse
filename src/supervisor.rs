@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
@@ -6,6 +7,7 @@ use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use eclipse::diagnostics::{
@@ -47,6 +49,12 @@ const FAILURE_REPORT_OPTION: &str = "--failure-report=";
 const START_FAILURE_REPORT_OPTION: &str = "--start-failure-report=";
 const RENDERER_VARIABLE: &str = "GSK_RENDERER";
 const SOFTWARE_RENDERER: &str = "cairo";
+const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+const NO_CLIENT: libc::pid_t = 0;
+const CLIENT_STARTING: libc::pid_t = -1;
+
+static SUPERVISED_CLIENT: AtomicI32 = AtomicI32::new(NO_CLIENT);
+static STOP_WHILE_STARTING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) struct Supervision {
     pub(crate) records: File,
@@ -487,6 +495,14 @@ pub(crate) fn run<O: Write, E: Write>(
         facts: Facts::default(),
     };
     let oom_kills_before = oom_kills();
+    let stops = match StopForwarding::start() {
+        Ok(stops) => stops,
+        Err(error) => {
+            let message = format!("Eclipse could not take over Ctrl-C to stop Roblox: {error}");
+            sink.footer(Level::ERROR, &message);
+            return Err(message);
+        }
+    };
     let (mut child, streams) = match spawn(&mut command, &mut sink) {
         Ok(spawned) => spawned,
         Err(error) => {
@@ -495,6 +511,13 @@ pub(crate) fn run<O: Write, E: Write>(
             return Err(message);
         }
     };
+    let client = Pid::from_child(&child);
+    if let Err(error) = stops.to(client) {
+        sink.note(
+            Level::WARN,
+            &format!("cannot pass a stop request on to Roblox's process {client}: {error}"),
+        );
+    }
     let mut drain = Drain {
         streams,
         stdout_lines: Lines::default(),
@@ -503,11 +526,19 @@ pub(crate) fn run<O: Write, E: Write>(
         exit_record: Vec::new(),
         sink,
     };
-    let waited = drain.until_exit(&mut child);
+    let gone = drain.until_exit(client);
     if let Err(error) = eclipse::session::clear(runtime_dir) {
         drain.sink.note(Level::WARN, &error.to_string());
     }
+    if let Err(error) = eclipse::apk::store::remove_run_copy(runtime_dir) {
+        drain.sink.note(
+            Level::WARN,
+            &format!("cannot remove the copy of Roblox made for this run: {error}"),
+        );
+    }
+    drop(stops);
     drop(lock);
+    let waited = gone.and_then(|gone_at| Ok((child.wait()?, gone_at)));
     let (status, gone_at) = match waited {
         Ok(waited) => waited,
         Err(error) => {
@@ -591,6 +622,69 @@ fn spawn<O: Write, E: Write>(
         Some(File::from(OwnedFd::from(exit))),
     ]);
     Ok((child, streams))
+}
+
+struct StopForwarding;
+
+impl StopForwarding {
+    fn start() -> io::Result<Self> {
+        STOP_WHILE_STARTING.store(false, Ordering::SeqCst);
+        SUPERVISED_CLIENT.store(CLIENT_STARTING, Ordering::SeqCst);
+        let forwarding = Self;
+        for signal in STOP_SIGNALS {
+            catch_unless_ignored(signal)?;
+        }
+        Ok(forwarding)
+    }
+
+    fn to(&self, client: Pid) -> io::Result<()> {
+        SUPERVISED_CLIENT.store(client.as_raw_nonzero().get(), Ordering::SeqCst);
+        if STOP_WHILE_STARTING.swap(false, Ordering::SeqCst) {
+            rustix::process::kill_process(client, rustix::process::Signal::TERM)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StopForwarding {
+    fn drop(&mut self) {
+        SUPERVISED_CLIENT.store(NO_CLIENT, Ordering::SeqCst);
+    }
+}
+
+fn catch_unless_ignored(signal: libc::c_int) -> io::Result<()> {
+    let mut current = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    if unsafe { libc::sigaction(signal, std::ptr::null(), current.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { current.assume_init() }.sa_sigaction == libc::SIG_IGN {
+        return Ok(());
+    }
+    let handler: extern "C" fn(libc::c_int) = stop_supervised_client;
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler as libc::sighandler_t;
+    action.sa_flags = libc::SA_RESTART;
+    if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0
+        || unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+extern "C" fn stop_supervised_client(signal: libc::c_int) {
+    let errno = unsafe { *libc::__errno_location() };
+    match SUPERVISED_CLIENT.load(Ordering::SeqCst) {
+        NO_CLIENT => unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        },
+        CLIENT_STARTING => STOP_WHILE_STARTING.store(true, Ordering::SeqCst),
+        client => unsafe {
+            libc::kill(client, libc::SIGTERM);
+        },
+    }
+    unsafe { *libc::__errno_location() = errno };
 }
 
 fn inherit_supervision(parent: Pid, inherited: [RawFd; 2]) -> io::Result<()> {
@@ -897,13 +991,17 @@ impl<O: Write, E: Write> Sink<O, E> {
         if let Some(head) = record_head(&text) {
             self.note_record(&head);
         }
-        let line = text.as_bytes();
         if self.echoing {
-            if let Some(Err(error)) = self.stderr.as_mut().map(|out| copy(out, &[line, b"\n"])) {
+            let shown = terminal_text(&text);
+            if let Some(Err(error)) = self
+                .stderr
+                .as_mut()
+                .map(|out| copy(out, &[shown.as_bytes(), b"\n"]))
+            {
                 self.stop_forwarding(RawStream::Stderr, &error);
             }
         }
-        self.write_log(|log| log.append_line(line));
+        self.write_log(|log| log.append_line(text.as_bytes()));
     }
 
     fn note_record(&mut self, head: &RecordHead<'_>) {
@@ -915,6 +1013,23 @@ impl<O: Write, E: Write> Sink<O, E> {
                 Some(message[..message.floor_char_boundary(FACT_BYTES)].to_owned());
         }
     }
+}
+
+fn terminal_text(text: &str) -> Cow<'_, str> {
+    let hidden = |c: char| c.is_control() && c != '\t';
+    let Some(first) = text.find(hidden) else {
+        return Cow::Borrowed(text);
+    };
+    let mut shown = String::with_capacity(text.len());
+    shown.push_str(&text[..first]);
+    for c in text[first..].chars() {
+        if hidden(c) {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+    }
+    Cow::Owned(shown)
 }
 
 fn copy(out: &mut impl Write, parts: &[&[u8]]) -> io::Result<()> {
@@ -934,8 +1049,7 @@ struct Drain<O, E> {
 }
 
 impl<O: Write, E: Write> Drain<O, E> {
-    fn until_exit(&mut self, child: &mut Child) -> io::Result<(ExitStatus, Instant)> {
-        let client = Pid::from_child(child);
+    fn until_exit(&mut self, client: Pid) -> io::Result<Instant> {
         let mut buffer = vec![0; READ_CHUNK];
         let mut next_check = Instant::now() + EXIT_CHECK;
         while self.streams.is_open(Source::Exit) {
@@ -966,7 +1080,7 @@ impl<O: Write, E: Write> Drain<O, E> {
             }
         }
         self.finish_lines();
-        Ok((child.wait()?, gone_at))
+        Ok(gone_at)
     }
 
     fn end_leftovers(&mut self, client: Pid) {
@@ -1108,6 +1222,7 @@ mod tests {
     const FLOOD_LONG_BYTES: usize = 5_000;
     const PIPE_BUF: usize = 4_096;
     const SESSION_FILE: &str = "session.json";
+    const RUN_COPY_DIR: &str = "run-file";
 
     struct Supervised {
         finished: Finished,
@@ -1116,6 +1231,7 @@ mod tests {
         log: String,
         newest_part: String,
         session_file_left: bool,
+        run_copy_left: bool,
     }
 
     fn test_dir(test: &str) -> PathBuf {
@@ -1174,6 +1290,7 @@ mod tests {
         }
         let newest_part = std::fs::read_to_string(&finished.log).unwrap();
         let session_file_left = dir.join(SESSION_FILE).exists();
+        let run_copy_left = dir.join(RUN_COPY_DIR).exists();
         std::fs::remove_dir_all(&dir).ok();
         Supervised {
             finished,
@@ -1182,6 +1299,7 @@ mod tests {
             log,
             newest_part,
             session_file_left,
+            run_copy_left,
         }
     }
 
@@ -1326,6 +1444,22 @@ mod tests {
         let run = supervise(TEST);
         assert_eq!(run.finished.end, RunEnd::Crashed(Signal(libc::SIGSEGV)));
         assert!(!run.session_file_left);
+    }
+
+    #[test]
+    fn the_copy_of_roblox_made_for_a_run_is_removed_once_the_client_is_gone_even_after_a_crash() {
+        const TEST: &str =
+            "the_copy_of_roblox_made_for_a_run_is_removed_once_the_client_is_gone_even_after_a_crash";
+        if supervised_child() {
+            let copy = test_dir(TEST).join(RUN_COPY_DIR);
+            std::fs::create_dir_all(&copy).unwrap();
+            std::fs::write(copy.join("base.apk"), b"copied for this run").unwrap();
+            die_by(libc::SIGSEGV);
+        }
+
+        let run = supervise(TEST);
+        assert_eq!(run.finished.end, RunEnd::Crashed(Signal(libc::SIGSEGV)));
+        assert!(!run.run_copy_left);
     }
 
     #[test]
@@ -1534,8 +1668,11 @@ mod tests {
 
     #[test]
     fn records_are_echoed_to_a_terminal_except_status_records() {
+        const CONTROLLED: &str = "osc \u{1b}]52;c;ZWNobyBoaQ==\u{7} csi \u{9b}2J cr \r tab \t end";
+        const ESCAPED: &str = "osc \\u{1b}]52;c;ZWNobyBoaQ==\\u{7} csi \\u{9b}2J cr \\r tab \t end";
         if supervised_child() {
             tracing::warn!(target: "liblog", "first line\ncontinued line");
+            tracing::info!(target: "liblog", "{CONTROLLED}");
             eclipse::diagnostics::record_status(Level::WARN, "printed by the status sink");
             finish_android_process(ClientEnd::Played);
         }
@@ -1555,6 +1692,10 @@ mod tests {
             RunLog::start(&dir).unwrap(),
             output,
         );
+        let log = finished
+            .as_ref()
+            .ok()
+            .map(|finished| std::fs::read_to_string(&finished.log));
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(finished.unwrap().end, RunEnd::Ended);
         let stderr = String::from_utf8(stderr).unwrap();
@@ -1563,6 +1704,14 @@ mod tests {
             "{stderr}"
         );
         assert!(!stderr.contains("printed by the status sink"), "{stderr}");
+        assert!(
+            stderr.contains(&format!("  INFO liblog: {ESCAPED}\n")),
+            "{stderr:?}"
+        );
+        for control in ['\u{1b}', '\u{7}', '\u{9b}', '\r'] {
+            assert!(!stderr.contains(control), "{control:?} in {stderr:?}");
+        }
+        assert!(log.unwrap().unwrap().contains(CONTROLLED));
     }
 
     #[test]
@@ -1726,6 +1875,73 @@ mod tests {
             terminated,
             "the client outlived its supervisor by more than 2 s"
         );
+    }
+
+    #[test]
+    fn a_supervisor_stopped_by_sigint_stops_the_client_and_removes_its_session_and_run_copy() {
+        const TEST: &str =
+            "a_supervisor_stopped_by_sigint_stops_the_client_and_removes_its_session_and_run_copy";
+        if supervised_child() {
+            let dir = test_dir(TEST);
+            let copy = dir.join(RUN_COPY_DIR);
+            std::fs::create_dir_all(&copy).unwrap();
+            std::fs::write(copy.join("base.apk"), b"copied for this run").unwrap();
+            std::fs::write(dir.join(SESSION_FILE), "{}\n").unwrap();
+            write_raw(RawStream::Stdout, b"ready\n");
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        if let Some(dir) = std::env::var_os(PARENT) {
+            let dir = PathBuf::from(dir);
+            let output = Output {
+                stdout: io::stdout(),
+                stderr: io::stderr(),
+                echo_records: false,
+            };
+            let finished = run(
+                child_command(TEST),
+                lock_in(&dir),
+                &dir,
+                RunLog::start(&dir).unwrap(),
+                output,
+            )
+            .unwrap();
+            assert_eq!(finished.end, RunEnd::Stopped(Signal(libc::SIGTERM)));
+            return;
+        }
+
+        let dir = temp_dir(TEST);
+        let mut parent = test_command(TEST)
+            .env(PARENT, &dir)
+            .env_remove(CHILD)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = io::BufReader::new(parent.stdout.take().unwrap());
+        let (ready, started) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in io::BufRead::lines(stdout).map_while(Result::ok) {
+                if line == "ready" {
+                    ready.send(()).ok();
+                }
+            }
+        });
+        if started.recv_timeout(Duration::from_secs(60)).is_err() {
+            parent.kill().ok();
+            parent.wait().ok();
+            panic!("the supervised child did not start");
+        }
+        rustix::process::kill_process(Pid::from_child(&parent), rustix::process::Signal::INT)
+            .unwrap();
+        let status = parent.wait().unwrap();
+        let session_file_left = dir.join(SESSION_FILE).exists();
+        let run_copy_left = dir.join(RUN_COPY_DIR).exists();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(status.success(), "the supervisor ended with {status}");
+        assert!(!session_file_left);
+        assert!(!run_copy_left);
     }
 
     fn flood_error(record: usize) -> bool {

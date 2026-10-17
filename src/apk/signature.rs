@@ -4,12 +4,11 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt as _;
 
+use ring::digest::{digest, Algorithm, Context, Digest, SHA256, SHA512};
 use ring::signature::{
     RsaParameters, UnparsedPublicKey, RSA_PKCS1_1024_8192_SHA256_FOR_LEGACY_USE_ONLY,
     RSA_PKCS1_1024_8192_SHA512_FOR_LEGACY_USE_ONLY,
 };
-use sha2::digest::Output;
-use sha2::{Digest, Sha256, Sha512};
 
 const ROBLOX_CERTIFICATE_SHA256: &str =
     "44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477";
@@ -133,7 +132,7 @@ pub fn verify_roblox_signing_history(
     let contents_match = match v3.algorithm {
         SignatureAlgorithm::RsaPkcs1Sha256 => v3.content_digest == v2.content_digest,
         SignatureAlgorithm::RsaPkcs1Sha512 => {
-            content_digest::<Sha512>(apk.file, &apk.layout)? == v3.content_digest
+            content_digest(&SHA512, apk.file, &apk.layout)?.as_ref() == v3.content_digest
         }
     };
     if !contents_match {
@@ -171,7 +170,7 @@ fn verify_v2<'a>(apk: &'a SignedApk<'_>) -> Result<V2Signer<'a>, SignatureError>
         return Err(SignatureError::Malformed("more than one signer"));
     }
     let v2 = verify_v2_signer(signer)?;
-    if content_digest::<Sha256>(apk.file, &apk.layout)? != v2.content_digest {
+    if content_digest(&SHA256, apk.file, &apk.layout)?.as_ref() != v2.content_digest {
         return Err(SignatureError::ContentDigestMismatch);
     }
     Ok(v2)
@@ -538,11 +537,11 @@ fn find_pair(pairs: &[u8], id: u32) -> Result<Option<&[u8]>, SignatureError> {
     Ok(None)
 }
 
-fn content_digest<D>(file: &File, layout: &ZipLayout) -> Result<Vec<u8>, SignatureError>
-where
-    D: Digest,
-    Output<D>: Send,
-{
+fn content_digest(
+    algorithm: &'static Algorithm,
+    file: &File,
+    layout: &ZipLayout,
+) -> Result<Digest, SignatureError> {
     let mut eocd = layout.eocd.clone();
     let offset = u32::try_from(layout.signing_block_offset)
         .map_err(|_| SignatureError::Malformed("signing block offset"))?;
@@ -568,7 +567,7 @@ where
             .chunks(chunks.len().div_ceil(threads).max(1))
             .map(|group| {
                 std::thread::Builder::new()
-                    .spawn_scoped(scope, move || digest_chunks::<D>(file, group))
+                    .spawn_scoped(scope, move || digest_chunks(algorithm, file, group))
             })
             .collect::<io::Result<Vec<_>>>()?;
         let mut digests = Vec::with_capacity(chunks.len() + 1);
@@ -581,48 +580,52 @@ where
         Ok::<_, SignatureError>(digests)
     })?;
     for chunk in eocd.chunks(CHUNK_LEN) {
-        digests.push(chunk_digest::<D>(chunk));
+        digests.push(chunk_digest(algorithm, chunk));
     }
-    top_digest::<D>(&digests)
+    top_digest(algorithm, &digests)
 }
 
-fn digest_chunks<D: Digest>(
+fn digest_chunks(
+    algorithm: &'static Algorithm,
     file: &File,
     chunks: &[(u64, usize)],
-) -> Result<Vec<Output<D>>, SignatureError> {
+) -> Result<Vec<Digest>, SignatureError> {
     let mut buffer = vec![0; CHUNK_LEN];
     let mut digests = Vec::with_capacity(chunks.len());
     for &(offset, len) in chunks {
         let chunk = &mut buffer[..len];
         file.read_exact_at(chunk, offset)?;
-        digests.push(chunk_digest::<D>(chunk));
+        digests.push(chunk_digest(algorithm, chunk));
     }
     Ok(digests)
 }
 
-fn chunk_digest<D: Digest>(chunk: &[u8]) -> Output<D> {
-    let mut hasher = D::new();
-    hasher.update([0xa5]);
-    hasher.update((chunk.len() as u32).to_le_bytes());
-    hasher.update(chunk);
-    hasher.finalize()
+fn chunk_digest(algorithm: &'static Algorithm, chunk: &[u8]) -> Digest {
+    let mut context = Context::new(algorithm);
+    context.update(&[0xa5]);
+    context.update(&(chunk.len() as u32).to_le_bytes());
+    context.update(chunk);
+    context.finish()
 }
 
-fn top_digest<D: Digest>(chunk_digests: &[Output<D>]) -> Result<Vec<u8>, SignatureError> {
+fn top_digest(
+    algorithm: &'static Algorithm,
+    chunk_digests: &[Digest],
+) -> Result<Digest, SignatureError> {
     let count =
         u32::try_from(chunk_digests.len()).map_err(|_| SignatureError::Malformed("chunk count"))?;
-    let mut top = D::new();
-    top.update([0x5a]);
-    top.update(count.to_le_bytes());
+    let mut top = Context::new(algorithm);
+    top.update(&[0x5a]);
+    top.update(&count.to_le_bytes());
     for digest in chunk_digests {
-        top.update(digest);
+        top.update(digest.as_ref());
     }
-    Ok(top.finalize().to_vec())
+    Ok(top.finish())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
+    for byte in digest(&SHA256, bytes).as_ref() {
         let _ = write!(hex, "{byte:02x}");
     }
     hex

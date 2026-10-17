@@ -1472,7 +1472,7 @@ fn platform_test_keeps_the_screen_on_only_for_the_keep_screen_on_flag() {
 }
 
 #[test]
-fn platform_test_obtains_a_second_finger_motion_event_under_check_jni() {
+fn platform_test_obtains_touch_motion_events_under_check_jni() {
     if !platform_test_can_boot() {
         return;
     }
@@ -1486,6 +1486,9 @@ fn platform_test_obtains_a_second_finger_motion_event_under_check_jni() {
             "__platform-test: MotionEvent.obtain for a second finger returned action 0x105, \
              source 0x1002, down 1000 ms, event 1016 ms, pointer 0 at (10.5, 20.25), pointer 1 \
              at (30.75, 40.5)"
+                .to_owned(),
+            "__platform-test: MotionEvent.obtain for a pointer move returned action 0x2, down 1000 \
+             ms, event 1016 ms, pointer 1 at (12.5, 34.75)"
                 .to_owned(),
         ],
     );
@@ -1525,6 +1528,47 @@ fn platform_test_calls_the_appsflyer_statics_under_check_jni() {
     assert_lines(
         &text,
         &returned.map(|(call, value)| format!("__platform-test: {call} returned {value}")),
+    );
+}
+
+#[test]
+fn platform_test_loads_dex_files_from_heap_and_direct_buffers_under_check_jni() {
+    if !platform_test_can_boot() {
+        return;
+    }
+
+    let root = PlatformTestRoot::create("in-memory-dex");
+    let text = root.run_with_vm_options("-Xcheck:jni");
+
+    assert_lines(
+        &text,
+        &[
+            "__platform-test: InMemoryDexClassLoader over a heap buffer defined \
+             eclipse.InMemoryDexProbe"
+                .to_owned(),
+            "__platform-test: InMemoryDexClassLoader over a direct buffer defined \
+             eclipse.InMemoryDexProbe"
+                .to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn platform_test_passes_on_the_io_exception_of_a_bad_in_memory_dex_under_check_jni() {
+    if !platform_test_can_boot() {
+        return;
+    }
+
+    let root = PlatformTestRoot::create("bad-in-memory-dex");
+    let text = root.run_with_vm_options("-Xcheck:jni");
+
+    assert_lines(
+        &text,
+        &[
+            "__platform-test: new DexFile(ByteBuffer) over a dex with a bad checksum threw \
+           java.io.IOException"
+                .to_owned(),
+        ],
     );
 }
 

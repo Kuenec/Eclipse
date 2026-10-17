@@ -14,7 +14,8 @@ use jni::{jni_sig, jni_str, Env, JValue};
 use winit::event::TouchPhase;
 
 use super::{
-    checked, EngineTouchOutcome, FrameworkError, MOTION_EVENT_CLASS, NATIVE_INPUT_INTERFACE_CLASS,
+    checked, EngineTouchOutcome, FrameworkError, MotionAction, MOTION_EVENT_CLASS,
+    NATIVE_INPUT_INTERFACE_CLASS,
 };
 use crate::gamepad::GamepadCall;
 use crate::input::{TouchMotion, TouchPointer, TouchTracker, MAX_TOUCH_POINTERS};
@@ -261,9 +262,23 @@ const MOTION_EVENT_OBTAIN_POINTERS_SIG: MethodSignature<'static, 'static> = jni_
     "(JJII[Landroid/view/MotionEvent$PointerProperties;[Landroid/view/MotionEvent$PointerCoords;IIFFIIII)Landroid/view/MotionEvent;"
 );
 
+const MOTION_EVENT_OBTAIN_POINT_SIG: MethodSignature<'static, 'static> =
+    jni_sig!("(JJIFFI)Landroid/view/MotionEvent;");
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EngineTouch<'a> {
+    Pointers(&'a TouchMotion),
+    Point {
+        action: MotionAction,
+        x: f32,
+        y: f32,
+    },
+}
+
 struct TouchMotionJni {
     motion_event: Global<JClass<'static>>,
     obtain: JStaticMethodID,
+    obtain_at_point: JStaticMethodID,
     recycle: JMethodID,
     on_touch_event_internal: JMethodID,
     pointer_id: JFieldID,
@@ -279,7 +294,7 @@ static TOUCH_MOTION_JNI: OnceLock<TouchMotionJni> = OnceLock::new();
 
 pub(crate) fn dispatch_touch_motion(
     vm: &Vm,
-    motion: &TouchMotion,
+    touch: EngineTouch,
     down_time_ms: Option<i64>,
 ) -> Result<Option<EngineTouchOutcome>, FrameworkError> {
     let raw = vm.as_raw();
@@ -289,7 +304,7 @@ pub(crate) fn dispatch_touch_motion(
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            touch_engine_surface(env, motion, down_time_ms)
+            touch_engine_surface(env, touch, down_time_ms)
         })) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
@@ -299,12 +314,12 @@ pub(crate) fn dispatch_touch_motion(
 
 fn touch_engine_surface(
     env: &mut Env,
-    motion: &TouchMotion,
+    touch: EngineTouch,
     down_time_ms: Option<i64>,
 ) -> Result<Option<EngineTouchOutcome>, FrameworkError> {
     let Some(handle) = super::engine_surface_view_handle() else {
         tracing::debug!(
-            action = ?motion.action,
+            ?touch,
             "engine touch: no RBXSurfaceView holds the engine surface yet (no-op)"
         );
         return Ok(None);
@@ -315,7 +330,14 @@ fn touch_engine_surface(
     let jni = touch_motion_jni(env)?;
     let event_time = super::monotonic_millis();
     let down_time = down_time_ms.unwrap_or(event_time);
-    let event = obtain_touch_event(env, jni, motion, down_time, event_time)?;
+    let event = match touch {
+        EngineTouch::Pointers(motion) => {
+            obtain_touch_event(env, jni, motion, down_time, event_time)
+        }
+        EngineTouch::Point { action, x, y } => {
+            obtain_point_event(env, jni, action, (x, y), down_time, event_time)
+        }
+    }?;
     let consumed = checked(env, "RBXSurfaceView.onTouchEventInternal", |env| {
         unsafe {
             env.call_method_unchecked(
@@ -380,6 +402,35 @@ fn obtain_touch_event<'local>(
     })
 }
 
+fn obtain_point_event<'local>(
+    env: &mut Env<'local>,
+    jni: &TouchMotionJni,
+    action: MotionAction,
+    (x, y): (f32, f32),
+    down_time: i64,
+    event_time: i64,
+) -> Result<JObject<'local>, FrameworkError> {
+    let args = [
+        JValue::Long(down_time).as_jni(),
+        JValue::Long(event_time).as_jni(),
+        JValue::Int(action.code()).as_jni(),
+        JValue::Float(x).as_jni(),
+        JValue::Float(y).as_jni(),
+        JValue::Int(NO_FLAGS).as_jni(),
+    ];
+    checked(env, "MotionEvent.obtain for a pointer", |env| {
+        unsafe {
+            env.call_static_method_unchecked(
+                &jni.motion_event,
+                jni.obtain_at_point,
+                JavaType::Object,
+                &args,
+            )
+        }?
+        .l()
+    })
+}
+
 fn recycle_touch_event(
     env: &mut Env,
     jni: &TouchMotionJni,
@@ -404,6 +455,8 @@ const PROBE_DOWN_TIME_MS: i64 = 1000;
 
 const PROBE_EVENT_TIME_MS: i64 = 1016;
 
+const PROBE_POINT: (f32, f32) = (12.5, 34.75);
+
 pub(crate) struct TouchEventReadback {
     action: i32,
     source: i32,
@@ -416,8 +469,7 @@ impl fmt::Display for TouchEventReadback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "MotionEvent.obtain for a second finger returned action {:#x}, source {:#x}, down \
-             {} ms, event {} ms",
+            "action {:#x}, source {:#x}, down {} ms, event {} ms",
             self.action, self.source, self.down_time, self.event_time
         )?;
         for TouchPointer { id, x, y } in &self.pointers {
@@ -437,6 +489,43 @@ pub(crate) fn probe_second_finger(env: &mut Env) -> Result<TouchEventReadback, F
     let jni = touch_motion_jni(env)?;
     let event = obtain_touch_event(env, jni, &motion, PROBE_DOWN_TIME_MS, PROBE_EVENT_TIME_MS)?;
     let readback = read_touch_event(env, &event);
+    recycle_touch_event(env, jni, &event)?;
+    readback
+}
+
+pub(crate) struct PointEventReadback(TouchEventReadback);
+
+impl fmt::Display for PointEventReadback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let TouchEventReadback {
+            action,
+            down_time,
+            event_time,
+            pointers,
+            ..
+        } = &self.0;
+        write!(
+            f,
+            "action {action:#x}, down {down_time} ms, event {event_time} ms"
+        )?;
+        for TouchPointer { id, x, y } in pointers {
+            write!(f, ", pointer {id} at ({x}, {y})")?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn probe_point_move(env: &mut Env) -> Result<PointEventReadback, FrameworkError> {
+    let jni = touch_motion_jni(env)?;
+    let event = obtain_point_event(
+        env,
+        jni,
+        MotionAction::Move,
+        PROBE_POINT,
+        PROBE_DOWN_TIME_MS,
+        PROBE_EVENT_TIME_MS,
+    )?;
+    let readback = read_touch_event(env, &event).map(PointEventReadback);
     recycle_touch_event(env, jni, &event)?;
     readback
 }
@@ -516,6 +605,11 @@ fn touch_motion_jni(env: &mut Env) -> Result<&'static TouchMotionJni, FrameworkE
                     &motion_event,
                     jni_str!("obtain"),
                     MOTION_EVENT_OBTAIN_POINTERS_SIG,
+                )?,
+                obtain_at_point: env.get_static_method_id(
+                    &motion_event,
+                    jni_str!("obtain"),
+                    MOTION_EVENT_OBTAIN_POINT_SIG,
                 )?,
                 recycle: env.get_method_id(&motion_event, jni_str!("recycle"), jni_sig!("()V"))?,
                 on_touch_event_internal: env.get_method_id(

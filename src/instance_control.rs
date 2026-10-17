@@ -16,9 +16,9 @@ use eclipse::graphics::activation::Token;
 use eclipse::graphics::launch_window::{WindowCommand, WindowControl, WindowGone};
 use eclipse::links::LaunchTarget;
 use eclipse::session::Experience;
+use ring::digest::{digest, SHA256};
 use rustix::process::Uid;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 pub(crate) const RUNTIME_DIR: &str = "runtime";
 const CLIENT_LOCK_FILE: &str = "client.lock";
@@ -137,8 +137,8 @@ fn socket_path(socket_dir: &Path, lock_root: &Path) -> Result<PathBuf, String> {
     let root = lock_root
         .canonicalize()
         .map_err(|error| format!("cannot resolve {}: {error}", lock_root.display()))?;
-    let digest = Sha256::digest(root.as_os_str().as_bytes());
-    let hash: String = digest[..SOCKET_HASH_BYTES]
+    let digest = digest(&SHA256, root.as_os_str().as_bytes());
+    let hash: String = digest.as_ref()[..SOCKET_HASH_BYTES]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
