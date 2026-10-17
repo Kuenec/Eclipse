@@ -12,8 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use sha2::Digest as _;
-
 const RUN_LIMIT: Duration = Duration::from_secs(60);
 const SHORT_RUNTIME_PARENT: &str = "/tmp";
 
@@ -396,8 +394,8 @@ fn a_launch_while_roblox_runs_is_handed_to_it_with_no_link_in_its_arguments() {
         .create(&socket_dir)
         .unwrap();
     let lock_root = app_data.canonicalize().unwrap();
-    let digest = sha2::Sha256::digest(lock_root.as_os_str().as_bytes());
-    let hash: String = digest[..8]
+    let digest = ring::digest::digest(&ring::digest::SHA256, lock_root.as_os_str().as_bytes());
+    let hash: String = digest.as_ref()[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();

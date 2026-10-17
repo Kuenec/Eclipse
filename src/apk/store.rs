@@ -41,6 +41,7 @@ const ANDROID_ABI_SPLIT_NAMES: [&str; 8] = [
     "mips64",
     "riscv64",
 ];
+const RUN_COPY_DIR: &str = "run-file";
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const FAILED_CHECK_RETRY: Duration = Duration::from_secs(30 * 60);
@@ -1122,9 +1123,14 @@ impl Staging<'_> {
         })?;
         if metadata.is_dir() {
             let paths = ApkSetPaths::locate(source)?;
-            self.copy_in(&paths.base, StagedFile::Base)?;
+            copy_in(&self.dir, &paths.base, StagedFile::Base, Durability::Synced)?;
             if let Some(split) = &paths.native_split {
-                self.copy_in(split, StagedFile::NativeSplit)?;
+                copy_in(
+                    &self.dir,
+                    split,
+                    StagedFile::NativeSplit,
+                    Durability::Synced,
+                )?;
             }
             return Ok(());
         }
@@ -1132,7 +1138,7 @@ impl Staging<'_> {
             return self.extract_bundle(source);
         }
         let role = classify_apk(source)?;
-        self.copy_in(source, role)
+        copy_in(&self.dir, source, role, Durability::Synced)
     }
 
     pub fn commit(mut self, expected: Option<VersionCode>) -> Result<ApkSet, StoreError> {
@@ -1144,14 +1150,6 @@ impl Staging<'_> {
         {
             return Err(StoreError::NoNativeSplitGiven);
         }
-        let partial = self.store.root.join(format!(
-            "{}{PARTIAL_SUFFIX}",
-            staged_version_code(&self.dir)?
-        ));
-        remove_dir_if_present(&partial)?;
-        rename(&self.dir, &partial)?;
-        self.dir = partial;
-
         let files = ApkSetFiles::open(ApkSetPaths::locate(&self.dir)?)?;
         let identity = files.identity()?;
         let staged = files.verify()?;
@@ -1164,6 +1162,13 @@ impl Staging<'_> {
                 });
             }
         }
+        let partial = self
+            .store
+            .root
+            .join(format!("{}{PARTIAL_SUFFIX}", installed.version_code));
+        remove_dir_if_present(&partial)?;
+        rename(&self.dir, &partial)?;
+        self.dir = partial;
 
         let target = self.store.version_dir(installed.version_code);
         let existing = if path_exists(&target)? {
@@ -1188,46 +1193,6 @@ impl Staging<'_> {
         sync_dir(&self.store.root)?;
         self.store.activate(&installed)?;
         Ok(set)
-    }
-
-    fn copy_in(&self, source: &Path, role: StagedFile) -> Result<(), StoreError> {
-        let mut input = File::open(source).map_err(|error| StoreError::Io {
-            path: source.to_path_buf(),
-            source: error,
-        })?;
-        self.write_staged(role, source, &mut input)
-    }
-
-    fn write_staged(
-        &self,
-        role: StagedFile,
-        origin: &Path,
-        input: &mut impl Read,
-    ) -> Result<(), StoreError> {
-        let dest = self.dir.join(role.file_name());
-        let mut output = match OpenOptions::new().write(true).create_new(true).open(&dest) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(StoreError::Duplicate {
-                    path: origin.to_path_buf(),
-                    file: role.file_name(),
-                });
-            }
-            Err(source) => return Err(StoreError::Io { path: dest, source }),
-        };
-        let io_error = |source| StoreError::Io {
-            path: origin.to_path_buf(),
-            source,
-        };
-        let copied = io::copy(&mut input.take(MAX_APK_BYTES + 1), &mut output).map_err(io_error)?;
-        if copied > MAX_APK_BYTES {
-            return Err(StoreError::TooLarge {
-                path: origin.to_path_buf(),
-            });
-        }
-        output
-            .sync_all()
-            .map_err(|source| StoreError::Io { path: dest, source })
     }
 
     fn extract_bundle(&self, bundle: &Path) -> Result<(), StoreError> {
@@ -1257,7 +1222,7 @@ impl Staging<'_> {
                 }
                 source => unreadable(source),
             })?;
-            self.write_staged(role, bundle, &mut entry)?;
+            write_staged(&self.dir, role, bundle, &mut entry, Durability::Synced)?;
         }
         Ok(())
     }
@@ -1282,6 +1247,84 @@ impl StagedFile {
             Self::NativeSplit => Abi::HOST.split_apk(),
         }
     }
+}
+
+fn copy_in(
+    dir: &Path,
+    source: &Path,
+    role: StagedFile,
+    durability: Durability,
+) -> Result<(), StoreError> {
+    let mut input = File::open(source).map_err(|error| StoreError::Io {
+        path: source.to_path_buf(),
+        source: error,
+    })?;
+    write_staged(dir, role, source, &mut input, durability)
+}
+
+fn write_staged(
+    dir: &Path,
+    role: StagedFile,
+    origin: &Path,
+    input: &mut impl Read,
+    durability: Durability,
+) -> Result<(), StoreError> {
+    let dest = dir.join(role.file_name());
+    let mut output = match OpenOptions::new().write(true).create_new(true).open(&dest) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(StoreError::Duplicate {
+                path: origin.to_path_buf(),
+                file: role.file_name(),
+            });
+        }
+        Err(source) => return Err(StoreError::Io { path: dest, source }),
+    };
+    let io_error = |source| StoreError::Io {
+        path: origin.to_path_buf(),
+        source,
+    };
+    let copied = io::copy(&mut input.take(MAX_APK_BYTES + 1), &mut output).map_err(io_error)?;
+    if copied > MAX_APK_BYTES {
+        return Err(StoreError::TooLarge {
+            path: origin.to_path_buf(),
+        });
+    }
+    match durability {
+        Durability::Synced => output
+            .sync_all()
+            .map_err(|source| StoreError::Io { path: dest, source }),
+        Durability::Unsynced => Ok(()),
+    }
+}
+
+pub fn copy_for_run(source: &Path, runtime_dir: &Path) -> Result<ApkSet, StoreError> {
+    let copied = copy_given_set(source, &runtime_dir.join(RUN_COPY_DIR))?;
+    Ok(ApkSet::open(copied)?)
+}
+
+pub fn remove_run_copy(runtime_dir: &Path) -> Result<(), StoreError> {
+    remove_dir_if_present(&runtime_dir.join(RUN_COPY_DIR))
+}
+
+fn copy_given_set(source: &Path, dir: &Path) -> Result<ApkSetPaths, StoreError> {
+    let given = ApkSetPaths::locate(source)?;
+    remove_dir_if_present(dir)?;
+    create_dir_all(dir)?;
+    copy_in(dir, &given.base, StagedFile::Base, Durability::Unsynced)?;
+    if let Some(split) = &given.native_split {
+        copy_in(dir, split, StagedFile::NativeSplit, Durability::Unsynced)?;
+    }
+    Ok(ApkSetPaths {
+        base: dir.join(BASE_APK),
+        native_split: given.native_split.map(|_| dir.join(Abi::HOST.split_apk())),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Durability {
+    Synced,
+    Unsynced,
 }
 
 fn member_file_name(name: &str) -> &str {
@@ -1392,20 +1435,6 @@ fn classify_apk(path: &Path) -> Result<StagedFile, StoreError> {
             split: split.to_owned(),
         }),
     }
-}
-
-fn staged_version_code(dir: &Path) -> Result<VersionCode, StoreError> {
-    let path = dir.join(BASE_APK);
-    let apk_error = |source| StoreError::Apk {
-        path: path.clone(),
-        source,
-    };
-    Apk::open(&path)
-        .map_err(apk_error)?
-        .package_info()
-        .map_err(apk_error)?
-        .version_code
-        .ok_or_else(|| ApkSetError::MissingVersionCode(path.clone()).into())
 }
 
 fn staged_base_has_engine(dir: &Path) -> Result<bool, StoreError> {
@@ -2197,6 +2226,120 @@ mod tests {
         fs::remove_dir_all(&sources).ok();
     }
 
+    fn open_unsigned(paths: ApkSetPaths) -> ApkSet {
+        ApkSetFiles::open(paths)
+            .and_then(|files| {
+                files.assemble(SigningCertificateHistory::unverified(vec![
+                    b"test certificate".to_vec(),
+                ]))
+            })
+            .expect("a consistent unsigned set")
+    }
+
+    #[test]
+    fn a_run_plays_a_private_copy_that_later_changes_to_the_given_files_never_reach() {
+        let runtime = temp_root("run-copy");
+        let sources = temp_root("run-copy-sources");
+        let base = synthetic_apk(None, false);
+        let split = synthetic_apk(Some(Abi::HOST.split_name()), true);
+        fs::write(sources.join(BASE_APK), &base).unwrap();
+        fs::write(sources.join(Abi::HOST.split_apk()), &split).unwrap();
+        let run_dir = runtime.join(RUN_COPY_DIR);
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(run_dir.join("left-by-an-earlier-run.apk"), b"stale").unwrap();
+
+        let set = open_unsigned(copy_given_set(&sources, &run_dir).unwrap());
+
+        let replacement = axml::fixture::Manifest {
+            package: ROBLOX_PACKAGE,
+            version_code: Some(4000),
+            version_name: None,
+            split: None,
+            launcher: Some(".Main"),
+        }
+        .encode();
+        let other_base = sources.join("other-base.apk");
+        fs::write(
+            &other_base,
+            zip_of(&[("AndroidManifest.xml", &replacement)], stored()),
+        )
+        .unwrap();
+        fs::rename(&other_base, sources.join(BASE_APK)).unwrap();
+        fs::write(sources.join(Abi::HOST.split_apk()), b"rewritten in place").unwrap();
+
+        assert_eq!(set.base_path(), run_dir.join(BASE_APK));
+        assert_eq!(set.native_libs_path(), run_dir.join(Abi::HOST.split_apk()));
+        assert_eq!(fs::read(set.base_path()).unwrap(), base);
+        assert_eq!(fs::read(set.native_libs_path()).unwrap(), split);
+        let reopened = crate::apk::cache::APP_APK
+            .open(set.base_path())
+            .and_then(|mut apk| apk.package_info())
+            .unwrap();
+        assert_eq!(reopened.version_code, Some(VersionCode(3056)));
+        assert_eq!(
+            fs::read_dir(&run_dir).unwrap().count(),
+            2,
+            "the run directory holds only this run's copy"
+        );
+        fs::remove_dir_all(&runtime).ok();
+        fs::remove_dir_all(&sources).ok();
+    }
+
+    #[test]
+    fn a_run_refuses_a_copy_that_roblox_did_not_sign_and_the_copy_can_be_removed() {
+        let runtime = temp_root("run-copy-unsigned");
+        let sources = temp_root("run-copy-unsigned-sources");
+        fs::write(sources.join(BASE_APK), synthetic_apk(None, false)).unwrap();
+        fs::write(
+            sources.join(Abi::HOST.split_apk()),
+            synthetic_apk(Some(Abi::HOST.split_name()), true),
+        )
+        .unwrap();
+
+        let err = copy_for_run(&sources, &runtime)
+            .err()
+            .expect("an unsigned set is refused");
+        let run_dir = runtime.join(RUN_COPY_DIR);
+        assert!(
+            matches!(
+                &err,
+                StoreError::Set(ApkSetError::Signature {
+                    path,
+                    source: SignatureError::MissingV2Signature,
+                }) if *path == run_dir.join(BASE_APK)
+            ),
+            "{err:?}"
+        );
+        remove_run_copy(&runtime).unwrap();
+        assert!(!run_dir.exists());
+        remove_run_copy(&runtime).unwrap();
+        fs::remove_dir_all(&runtime).ok();
+        fs::remove_dir_all(&sources).ok();
+    }
+
+    #[test]
+    fn the_official_set_runs_from_its_verified_copy() {
+        let Some(given) = std::env::var_os(crate::apk::DEV_APK_ENV).filter(|path| !path.is_empty())
+        else {
+            eprintln!("SKIP: set ECLIPSE_ROBLOX_APK to run a copy of the official Roblox APK set");
+            return;
+        };
+        let given = PathBuf::from(given);
+        let runtime = temp_root("run-copy-official");
+        let set = copy_for_run(&given, &runtime).expect("the copy of the official set verifies");
+        let run_dir = runtime.join(RUN_COPY_DIR);
+        assert_eq!(set.base_path(), run_dir.join(BASE_APK));
+        assert!(set.native_libs_path().starts_with(&run_dir));
+        let original = Apk::open(&ApkSetPaths::locate(&given).unwrap().base)
+            .and_then(|mut apk| apk.package_info())
+            .unwrap();
+        assert_eq!(Some(set.version_code()), original.version_code);
+        drop(set);
+        remove_run_copy(&runtime).unwrap();
+        assert!(!run_dir.exists());
+        fs::remove_dir_all(&runtime).ok();
+    }
+
     #[test]
     fn unsigned_candidates_are_rejected_without_touching_the_install() {
         let root = temp_root("unsigned");
@@ -2213,6 +2356,47 @@ mod tests {
             .install(std::slice::from_ref(&sources), &StatusSink::terminal())
             .err()
             .expect("unsigned APKs are refused");
+        assert!(
+            matches!(
+                err,
+                StoreError::Set(ApkSetError::Signature {
+                    source: SignatureError::MissingV2Signature,
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(store.current().unwrap(), None);
+        assert!(entries(&root).is_empty(), "{:?}", entries(&root));
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&sources).ok();
+    }
+
+    #[test]
+    fn staged_manifests_are_read_only_after_the_signature_check() {
+        let root = temp_root("unsigned-garbage");
+        let sources = temp_root("unsigned-garbage-sources");
+        fs::write(
+            sources.join(BASE_APK),
+            zip_of(
+                &[("AndroidManifest.xml", b"not a binary manifest")],
+                stored(),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            sources.join(Abi::HOST.split_apk()),
+            synthetic_apk(Some(Abi::HOST.split_name()), true),
+        )
+        .unwrap();
+
+        let store = Store::at(root.clone());
+        let staging = store.begin(&StatusSink::terminal()).unwrap();
+        staging.add_source(&sources).unwrap();
+        let err = staging
+            .commit(None)
+            .err()
+            .expect("an unsigned set is refused");
         assert!(
             matches!(
                 err,

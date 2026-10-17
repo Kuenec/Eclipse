@@ -27,8 +27,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crc32fast::Hasher as Crc32;
+use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use zip::{CompressionMethod, ZipArchive};
 
 use axml::AxmlError;
@@ -37,6 +37,7 @@ use intent_filter::{ViewHandler, ViewUri};
 use signature::{SignatureError, SigningCertificateHistory};
 
 use crate::abi::Abi;
+use crate::mapped_file::MappedFile;
 use crate::status::{StatusSink, WINDOW_PROGRESS_INTERVAL};
 
 const MANIFEST_ENTRY: &str = "AndroidManifest.xml";
@@ -231,9 +232,9 @@ fn extraction_digest(
     source: &Metadata,
     planned: &[PlannedEntry],
 ) -> io::Result<Option<Vec<u8>>> {
-    let mut digest = Sha256::new();
+    let mut digest = Context::new(&SHA256);
     digest.update(source_path.as_os_str().as_bytes());
-    digest.update([0]);
+    digest.update(&[0]);
     FileIdentity::of(source).hash_into(&mut digest);
     for entry in planned {
         let extracted = match std::fs::metadata(&entry.dest) {
@@ -252,12 +253,12 @@ fn extraction_digest(
             return Ok(None);
         }
         digest.update(entry.name.as_bytes());
-        digest.update([0]);
-        digest.update(entry.size.to_le_bytes());
-        digest.update(entry.crc32.to_le_bytes());
+        digest.update(&[0]);
+        digest.update(&entry.size.to_le_bytes());
+        digest.update(&entry.crc32.to_le_bytes());
         FileIdentity::of(&extracted).hash_into(&mut digest);
     }
-    Ok(Some(digest.finalize().to_vec()))
+    Ok(Some(digest.finish().as_ref().to_vec()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,12 +285,12 @@ impl FileIdentity {
         }
     }
 
-    fn hash_into(&self, digest: &mut Sha256) {
+    fn hash_into(&self, digest: &mut Context) {
         for field in [self.dev, self.ino, self.size] {
-            digest.update(field.to_le_bytes());
+            digest.update(&field.to_le_bytes());
         }
         for field in [self.mtime, self.mtime_nsec, self.ctime, self.ctime_nsec] {
-            digest.update(field.to_le_bytes());
+            digest.update(&field.to_le_bytes());
         }
     }
 }
@@ -730,6 +731,16 @@ impl Apk {
             stored: entry.compression() == CompressionMethod::Stored,
         })
     }
+
+    pub(crate) fn map_stored_entry(&mut self, name: &str) -> Result<MappedFile, ApkError> {
+        let span = self.entry_span(name)?;
+        if !span.stored {
+            return Err(ApkError::EntryCompressed(name.to_owned()));
+        }
+        MappedFile::range(&self.file, span.data_start, span.uncompressed_size).map_err(|error| {
+            ApkError::Io(io_context(error, &format!("map {name} from"), &self.path))
+        })
+    }
 }
 
 pub fn reopen(file: &File) -> io::Result<File> {
@@ -1082,6 +1093,8 @@ pub enum ApkError {
 
     EntryOffsetUnknown(String),
 
+    EntryCompressed(String),
+
     EngineMissing(Abi),
 
     ManifestTooLarge(u64),
@@ -1096,6 +1109,9 @@ impl fmt::Display for ApkError {
             Self::EntryMissing(name) => write!(f, "APK is missing required entry: {name}"),
             Self::EntryOffsetUnknown(name) => {
                 write!(f, "APK entry {name} has no resolved data offset")
+            }
+            Self::EntryCompressed(name) => {
+                write!(f, "APK entry {name} is compressed but must be stored")
             }
             Self::EngineMissing(abi) => {
                 let abi = abi.android_name();
@@ -1121,6 +1137,7 @@ impl std::error::Error for ApkError {
             Self::Axml(e) => Some(e),
             Self::EntryMissing(_)
             | Self::EntryOffsetUnknown(_)
+            | Self::EntryCompressed(_)
             | Self::EngineMissing(_)
             | Self::ManifestTooLarge(_) => None,
         }
@@ -1868,6 +1885,54 @@ mod tests {
         let err = apk.entry_span("assets/absent.bin").unwrap_err();
         assert!(matches!(err, ApkError::EntryMissing(_)), "got {err:?}");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_stored_entry_maps_in_place_and_a_compressed_one_is_refused() {
+        const PAYLOAD: &[u8] = b"resource-table-bytes-0123456789";
+        let bytes = build_apk_methods(&[
+            ("resources.arsc", PAYLOAD, CompressionMethod::Stored),
+            (
+                "assets/compressed.bin",
+                PAYLOAD,
+                CompressionMethod::Deflated,
+            ),
+        ]);
+        let (mut apk, path) = open_apk(&bytes, "map-stored");
+        let mapped = apk.map_stored_entry("resources.arsc").expect("map stored");
+        let Err(err) = apk.map_stored_entry("assets/compressed.bin") else {
+            panic!("a Deflated entry cannot be mapped");
+        };
+        std::fs::remove_file(&path).ok();
+        assert_eq!(&*mapped, PAYLOAD);
+        assert!(matches!(err, ApkError::EntryCompressed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_stored_entry_running_past_the_end_of_the_file_is_not_mapped() {
+        const PAYLOAD: &[u8] = b"resource-table-bytes-0123456789";
+        let mut bytes =
+            build_apk_methods(&[("resources.arsc", PAYLOAD, CompressionMethod::Stored)]);
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .expect("central directory entry");
+        let claimed = u32::try_from(PAYLOAD.len() + 1024 * 1024).expect("claimed size fits");
+        for field in [central + 20, central + 24] {
+            bytes[field..field + 4].copy_from_slice(&claimed.to_le_bytes());
+        }
+        let (mut apk, path) = open_apk(&bytes, "map-past-eof");
+        let span = apk.entry_span("resources.arsc").expect("span");
+        let Err(err) = apk.map_stored_entry("resources.arsc") else {
+            panic!("an entry past EOF must not map");
+        };
+        std::fs::remove_file(&path).ok();
+        assert!(span.stored);
+        assert_eq!(span.uncompressed_size, u64::from(claimed));
+        assert!(
+            matches!(&err, ApkError::Io(io) if io.kind() == io::ErrorKind::UnexpectedEof),
+            "got {err:?}"
+        );
     }
 
     #[test]

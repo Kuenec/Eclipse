@@ -5,8 +5,8 @@ use std::io::{self, Read as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use ring::digest::{digest, SHA256};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 use super::avcodec::Codec;
@@ -441,7 +441,7 @@ fn goertzel_power(samples: &[f32], sample_rate: f64, frequency: f64) -> f64 {
 }
 
 pub(super) fn sha256_hex(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
+    hex(digest(&SHA256, bytes).as_ref())
 }
 
 pub(super) fn hex(digest: &[u8]) -> String {

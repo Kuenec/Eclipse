@@ -9,8 +9,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use super::proto::{
     bytes_field, fixed64_field, message_at, repeated_bytes, string_field, varint_field, Encoder,
@@ -614,7 +614,7 @@ fn save_verified<R: Read>(
     status: &StatusSink,
 ) -> Result<(), PlayError> {
     let file = artifact.file;
-    let mut hasher = Sha256::new();
+    let mut hasher = Context::new(&SHA256);
     let total = https::save_download(open, MAX_APK_BYTES, dest, status, |chunk| {
         hasher.update(chunk)
     })
@@ -626,7 +626,7 @@ fn save_verified<R: Read>(
             actual: total,
         });
     }
-    if hasher.finalize()[..] != artifact.sha256 {
+    if hasher.finish().as_ref() != artifact.sha256 {
         return Err(PlayError::HashMismatch { file });
     }
     Ok(())
@@ -1254,7 +1254,10 @@ mod tests {
             file: BASE_APK,
             url: "https://play.googleapis.com/download".to_owned(),
             size,
-            sha256: Sha256::digest(body).into(),
+            sha256: ring::digest::digest(&SHA256, body)
+                .as_ref()
+                .try_into()
+                .unwrap(),
         }
     }
 

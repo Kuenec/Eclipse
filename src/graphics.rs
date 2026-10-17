@@ -12,6 +12,7 @@ use winit::platform::startup_notify::WindowAttributesExtStartupNotify as _;
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{ActivationToken, CursorGrabMode, Fullscreen, Window, WindowId};
 
+use crate::framework::engine_input::EngineTouch;
 use crate::web_view_parent::WebViewParent;
 
 pub mod activation;
@@ -1706,11 +1707,13 @@ impl GameWindow<'_> {
             }
             return;
         }
-        match crate::framework::dispatch_touch_to_engine_surface(
+        match crate::framework::engine_input::dispatch_touch_motion(
             vm,
-            crate::framework::MotionAction::Down,
-            px,
-            py,
+            EngineTouch::Point {
+                action: crate::framework::MotionAction::Down,
+                x: px,
+                y: py,
+            },
             None,
         ) {
             Ok(Some(outcome)) => {
@@ -1743,11 +1746,13 @@ impl GameWindow<'_> {
             }
             PrimaryRelease::TouchUp { down_time } => down_time,
         };
-        match crate::framework::dispatch_touch_to_engine_surface(
+        match crate::framework::engine_input::dispatch_touch_motion(
             vm,
-            crate::framework::MotionAction::Up,
-            px,
-            py,
+            EngineTouch::Point {
+                action: crate::framework::MotionAction::Up,
+                x: px,
+                y: py,
+            },
             Some(down_time),
         ) {
             Ok(Some(outcome)) => {
@@ -1821,7 +1826,11 @@ impl GameWindow<'_> {
         if let Some(pointer) = motion.pressed_pointer() {
             crate::framework::prepare_text_field_pointer_press((pointer.x, pointer.y));
         }
-        match crate::framework::engine_input::dispatch_touch_motion(vm, motion, down_time) {
+        match crate::framework::engine_input::dispatch_touch_motion(
+            vm,
+            EngineTouch::Pointers(motion),
+            down_time,
+        ) {
             Ok(Some(outcome)) => {
                 self.touch_down_time = Some(outcome.down_time_ms);
                 let action = motion.action;
@@ -1964,11 +1973,13 @@ impl GameWindow<'_> {
             return;
         };
         let Some(vm) = self.vm else { return };
-        if let Err(e) = crate::framework::dispatch_touch_to_engine_surface(
+        if let Err(e) = crate::framework::engine_input::dispatch_touch_motion(
             vm,
-            crate::framework::MotionAction::Move,
-            px,
-            py,
+            EngineTouch::Point {
+                action: crate::framework::MotionAction::Move,
+                x: px,
+                y: py,
+            },
             Some(down_time),
         ) {
             tracing::warn!(error = %e, "engine pointer ACTION_MOVE dispatch failed (ignored)");

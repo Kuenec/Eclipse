@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
+use ring::digest::{Context, SHA256};
 
 use super::avcodec::{self, Backend};
 use super::codec::{
@@ -689,7 +689,7 @@ fn check_video_frames(
     fixture: &Fixture,
     video: &VideoTrack,
     frames: &[(i64, String)],
-    stream: Sha256,
+    stream: Context,
 ) -> Result<(), String> {
     if frames.len() != fixture.frames {
         return Err(format!(
@@ -726,7 +726,7 @@ fn check_video_frames(
             ));
         }
     }
-    let stream = fixture::hex(&stream.finalize());
+    let stream = fixture::hex(stream.finish().as_ref());
     if stream != *expected_stream {
         return Err(format!(
             "the NV12 stream has the SHA-256 {stream}, not {expected_stream}"
@@ -740,7 +740,7 @@ fn decode_video_buffers(fixture: &Fixture, video: &VideoTrack) -> Result<FrameTi
     let decoder = Decoder::configured(fixture, std::ptr::null_mut())?;
     let mut layout = None;
     let mut frames = Vec::new();
-    let mut stream = Sha256::new();
+    let mut stream = Context::new(&SHA256);
     let mut timer = FrameTimer::start();
     drive(fixture, &decoder, |event| match event {
         Event::FormatChanged if layout.is_none() => {
@@ -997,7 +997,7 @@ fn decode_video_reader(fixture: &Fixture, video: &VideoTrack) -> Result<(), Stri
     let decoder = Decoder::configured(fixture, reader.window()?)?;
     let mut changed = false;
     let mut frames = Vec::new();
-    let mut stream = Sha256::new();
+    let mut stream = Context::new(&SHA256);
     drive(fixture, &decoder, |event| match event {
         Event::FormatChanged if !changed => {
             video_output(&decoder.output_format()?, video, COLOR_FORMAT_SURFACE)?;
