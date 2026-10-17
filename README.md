@@ -2,7 +2,7 @@
 
 # 🌘 Eclipse
 
-**Play the official Roblox client on Linux.**
+**Roblox on Linux — Open-Source Alternative to Sober**
 
 [![Release](https://img.shields.io/github/v/release/Kuenec/Eclipse?color=7c3aed)](https://github.com/Kuenec/Eclipse/releases/latest)
 [![CI](https://github.com/Kuenec/Eclipse/actions/workflows/ci.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/ci.yml)
