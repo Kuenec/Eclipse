@@ -166,9 +166,7 @@ unsafe fn swap_without_waiting(set_interval: HostSwapInterval, display: egl::EGL
     }
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        let error = egl_engine::load_host_egl()
-            .ok()
-            .and_then(|egl| egl.get_error());
+        let error = egl_engine::host_egl().ok().and_then(|egl| egl.get_error());
         tracing::warn!(
             ?error,
             "eglSwapInterval(0) failed, so Roblox's OpenGL ES frames wait for the compositor and \
@@ -230,7 +228,7 @@ struct Target {
 }
 
 struct FieldOverlay {
-    egl: EglInstance,
+    egl: &'static EglInstance,
     gl: Gles2,
     context: Option<OverlayContext>,
     texels: Vec<[u8; 4]>,
@@ -283,8 +281,8 @@ impl CurrentContext {
 
 impl FieldOverlay {
     fn load() -> Result<Self, EglError> {
-        let egl = egl_engine::load_host_egl()?;
-        let gl = Gles2::load(&egl)?;
+        let egl = egl_engine::host_egl()?;
+        let gl = Gles2::load(egl)?;
         Ok(Self {
             egl,
             gl,
@@ -321,7 +319,7 @@ impl FieldOverlay {
         if field.is_none() && !probing {
             return Ok(());
         }
-        let current = CurrentContext::of(&self.egl);
+        let current = CurrentContext::of(self.egl);
         let drawn = unsafe {
             self.draw_in_context(
                 target,
@@ -335,7 +333,7 @@ impl FieldOverlay {
             )
         };
         let restored = current
-            .restore(&self.egl, target.display)
+            .restore(self.egl, target.display)
             .map_err(OverlayError::Frame);
         drawn.and(restored)
     }
@@ -860,7 +858,7 @@ mod tests {
     }
 
     struct ClientGl {
-        egl: EglInstance,
+        egl: &'static EglInstance,
         gl: Gles2,
         display: egl::Display,
         context: egl::Context,
@@ -886,9 +884,9 @@ mod tests {
             native_window: egl::NativeWindowType,
             visual: Option<std::ffi::c_ulong>,
         ) -> Self {
-            let egl = egl_engine::load_host_egl().expect("host EGL");
+            let egl = egl_engine::host_egl().expect("host EGL");
             let display =
-                egl_engine::initialized_display(&egl, display_handle).expect("EGL display");
+                egl_engine::initialized_display(egl, display_handle).expect("EGL display");
             let wanted = [
                 egl::SURFACE_TYPE,
                 egl::WINDOW_BIT,
@@ -919,7 +917,7 @@ mod tests {
                     .expect("the client's window surface");
             egl.make_current(display, Some(surface), Some(surface), Some(context))
                 .expect("the client's context is current");
-            let gl = Gles2::load(&egl).expect("GLES");
+            let gl = Gles2::load(egl).expect("GLES");
             let program = unsafe { compile_program(&gl, CLIENT_VERTEX, CLIENT_FRAGMENT) }
                 .expect("the client's program");
             let gles = unsafe { libloading::Library::new(HOST_GLESV2_SONAME) }.expect("GLESv2");

@@ -153,9 +153,9 @@ impl GlesRenderer {
         native: EngineNativeWindow,
         size: PhysicalSize<u32>,
     ) -> Result<Self, EglError> {
-        let egl = egl_engine::load_host_egl()?;
-        let display = egl_engine::initialized_display(&egl, display_handle)?;
-        let config = window_config(&egl, display, native_visual(window_handle))?;
+        let egl = egl_engine::host_egl()?;
+        let display = egl_engine::initialized_display(egl, display_handle)?;
+        let config = window_config(egl, display, native_visual(window_handle))?;
         let context = EglContext::new(egl, display, config)?;
         let surface = unsafe {
             context
@@ -174,7 +174,7 @@ impl GlesRenderer {
             .egl
             .swap_interval(display, 0)
             .map_err(EglError::SwapInterval)?;
-        let gl = Gles2::load(&window.context.egl)?;
+        let gl = Gles2::load(window.context.egl)?;
         let (renderer, version) = unsafe {
             (
                 gl_string(&gl, GL_RENDERER, "GL_RENDERER")?,
@@ -581,13 +581,17 @@ unsafe fn new_texture(gl: &Gles2) -> u32 {
 }
 
 struct EglContext {
-    egl: EglInstance,
+    egl: &'static EglInstance,
     display: egl::Display,
     context: egl::Context,
 }
 
 impl EglContext {
-    fn new(egl: EglInstance, display: egl::Display, config: egl::Config) -> Result<Self, EglError> {
+    fn new(
+        egl: &'static EglInstance,
+        display: egl::Display,
+        config: egl::Config,
+    ) -> Result<Self, EglError> {
         egl.bind_api(egl::OPENGL_ES_API)
             .map_err(EglError::Context)?;
         let context = egl
@@ -631,7 +635,7 @@ impl EglWindow {
 
 impl Drop for EglWindow {
     fn drop(&mut self) {
-        let egl = &self.context.egl;
+        let egl = self.context.egl;
         let display = self.context.display;
         if egl.get_current_context() == Some(self.context.context) {
             if let Err(error) = egl.make_current(display, None, None, None) {
@@ -724,7 +728,7 @@ mod tests {
     use crate::graphics::roleless_wayland_surface::RolelessWaylandSurface;
     use crate::graphics::unmapped_xlib_window::UnmappedXlibWindow;
     use crate::graphics::{VulkanRenderer, WindowRenderer};
-    use crate::loader::native_provider::HOST_GLESV2_SONAME;
+    use crate::loader::native_provider::{HOST_EGL_SONAME, HOST_GLESV2_SONAME};
 
     const DRAW_CHILD: &str = "ECLIPSE_TEST_GLES_DRAW_CHILD";
 
@@ -936,8 +940,8 @@ mod tests {
         assert_eq!(swatch[..3], CANVAS_COLOR[..3], "the canvas's center pixel");
 
         drop(renderer);
-        let egl = egl_engine::load_host_egl().expect("host EGL");
-        let display = egl_engine::initialized_display(&egl, display_handle).expect("EGL display");
+        let egl = egl_engine::host_egl().expect("host EGL");
+        let display = egl_engine::initialized_display(egl, display_handle).expect("EGL display");
         egl.terminate(display).expect("eglTerminate");
 
         let maps = std::fs::read_to_string("/proc/self/maps").expect("/proc/self/maps");
@@ -947,36 +951,39 @@ mod tests {
         );
     }
 
+    fn draw_in_child(test: &str) {
+        if std::env::var_os("DISPLAY").is_none() {
+            eprintln!("SKIP: no X11 display (DISPLAY unset)");
+            return;
+        }
+        let output = crate::bounded_child::output(
+            std::process::Command::new(
+                std::env::current_exe().expect("the test harness executable must have a path"),
+            )
+            .args([
+                "--exact",
+                &format!("graphics::gles_renderer::tests::{test}"),
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(DRAW_CHILD, "1")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("WAYLAND_SOCKET"),
+            DRAW_CHILD_LIMIT,
+        );
+        let report = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && report.contains("1 passed"),
+            "status={:?}, stdout={report}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn x11_window_draws_views_text_and_canvases_with_opengl_es_only() {
         if std::env::var_os(DRAW_CHILD).is_none() {
-            if std::env::var_os("DISPLAY").is_none() {
-                eprintln!("SKIP: no X11 display (DISPLAY unset)");
-                return;
-            }
-            let output = crate::bounded_child::output(
-                std::process::Command::new(
-                    std::env::current_exe().expect("the test harness executable must have a path"),
-                )
-                .args([
-                    "--exact",
-                    "graphics::gles_renderer::tests::\
-                     x11_window_draws_views_text_and_canvases_with_opengl_es_only",
-                    "--test-threads=1",
-                    "--nocapture",
-                ])
-                .env(DRAW_CHILD, "1")
-                .env_remove("WAYLAND_DISPLAY")
-                .env_remove("WAYLAND_SOCKET"),
-                DRAW_CHILD_LIMIT,
-            );
-            let report = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success() && report.contains("1 passed"),
-                "status={:?}, stdout={report}, stderr={}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
+            draw_in_child("x11_window_draws_views_text_and_canvases_with_opengl_es_only");
             return;
         }
         let window = match UnmappedXlibWindow::open(WIDTH, HEIGHT) {
@@ -987,6 +994,31 @@ mod tests {
             }
         };
         draw_on_unmapped_x11_window(&window);
+    }
+
+    #[test]
+    fn dropping_an_opengl_es_renderer_keeps_the_egl_driver_loaded() {
+        if std::env::var_os(DRAW_CHILD).is_none() {
+            draw_in_child("dropping_an_opengl_es_renderer_keeps_the_egl_driver_loaded");
+            return;
+        }
+        let Some(window) = open_child_window() else {
+            return;
+        };
+        let (display_handle, window_handle) = x11_handles(&window);
+        let renderer = GlesRenderer::on_own_window(
+            display_handle,
+            window_handle,
+            PhysicalSize::new(WIDTH, HEIGHT),
+        )
+        .expect("an OpenGL ES renderer on the X11 window");
+        drop(renderer);
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("/proc/self/maps");
+        assert!(
+            maps.contains(HOST_EGL_SONAME),
+            "dropping the renderer unloaded {HOST_EGL_SONAME} and its driver, whose threads may \
+             still be running"
+        );
     }
 
     fn x11_handles(window: &UnmappedXlibWindow) -> (RawDisplayHandle, RawWindowHandle) {

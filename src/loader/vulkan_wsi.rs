@@ -1626,11 +1626,7 @@ mod tests {
         use khronos_egl as egl;
         let get_display: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void =
             unsafe { std::mem::transmute(bionic_native("eglGetDisplay") as usize) };
-        let lib =
-            unsafe { libloading::Library::new(super::super::native_provider::HOST_EGL_SONAME) }
-                .expect("host libEGL");
-        let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib) }
-            .expect("EGL 1.4 entry points");
+        let egl = crate::egl_engine::host_egl().expect("host EGL");
         let raw = unsafe { get_display(std::ptr::null_mut()) };
         assert!(!raw.is_null(), "eglGetDisplay(EGL_DEFAULT_DISPLAY) on X11");
         let display = unsafe { egl::Display::from_ptr(raw) };
