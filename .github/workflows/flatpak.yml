@@ -115,6 +115,11 @@ jobs:
           repo-dir: build-repo
           cache-key: flatpak-builder-x86_64-${{ hashFiles('packaging/flatpak/io.github.kuenec.Eclipse.yml', 'packaging/flatpak/patches/**', 'tools/framework-overlay/**') }}
 
+      - name: Decode the media fixtures with the runtime's FFmpeg
+        run: |
+          fixtures="$PWD/tests/fixtures/media"
+          flatpak build --filesystem="$fixtures:ro" flatpak_app eclipse __media-test "$fixtures"
+
       - name: Check the installed size against the budget
         run: packaging/flatpak/check-installed-size.sh build-repo "app/$FLATPAK_ID/x86_64/$FLATPAK_BRANCH"
 

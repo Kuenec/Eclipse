@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,6 +8,8 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use eclipse_config::audio::Direction;
 
 use super::ndk_registry::{NdkHandle, Slab};
+
+pub mod harness;
 
 const AAUDIO_OK: i32 = 0;
 const AAUDIO_ERROR_DISCONNECTED: i32 = -899;
@@ -60,7 +62,13 @@ const AAUDIO_CALLBACK_RESULT_CONTINUE: i32 = 0;
 
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+const START_GRACE: Duration = Duration::from_secs(1);
+
+const LATE_CALLBACK_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 pub(crate) const APP_SAMPLE_RATE: u32 = 48_000;
+
+pub(crate) const APP_CHANNELS: u16 = 2;
 
 pub const AAUDIO_NATIVE_COUNT: usize = 26;
 
@@ -378,27 +386,42 @@ fn negotiate_format(
     device_default: &cpal::SupportedStreamConfig,
     ranges: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
 ) -> Result<StreamFormat, i32> {
-    let channels = device_default.channels();
-    let sample_rate = device_default.sample_rate();
-    let usable: Vec<cpal::SampleFormat> = ranges
-        .into_iter()
-        .filter(|range| range.channels() == channels)
-        .filter_map(|range| range.try_with_sample_rate(sample_rate))
-        .map(|config| config.sample_format())
-        .collect();
+    let ranges: Vec<cpal::SupportedStreamConfigRange> = ranges.into_iter().collect();
     let app = requested
         .or_else(|| SampleFormat::from_cpal(device_default.sample_format()))
         .unwrap_or(SampleFormat::Float);
-    let device = std::iter::once(DeviceFormat::from(app))
+    let layouts = [
+        (APP_CHANNELS, APP_SAMPLE_RATE),
+        (device_default.channels(), device_default.sample_rate()),
+    ];
+    layouts
+        .into_iter()
+        .find_map(|(channels, sample_rate)| {
+            Some(StreamFormat {
+                channels,
+                sample_rate,
+                app,
+                device: device_format(app, &ranges, channels, sample_rate)?,
+            })
+        })
+        .ok_or(AAUDIO_ERROR_UNAVAILABLE)
+}
+
+fn device_format(
+    app: SampleFormat,
+    ranges: &[cpal::SupportedStreamConfigRange],
+    channels: u16,
+    sample_rate: u32,
+) -> Option<DeviceFormat> {
+    std::iter::once(DeviceFormat::from(app))
         .chain(DeviceFormat::BY_PRECISION)
-        .find(|format| usable.contains(&format.cpal()))
-        .ok_or(AAUDIO_ERROR_UNAVAILABLE)?;
-    Ok(StreamFormat {
-        channels,
-        sample_rate,
-        app,
-        device,
-    })
+        .find(|format| {
+            ranges.iter().any(|range| {
+                range.channels() == channels
+                    && range.contains_rate(sample_rate)
+                    && range.sample_format() == format.cpal()
+            })
+        })
 }
 
 fn burst_frames(
@@ -422,10 +445,15 @@ pub(crate) fn low_latency_burst_frames() -> u32 {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Run(u64);
+
 struct StreamShared {
     state: AtomicStreamState,
+    starts: AtomicU64,
     frames_per_burst: AtomicI32,
     xrun_count: AtomicI32,
+    host_xrun: AtomicBool,
     host_callbacks: AtomicU64,
 }
 
@@ -433,14 +461,111 @@ impl StreamShared {
     fn new(frames_per_burst: u32) -> Self {
         Self {
             state: AtomicStreamState::new(StreamState::Open),
+            starts: AtomicU64::new(0),
             frames_per_burst: AtomicI32::new(frames_per_burst as i32),
             xrun_count: AtomicI32::new(0),
+            host_xrun: AtomicBool::new(false),
             host_callbacks: AtomicU64::new(0),
         }
     }
 
     fn capacity_frames(&self) -> i32 {
         2 * self.frames_per_burst.load(Ordering::Relaxed)
+    }
+
+    fn run(&self) -> Option<Run> {
+        let starts = self.starts.load(Ordering::Acquire);
+        (self.state.load() == StreamState::Started).then_some(Run(starts))
+    }
+}
+
+struct RunTiming {
+    run: Run,
+    started: Instant,
+    previous: Instant,
+    ahead: Duration,
+}
+
+impl RunTiming {
+    fn new(run: Run, at: Instant, delivered: Duration) -> Self {
+        Self {
+            run,
+            started: at,
+            previous: at,
+            ahead: delivered,
+        }
+    }
+
+    fn late(&mut self, at: Instant, delivered: Duration, buffer: Duration) -> bool {
+        let gap = at.saturating_duration_since(self.previous);
+        let late = gap > buffer.max(self.ahead) + buffer
+            && at.saturating_duration_since(self.started) >= START_GRACE;
+        self.ahead = if gap < self.ahead / 2 {
+            self.ahead - gap + delivered
+        } else {
+            delivered
+        };
+        self.previous = at;
+        late
+    }
+}
+
+struct LateCallbackDetector {
+    sample_rate: u32,
+    buffer: Duration,
+    timing: Option<RunTiming>,
+}
+
+impl LateCallbackDetector {
+    fn new(capacity_frames: u32, sample_rate: u32) -> Self {
+        Self {
+            sample_rate,
+            buffer: Duration::from_secs(u64::from(capacity_frames)) / sample_rate,
+            timing: None,
+        }
+    }
+
+    fn underrun(
+        &mut self,
+        at: Instant,
+        frames: usize,
+        run: Option<Run>,
+        host_xrun: &AtomicBool,
+    ) -> bool {
+        let reported = host_xrun.swap(false, Ordering::Relaxed);
+        let Some(run) = run else {
+            self.timing = None;
+            return false;
+        };
+        let delivered = Duration::from_secs(frames as u64) / self.sample_rate;
+        let late = match &mut self.timing {
+            Some(timing) if timing.run == run => timing.late(at, delivered, self.buffer),
+            _ => {
+                self.timing = Some(RunTiming::new(run, at, delivered));
+                false
+            }
+        };
+        reported || late
+    }
+}
+
+#[derive(Default)]
+struct LateCallbackLog {
+    logged_xruns: i32,
+    logged_at: Option<Instant>,
+}
+
+impl LateCallbackLog {
+    fn due(&mut self, xruns: i32, at: Instant) -> bool {
+        let recent = self.logged_at.is_some_and(|logged_at| {
+            at.saturating_duration_since(logged_at) < LATE_CALLBACK_LOG_INTERVAL
+        });
+        if xruns == self.logged_xruns || recent {
+            return false;
+        }
+        self.logged_xruns = xruns;
+        self.logged_at = Some(at);
+        true
     }
 }
 
@@ -464,6 +589,9 @@ impl StreamEntry {
                 Ok(next) => next,
                 Err(code) => return code,
             };
+            if next == StreamState::Started {
+                self.shared.starts.fetch_add(1, Ordering::Release);
+            }
             if !self.shared.state.compare_exchange(current, next) {
                 continue;
             }
@@ -530,8 +658,11 @@ struct Renderer<A> {
     error_callback: Option<ErrorCallbackTarget>,
     route: Route,
     stream: usize,
+    direction: Direction,
     channels: usize,
     scratch: Box<[A]>,
+    late: LateCallbackDetector,
+    late_log: LateCallbackLog,
 }
 
 impl<A: cpal::SizedSample> Renderer<A> {
@@ -541,20 +672,22 @@ impl<A: cpal::SizedSample> Renderer<A> {
         error_callback: Option<ErrorCallbackTarget>,
         route: Route,
         stream: NdkHandle,
+        direction: Direction,
         format: StreamFormat,
     ) -> Self {
         let channels = usize::from(format.channels);
-        let capacity = usize::try_from(shared.capacity_frames())
-            .unwrap_or(0)
-            .max(1);
+        let capacity = u32::try_from(shared.capacity_frames()).unwrap_or(0).max(1);
         Self {
             shared,
             callback,
             error_callback,
             route,
             stream: stream as usize,
+            direction,
             channels,
-            scratch: vec![A::EQUILIBRIUM; capacity * channels].into_boxed_slice(),
+            scratch: vec![A::EQUILIBRIUM; capacity as usize * channels].into_boxed_slice(),
+            late: LateCallbackDetector::new(capacity, format.sample_rate),
+            late_log: LateCallbackLog::default(),
         }
     }
 
@@ -573,13 +706,31 @@ impl<A: cpal::SizedSample> Renderer<A> {
         }
     }
 
-    fn note_burst(&self, samples: usize) {
+    fn note_burst(&self, frames: usize) {
         self.shared.host_callbacks.fetch_add(1, Ordering::Relaxed);
-        let frames = (samples / self.channels) as i32;
+        let frames = frames as i32;
         if frames > 0 && self.shared.frames_per_burst.load(Ordering::Relaxed) != frames {
             self.shared
                 .frames_per_burst
                 .store(frames, Ordering::Relaxed);
+        }
+    }
+
+    fn note_timing(&mut self, at: Instant, frames: usize) {
+        if self
+            .late
+            .underrun(at, frames, self.shared.run(), &self.shared.host_xrun)
+        {
+            self.shared.xrun_count.fetch_add(1, Ordering::Relaxed);
+        }
+        let xruns = self.shared.xrun_count.load(Ordering::Relaxed);
+        if self.late_log.due(xruns, at) {
+            tracing::warn!(
+                target: "eclipse::audio",
+                direction = ?self.direction,
+                xruns,
+                "AAudio: late callbacks; audio likely dropped out"
+            );
         }
     }
 
@@ -606,12 +757,14 @@ impl<A: cpal::SizedSample> Renderer<A> {
         true
     }
 
-    fn render_output<T>(&mut self, out: &mut [T])
+    fn render_output<T>(&mut self, out: &mut [T], at: Instant)
     where
         T: cpal::SizedSample + cpal::FromSample<A>,
     {
         self.follow_route();
-        self.note_burst(out.len());
+        let frames = out.len() / self.channels;
+        self.note_burst(frames);
+        self.note_timing(at, frames);
         let chunk_len = self.scratch.len();
         for chunk in out.chunks_mut(chunk_len) {
             if self.invoke(chunk.len()) {
@@ -624,13 +777,15 @@ impl<A: cpal::SizedSample> Renderer<A> {
         }
     }
 
-    fn capture_input<T>(&mut self, input: &[T])
+    fn capture_input<T>(&mut self, input: &[T], at: Instant)
     where
         T: cpal::SizedSample,
         A: cpal::FromSample<T>,
     {
         self.follow_route();
-        self.note_burst(input.len());
+        let frames = input.len() / self.channels;
+        self.note_burst(frames);
+        self.note_timing(at, frames);
         let chunk_len = self.scratch.len();
         for chunk in input.chunks(chunk_len) {
             for (app, sample) in self.scratch.iter_mut().zip(chunk) {
@@ -687,7 +842,7 @@ struct ErrorReporter {
 impl ErrorReporter {
     fn report(&mut self, error: cpal::Error, at: Instant) {
         if error.kind() == cpal::ErrorKind::Xrun {
-            self.shared.xrun_count.fetch_add(1, Ordering::Relaxed);
+            self.shared.host_xrun.store(true, Ordering::Relaxed);
         }
         let host_callbacks = self.shared.host_callbacks.load(Ordering::Relaxed);
         if !self.streak.ends_stream(error.kind(), host_callbacks, at)
@@ -734,6 +889,7 @@ fn build_host_stream(
                 params.error_callback,
                 route,
                 stream,
+                plan.direction,
                 plan.format,
             ),
             reporter,
@@ -747,6 +903,7 @@ fn build_host_stream(
                 params.error_callback,
                 route,
                 stream,
+                plan.direction,
                 plan.format,
             ),
             reporter,
@@ -814,7 +971,9 @@ where
 {
     device.build_output_stream(
         config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| renderer.render_output(data),
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            renderer.render_output(data, Instant::now())
+        },
         move |error| reporter.report(error, Instant::now()),
         None,
     )
@@ -832,7 +991,7 @@ where
 {
     device.build_input_stream(
         config,
-        move |data: &[T], _: &cpal::InputCallbackInfo| renderer.capture_input(data),
+        move |data: &[T], _: &cpal::InputCallbackInfo| renderer.capture_input(data, Instant::now()),
         move |error| reporter.report(error, Instant::now()),
         None,
     )
@@ -1057,15 +1216,27 @@ unsafe extern "C" fn stream_close(stream: *mut c_void) -> i32 {
     if collides_with_callback(stream) {
         return AAUDIO_ERROR_INVALID_STATE;
     }
-    let host = match with_stream(stream, |entry| entry.host.take()) {
-        Ok(host) => host,
+    let (host, shared, direction) = match with_stream(stream, |entry| {
+        (
+            entry.host.take(),
+            Arc::clone(&entry.shared),
+            entry.direction,
+        )
+    }) {
+        Ok(closing) => closing,
         Err(code) => return code,
     };
     drop(host);
-    match streams().remove(handle_of(stream)) {
-        Ok(()) => AAUDIO_OK,
-        Err(_) => AAUDIO_ERROR_INVALID_HANDLE,
+    if streams().remove(handle_of(stream)).is_err() {
+        return AAUDIO_ERROR_INVALID_HANDLE;
     }
+    tracing::info!(
+        target: "eclipse::audio",
+        ?direction,
+        xruns = shared.xrun_count.load(Ordering::Relaxed),
+        "AAudio: stream closed"
+    );
+    AAUDIO_OK
 }
 
 unsafe extern "C" fn stream_request_start(stream: *mut c_void) -> i32 {

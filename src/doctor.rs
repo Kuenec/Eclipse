@@ -42,6 +42,7 @@ pub(crate) struct Doctor {
     cpu: Cpu,
     memory: Fact<Memory>,
     graphics: Graphics,
+    media: Media,
     storage: Storage,
     roblox: Roblox,
     config: ConfigFile,
@@ -184,6 +185,11 @@ fn parse_os_release(text: &str) -> Option<String> {
 struct Graphics {
     section: String,
     problems: Vec<String>,
+}
+
+struct Media {
+    ffmpeg: String,
+    problem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,6 +366,7 @@ struct NewestRun {
 enum Problem {
     CpuBelowBaseline(&'static str),
     Graphics(String),
+    Media(String),
     RuntimeDir(RuntimeDirProblem),
     LowSpace {
         path: PathBuf,
@@ -385,7 +392,7 @@ impl fmt::Display for Problem {
                 "This CPU lacks {feature}. Roblox's Android x86-64 client needs SSSE3, SSE4.1, \
                  SSE4.2 and POPCNT, so it cannot run on this computer."
             ),
-            Self::Graphics(problem) => f.write_str(problem),
+            Self::Graphics(problem) | Self::Media(problem) => f.write_str(problem),
             Self::RuntimeDir(problem) => {
                 let text = problem.to_string();
                 let mut characters = text.chars();
@@ -472,6 +479,7 @@ impl Doctor {
         let store = Store::open().map_err(|error| error.to_string());
         let loaded = eclipse_config::load();
         let graphics = eclipse::gpu::diagnosis::diagnose(&loaded.config);
+        let media = eclipse::loader::mediacodec::diagnose();
         let config_repair = ConfigRepair::of(loaded.path.as_deref());
         let url_handler = match &install {
             Ok(Install::Flatpak(flatpak)) => {
@@ -516,6 +524,10 @@ impl Doctor {
             graphics: Graphics {
                 section: graphics.to_string(),
                 problems: graphics.problems(),
+            },
+            media: Media {
+                ffmpeg: media.to_string(),
+                problem: media.problem(),
             },
             storage: examine_storage(app_data.clone(), &store),
             roblox: examine_roblox(&store),
@@ -563,6 +575,7 @@ impl Doctor {
                 .cloned()
                 .map(Problem::Graphics),
         );
+        problems.extend(self.media.problem.clone().map(Problem::Media));
         if let Ok(Some(problem)) = &self.storage.runtime_dir {
             problems.push(Problem::RuntimeDir(problem.clone()));
         }
@@ -709,6 +722,8 @@ impl fmt::Display for Doctor {
         self.write_cpu(f)?;
         writeln!(f, "Graphics")?;
         f.write_str(&self.graphics.section)?;
+        writeln!(f, "Media")?;
+        writeln!(f, "  FFmpeg: {}", self.media.ffmpeg)?;
         self.write_storage(f)?;
         self.write_roblox(f)?;
         self.write_config(f)?;
@@ -973,6 +988,14 @@ mod tests {
 
     const ON_LLVMPIPE: &str = "Roblox is rendering on the CPU (llvmpipe), which is slow.";
 
+    const ALL_DECODERS: &str = "libavcodec.so.62 62.28.102 with the decoders aac, h264, hevc, \
+                                mp3, opus";
+
+    const NO_VIDEO: &str = "H.264 and HEVC videos in games will not play: H.264/HEVC need \
+                            org.freedesktop.Platform.codecs-extra//26.08-extra; install it with \
+                            flatpak install flathub \
+                            org.freedesktop.Platform.codecs-extra//26.08-extra.";
+
     fn flatpak() -> Packaging {
         Packaging::Flatpak {
             app_id: "io.github.kuenec.Eclipse".to_owned(),
@@ -1015,6 +1038,10 @@ mod tests {
             graphics: Graphics {
                 section: format!("{RX_6800}\n{DRAWS_WITH_VULKAN}"),
                 problems: Vec::new(),
+            },
+            media: Media {
+                ffmpeg: ALL_DECODERS.to_owned(),
+                problem: None,
             },
             storage: Storage {
                 runtime_dir: Ok(None),
@@ -1121,6 +1148,30 @@ mod tests {
                 .contains(&format!("\n  - {ON_LLVMPIPE}\n")),
             "{doctor}"
         );
+    }
+
+    #[test]
+    fn missing_video_decoders_follow_the_graphics_problems_with_their_fix() {
+        let mut doctor = healthy();
+        doctor.graphics.problems = vec![ON_LLVMPIPE.to_owned()];
+        doctor.media = Media {
+            ffmpeg: "libavcodec.so.62 62.28.102 with the decoders aac, mp3, opus".to_owned(),
+            problem: Some(NO_VIDEO.to_owned()),
+        };
+        assert_eq!(
+            doctor.problems(),
+            [
+                Problem::Graphics(ON_LLVMPIPE.to_owned()),
+                Problem::Media(NO_VIDEO.to_owned()),
+            ]
+        );
+        let text = doctor.to_string();
+        for line in [
+            "\nMedia\n  FFmpeg: libavcodec.so.62 62.28.102 with the decoders aac, mp3, opus\n",
+            &format!("\n  - {NO_VIDEO}\n"),
+        ] {
+            assert!(text.contains(line), "{line:?} in {text}");
+        }
     }
 
     #[test]
@@ -1314,6 +1365,8 @@ Graphics
   Device 0: AMD Radeon RX 6800 (RADV NAVI21) [1002:73bf], discrete, Vulkan 1.4.312, driver radv \
 Mesa 25.2.4
   Roblox draws with: Vulkan
+Media
+  FFmpeg: libavcodec.so.62 62.28.102 with the decoders aac, h264, hevc, mp3, opus
 Storage
   App data: /data/eclipse/app-data (100.0 GiB free)
   Roblox store: /data/eclipse/roblox (100.0 GiB free)

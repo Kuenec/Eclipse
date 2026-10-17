@@ -1,0 +1,22 @@
+{
+  "mime": "audio/mp4a-latm",
+  "sample_rate": 48000,
+  "channel_count": 2,
+  "samples_per_frame": 1024,
+  "tone_hz": 440,
+  "csd-0": "119056e500",
+  "csd-1": "",
+  "packets": [
+    {"offset": 0, "size": 286, "pts_us": 0, "flags": 1},
+    {"offset": 286, "size": 363, "pts_us": 21333, "flags": 1},
+    {"offset": 649, "size": 306, "pts_us": 42666, "flags": 1},
+    {"offset": 955, "size": 307, "pts_us": 64000, "flags": 1},
+    {"offset": 1262, "size": 317, "pts_us": 85333, "flags": 1},
+    {"offset": 1579, "size": 315, "pts_us": 106666, "flags": 1},
+    {"offset": 1894, "size": 356, "pts_us": 128000, "flags": 1},
+    {"offset": 2250, "size": 351, "pts_us": 149333, "flags": 1},
+    {"offset": 2601, "size": 328, "pts_us": 170666, "flags": 1},
+    {"offset": 2929, "size": 349, "pts_us": 192000, "flags": 1}
+  ],
+  "frames": 10
+}

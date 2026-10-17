@@ -98,6 +98,61 @@ jobs:
           WINIT_UNIX_BACKEND: x11
         run: xvfb-run -a -s "-screen 0 1280x720x24" timeout 30s target/debug/eclipse __gl-test-anw
 
+  audio:
+    name: Audio / ${{ matrix.server }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - server: pipewire
+            packages: >-
+              pipewire wireplumber pipewire-pulse pulseaudio-utils libasound2-plugins dbus
+          - server: pulseaudio
+            packages: pulseaudio pulseaudio-utils libasound2-plugins dbus
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies and the sound server
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libasound2-dev \
+            libdbus-1-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            pkg-config \
+            ${{ matrix.packages }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: e2e-headless
+
+      - name: Build the E2E binary
+        run: cargo build --locked
+
+      - name: Play and record through AAudio on a private sound server
+        env:
+          SERVER: ${{ matrix.server }}
+        run: |
+          servers() {
+            pgrep -u "$(id -un)" -x 'pipewire|wireplumber|pipewire-pulse|pulseaudio' | sort || true
+          }
+          before="$(servers)"
+          tools/audio-harness/session.sh --server "$SERVER" -- \
+            python3 tools/audio-harness/check.py \
+            --eclipse target/debug/eclipse --out "$RUNNER_TEMP/audio.jsonl"
+          if [ "$(servers)" != "$before" ]; then
+            echo "::error::the audio harness left a sound server running"
+            exit 1
+          fi
+
   full-runtime-e2e:
     name: Full runtime / APK + ART + WebView
     if: github.event_name != 'pull_request' && vars.ECLIPSE_FULL_E2E_ENABLED == 'true'

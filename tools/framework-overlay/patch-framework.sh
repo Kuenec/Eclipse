@@ -215,6 +215,14 @@ pl_src="$here/src/android/os/PreloadedLibrary.java"
 [ -f "$pl_src" ] || fail "preloaded-library bridge missing at $pl_src"
 grep -qF 'public static native String initialize(String name);' "$pl_src" || fail "PreloadedLibrary.java lost its JNI_OnLoad trampoline native"
 
+mcl_src="$here/src/android/media/MediaCodecList.java"
+mci_src="$here/src/android/media/MediaCodecInfo.java"
+range_src="$here/src/android/util/Range.java"
+for media_src in "$mcl_src" "$mci_src" "$range_src"; do
+    [ -f "$media_src" ] || fail "media codec list overlay source missing at $media_src"
+done
+grep -qF 'private static native String[] native_decoders();' "$mcl_src" || fail "MediaCodecList.java lost its native decoder table"
+
 r_src="$ATL_SRC/com/android/internal/R.java"
 [ -f "$r_src" ] || fail "vendored com/android/internal/R.java not found at $r_src (set ATL_SRC)"
 grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+id[[:space:]]*=[[:space:]]*0x010100d0;' "$r_src" || fail "vendored internal R.attr.id != 0x010100d0 — ATL source drifted; re-verify the overlay's inlined constants"
@@ -243,9 +251,12 @@ grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+th
     "$si_src" \
     "$sc_src" \
     "$pl_src" \
+    "$mcl_src" \
+    "$mci_src" \
+    "$range_src" \
     "$r_src"
 
-for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/webkit/WebResourceError*.class' 'android/webkit/EclipseWebResourceRequest*.class' 'android/app/KeyguardManager*.class' 'android/media/audiofx/AudioEffect*.class' 'android/media/audiofx/AcousticEchoCanceler*.class' 'android/media/audiofx/NoiseSuppressor*.class' 'android/security/keystore/KeyGenParameterSpec*.class' 'android/content/pm/SigningInfo*.class' 'android/content/pm/SigningCertificates*.class' 'android/os/PreloadedLibrary*.class'; do
+for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/webkit/WebResourceError*.class' 'android/webkit/EclipseWebResourceRequest*.class' 'android/app/KeyguardManager*.class' 'android/media/audiofx/AudioEffect*.class' 'android/media/audiofx/AcousticEchoCanceler*.class' 'android/media/audiofx/NoiseSuppressor*.class' 'android/security/keystore/KeyGenParameterSpec*.class' 'android/content/pm/SigningInfo*.class' 'android/content/pm/SigningCertificates*.class' 'android/os/PreloadedLibrary*.class' 'android/media/MediaCodecList*.class' 'android/media/MediaCodecInfo*.class' 'android/util/Range*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     mapfile -t class_files < <(compgen -G "$work/classes/$pattern")
@@ -319,6 +330,16 @@ plsm="$work/smali-check/android/os/PreloadedLibrary.smali"
 [ -f "$plsm" ] || fail "PreloadedLibrary.smali not in the built classes.dex"
 grep -qF '.method public static native initialize(Ljava/lang/String;)Ljava/lang/String;' "$plsm" || fail "dexed PreloadedLibrary lost its JNI_OnLoad trampoline native"
 
+mclsm="$work/smali-check/android/media/MediaCodecList.smali"
+mcvsm="$work/smali-check/android/media/MediaCodecInfo\$VideoCapabilities.smali"
+mccsm="$work/smali-check/android/media/MediaCodecInfo\$CodecCapabilities.smali"
+[ -f "$mclsm" ] || fail "MediaCodecList.smali not in the built classes.dex — ATL's fixed codec list would answer"
+[ -f "$work/smali-check/android/util/Range.smali" ] || fail "Range.smali not in the built classes.dex"
+grep -qF '.method private static native native_decoders()[Ljava/lang/String;' "$mclsm" || fail "dexed MediaCodecList lost its native decoder table"
+grep -qF 'getSupportedWidths()Landroid/util/Range;' "$mcvsm" || fail "dexed VideoCapabilities lost getSupportedWidths"
+grep -qF 'getBitrateRange()Landroid/util/Range;' "$mcvsm" || fail "dexed VideoCapabilities lost getBitrateRange"
+grep -qF 'getMaxSupportedInstances()I' "$mccsm" || fail "dexed CodecCapabilities lost getMaxSupportedInstances"
+
 kgpssm="$work/smali-check/android/security/keystore/KeyGenParameterSpec.smali"
 kgpsbsm="$work/smali-check/android/security/keystore/KeyGenParameterSpec\$Builder.smali"
 [ -f "$kgpssm" ] || fail "KeyGenParameterSpec.smali not in the built classes.dex"
@@ -341,6 +362,10 @@ done
 unzip -p "$ORIG_FW/api-impl.jar" classes.dex > "$work/stock-classes.dex"
 "$JAVA" -jar "$BAKSMALI_JAR" disassemble --debug-info false \
     "$work/stock-classes.dex" -o "$work/smali" >/dev/null
+
+[ ! -e "$work/smali/android/util/Range.smali" ] || fail "the installed framework already declares android.util.Range — the overlay copy would shadow it; update patch-framework.sh"
+media_codec_users="$(grep -rlE 'Landroid/media/MediaCodec(Info|List)[;$]' --exclude='MediaCodecInfo*.smali' --exclude='MediaCodecList*.smali' "$work/smali")" || true
+[ -z "$media_codec_users" ] || fail "the installed framework now calls android.media.MediaCodecInfo or MediaCodecList from $media_codec_users — the overlay copies replace ATL's; check they keep what it calls"
 
 crsm="$work/smali/android/content/ContentResolver.smali"
 [ -f "$crsm" ] || fail "ContentResolver.smali not found after baksmali of the installed framework"
@@ -2122,6 +2147,15 @@ signing_output="$("$JAVA" -cp "$work/classes:$work/signing-probe/classes" androi
 [ "$signing_output" = 'signing-certificates-ok' ] \
     || fail "signing-certificate regression probe returned '$signing_output'"
 
+media_codec_list_probe="$here/tests/MediaCodecListProbe.java"
+[ -f "$media_codec_list_probe" ] || fail "media codec list probe missing at $media_codec_list_probe"
+mkdir -p "$work/media-codec-list-probe/classes"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -cp "$work/classes" \
+    -d "$work/media-codec-list-probe/classes" "$media_codec_list_probe"
+media_codec_list_output="$("$JAVA" -cp "$work/classes:$work/media-codec-list-probe/classes" android.media.MediaCodecListProbe)"
+[ "$media_codec_list_output" = 'media-codec-list-ok' ] \
+    || fail "media codec list probe returned '$media_codec_list_output'"
+
 display_probe="$here/tests/DisplayRefreshRateProbe.java"
 [ -f "$display_probe" ] || fail "display refresh-rate regression probe missing at $display_probe"
 mkdir -p "$work/display-probe/classes" "$work/display-probe/cache" "$work/display-probe/data"
@@ -2273,5 +2307,5 @@ classes_dex_size="$(stat -c '%s' "$work/jar/classes.dex")"
 classes2_dex_size="$(stat -c '%s' "$work/jar/classes2.dex")"
 classes3_dex_size="$(stat -c '%s' "$work/jar/classes3.dex")"
 echo "    classes.dex (javac-patched): $classes_dex_size bytes; classes2.dex (smali Android API gaps, including LocationManager): $classes2_dex_size bytes; classes3.dex (stock): $classes3_dex_size bytes"
-echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, date-time, display refresh-rate, MotionEvent pointer, voice chat, audio properties, WebView callback, and wolfSSL contracts verified"
+echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, media codec list, date-time, display refresh-rate, MotionEvent pointer, voice chat, audio properties, WebView callback, and wolfSSL contracts verified"
 echo "    use it with: export ECLIPSE_ANDROID_FRAMEWORK_DIR=\"$OUT\""

@@ -142,6 +142,14 @@ impl<T> Slab<T> {
     }
 }
 
+pub fn handle_to_ptr<T>(handle: NdkHandle) -> *mut T {
+    handle as usize as *mut T
+}
+
+pub fn ptr_to_handle<T>(ptr: *const T) -> NdkHandle {
+    ptr as usize as NdkHandle
+}
+
 #[derive(Debug, Clone)]
 pub struct AssetManagerState {
     pub apk_path: PathBuf,
@@ -308,6 +316,78 @@ pub fn fallback_native_window_state(native_window: usize) -> Option<NativeWindow
         height,
         format: FALLBACK_NATIVE_WINDOW_FORMAT.load(Ordering::Acquire),
     })
+}
+
+pub const MAX_READER_WINDOWS: usize = 16;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReaderWindow {
+    pub reader: NdkHandle,
+
+    pub state: NativeWindowState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderWindowsFull;
+
+impl fmt::Display for ReaderWindowsFull {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{MAX_READER_WINDOWS} AImageReader windows are already live"
+        )
+    }
+}
+
+impl std::error::Error for ReaderWindowsFull {}
+
+struct ReaderWindows(Mutex<Vec<(usize, ReaderWindow)>>);
+
+impl ReaderWindows {
+    const fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(usize, ReaderWindow)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn register(&self, window: usize, reader: ReaderWindow) -> Result<(), ReaderWindowsFull> {
+        let mut windows = self.lock();
+        if windows.len() >= MAX_READER_WINDOWS {
+            return Err(ReaderWindowsFull);
+        }
+        windows.push((window, reader));
+        Ok(())
+    }
+
+    fn unregister(&self, window: usize) {
+        self.lock().retain(|(known, _)| *known != window);
+    }
+
+    fn get(&self, window: usize) -> Option<ReaderWindow> {
+        self.lock()
+            .iter()
+            .find(|(known, _)| *known == window)
+            .map(|(_, reader)| *reader)
+    }
+}
+
+static READER_WINDOWS: ReaderWindows = ReaderWindows::new();
+
+pub fn register_reader_window(
+    window: usize,
+    reader: ReaderWindow,
+) -> Result<(), ReaderWindowsFull> {
+    READER_WINDOWS.register(window, reader)
+}
+
+pub fn unregister_reader_window(window: usize) {
+    READER_WINDOWS.unregister(window);
+}
+
+pub fn reader_window(window: usize) -> Option<ReaderWindow> {
+    READER_WINDOWS.get(window)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -652,6 +732,49 @@ mod tests {
         assert_eq!(wsi_target(), xlib);
         set_wsi_target(None);
         assert_eq!(wsi_target(), None);
+    }
+
+    #[test]
+    fn reader_windows_hold_at_most_sixteen_entries_and_forget_unregistered_ones() {
+        let windows = ReaderWindows::new();
+        let entry = |reader: NdkHandle| ReaderWindow {
+            reader,
+            state: NativeWindowState {
+                width: 64,
+                height: 48,
+                format: 0x23,
+            },
+        };
+        let address = |index: usize| 0x7000_0000 + index * 0x40;
+        for index in 0..MAX_READER_WINDOWS {
+            let reader = NdkHandle::try_from(index).expect("a small index");
+            assert_eq!(windows.register(address(index), entry(reader)), Ok(()));
+        }
+        assert_eq!(
+            windows.register(address(MAX_READER_WINDOWS), entry(99)),
+            Err(ReaderWindowsFull)
+        );
+        let found = windows.get(address(3)).expect("a registered window");
+        assert_eq!(found.reader, 3);
+        assert_eq!(
+            (found.state.width, found.state.height, found.state.format),
+            (64, 48, 0x23)
+        );
+        assert!(windows.get(0xdead_beef).is_none());
+
+        windows.unregister(address(3));
+        assert!(windows.get(address(3)).is_none());
+        assert_eq!(
+            windows.register(address(MAX_READER_WINDOWS), entry(99)),
+            Ok(()),
+            "an unregistered window frees its place"
+        );
+        assert_eq!(
+            windows
+                .get(address(MAX_READER_WINDOWS))
+                .map(|window| window.reader),
+            Some(99)
+        );
     }
 
     #[test]

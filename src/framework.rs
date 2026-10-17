@@ -37,6 +37,7 @@ mod fake_jvm;
 pub(crate) mod keep_screen_on;
 pub mod lifecycle;
 pub mod matrix_registry;
+mod media_codecs;
 pub(crate) mod memory;
 mod message_queue;
 pub(crate) mod notifications;
@@ -14061,6 +14062,8 @@ fn register_framework_natives(
 
     preloaded_library::register_natives(env)?;
 
+    media_codecs::register_natives(env)?;
+
     register_log_natives(env)?;
 
     register_process_natives(env)?;
@@ -14639,6 +14642,8 @@ pub enum FrameworkError {
 
     OverlayPredatesPreloadedLibraries(jni::errors::Error),
 
+    OverlayPredatesMediaCodecList(jni::errors::Error),
+
     NativeLibraryDirNotUtf8(std::path::PathBuf),
 
     MainThreadLooper(std::io::Error),
@@ -14681,6 +14686,12 @@ impl fmt::Display for FrameworkError {
                 "the Android framework overlay predates deferred native library \
                  initialization ({e}); rebuild it with tools/framework-overlay/patch-framework.sh"
             ),
+            Self::OverlayPredatesMediaCodecList(e) => write!(
+                f,
+                "the Android framework overlay predates the FFmpeg decoder list in \
+                 android.media.MediaCodecList ({e}); rebuild it with \
+                 tools/framework-overlay/patch-framework.sh"
+            ),
             Self::NativeLibraryDirNotUtf8(dir) => write!(
                 f,
                 "the native library directory {} is not valid UTF-8, so \
@@ -14711,7 +14722,8 @@ impl std::error::Error for FrameworkError {
         match self {
             Self::Jni(e)
             | Self::OverlayPredatesSigningCertificates(e)
-            | Self::OverlayPredatesPreloadedLibraries(e) => Some(e),
+            | Self::OverlayPredatesPreloadedLibraries(e)
+            | Self::OverlayPredatesMediaCodecList(e) => Some(e),
             Self::WindowRegistry(e) => Some(e),
             Self::ViewRegistry(e) => Some(e),
             Self::MainThreadLooper(e) => Some(e),

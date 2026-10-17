@@ -12,6 +12,7 @@ finish-args:
   - --socket=wayland
   - --socket=fallback-x11
   - --socket=pulseaudio
+  - --env=PULSE_PROP_OVERRIDE=application.name=Eclipse application.id=io.github.kuenec.Eclipse application.icon_name=io.github.kuenec.Eclipse
   - --device=dri
   - --device=input
   - --filesystem=xdg-download:ro
