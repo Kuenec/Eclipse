@@ -23,7 +23,15 @@ Eclipse runs Roblox's official Android x86-64 client natively on Linux, with a s
 flatpak install --user https://kuenec.github.io/Eclipse/io.github.kuenec.Eclipse.flatpakref
 ```
 
-You need an x86-64 Linux desktop (Wayland or X11) and a GPU driver with Vulkan or OpenGL ES. Eclipse takes about 100 MB on top of the shared GNOME runtime and updates with `flatpak update`. A [standalone bundle](https://github.com/Kuenec/Eclipse/releases/latest) is also available; it needs GTK 4.10+ and WebKitGTK 6.0 (2.42+) from your distribution for sign-in and web pages, and xdg-desktop-portal with a GTK, GNOME or KDE backend for links and notifications.
+To update Eclipse later, close it and run:
+
+```bash
+flatpak update --user io.github.kuenec.Eclipse
+```
+
+Roblox itself updates automatically when Eclipse starts.
+
+You need an x86-64 Linux desktop (Wayland or X11) and a GPU driver with Vulkan or OpenGL ES. Eclipse takes about 100 MB on top of the shared GNOME runtime. A [standalone bundle](https://github.com/Kuenec/Eclipse/releases/latest) is also available; it needs GTK 4.10+ and WebKitGTK 6.0 (2.42+) from your distribution for sign-in and web pages, and xdg-desktop-portal with a GTK, GNOME or KDE backend for links and notifications.
 
 ## Features
 
