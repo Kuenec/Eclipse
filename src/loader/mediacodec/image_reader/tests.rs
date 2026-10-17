@@ -378,10 +378,20 @@ fn a_reader_hands_out_at_most_max_images_and_only_the_newest_frame() {
         unsafe { (natives().row_stride)(third.0, 3, &mut stride) },
         AMEDIA_ERROR_INVALID_PARAMETER
     );
-    let mut length = 0;
+    let mut data = std::ptr::dangling_mut();
+    let mut length = -1;
     assert_eq!(
         unsafe { (natives().plane_data)(third.0, 0, std::ptr::null_mut(), &mut length) },
         AMEDIA_ERROR_INVALID_PARAMETER
+    );
+    assert_eq!(
+        unsafe { (natives().plane_data)(third.0, 0, &mut data, std::ptr::null_mut()) },
+        AMEDIA_ERROR_INVALID_PARAMETER
+    );
+    assert_eq!(
+        (data, length),
+        (std::ptr::dangling_mut(), -1),
+        "a plane call with one null output writes neither"
     );
     drop((second, third));
 
@@ -502,7 +512,7 @@ fn the_reader_window_reports_the_reader_size_until_the_reader_is_deleted() {
 #[test]
 fn readers_take_yuv_420_888_with_one_to_sixty_four_images() {
     let natives = natives();
-    let mut reader = std::ptr::null_mut();
+    let mut reader = std::ptr::dangling_mut();
     let refused = [
         (WIDTH, HEIGHT, 1, 2),
         (WIDTH, HEIGHT, AIMAGE_FORMAT_YUV_420_888, 0),
@@ -516,7 +526,7 @@ fn readers_take_yuv_420_888_with_one_to_sixty_four_images() {
             status, AMEDIA_ERROR_INVALID_PARAMETER,
             "{width}x{height} format {format:#x} maxImages {max_images}"
         );
-        assert!(reader.is_null());
+        assert_eq!(reader, std::ptr::dangling_mut());
     }
     assert_eq!(
         unsafe {
@@ -564,7 +574,7 @@ fn stale_fabricated_and_null_handles_are_refused() {
     let natives = natives();
     let deleted = TestReader::new(1);
     deleted.delete();
-    let mut out = std::ptr::null_mut();
+    let mut out = std::ptr::dangling_mut();
     for (reader, status) in [
         (deleted.0, AMEDIA_ERROR_INVALID_OBJECT),
         (
@@ -584,7 +594,7 @@ fn stale_fabricated_and_null_handles_are_refused() {
             (natives.delete)(reader);
         }
     }
-    assert!(out.is_null(), "refused calls write nothing");
+    assert_eq!(out, std::ptr::dangling_mut(), "refused calls write nothing");
 
     for (image, status) in [
         (
@@ -593,11 +603,11 @@ fn stale_fabricated_and_null_handles_are_refused() {
         ),
         (std::ptr::null_mut(), AMEDIA_ERROR_INVALID_PARAMETER),
     ] {
-        let mut value = 0;
-        let mut timestamp = 0;
-        let mut rect = [0; 4];
-        let mut data = std::ptr::null_mut();
-        let mut length = 0;
+        let mut value = -1;
+        let mut timestamp = -1;
+        let mut rect = [-1; 4];
+        let mut data = std::ptr::dangling_mut();
+        let mut length = -1;
         unsafe {
             assert_eq!((natives.format)(image, &mut value), status);
             assert_eq!((natives.crop)(image, &mut rect), status);
@@ -612,8 +622,56 @@ fn stale_fabricated_and_null_handles_are_refused() {
             (natives.image_delete)(image);
             (natives.image_delete_async)(image, -1);
         }
-        assert_eq!((value, timestamp, rect, length), (0, 0, [0; 4], 0));
+        assert_eq!(
+            (value, timestamp, rect, data, length),
+            (-1, -1, [-1; 4], std::ptr::dangling_mut(), -1)
+        );
     }
+}
+
+#[test]
+fn null_outputs_are_refused_before_the_handle_is_checked() {
+    let natives = natives();
+    let handle = 0xdead_beef_usize as *mut c_void;
+    let mut data = std::ptr::dangling_mut();
+    let mut length = -1;
+    let statuses = unsafe {
+        [
+            (natives.get_window)(handle, std::ptr::null_mut()),
+            (natives.acquire_latest)(handle, std::ptr::null_mut()),
+            (natives.format)(handle, std::ptr::null_mut()),
+            (natives.crop)(handle, std::ptr::null_mut()),
+            (natives.timestamp)(handle, std::ptr::null_mut()),
+            (natives.pixel_stride)(handle, 0, std::ptr::null_mut()),
+            (natives.row_stride)(handle, 0, std::ptr::null_mut()),
+            (natives.plane_data)(handle, 0, std::ptr::null_mut(), &mut length),
+            (natives.plane_data)(handle, 0, &mut data, std::ptr::null_mut()),
+            (natives.hardware_buffer)(handle, std::ptr::null_mut()),
+        ]
+    };
+    assert_eq!(statuses, [AMEDIA_ERROR_INVALID_PARAMETER; 10]);
+    assert_eq!(
+        (data, length),
+        (std::ptr::dangling_mut(), -1),
+        "refused calls write nothing"
+    );
+}
+
+#[test]
+fn a_null_image_output_takes_no_frame() {
+    if !decodable("a_null_image_output_takes_no_frame", Codec::H264) {
+        return;
+    }
+    let reader = TestReader::new(1);
+    let mut decoder = RenderingDecoder::start("h264-bframes", reader.window());
+    let (pts_us, status) = decoder.render_next().expect("a frame");
+    assert_eq!(status, AMEDIA_OK);
+    assert_eq!(
+        unsafe { (natives().acquire_latest)(reader.0, std::ptr::null_mut()) },
+        AMEDIA_ERROR_INVALID_PARAMETER
+    );
+    let image = reader.acquire().expect("the frame is still waiting");
+    assert_eq!(image.timestamp_ns(), pts_us * 1000);
 }
 
 #[test]
