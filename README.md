@@ -10,7 +10,7 @@
 [![Security](https://github.com/Kuenec/Eclipse/actions/workflows/security.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/security.yml)
 [![Rust 1.95+](https://img.shields.io/badge/Rust-1.95%2B-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Linux x86-64](https://img.shields.io/badge/Linux-x86--64-FCC624?logo=linux&logoColor=black)](https://kernel.org/)
-[![License MIT](https://img.shields.io/github/license/Kuenec/Eclipse?color=7c3aed)](LICENSE)
+[![License MIT](https://img.shields.io/badge/License-MIT-7c3aed)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/Kuenec/Eclipse?style=flat&color=f59e0b)](https://github.com/Kuenec/Eclipse/stargazers)
 
 </div>
