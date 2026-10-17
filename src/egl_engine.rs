@@ -1,5 +1,6 @@
 use std::ffi::{c_char, c_void, CStr};
 use std::fmt;
+use std::sync::OnceLock;
 
 use crate::loader::native_provider::{HOST_EGL_SONAME, HOST_GLESV2_SONAME};
 use khronos_egl as egl;
@@ -112,12 +113,15 @@ impl fmt::Display for EglError {
 
 impl std::error::Error for EglError {}
 
-pub(crate) fn load_host_egl() -> Result<EglInstance, EglError> {
-    unsafe {
-        let lib = libloading::Library::new(HOST_EGL_SONAME)
-            .map_err(|e| EglError::LoadEgl(e.to_string()))?;
-        EglInstance::load_required_from(lib).map_err(|e| EglError::LoadEgl(e.to_string()))
-    }
+pub(crate) fn host_egl() -> Result<&'static EglInstance, EglError> {
+    static HOST_EGL: OnceLock<Result<EglInstance, String>> = OnceLock::new();
+    HOST_EGL
+        .get_or_init(|| unsafe {
+            let lib = libloading::Library::new(HOST_EGL_SONAME).map_err(|e| e.to_string())?;
+            EglInstance::load_required_from(lib).map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| EglError::LoadEgl(e.clone()))
 }
 
 pub(crate) fn initialized_display(
@@ -147,9 +151,9 @@ pub(crate) struct GlDriver {
 }
 
 pub(crate) fn probe_gl(display_handle: RawDisplayHandle) -> Result<GlDriver, EglError> {
-    let egl = load_host_egl()?;
-    let display = initialized_display(&egl, display_handle)?;
-    let driver = surfaceless_gl_driver(&egl, display);
+    let egl = host_egl()?;
+    let display = initialized_display(egl, display_handle)?;
+    let driver = surfaceless_gl_driver(egl, display);
     if let Err(error) = egl.terminate(display) {
         tracing::warn!(%error, "terminating the EGL display that named the OpenGL ES driver failed");
     }
@@ -188,7 +192,7 @@ fn surfaceless_gl_driver(egl: &EglInstance, display: egl::Display) -> Result<GlD
 }
 
 pub struct EngineGlSurface {
-    egl: EglInstance,
+    egl: &'static EglInstance,
     display: egl::Display,
     context: egl::Context,
     surface: egl::Surface,
@@ -226,8 +230,8 @@ impl EngineGlSurface {
         native: EngineNativeWindow,
         geometry: WindowGeometry,
     ) -> Result<Self, EglError> {
-        let egl = load_host_egl()?;
-        let display = initialized_display(&egl, display_handle)?;
+        let egl = host_egl()?;
+        let display = initialized_display(egl, display_handle)?;
 
         let config = egl
             .choose_first_config(display, &gles2_config_attribs())
@@ -248,7 +252,7 @@ impl EngineGlSurface {
         egl.make_current(display, Some(surface), Some(surface), Some(context))
             .map_err(EglError::Present)?;
 
-        let gl = Gles2::load(&egl)?;
+        let gl = Gles2::load(egl)?;
 
         Ok(Self {
             egl,
