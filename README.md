@@ -4,14 +4,14 @@
 
 **Roblox on Linux — Open-Source Alternative to Sober**
 
-[![Release](https://img.shields.io/github/v/release/Kuenec/Eclipse?color=7c3aed)](https://github.com/Kuenec/Eclipse/releases/latest)
+[![Release](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FKuenec%2FEclipse%2Fbadges%2Frelease.json)](https://github.com/Kuenec/Eclipse/releases/latest)
 [![CI](https://github.com/Kuenec/Eclipse/actions/workflows/ci.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/ci.yml)
 [![E2E](https://github.com/Kuenec/Eclipse/actions/workflows/e2e.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/e2e.yml)
 [![Security](https://github.com/Kuenec/Eclipse/actions/workflows/security.yml/badge.svg)](https://github.com/Kuenec/Eclipse/actions/workflows/security.yml)
 [![Rust 1.95+](https://img.shields.io/badge/Rust-1.95%2B-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Linux x86-64](https://img.shields.io/badge/Linux-x86--64-FCC624?logo=linux&logoColor=black)](https://kernel.org/)
 [![License MIT](https://img.shields.io/badge/License-MIT-7c3aed)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/Kuenec/Eclipse?style=flat&color=f59e0b)](https://github.com/Kuenec/Eclipse/stargazers)
+[![GitHub stars](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FKuenec%2FEclipse%2Fbadges%2Fstars.json)](https://github.com/Kuenec/Eclipse/stargazers)
 
 </div>
 

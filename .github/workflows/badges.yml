@@ -1,0 +1,65 @@
+name: Badges
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/badges.yml
+  watch:
+    types: [started]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: badges
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish the badge endpoints
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Write the stars and release endpoints
+        run: |
+          mkdir badges
+          stars="$(gh api "repos/$GITHUB_REPOSITORY" --jq .stargazers_count)"
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          jq --null-input --arg message "$stars" \
+            '{schemaVersion: 1, label: "stars", message: $message, color: "f59e0b"}' > badges/stars.json
+          jq --null-input --arg message "$release" \
+            '{schemaVersion: 1, label: "release", message: $message, color: "7c3aed"}' > badges/release.json
+
+      - name: Replace the badges branch with one commit of the endpoints when they changed
+        working-directory: badges
+        env:
+          REMOTE: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          gh auth setup-git
+          git init --quiet --initial-branch=badges
+          git add stars.json release.json
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet --message="chore: update badges"
+          published="$(git ls-remote "$REMOTE" refs/heads/badges)"
+          if [ -n "$published" ]; then
+            git fetch --quiet --depth=1 "$REMOTE" refs/heads/badges
+            if [ "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$(git rev-parse 'HEAD^{tree}')" ]; then
+              echo "The badges are unchanged"
+              exit 0
+            fi
+          fi
+          git push --quiet --force "$REMOTE" HEAD:refs/heads/badges
