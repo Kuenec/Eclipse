@@ -1,11 +1,15 @@
 use super::*;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
+use std::process::Stdio;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use rustix::process::{Pid, PidfdFlags, Signal};
+
+use crate::audio::private_server::{assert_passed, exited_by, test_command};
 use crate::loader::aaudio::HOST_ERROR_STREAK_LIMIT;
 
 const MONO_16: PcmFormat = PcmFormat {
@@ -1099,22 +1103,67 @@ fn on_host_output(output: HostOutput, test: &str, body: impl FnOnce()) {
             "/tests/fixtures/alsa-null-output.conf"
         ),
     };
-    let filter = format!("loader::opensl::tests::{test}");
-    let child = crate::bounded_child::output(
-        std::process::Command::new(
-            std::env::current_exe().expect("the test harness executable must have a path"),
-        )
-        .args(["--exact", filter.as_str(), "--test-threads=1"])
+    let mut command = test_command(&format!("loader::opensl::tests::{test}"));
+    command
         .env(HOST_OUTPUT_CHILD, "1")
-        .env("ALSA_CONFIG_PATH", alsa_config),
+        .env("ALSA_CONFIG_PATH", alsa_config);
+    assert_passed(&crate::bounded_child::output(
+        &mut command,
         HOST_OUTPUT_CHILD_LIMIT,
-    );
-    let stdout = String::from_utf8_lossy(&child.stdout);
+    ));
+}
+
+const HOST_OUTPUT_HOLDER: &str = "ECLIPSE_TEST_HOST_OUTPUT_HOLDER";
+
+const HOLDER_TEST: &str = "a_killed_test_process_takes_its_host_output_child_with_it";
+
+const CHILD_EXIT_LIMIT: Duration = Duration::from_secs(10);
+
+#[test]
+fn a_killed_test_process_takes_its_host_output_child_with_it() {
+    if let Some(named) = std::env::var_os(HOST_OUTPUT_HOLDER) {
+        on_host_output(HostOutput::Missing, HOLDER_TEST, || {
+            std::fs::write(&named, std::process::id().to_string())
+                .expect("name the host output child");
+            std::thread::sleep(HOST_OUTPUT_CHILD_LIMIT);
+        });
+        return;
+    }
+    let named =
+        std::env::temp_dir().join(format!("eclipse-host-output-child-{}", std::process::id()));
+    std::fs::remove_file(&named).ok();
+    let mut holder = test_command(&format!("loader::opensl::tests::{HOLDER_TEST}"))
+        .env(HOST_OUTPUT_HOLDER, &named)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the test process to kill");
+    let deadline = Instant::now() + HOST_OUTPUT_CHILD_LIMIT;
+    let child = loop {
+        let written = std::fs::read_to_string(&named).ok();
+        if let Some(pid) = written.and_then(|pid| pid.parse::<i32>().ok()) {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline && holder.try_wait().expect("check the holder").is_none(),
+            "the holder never started its host output child"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    std::fs::remove_file(&named).ok();
+    let child = Pid::from_raw(child).expect("a host output child pid");
+    let exit = rustix::process::pidfd_open(child, PidfdFlags::empty())
+        .expect("watch the host output child");
+    holder.kill().expect("kill the holder");
+    holder.wait().expect("wait for the holder");
+    let ended = exited_by(&exit, Instant::now() + CHILD_EXIT_LIMIT);
+    if !ended {
+        rustix::process::pidfd_send_signal(&exit, Signal::KILL).ok();
+    }
     assert!(
-        child.status.success() && stdout.contains("1 passed"),
-        "status={:?}, stdout={stdout}, stderr={}",
-        child.status,
-        String::from_utf8_lossy(&child.stderr)
+        ended,
+        "the host output child outlived its killed test process"
     );
 }
 

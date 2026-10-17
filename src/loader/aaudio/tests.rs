@@ -1,15 +1,15 @@
 use super::*;
 use cpal::traits::HostTrait;
 use std::ffi::{c_char, c_int, CStr, OsStr};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use eclipse_config::audio::AudioDevice;
 
 use crate::audio::null_devices::{stream_device, NullDevices};
-use crate::audio::private_server::PrivateServer;
+use crate::audio::private_server::{assert_passed, on_private_server, outcome, test_command};
 use crate::audio::Routing;
 use crate::loader::log_capture::formatted_log;
 use crate::loader::native_provider::EclipseNativeProvider;
@@ -1387,12 +1387,19 @@ fn fmod_view() -> FmodView {
     }
 }
 
-fn default_device_config(direction: Direction) -> Option<cpal::SupportedStreamConfig> {
+fn default_device_config(direction: Direction) -> cpal::SupportedStreamConfig {
     let host = cpal::default_host();
     match direction {
-        Direction::Output => host.default_output_device()?.default_output_config().ok(),
-        Direction::Input => host.default_input_device()?.default_input_config().ok(),
+        Direction::Output => host
+            .default_output_device()
+            .expect("ALSA names a default device")
+            .default_output_config(),
+        Direction::Input => host
+            .default_input_device()
+            .expect("ALSA names a default device")
+            .default_input_config(),
     }
+    .expect("the private sound server's default device has a configuration")
 }
 
 fn fmod_driver_probe(api: &FmodView, direction: i32) -> Result<(i32, i32), i32> {
@@ -1441,17 +1448,13 @@ fn offers_48_khz_stereo(direction: Direction) -> bool {
         .any(|range| range.channels() == APP_CHANNELS && range.contains_rate(APP_SAMPLE_RATE))
 }
 
-#[test]
-fn fmod_driver_probe_opens_callback_less_streams_in_both_directions() {
+fn probe_both_directions(_: &NullDevices) {
     let api = fmod_view();
     for (direction, raw) in [
         (Direction::Output, AAUDIO_DIRECTION_OUTPUT),
         (Direction::Input, AAUDIO_DIRECTION_INPUT),
     ] {
-        let Some(config) = default_device_config(direction) else {
-            eprintln!("fmod_driver_probe_opens_callback_less_streams_in_both_directions: no {direction:?} device");
-            continue;
-        };
+        let config = default_device_config(direction);
         let expected = if offers_48_khz_stereo(direction) {
             (APP_SAMPLE_RATE as i32, i32::from(APP_CHANNELS))
         } else {
@@ -1466,11 +1469,14 @@ fn fmod_driver_probe_opens_callback_less_streams_in_both_directions() {
 }
 
 #[test]
-fn the_stream_opened_line_names_the_data_path() {
-    if default_device_config(Direction::Output).is_none() {
-        eprintln!("the_stream_opened_line_names_the_data_path: no Output device");
-        return;
-    }
+fn fmod_driver_probe_opens_callback_less_streams_in_both_directions() {
+    on_private_server(
+        "loader::aaudio::tests::fmod_driver_probe_opens_callback_less_streams_in_both_directions",
+        probe_both_directions,
+    );
+}
+
+fn open_a_stream_on_each_data_path(_: &NullDevices) {
     let api = fmod_view();
     let probe = CallbackProbe::default();
     let callbacks: [Option<DataCallback>; 2] = [None, Some(write_silence)];
@@ -1496,16 +1502,17 @@ fn the_stream_opened_line_names_the_data_path() {
 }
 
 #[test]
-fn fmod_output_sequence_plays_through_the_host_device() {
+fn the_stream_opened_line_names_the_data_path() {
+    on_private_server(
+        "loader::aaudio::tests::the_stream_opened_line_names_the_data_path",
+        open_a_stream_on_each_data_path,
+    );
+}
+
+fn play_the_fmod_output_sequence(_: &NullDevices) {
     let api = fmod_view();
-    let (probed_rate, probed_channels) = match fmod_driver_probe(&api, AAUDIO_DIRECTION_OUTPUT) {
-        Ok(reported) => reported,
-        Err(AAUDIO_ERROR_UNAVAILABLE) => {
-            eprintln!("fmod_output_sequence_plays_through_the_host_device: no host output device");
-            return;
-        }
-        Err(code) => panic!("driver probe failed with {code}"),
-    };
+    let (probed_rate, probed_channels) = fmod_driver_probe(&api, AAUDIO_DIRECTION_OUTPUT)
+        .expect("the private sound server's default output opens");
     let probe = CallbackProbe::default();
     let user = probe.user_data() as *mut c_void;
     let mut builder = std::ptr::null_mut();
@@ -1578,6 +1585,14 @@ fn fmod_output_sequence_plays_through_the_host_device() {
         assert_eq!((api.delete)(builder), AAUDIO_OK);
     }
     assert!(probe.errors.lock().unwrap().is_empty());
+}
+
+#[test]
+fn fmod_output_sequence_plays_through_the_host_device() {
+    on_private_server(
+        "loader::aaudio::tests::fmod_output_sequence_plays_through_the_host_device",
+        play_the_fmod_output_sequence,
+    );
 }
 
 const ROUTED_CHILD: &str = "ECLIPSE_TEST_ROUTED_AAUDIO_CHILD";
@@ -1654,10 +1669,16 @@ fn play_silence_and_record_until(stop: &Path) {
         started_stream(&api, AAUDIO_DIRECTION_INPUT, count_input, &input),
     ];
     let deadline = Instant::now() + ROUTED_LIMIT;
-    while !stop.exists() {
+    loop {
+        let stopped = stop.exists();
+        let calls = [&output, &input].map(|probe| probe.calls.load(Ordering::SeqCst));
+        if stopped && calls.iter().all(|&calls| calls > 0) {
+            break;
+        }
         assert!(
             Instant::now() < deadline,
-            "the parent test did not see the streams within {ROUTED_LIMIT:?}"
+            "after {ROUTED_LIMIT:?}: stopped by the parent test: {stopped}, \
+             output and input callbacks: {calls:?}"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1667,11 +1688,60 @@ fn play_silence_and_record_until(stop: &Path) {
             assert_eq!((api.close)(stream), AAUDIO_OK);
         }
     }
-    assert!(
-        output.calls.load(Ordering::SeqCst) > 0,
-        "no output callbacks"
-    );
-    assert!(input.calls.load(Ordering::SeqCst) > 0, "no input callbacks");
+}
+
+fn routing_to(devices: &NullDevices) -> Routing {
+    Routing::plan(&eclipse_config::Config {
+        audio_output_device: AudioDevice::Named(devices.sink.clone()),
+        audio_input_device: AudioDevice::Named(devices.source.clone()),
+        ..eclipse_config::Config::default()
+    })
+}
+
+struct StopFile(PathBuf);
+
+impl StopFile {
+    fn new(purpose: &str) -> Self {
+        let stop = std::env::temp_dir().join(format!("eclipse-{purpose}-{}", std::process::id()));
+        std::fs::remove_file(&stop).ok();
+        Self(stop)
+    }
+
+    fn stop(&self) {
+        std::fs::write(&self.0, "").expect("stop the player");
+    }
+}
+
+impl Drop for StopFile {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.0).ok();
+    }
+}
+
+#[test]
+fn a_failed_sound_test_leaves_no_stop_file() {
+    let mut written = None;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let stop = StopFile::new("failed-test");
+        stop.stop();
+        written = Some(stop.0.clone());
+        panic!("the sound test fails after stopping its player");
+    }));
+    assert!(failed.is_err());
+    let written = written.expect("the test wrote its stop file");
+    assert!(!written.exists(), "{} was left behind", written.display());
+}
+
+fn route_the_streams_to_the_chosen_devices(_: &NullDevices) {
+    let chosen = NullDevices::create("chosen");
+    let routing = routing_to(&chosen);
+    let stop = StopFile::new("aaudio-routed");
+    let mut player = run_child_test(ROUTED_TEST, ROUTED_CHILD, stop.0.as_os_str(), |command| {
+        routing.apply(command);
+    });
+    wait_for_streams_on(&mut player, &chosen, "while the player plays and records");
+    stop.stop();
+    assert_passed(&player.finish());
 }
 
 #[test]
@@ -1680,57 +1750,51 @@ fn aaudio_streams_reach_the_devices_chosen_in_the_settings() {
         play_silence_and_record_until(Path::new(&stop));
         return;
     }
-    let Some(devices) = NullDevices::create("aaudio") else {
-        return;
-    };
-    let pulse = cpal::DeviceId::new(cpal::HostId::Alsa, crate::audio::PULSE_PCM);
-    if cpal::default_host().device_by_id(&pulse).is_none() {
-        eprintln!("aaudio_streams_reach_the_devices_chosen_in_the_settings: no ALSA pulse device");
-        return;
-    }
-    let routing = Routing::plan(&eclipse_config::Config {
-        audio_output_device: AudioDevice::Named(devices.sink.clone()),
-        audio_input_device: AudioDevice::Named(devices.source.clone()),
-        ..eclipse_config::Config::default()
-    });
-    let stop = std::env::temp_dir().join(format!("eclipse-aaudio-routed-{}", std::process::id()));
-    std::fs::remove_file(&stop).ok();
-    let mut command = Command::new(std::env::current_exe().expect("the test binary has a path"));
-    command
-        .args(["--exact", ROUTED_TEST, "--test-threads=1"])
-        .env(ROUTED_CHILD, &stop)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    routing.apply(&mut command);
-    let child = command.spawn().expect("start the child test");
-    let wanted = (
-        Some(devices.sink.to_string()),
-        Some(devices.source.to_string()),
-    );
-    let deadline = Instant::now() + ROUTED_LIMIT;
-    let mut seen = (None, None);
-    while seen != wanted && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-        seen = (
-            stream_device(Direction::Output, child.id()),
-            stream_device(Direction::Input, child.id()),
-        );
-    }
-    std::fs::write(&stop, "").expect("stop the child test");
-    let output = child.wait_with_output().expect("wait for the child test");
-    std::fs::remove_file(&stop).ok();
-    assert!(
-        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-        "status={:?}, stdout={}, stderr={}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(seen, wanted);
+    on_private_server(ROUTED_TEST, route_the_streams_to_the_chosen_devices);
 }
 
-const FOLLOW_CONTROLLER: &str = "ECLIPSE_TEST_FOLLOW_CONTROLLER";
+fn stop_the_player_before_it_starts(defaults: &NullDevices) {
+    let routing = routing_to(defaults);
+    let stop = StopFile::new("aaudio-stopped");
+    stop.stop();
+    let player = run_child_test(ROUTED_TEST, ROUTED_CHILD, stop.0.as_os_str(), |command| {
+        routing.apply(command);
+    });
+    assert_passed(&player.finish());
+}
+
+#[test]
+fn a_player_stopped_at_once_keeps_its_streams_until_both_call_back() {
+    on_private_server(
+        "loader::aaudio::tests::a_player_stopped_at_once_keeps_its_streams_until_both_call_back",
+        stop_the_player_before_it_starts,
+    );
+}
+
+fn wait_for_a_player_that_cannot_route(defaults: &NullDevices) {
+    let stop = StopFile::new("aaudio-unrouted");
+    let mut player = run_child_test(ROUTED_TEST, ROUTED_CHILD, stop.0.as_os_str(), |_| {});
+    let started = Instant::now();
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_streams_on(&mut player, defaults, "while the unrouted player starts");
+    }))
+    .expect_err("a player without chosen devices cannot open the PulseAudio plug-in");
+    let waited = started.elapsed();
+    let said = failure.downcast_ref::<String>().map_or("", String::as_str);
+    assert!(said.contains("must open the PulseAudio plug-in"), "{said}");
+    assert!(
+        waited < MOVE_LIMIT,
+        "the wait outlived the player: {waited:?}"
+    );
+}
+
+#[test]
+fn a_player_that_fails_ends_the_wait_with_its_own_error() {
+    on_private_server(
+        "loader::aaudio::tests::a_player_that_fails_ends_the_wait_with_its_own_error",
+        wait_for_a_player_that_cannot_route,
+    );
+}
 
 const FOLLOW_PLAYER: &str = "ECLIPSE_TEST_FOLLOW_PLAYER";
 
@@ -1749,6 +1813,30 @@ impl ChildTest {
     fn id(&self) -> u32 {
         self.0.as_ref().expect("the child test runs").id()
     }
+
+    fn running(&mut self) -> bool {
+        self.0
+            .as_mut()
+            .expect("the child test runs")
+            .try_wait()
+            .expect("check on the child test")
+            .is_none()
+    }
+
+    fn finish(mut self) -> Output {
+        self.0
+            .take()
+            .expect("the child test runs")
+            .wait_with_output()
+            .expect("wait for the child test")
+    }
+
+    fn fail(&mut self, problem: &str) -> ! {
+        let mut child = self.0.take().expect("the child test runs");
+        child.kill().ok();
+        let output = child.wait_with_output().expect("wait for the child test");
+        panic!("{problem}; the child test ended with {}", outcome(&output));
+    }
 }
 
 impl Drop for ChildTest {
@@ -1760,36 +1848,20 @@ impl Drop for ChildTest {
     }
 }
 
-fn run_follow_test(
+fn run_child_test(
+    test: &str,
     variable: &str,
     value: &OsStr,
     configure: impl FnOnce(&mut Command),
 ) -> ChildTest {
-    let mut command = Command::new(std::env::current_exe().expect("the test binary has a path"));
+    let mut command = test_command(test);
     command
-        .args(["--exact", FOLLOW_TEST, "--test-threads=1", "--nocapture"])
         .env(variable, value)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure(&mut command);
     ChildTest(Some(command.spawn().expect("start the child test")))
-}
-
-fn assert_passed(mut child: ChildTest) {
-    let output = child
-        .0
-        .take()
-        .expect("the child test runs")
-        .wait_with_output()
-        .expect("wait for the child test");
-    assert!(
-        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-        "status={:?}, stdout={}, stderr={}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn play_and_record_reopening_until(stop: &Path) {
@@ -1834,13 +1906,18 @@ fn play_and_record_reopening_until(stop: &Path) {
     }
 }
 
-fn wait_for_streams_on(player: &ChildTest, devices: &NullDevices, moment: &str) {
+fn wait_for_streams_on(player: &mut ChildTest, devices: &NullDevices, moment: &str) {
     let wanted = (
         Some(devices.sink.to_string()),
         Some(devices.source.to_string()),
     );
     let deadline = Instant::now() + MOVE_LIMIT;
     loop {
+        if !player.running() {
+            player.fail(&format!(
+                "{moment}: the player ended before its streams reached {wanted:?}"
+            ));
+        }
         let seen = (
             stream_device(Direction::Output, player.id()),
             stream_device(Direction::Input, player.id()),
@@ -1848,47 +1925,35 @@ fn wait_for_streams_on(player: &ChildTest, devices: &NullDevices, moment: &str) 
         if seen == wanted {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{moment}: the streams are on {seen:?}, not {wanted:?}"
-        );
+        if Instant::now() >= deadline {
+            player.fail(&format!(
+                "{moment}: the streams are on {seen:?}, not {wanted:?}"
+            ));
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-fn unplug_and_replug_the_chosen_devices() {
-    let server = std::env::var_os("PULSE_SERVER").expect("the parent names the sound server");
-    assert!(
-        PrivateServer::is_private(&server),
-        "refusing to change devices on {server:?}"
-    );
-    let pulse = cpal::DeviceId::new(cpal::HostId::Alsa, crate::audio::PULSE_PCM);
-    if cpal::default_host().device_by_id(&pulse).is_none() {
-        eprintln!("{FOLLOW_TEST}: no ALSA pulse device");
-        return;
-    }
-    let fallback = NullDevices::create("fallback").expect("the private server answers");
-    fallback.make_system_default();
-    let chosen = NullDevices::create("chosen").expect("the private server answers");
-    let routing = Routing::plan(&eclipse_config::Config {
-        audio_output_device: AudioDevice::Named(chosen.sink.clone()),
-        audio_input_device: AudioDevice::Named(chosen.source.clone()),
-        ..eclipse_config::Config::default()
-    });
-    let stop = std::env::temp_dir().join(format!("eclipse-follow-{}", std::process::id()));
-    std::fs::remove_file(&stop).ok();
-    let player = run_follow_test(FOLLOW_PLAYER, stop.as_os_str(), |command| {
+fn unplug_and_replug_the_chosen_devices(fallback: &NullDevices) {
+    let chosen = NullDevices::create("chosen");
+    let routing = routing_to(&chosen);
+    let stop = StopFile::new("follow");
+    let mut player = run_child_test(FOLLOW_TEST, FOLLOW_PLAYER, stop.0.as_os_str(), |command| {
         routing.apply(command);
     });
 
-    wait_for_streams_on(&player, &chosen, "at the start");
+    wait_for_streams_on(&mut player, &chosen, "at the start");
     drop(chosen);
-    wait_for_streams_on(&player, &fallback, "after the chosen devices are unplugged");
-    let other = NullDevices::create("other").expect("the private server answers");
-    std::thread::sleep(SETTLE);
-    let chosen = NullDevices::create("chosen").expect("the private server answers");
     wait_for_streams_on(
-        &player,
+        &mut player,
+        fallback,
+        "after the chosen devices are unplugged",
+    );
+    let other = NullDevices::create("other");
+    std::thread::sleep(SETTLE);
+    let chosen = NullDevices::create("chosen");
+    wait_for_streams_on(
+        &mut player,
         &chosen,
         "after another device appears and the chosen ones are plugged in again",
     );
@@ -1896,14 +1961,13 @@ fn unplug_and_replug_the_chosen_devices() {
     std::thread::sleep(SETTLE);
     fallback.make_system_default();
     wait_for_streams_on(
-        &player,
+        &mut player,
         &chosen,
         "after the chosen devices were the defaults and stopped being them",
     );
 
-    std::fs::write(&stop, "").expect("stop the player");
-    assert_passed(player);
-    std::fs::remove_file(&stop).ok();
+    stop.stop();
+    assert_passed(&player.finish());
     drop(other);
 }
 
@@ -1913,15 +1977,5 @@ fn streams_follow_a_chosen_device_that_returns_or_stops_being_the_default() {
         play_and_record_reopening_until(Path::new(&stop));
         return;
     }
-    if std::env::var_os(FOLLOW_CONTROLLER).is_some() {
-        unplug_and_replug_the_chosen_devices();
-        return;
-    }
-    let Some(server) = PrivateServer::start("follow") else {
-        return;
-    };
-    let controller = run_follow_test(FOLLOW_CONTROLLER, OsStr::new("1"), |command| {
-        command.env("PULSE_SERVER", server.address());
-    });
-    assert_passed(controller);
+    on_private_server(FOLLOW_TEST, unplug_and_replug_the_chosen_devices);
 }

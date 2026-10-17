@@ -68,12 +68,16 @@ fn pactl_command(arguments: &[&str]) -> Command {
         .args(arguments)
         .env_remove("LC_ALL")
         .env("LC_NUMERIC", "C");
+    end_with_this_process(&mut command);
+    command
+}
+
+fn end_with_this_process(command: &mut Command) {
     let parent = rustix::process::getpid();
     let cutoff = InheritanceCutoff::at(FIRST_NON_STDIO_FD);
     unsafe {
         command.pre_exec(move || end_with(parent, cutoff));
     }
-    command
 }
 
 fn end_with(parent: Pid, cutoff: InheritanceCutoff) -> io::Result<()> {
