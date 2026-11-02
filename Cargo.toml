@@ -70,7 +70,7 @@ cpal = "0.18"
 
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 
-libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }
+libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
 
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 
