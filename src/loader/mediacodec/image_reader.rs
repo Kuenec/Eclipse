@@ -191,17 +191,28 @@ impl ReaderShared {
     }
 
     fn take_latest(&self) -> Result<VideoFrame<'static>, ReaderError> {
+        self.take(|queue| {
+            let latest = queue.pop_back();
+            queue.clear();
+            latest
+        })
+    }
+
+    fn take_next(&self) -> Result<VideoFrame<'static>, ReaderError> {
+        self.take(VecDeque::pop_front)
+    }
+
+    fn take(
+        &self,
+        pick: impl FnOnce(&mut VecDeque<VideoFrame<'static>>) -> Option<VideoFrame<'static>>,
+    ) -> Result<VideoFrame<'static>, ReaderError> {
         let mut frames = lock(&self.frames);
         if frames.acquired >= self.max_images {
             return Err(ReaderError::MaxImagesAcquired(self.max_images));
         }
-        let latest = frames
-            .queue
-            .pop_back()
-            .ok_or(ReaderError::NoBufferAvailable)?;
-        frames.queue.clear();
+        let frame = pick(&mut frames.queue).ok_or(ReaderError::NoBufferAvailable)?;
         frames.acquired += 1;
-        Ok(latest)
+        Ok(frame)
     }
 
     fn return_image(&self) {
@@ -503,8 +514,19 @@ fn images() -> &'static Images {
 }
 
 fn acquire_latest(handle: *mut c_void) -> Result<NdkHandle, ReaderError> {
+    acquire(handle, ReaderShared::take_latest)
+}
+
+fn acquire_next(handle: *mut c_void) -> Result<NdkHandle, ReaderError> {
+    acquire(handle, ReaderShared::take_next)
+}
+
+fn acquire(
+    handle: *mut c_void,
+    take: fn(&ReaderShared) -> Result<VideoFrame<'static>, ReaderError>,
+) -> Result<NdkHandle, ReaderError> {
     let shared = live_reader(handle)?;
-    let frame = shared.take_latest()?;
+    let frame = take(&shared)?;
     let image = Image::new(frame, Arc::downgrade(&shared));
     images()
         .insert(image)
@@ -620,6 +642,27 @@ pub(super) unsafe extern "C" fn eclipse_aimagereader_acquirelatestimage(
         status,
         error = failure(&result),
         "AImageReader_acquireLatestImage"
+    );
+    status
+}
+
+pub(super) unsafe extern "C" fn eclipse_aimagereader_acquirenextimage(
+    handle: *mut c_void,
+    image: *mut *mut c_void,
+) -> MediaStatus {
+    let result = unsafe {
+        write_output(image, "image output", || {
+            acquire_next(handle).map(handle_to_ptr)
+        })
+    };
+    let status = status_of(&result);
+    tracing::trace!(
+        target: "mediandk",
+        reader = ?handle,
+        image = ?result.as_ref().ok(),
+        status,
+        error = failure(&result),
+        "AImageReader_acquireNextImage"
     );
     status
 }

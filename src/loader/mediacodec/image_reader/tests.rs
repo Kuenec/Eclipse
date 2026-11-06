@@ -35,6 +35,7 @@ struct Natives {
     new_with_usage: NewWithUsageFn,
     get_window: ReaderOutFn,
     acquire_latest: ReaderOutFn,
+    acquire_next: ReaderOutFn,
     set_listener: ListenerFn,
     set_buffer_removed_listener: ReaderOutFn,
     delete: ReleaseFn,
@@ -70,6 +71,7 @@ fn natives() -> &'static Natives {
             new_with_usage: native(&provider, "AImageReader_newWithUsage"),
             get_window: native(&provider, "AImageReader_getWindow"),
             acquire_latest: native(&provider, "AImageReader_acquireLatestImage"),
+            acquire_next: native(&provider, "AImageReader_acquireNextImage"),
             set_listener: native(&provider, "AImageReader_setImageListener"),
             set_buffer_removed_listener: native(&provider, "AImageReader_setBufferRemovedListener"),
             delete: native(&provider, "AImageReader_delete"),
@@ -404,6 +406,46 @@ fn a_reader_hands_out_at_most_max_images_and_only_the_newest_frame() {
         Some(AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE),
         "acquiring the newest frame drops the older one"
     );
+}
+
+#[test]
+fn acquire_next_hands_out_queued_frames_oldest_first() {
+    if !decodable(
+        "acquire_next_hands_out_queued_frames_oldest_first",
+        Codec::H264,
+    ) {
+        return;
+    }
+    let reader = TestReader::new(3);
+    let acquire_next = || {
+        let mut image = std::ptr::null_mut();
+        match unsafe { (natives().acquire_next)(reader.0, &mut image) } {
+            AMEDIA_OK => Ok(TestImage(image)),
+            status => Err(status),
+        }
+    };
+    assert_eq!(
+        acquire_next().err(),
+        Some(AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE)
+    );
+    let mut decoder = RenderingDecoder::start("h264-bframes", reader.window());
+    let mut render = || {
+        let (pts_us, status) = decoder.render_next().expect("a frame");
+        assert_eq!(status, AMEDIA_OK);
+        pts_us
+    };
+
+    let first_pts = render();
+    let second_pts = render();
+    let first = acquire_next().expect("the oldest image");
+    assert_eq!(first.timestamp_ns(), first_pts * 1000);
+    let second = acquire_next().expect("the next image stays queued");
+    assert_eq!(second.timestamp_ns(), second_pts * 1000);
+    assert_eq!(
+        acquire_next().err(),
+        Some(AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE)
+    );
+    drop((first, second));
 }
 
 #[derive(Default)]
