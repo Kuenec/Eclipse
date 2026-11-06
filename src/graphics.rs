@@ -2094,8 +2094,6 @@ impl GameWindow<'_> {
                 }
             }
         };
-        // A Wayland cursor position hint only takes effect on the next surface commit, so a
-        // hint set just before unlocking would lose to the previous lock's anchor.
         if let PointerLock::Held { anchor, .. } = self.pointer_lock {
             self.return_cursor_to(anchor);
         }

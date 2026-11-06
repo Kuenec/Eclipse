@@ -1918,9 +1918,6 @@ UPSTREAM_SURFACE_CREATED=$'.method private surfaceCreated()V\n    .registers 4\n
 SURFACE_CREATED=$'.method private surfaceCreated()V\n    .registers 6\n\n    invoke-direct {p0}, Landroid/view/SurfaceView;->getSurfaceCallbacks()[Landroid/view/SurfaceHolder$Callback;\n\n    move-result-object v0\n\n    array-length v1, v0\n\n    const/4 v2, 0x0\n\n    :eclipse_next_callback\n    if-ge v2, v1, :eclipse_callbacks_done\n\n    aget-object v3, v0, v2\n\n    iget-object v4, p0, Landroid/view/SurfaceView;->mSurfaceHolder:Landroid/view/SurfaceHolder;\n\n    invoke-interface {v3, v4}, Landroid/view/SurfaceHolder$Callback;->surfaceCreated(Landroid/view/SurfaceHolder;)V\n\n    add-int/lit8 v2, v2, 0x1\n\n    goto :eclipse_next_callback\n\n    :eclipse_callbacks_done\n    return-void\n.end method\n'
 replace_upstream_method "$svsm" "$UPSTREAM_SURFACE_CREATED" "$SURFACE_CREATED" 'surfaceCreated'
 
-# Settings.Global.getString answers every key with a placeholder string. Android returns
-# null for an unset setting, and Roblox treats any non-empty roblox_channel_override as a
-# channel, so the placeholder became an invalid client-settings bucket and startup failed.
 sgsm="$work/smali/android/provider/Settings\$Global.smali"
 [ -f "$sgsm" ] || fail "Settings\$Global.smali not found after baksmali"
 UPSTREAM_GLOBAL_GET_STRING_PATTERN='\.method public static getString\(Landroid/content/ContentResolver;Ljava/lang/String;\)Ljava/lang/String;\n(?:(?!\.end method\n).)*?"STRING_FROM_SETTINGS_GLOBAL_WITH_KEY_"(?:(?!\.end method\n).)*?\.end method\n'

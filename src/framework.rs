@@ -10878,8 +10878,6 @@ fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), Framewor
             BUTTON_SET_COMPOUND_DRAWABLES_SIG,
             button_set_compound_drawables as *mut c_void,
         ),
-        // Button redeclares View's nativeSetOnClickListener; without its own binding the
-        // engine's Retry dialog dies with UnsatisfiedLinkError when it wires up its button.
         (
             IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME,
             IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG,

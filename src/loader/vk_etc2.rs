@@ -1,15 +1,3 @@
-//! ETC2 texture emulation for host Vulkan drivers without `textureCompressionETC2`.
-//!
-//! The Android client only streams full-resolution world textures when the device reports
-//! ETC2; otherwise it falls back to half-size 16-bit textures. Desktop drivers rarely support
-//! ETC2, so Eclipse reports it anyway, backs every ETC2 image with an RGBA8 image, and decodes
-//! the blocks on the CPU when the engine records `vkCmdCopyBufferToImage`. Roblox fills its
-//! staging buffers through a persistent coherent mapping before recording the copy, and only
-//! destroys them after the submission's fence, so the decoded copy's buffer is tied to the
-//! lifetime of the engine's staging buffer.
-//!
-//! `ECLIPSE_ETC2_EMULATION=0` turns all of this off.
-
 use super::etc2::{self, Etc2Format};
 use ash::vk;
 use ash::vk::Handle;
@@ -40,10 +28,6 @@ static HOST_UNMAP_MEMORY: AtomicU64 = AtomicU64::new(0);
 static HOST_FREE_MEMORY: AtomicU64 = AtomicU64::new(0);
 static HOST_CMD_COPY_BUFFER_TO_IMAGE: AtomicU64 = AtomicU64::new(0);
 
-/// A layer-owned, persistently mapped staging buffer holding decoded texels until the
-/// engine's own staging buffer, recorded in the same submission, is destroyed. It then goes
-/// back to [`POOL`]: allocating and freeing Vulkan memory per upload made the engine's
-/// `releaseResources` stall for tens of milliseconds whenever it freed a batch.
 struct Decoded {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -51,9 +35,7 @@ struct Decoded {
     mapped: usize,
 }
 
-/// Smallest staging buffer worth keeping for reuse.
 const MIN_STAGING_BYTES: u64 = 64 * 1024;
-/// Idle staging memory kept for reuse; anything beyond this is freed.
 const POOL_KEEP_BYTES: u64 = 256 * 1024 * 1024;
 
 static POOL: Mutex<Vec<Decoded>> = Mutex::new(Vec::new());
@@ -98,9 +80,6 @@ macro_rules! shim {
     };
 }
 
-/// Returns Eclipse's wrapper for `name` when it takes part in ETC2 emulation, after storing
-/// the host function from `host`. Works for both `vkGetInstanceProcAddr` and
-/// `vkGetDeviceProcAddr` lookups.
 pub(crate) fn intercept(
     name: &CStr,
     host: impl FnOnce() -> vk::PFN_vkVoidFunction,
@@ -169,7 +148,6 @@ pub(crate) fn intercept(
     }
 }
 
-/// Removes the ETC2 feature Eclipse advertised before the host driver sees the request.
 pub(crate) fn strip_from_enabled_features(features: &mut vk::PhysicalDeviceFeatures) {
     if enabled() {
         features.texture_compression_etc2 = vk::FALSE;
@@ -188,8 +166,6 @@ pub(crate) fn device_created(
         tracing::warn!("vk-etc2: no host Vulkan entry; ETC2 uploads will be skipped");
         return;
     };
-    // ash replaces missing commands with stubs that panic, which aborts inside a Vulkan
-    // callback, so check everything the staging path calls before loading the tables.
     let gipa = entry.static_fn().get_instance_proc_addr;
     let Some(gdpa) = (unsafe { gipa(instance, c"vkGetDeviceProcAddr".as_ptr()) }) else {
         tracing::warn!("vk-etc2: host has no vkGetDeviceProcAddr; ETC2 uploads will be skipped");
@@ -241,8 +217,6 @@ pub(crate) fn device_destroyed() {
     }
 }
 
-/// Returns staging buffers whose upload has finished to the pool, freeing the largest idle
-/// ones once the pool holds more than [`POOL_KEEP_BYTES`].
 fn recycle(host: &Host, finished: Vec<Decoded>) {
     let Ok(mut pool) = POOL.lock() else { return };
     pool.extend(finished);
@@ -264,7 +238,6 @@ unsafe fn free_decoded(device: &ash::Device, decoded: &Decoded) {
     }
 }
 
-/// The RGBA8 format that stands in for an ETC2 format, keeping its colour space.
 fn substitute(format: vk::Format) -> Option<(Etc2Format, vk::Format)> {
     let etc2 = Etc2Format::from_vk(format.as_raw())?;
     let srgb = matches!(
@@ -483,7 +456,6 @@ unsafe extern "system" fn free_memory(
     }
 }
 
-/// How one copy region's ETC2 blocks are laid out in the source buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RegionLayout {
     blocks_per_row: usize,
@@ -514,7 +486,6 @@ fn region_layout(format: Etc2Format, region: &vk::BufferImageCopy) -> RegionLayo
     }
 }
 
-/// Decodes every layer of one region from `src` into tightly packed RGBA8.
 fn decode_region(format: Etc2Format, src: &[u8], region: &vk::BufferImageCopy) -> Vec<u8> {
     let layout = region_layout(format, region);
     let (width, height) = (region.image_extent.width, region.image_extent.height);
@@ -537,8 +508,6 @@ fn decode_region(format: Etc2Format, src: &[u8], region: &vk::BufferImageCopy) -
     out
 }
 
-/// The engine's mapped bytes for `region` of `buffer`, if Eclipse saw the buffer's memory
-/// get mapped.
 unsafe fn source_bytes<'a>(
     tracking: &Tracking,
     buffer: vk::Buffer,
@@ -619,10 +588,6 @@ unsafe fn allocate_staging(host: &Host, capacity: u64) -> Option<Decoded> {
     Some(decoded)
 }
 
-/// Copies bytes out of a mapping the engine writes through. Staging memory is usually
-/// write-combined (uncached), where every ordinary load is a separate trip to memory, so
-/// decoding straight from it stalls the render thread for tens of milliseconds per texture.
-/// Streaming loads fetch whole lines instead.
 fn read_mapped(src: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; src.len()];
     #[cfg(target_arch = "x86_64")]
