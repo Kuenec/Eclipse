@@ -11,6 +11,7 @@ pub mod dlfcn;
 mod egl_seam;
 pub mod elf;
 pub mod engine;
+pub(crate) mod etc2;
 mod fault_registers;
 pub mod frame_log;
 pub mod init_run;
@@ -31,6 +32,7 @@ pub mod reloc;
 pub mod resolve;
 mod text_overlay;
 pub mod tls;
+mod vk_etc2;
 pub mod vk_overlay;
 pub mod vulkan_wsi;
 

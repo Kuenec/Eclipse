@@ -369,17 +369,23 @@ fn serve_connection(
         MESSAGE_LIMIT + 2,
         Instant::now() + REQUEST_TIMEOUT,
     )?;
-    let reply = match parse_request(&message) {
+    let request = parse_request(&message);
+    let quitting = matches!(&request, Ok(Request::Quit));
+    let reply = match request {
         Ok(request) => answer(request, slot, window, experience),
         Err(reason) => {
             tracing::warn!(%reason, "refused a request from another Eclipse launch");
             Some(Reply::Refused { reason })
         }
     };
-    match reply {
+    let written = match reply {
         Some(reply) => stream.write_all(&serde_json::to_vec(&reply)?),
         None => Ok(()),
+    };
+    if quitting {
+        window(WindowCommand::Close).ok();
     }
+    written
 }
 
 fn read_within(stream: &mut UnixStream, limit: usize, deadline: Instant) -> io::Result<Vec<u8>> {
@@ -456,7 +462,6 @@ fn answer(
         Request::Quit => {
             tracing::info!("another Eclipse launch asked Roblox to close");
             slot.close();
-            window(WindowCommand::Close).ok();
             Some(Reply::Accepted)
         }
     }
@@ -988,6 +993,34 @@ mod tests {
             "{waited:?}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_quit_is_acknowledged_before_the_window_can_exit() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&message(r#""quit""#)).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        client.set_read_timeout(Some(REQUEST_TIMEOUT)).unwrap();
+        let client = Mutex::new(client);
+        let slot = LaunchSlot::new(None);
+        let closed = std::cell::Cell::new(false);
+
+        serve_connection(
+            server,
+            &slot,
+            &|command| {
+                assert!(matches!(command, WindowCommand::Close));
+                assert!(slot.closing());
+                let mut reply = [0; br#""accepted""#.len()];
+                client.lock().unwrap().read_exact(&mut reply).unwrap();
+                assert_eq!(&reply, br#""accepted""#);
+                closed.set(true);
+                Ok(())
+            },
+            &|| Experience::NotJoined,
+        )
+        .unwrap();
+        assert!(closed.get(), "the acknowledged quit must close the window");
     }
 
     #[test]

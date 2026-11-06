@@ -9,7 +9,7 @@ mod format;
 mod image_reader;
 pub mod self_test;
 
-pub const MEDIA_NDK_NATIVE_COUNT: usize = 54;
+pub const MEDIA_NDK_NATIVE_COUNT: usize = 55;
 
 type MediaStatus = c_int;
 
@@ -173,6 +173,10 @@ pub(crate) fn register_natives(mut register: impl FnMut(&'static str, u64)) {
     reg!(
         "AImageReader_acquireLatestImage",
         image_reader::eclipse_aimagereader_acquirelatestimage
+    );
+    reg!(
+        "AImageReader_acquireNextImage",
+        image_reader::eclipse_aimagereader_acquirenextimage
     );
     reg!(
         "AImageReader_setImageListener",

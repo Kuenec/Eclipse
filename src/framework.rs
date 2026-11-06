@@ -10867,7 +10867,7 @@ extern "system" fn edit_text_set_on_editor_action_listener<'local>(
 }
 
 fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    let button: [NativeBinding; 2] = [
+    let button: [NativeBinding; 3] = [
         (
             WIDGET_NATIVE_SET_TEXT_NAME,
             WIDGET_NATIVE_SET_TEXT_SIG,
@@ -10877,6 +10877,11 @@ fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), Framewor
             BUTTON_SET_COMPOUND_DRAWABLES_NAME,
             BUTTON_SET_COMPOUND_DRAWABLES_SIG,
             button_set_compound_drawables as *mut c_void,
+        ),
+        (
+            IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME,
+            IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG,
+            image_button_set_on_click_listener as *mut c_void,
         ),
     ];
     register_class_natives_best_effort(env, BUTTON_CLASS, &button)?;

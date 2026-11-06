@@ -575,12 +575,6 @@ fn full_engine_path_builds_and_enqueues_with_zero_sl_errors() {
             assert_eq!(r, SL_RESULT_SUCCESS);
             assert_eq!(level, 0);
 
-            let r = unsafe {
-                let vt = *(play_itf as *const *const PlayItfVtable);
-                ((*vt).set_play_state)(play_itf, SL_PLAYSTATE_PLAYING)
-            };
-            assert_eq!(r, SL_RESULT_SUCCESS);
-
             let bytes = super::generate_sine_pcm16(440.0, 44_100, 256);
 
             let r = unsafe {
@@ -596,10 +590,14 @@ fn full_engine_path_builds_and_enqueues_with_zero_sl_errors() {
                 ((*vt).get_state)(bq_itf, &mut bqs)
             };
             assert_eq!(r, SL_RESULT_SUCCESS);
-            assert!(
-                bqs.count >= 1,
-                "the enqueued buffer is queued (or already draining on a device)"
-            );
+            assert_eq!(bqs.count, 1);
+            assert_eq!(bqs.index, 0);
+
+            let r = unsafe {
+                let vt = *(play_itf as *const *const PlayItfVtable);
+                ((*vt).set_play_state)(play_itf, SL_PLAYSTATE_PLAYING)
+            };
+            assert_eq!(r, SL_RESULT_SUCCESS);
 
             let mut rec_itf: *mut c_void = std::ptr::null_mut();
             assert_eq!(
