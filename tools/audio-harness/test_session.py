@@ -16,6 +16,7 @@ STUBS = {
         '    echo "Linked with libwireplumber 0.5.18"\n'
         "    exit 0\n"
         "fi\n"
+        'echo "$*" >"$STUB_DAEMONS.wireplumber"\n'
         'echo "$$" >>"$STUB_DAEMONS"\n'
         "exec sleep 30\n"
     ),
@@ -46,6 +47,7 @@ COMMAND = (
     'test -e "$STUB_DAEMONS.default" || exit 4\n'
     'printf "%s\\n" "$PULSE_SERVER" "$ECLIPSE_AUDIO_HARNESS" "$XDG_RUNTIME_DIR" '
     '"$XDG_CONFIG_HOME" >"$STUB_DAEMONS.seen"\n'
+    'cp "$XDG_CONFIG_HOME/alsa/asoundrc" "$STUB_DAEMONS.asoundrc"\n'
     "exit 3\n"
 )
 
@@ -104,6 +106,18 @@ class SessionScriptTest(unittest.TestCase):
         self.assertEqual(runtime, f"{harness}/runtime")
         self.assertEqual(server, f"unix:{harness}/runtime/pulse/native")
         self.assertEqual(config, f"{harness}/config")
+        self.assertEqual(
+            (self.root / "daemons.asoundrc").read_text(encoding="utf-8"),
+            "pcm.!default { type pulse }\nctl.!default { type pulse }\n",
+        )
+        self.assertEqual(
+            (self.root / "daemons.wireplumber").read_text(encoding="utf-8"),
+            "--profile policy\n",
+        )
+        self.assertEqual(
+            (self.root / "daemons.default").read_text(encoding="utf-8"), "harness_a\n"
+        )
+        self.assertEqual(len(self.daemons.read_text(encoding="utf-8").split()), 3)
         self.assert_cleaned_up()
 
     def test_the_command_waits_until_the_default_sink_can_be_selected(self):
