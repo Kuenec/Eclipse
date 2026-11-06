@@ -373,7 +373,7 @@ mod tests {
 
         let mut names = Vec::new();
         super::super::mediacodec::register_natives(|name, _| names.push(name));
-        assert_eq!(names.len(), 54);
+        assert_eq!(names.len(), 55);
         for name in names {
             let name = CString::new(name).expect("a C symbol name");
             let found = unsafe { (dl.sym)(handle, name.as_ptr()) };

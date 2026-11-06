@@ -1918,8 +1918,21 @@ UPSTREAM_SURFACE_CREATED=$'.method private surfaceCreated()V\n    .registers 4\n
 SURFACE_CREATED=$'.method private surfaceCreated()V\n    .registers 6\n\n    invoke-direct {p0}, Landroid/view/SurfaceView;->getSurfaceCallbacks()[Landroid/view/SurfaceHolder$Callback;\n\n    move-result-object v0\n\n    array-length v1, v0\n\n    const/4 v2, 0x0\n\n    :eclipse_next_callback\n    if-ge v2, v1, :eclipse_callbacks_done\n\n    aget-object v3, v0, v2\n\n    iget-object v4, p0, Landroid/view/SurfaceView;->mSurfaceHolder:Landroid/view/SurfaceHolder;\n\n    invoke-interface {v3, v4}, Landroid/view/SurfaceHolder$Callback;->surfaceCreated(Landroid/view/SurfaceHolder;)V\n\n    add-int/lit8 v2, v2, 0x1\n\n    goto :eclipse_next_callback\n\n    :eclipse_callbacks_done\n    return-void\n.end method\n'
 replace_upstream_method "$svsm" "$UPSTREAM_SURFACE_CREATED" "$SURFACE_CREATED" 'surfaceCreated'
 
+sgsm="$work/smali/android/provider/Settings\$Global.smali"
+[ -f "$sgsm" ] || fail "Settings\$Global.smali not found after baksmali"
+UPSTREAM_GLOBAL_GET_STRING_PATTERN='\.method public static getString\(Landroid/content/ContentResolver;Ljava/lang/String;\)Ljava/lang/String;\n(?:(?!\.end method\n).)*?"STRING_FROM_SETTINGS_GLOBAL_WITH_KEY_"(?:(?!\.end method\n).)*?\.end method\n'
+n="$(PATTERN="$UPSTREAM_GLOBAL_GET_STRING_PATTERN" perl -0777 -ne 'print scalar(() = /$ENV{PATTERN}/gs)' "$sgsm")"
+[ "$n" = "1" ] || fail "Settings\$Global.smali getString is not the upstream placeholder body (found $n, expected 1) — installed framework drifted; update patch-framework.sh"
+GLOBAL_GET_STRING=$'.method public static getString(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;\n    .registers 3\n\n    const/4 v0, 0x0\n\n    return-object v0\n.end method\n'
+PATTERN="$UPSTREAM_GLOBAL_GET_STRING_PATTERN" PATCHED="$GLOBAL_GET_STRING" perl -0777 -pi -e 's{$ENV{PATTERN}}{$ENV{PATCHED}}s' "$sgsm"
+n="$(smali_count "$sgsm" "$GLOBAL_GET_STRING")"
+[ "$n" = "1" ] || fail "Settings\$Global.smali getString insert found $n times (expected 1)"
+! grep -qF 'STRING_FROM_SETTINGS_GLOBAL_WITH_KEY_' "$sgsm" || fail "Settings\$Global.smali still returns the placeholder string"
+
 mkdir -p "$work/smali-view/android/atl" "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/content" "$work/smali-view/android/content/pm" "$work/smali-view/android/net" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics" "$work/smali-view/android/media"
 cp "$crsm" "$work/smali-view/android/content/ContentResolver.smali"
+mkdir -p "$work/smali-view/android/provider"
+cp "$sgsm" "$work/smali-view/android/provider/Settings\$Global.smali"
 cp "$connectivity_sm" "$work/smali-view/android/net/ConnectivityManager.smali"
 cp "$here/smali/android/net/LinkProperties.smali" "$work/smali-view/android/net/"
 cp "$here/smali/android/net/LinkAddress.smali" "$work/smali-view/android/net/"

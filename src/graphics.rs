@@ -2094,6 +2094,9 @@ impl GameWindow<'_> {
                 }
             }
         };
+        if let PointerLock::Held { anchor, .. } = self.pointer_lock {
+            self.return_cursor_to(anchor);
+        }
     }
 
     fn release_pointer_lock(&mut self, ended: PointerLockReasons) {

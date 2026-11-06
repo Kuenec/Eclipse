@@ -175,6 +175,11 @@ pub(crate) unsafe fn intercept_instance_proc(
             )
         }));
     }
+    if let Some(shim) =
+        super::vk_etc2::intercept(name, || unsafe { host_gipa(instance, name.as_ptr()) })
+    {
+        return Some(shim);
+    }
     if name == c"vkGetDeviceProcAddr" {
         let host = unsafe { host_gipa(instance, name.as_ptr()) };
         HOST_GDPA.store(pfn_to_addr(host), Ordering::Relaxed);
@@ -202,6 +207,9 @@ unsafe extern "system" fn eclipse_vk_get_device_proc_addr(
 
     let name = unsafe { CStr::from_ptr(p_name) };
 
+    if let Some(shim) = super::vk_etc2::intercept(name, || unsafe { host_gdpa(device, p_name) }) {
+        return shim;
+    }
     if name == c"vkDestroyDevice" {
         let host = unsafe { host_gdpa(device, p_name) };
         HOST_DESTROY_DEVICE.store(pfn_to_addr(host), Ordering::Relaxed);
@@ -388,6 +396,7 @@ unsafe extern "system" fn eclipse_vk_destroy_device(
         unsafe { std::mem::transmute::<usize, vk::PFN_vkDestroyDevice>(addr) };
 
     release_overlay_device_resources(device);
+    super::vk_etc2::device_destroyed();
     unsafe { host(device, p_allocator) };
 }
 
@@ -404,6 +413,19 @@ unsafe extern "system" fn eclipse_vk_create_device(
     let host: vk::PFN_vkCreateDevice =
         unsafe { std::mem::transmute::<usize, vk::PFN_vkCreateDevice>(addr) };
 
+    let mut host_info;
+    let mut host_features;
+    let mut p_create_info = p_create_info;
+    if let Some(info) = unsafe { p_create_info.as_ref() } {
+        if let Some(features) = unsafe { info.p_enabled_features.as_ref() } {
+            host_features = *features;
+            super::vk_etc2::strip_from_enabled_features(&mut host_features);
+            host_info = *info;
+            host_info.p_enabled_features = &host_features;
+            p_create_info = &host_info;
+        }
+    }
+
     let r = unsafe { host(physical_device, p_create_info, p_allocator, p_device) };
     if r == vk::Result::SUCCESS && !p_device.is_null() {
         let device = unsafe { *p_device };
@@ -419,6 +441,11 @@ unsafe extern "system" fn eclipse_vk_create_device(
         if let Ok(mut st) = STATE.lock() {
             st.device = device.as_raw();
         }
+        super::vk_etc2::device_created(
+            vk::Instance::from_raw(INSTANCE.load(Ordering::Relaxed)),
+            physical_device,
+            device,
+        );
         tracing::info!("vk-overlay: captured engine VkDevice");
     }
     r
