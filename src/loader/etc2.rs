@@ -1,5 +1,3 @@
-//! Software decoding of ETC2 texture blocks for hosts whose Vulkan driver cannot sample them.
-
 const MODIFIERS: [[i32; 2]; 8] = [
     [2, 8],
     [5, 17],
@@ -32,12 +30,9 @@ const EAC_MODIFIERS: [[i32; 8]; 16] = [
     [-3, -5, -7, -9, 2, 4, 6, 8],
 ];
 
-/// The ETC2 block formats Roblox uploads, keyed by their Vulkan format numbers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Etc2Format {
-    /// `VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK` / `_SRGB_BLOCK` (ETC1 data decodes the same way).
     Rgb8,
-    /// `VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK` / `_SRGB_BLOCK`.
     Rgba8,
 }
 
@@ -101,7 +96,6 @@ fn signed3(v: u32) -> i32 {
     }
 }
 
-/// Decodes one 8-byte ETC2 RGB block into 4x4 RGB pixels, indexed `[y][x]`.
 fn decode_rgb_block(block: &[u8; 8]) -> [[[u8; 3]; 4]; 4] {
     let word = u64::from_be_bytes(*block);
 
@@ -239,7 +233,6 @@ fn decode_planar_block(word: u64) -> [[[u8; 3]; 4]; 4] {
     out
 }
 
-/// Decodes one 8-byte EAC alpha block into 4x4 alpha values, indexed `[y][x]`.
 fn decode_alpha_block(block: &[u8; 8]) -> [[u8; 4]; 4] {
     let word = u64::from_be_bytes(*block);
     let base = bits(word, 63, 8) as i32;
@@ -256,9 +249,6 @@ fn decode_alpha_block(block: &[u8; 8]) -> [[u8; 4]; 4] {
     out
 }
 
-/// Decodes `width` x `height` texels of ETC2 blocks, laid out `blocks_per_row` blocks to a
-/// row, into RGBA8 rows of `width * 4` bytes. Blocks missing from `src` leave their texels
-/// untouched.
 pub(crate) fn decode(
     format: Etc2Format,
     src: &[u8],
@@ -318,7 +308,6 @@ mod tests {
 
     #[test]
     fn individual_mode_paints_each_half_with_its_base_color_and_modifier() {
-        // R1=0xF R2=0x0, G1=G2=0x8, B1=0x0 B2=0xF, tables 0/0, no flip, every index 0.
         let word = (0xF0u64 << 56) | (0x88 << 48) | (0x0F << 40);
         let px = rgb_block(word);
         assert_eq!(px[0][0], [255, 138, 2]);
@@ -337,7 +326,6 @@ mod tests {
 
     #[test]
     fn pixel_indices_select_the_four_modifiers_column_by_column() {
-        // Grey 0x8, table 7 (47/183). Pixel (0,1) has its lsb set, (0,2) its msb, (0,3) both.
         let word = (0x88u64 << 56)
             | (0x88 << 48)
             | (0x88 << 40)
@@ -355,7 +343,6 @@ mod tests {
 
     #[test]
     fn differential_mode_adds_the_signed_delta_to_the_second_half() {
-        // R1=16 dR=-1, G1=16 dG=+3, B1=0 dB=0.
         let r = (16u64 << 3) | 0b111;
         let g = (16u64 << 3) | 0b011;
         let word = (r << 56) | (g << 48) | (1 << 33);
@@ -367,14 +354,12 @@ mod tests {
 
     #[test]
     fn red_overflow_selects_t_mode() {
-        // R1=31 dR=+3 overflows; T-mode color 1 reads R from bits 60..59 and 57..56 (0xF).
         let word = (0b1111_1011u64 << 56) | (1 << 33);
         assert_eq!(rgb_block(word)[0][0], [255, 0, 0]);
     }
 
     #[test]
     fn green_overflow_selects_h_mode() {
-        // R1=0, G1=31 dG=+1 overflows. Every pixel index 0 paints color 1 plus the distance.
         let word = (0b1111_1001u64 << 48) | (1 << 33);
         let g = bits(word, 55, 5) as i32 + signed3(bits(word, 50, 3));
         assert!(!(0..=31).contains(&g));
@@ -384,7 +369,6 @@ mod tests {
 
     #[test]
     fn blue_overflow_selects_planar_mode() {
-        // B1=31 dB=+1 overflows. Blue origin = 0b0_11_010 = 26, gradients 0.
         let word = (1u64 << 33) | (0b1111_1001 << 40);
         let px = rgb_block(word);
         let blue = extend6(26);
@@ -400,7 +384,6 @@ mod tests {
 
     #[test]
     fn eac_alpha_applies_table_times_multiplier_per_pixel() {
-        // Base 100, multiplier 2, table 0; pixel (0,0) index 7 (+14), the rest index 0 (-3).
         let word: u64 = (100 << 56) | (2 << 52) | (0b111 << 45);
         let alpha = decode_alpha_block(&word.to_be_bytes());
         assert_eq!(alpha[0][0], 128);
@@ -424,7 +407,6 @@ mod tests {
     fn decode_skips_padding_blocks_at_the_end_of_each_row() {
         let red = (0xF0u64 << 56).to_be_bytes();
         let blue = (0x0Fu64 << 40).to_be_bytes();
-        // Two block rows of three blocks each; only the first block of each row is in range.
         let src: Vec<u8> = [red, blue, blue, blue, blue, blue].concat();
         let mut dst = vec![0u8; 4 * 8 * 4];
         decode(Etc2Format::Rgb8, &src, 3, 4, 8, &mut dst);

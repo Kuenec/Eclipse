@@ -109,7 +109,6 @@ do
     fi
     sleep 0.1
 done
-# PipeWire's socket and sinks can appear before WirePlumber's default metadata.
 polls=0
 until pactl set-default-sink "$DEFAULT_SINK" 2>"$root/default-sink.log"; do
     polls=$((polls + 1))

@@ -382,7 +382,6 @@ fn serve_connection(
         Some(reply) => stream.write_all(&serde_json::to_vec(&reply)?),
         None => Ok(()),
     };
-    // Closing the window may exit the process before the peer receives its reply.
     if quitting {
         window(WindowCommand::Close).ok();
     }
