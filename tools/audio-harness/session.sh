@@ -109,7 +109,16 @@ do
     fi
     sleep 0.1
 done
-pactl set-default-sink "$DEFAULT_SINK"
+# PipeWire's socket and sinks can appear before WirePlumber's default metadata.
+polls=0
+until pactl set-default-sink "$DEFAULT_SINK" 2>"$root/default-sink.log"; do
+    polls=$((polls + 1))
+    if [ "$polls" -ge "$STARTUP_POLLS" ]; then
+        tail -n 20 "$root"/*.log >&2
+        fail "the private $server server did not accept $DEFAULT_SINK as its default sink"
+    fi
+    sleep 0.1
+done
 
 printf 'pcm.!default { type pulse }\nctl.!default { type pulse }\n' \
     >"$XDG_CONFIG_HOME/alsa/asoundrc"
