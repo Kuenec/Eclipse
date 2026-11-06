@@ -43,6 +43,8 @@ To check H.264, HEVC and AAC decoding in the Flatpak, run `flatpak run --filesys
 
 To check audio after a cargo build, run `tools/audio-harness/session.sh --server pipewire -- tools/audio-harness/check.py --eclipse target/debug/eclipse`. It plays and records only on a private PipeWire or PulseAudio server with null sinks, never on your devices, and appends its results to `build/perf/audio-baseline.jsonl`; add `--quantum 512` to force PipeWire's quantum. `--scenarios all` adds the stress baseline, about 30 minutes more.
 
+The audio harness waits until the private server accepts its default sink before starting a scenario. PipeWire can expose its socket and sinks before WirePlumber publishes the default-device metadata. If selection still fails after the startup deadline, the harness prints the server logs, stops its daemons and fails without running the scenario.
+
 ## Layout
 
 | Path | Contents |
