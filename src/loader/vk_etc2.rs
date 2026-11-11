@@ -3,8 +3,9 @@ use ash::vk;
 use ash::vk::Handle;
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -37,6 +38,8 @@ struct Decoded {
 
 const MIN_STAGING_BYTES: u64 = 64 * 1024;
 const POOL_KEEP_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_DECODE_THREADS: usize = 4;
+const BLOCKS_PER_DECODE_TASK: usize = 4096;
 
 static POOL: Mutex<Vec<Decoded>> = Mutex::new(Vec::new());
 
@@ -486,26 +489,104 @@ fn region_layout(format: Etc2Format, region: &vk::BufferImageCopy) -> RegionLayo
     }
 }
 
-fn decode_region(format: Etc2Format, src: &[u8], region: &vk::BufferImageCopy) -> Vec<u8> {
+fn decoded_bytes(format: Etc2Format, region: &vk::BufferImageCopy) -> usize {
+    let extent = region.image_extent;
+    extent.width as usize * extent.height as usize * 4 * region_layout(format, region).layers
+}
+
+fn decode_region(
+    format: Etc2Format,
+    mapped: &[u8],
+    region: &vk::BufferImageCopy,
+    staging: &mut [u8],
+) {
     let layout = region_layout(format, region);
-    let (width, height) = (region.image_extent.width, region.image_extent.height);
-    let texel_bytes = width as usize * height as usize * 4;
-    let mut out = vec![0u8; texel_bytes * layout.layers];
-    for layer in 0..layout.layers {
-        let start = layer * layout.layer_bytes;
-        let Some(blocks) = src.get(start..start + layout.layer_bytes) else {
+    let width = region.image_extent.width;
+    let layer_texel_bytes = staging.len() / layout.layers;
+    if layout.layer_bytes == 0 || layer_texel_bytes == 0 {
+        return;
+    }
+    let layers = mapped
+        .chunks_exact(layout.layer_bytes)
+        .zip(staging.chunks_exact_mut(layer_texel_bytes));
+    for (mapped, staging) in layers {
+        decode_layer(format, mapped, layout.blocks_per_row, width, staging);
+    }
+}
+
+fn decode_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .min(MAX_DECODE_THREADS)
+    })
+}
+
+fn decode_layer(
+    format: Etc2Format,
+    mapped: &[u8],
+    blocks_per_row: usize,
+    width: u32,
+    staging: &mut [u8],
+) {
+    let block_rows_per_task = (BLOCKS_PER_DECODE_TASK / blocks_per_row).max(1);
+    let mapped_task_bytes = block_rows_per_task * blocks_per_row * format.block_bytes();
+    let staging_task_bytes = block_rows_per_task * 4 * width as usize * 4;
+    let task_count = staging.len().div_ceil(staging_task_bytes);
+    let tasks = Mutex::new(
+        mapped
+            .chunks(mapped_task_bytes)
+            .zip(staging.chunks_mut(staging_task_bytes)),
+    );
+    let decode_tasks = || loop {
+        let task = tasks.lock().unwrap_or_else(PoisonError::into_inner).next();
+        let Some((mapped, staging)) = task else {
             break;
         };
-        etc2::decode(
-            format,
-            blocks,
-            layout.blocks_per_row,
-            width,
-            height,
-            &mut out[layer * texel_bytes..(layer + 1) * texel_bytes],
-        );
+        decode_block_rows(format, mapped, blocks_per_row, width, staging);
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..task_count.min(decode_threads()) {
+            let spawned = std::thread::Builder::new()
+                .name("eclipse-etc2".to_owned())
+                .spawn_scoped(scope, decode_tasks);
+            if let Err(error) = spawned {
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        %error,
+                        "vk-etc2: cannot start an ETC2 decode thread; \
+                         the uploading thread decodes alone"
+                    );
+                }
+                break;
+            }
+        }
+        decode_tasks();
+    });
+}
+
+fn decode_block_rows(
+    format: Etc2Format,
+    mapped: &[u8],
+    blocks_per_row: usize,
+    width: u32,
+    staging: &mut [u8],
+) {
+    let row_bytes = width as usize * 4;
+    let mut block_row = vec![0u8; blocks_per_row * format.block_bytes()];
+    let mut band = vec![0u8; 4 * row_bytes];
+    let block_rows = mapped
+        .chunks_exact(block_row.len())
+        .zip(staging.chunks_mut(band.len()));
+    for (mapped, staging) in block_rows {
+        read_mapped(mapped, &mut block_row);
+        let band = &mut band[..staging.len()];
+        let height = (band.len() / row_bytes) as u32;
+        etc2::decode(format, &block_row, blocks_per_row, width, height, band);
+        staging.copy_from_slice(band);
     }
-    out
 }
 
 unsafe fn source_bytes<'a>(
@@ -522,22 +603,17 @@ unsafe fn source_bytes<'a>(
     Some(unsafe { std::slice::from_raw_parts((base + at as usize) as *const u8, len) })
 }
 
-unsafe fn upload_decoded(host: &Host, texels: &[u8]) -> Option<Decoded> {
-    let len = texels.len() as u64;
+unsafe fn take_staging(host: &Host, len: u64) -> Option<Decoded> {
     let reused = POOL.lock().ok().and_then(|mut pool| {
         let best = (0..pool.len())
             .filter(|&i| pool[i].capacity >= len)
             .min_by_key(|&i| pool[i].capacity)?;
         Some(pool.swap_remove(best))
     });
-    let decoded = match reused {
-        Some(decoded) => decoded,
-        None => unsafe { allocate_staging(host, len.next_power_of_two().max(MIN_STAGING_BYTES))? },
-    };
-    unsafe {
-        std::ptr::copy_nonoverlapping(texels.as_ptr(), decoded.mapped as *mut u8, texels.len());
+    match reused {
+        Some(decoded) => Some(decoded),
+        None => unsafe { allocate_staging(host, len.next_power_of_two().max(MIN_STAGING_BYTES)) },
     }
-    Some(decoded)
 }
 
 unsafe fn allocate_staging(host: &Host, capacity: u64) -> Option<Decoded> {
@@ -588,15 +664,14 @@ unsafe fn allocate_staging(host: &Host, capacity: u64) -> Option<Decoded> {
     Some(decoded)
 }
 
-fn read_mapped(src: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; src.len()];
+fn read_mapped(src: &[u8], dst: &mut [u8]) {
+    assert_eq!(src.len(), dst.len());
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("sse4.1") {
-        unsafe { stream_copy(src, &mut out) };
-        return out;
+        unsafe { stream_copy(src, dst) };
+        return;
     }
-    out.copy_from_slice(src);
-    out
+    dst.copy_from_slice(src);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -657,20 +732,20 @@ unsafe extern "system" fn cmd_copy_buffer_to_image(
     static UPLOADED: AtomicBool = AtomicBool::new(false);
 
     for region in regions {
-        let src =
+        let mapped =
             with_tracking(|t| unsafe { source_bytes(t, src_buffer, format, region) }).flatten();
-        let texels = src.map(|src| decode_region(format, &read_mapped(src), region));
-        let Some(texels) = texels else {
+        let Some(mapped) = mapped else {
             warn_once(
                 &UNMAPPED,
                 "an ETC2 upload's staging buffer is not mapped; that texture stays blank",
             );
             continue;
         };
+        let len = decoded_bytes(format, region);
         let decoded = HOST
             .lock()
             .ok()
-            .and_then(|host| unsafe { upload_decoded(host.as_ref()?, &texels) });
+            .and_then(|host| unsafe { take_staging(host.as_ref()?, len as u64) });
         let Some(decoded) = decoded else {
             warn_once(
                 &NO_STAGING,
@@ -678,6 +753,8 @@ unsafe extern "system" fn cmd_copy_buffer_to_image(
             );
             continue;
         };
+        let staging = unsafe { std::slice::from_raw_parts_mut(decoded.mapped as *mut u8, len) };
+        decode_region(format, mapped, region, staging);
         let copy = vk::BufferImageCopy {
             buffer_offset: 0,
             buffer_row_length: 0,
@@ -708,6 +785,7 @@ unsafe extern "system" fn cmd_copy_buffer_to_image(
 
 #[cfg(test)]
 mod tests {
+    use super::super::etc2::tests::noise;
     use super::*;
 
     fn region(
@@ -736,15 +814,62 @@ mod tests {
         }
     }
 
+    fn decoded(format: Etc2Format, mapped: &[u8], region: &vk::BufferImageCopy) -> Vec<u8> {
+        let mut staging = vec![0u8; decoded_bytes(format, region)];
+        decode_region(format, mapped, region, &mut staging);
+        staging
+    }
+
     #[test]
     fn mapped_reads_copy_every_byte_at_any_alignment_and_length() {
         let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
         for start in 0..17 {
             for len in [0, 1, 15, 16, 17, 63, 64, 500, 1000 - start] {
                 let src = &data[start..start + len];
-                assert_eq!(read_mapped(src), src, "start {start} len {len}");
+                let mut copy = vec![0u8; len];
+                read_mapped(src, &mut copy);
+                assert_eq!(copy, src, "start {start} len {len}");
             }
         }
+    }
+
+    #[test]
+    fn a_level_shared_between_decode_tasks_matches_one_pass_over_it() {
+        for (format, width, height, row) in [
+            (Etc2Format::Rgb8, 512, 512, 0),
+            (Etc2Format::Rgba8, 1024, 256, 0),
+            (Etc2Format::Rgba8, 301, 515, 320),
+        ] {
+            let region = region(width, height, row, 0, 1);
+            let layout = region_layout(format, &region);
+            assert!(layout.blocks_per_row * layout.block_rows > 2 * BLOCKS_PER_DECODE_TASK);
+            let mapped = noise(layout.layer_bytes);
+            let mut one_pass = vec![0u8; decoded_bytes(format, &region)];
+            etc2::decode(
+                format,
+                &mapped,
+                layout.blocks_per_row,
+                width,
+                height,
+                &mut one_pass,
+            );
+            assert!(
+                decoded(format, &mapped, &region) == one_pass,
+                "{format:?} {width}x{height} row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_size_counts_four_bytes_per_texel_in_every_layer() {
+        assert_eq!(
+            decoded_bytes(Etc2Format::Rgb8, &region(6, 5, 0, 0, 1)),
+            6 * 5 * 4
+        );
+        assert_eq!(
+            decoded_bytes(Etc2Format::Rgba8, &region(8, 8, 16, 12, 6)),
+            8 * 8 * 4 * 6
+        );
     }
 
     #[test]
@@ -789,7 +914,7 @@ mod tests {
         assert_eq!(layout.layer_bytes, 8);
         let src = (0xF0u64 << 56).to_be_bytes();
         assert_eq!(
-            decode_region(Etc2Format::Rgb8, &src, &region(1, 1, 0, 0, 1)),
+            decoded(Etc2Format::Rgb8, &src, &region(1, 1, 0, 0, 1)),
             vec![255, 2, 2, 255]
         );
     }
@@ -799,7 +924,7 @@ mod tests {
         let red = (0xF0u64 << 56).to_be_bytes();
         let blue = (0xFFu64 << 40).to_be_bytes();
         let src = [red, blue].concat();
-        let texels = decode_region(Etc2Format::Rgb8, &src, &region(4, 4, 0, 0, 2));
+        let texels = decoded(Etc2Format::Rgb8, &src, &region(4, 4, 0, 0, 2));
         assert_eq!(texels.len(), 2 * 4 * 4 * 4);
         assert_eq!(&texels[..4], &[255, 2, 2, 255]);
         assert_eq!(&texels[64..68], &[2, 2, 255, 255]);

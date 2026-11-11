@@ -30,6 +30,11 @@ const EAC_MODIFIERS: [[i32; 8]; 16] = [
     [-3, -5, -7, -9, 2, 4, 6, 8],
 ];
 
+const OPAQUE: u8 = 255;
+
+type Texel = [u8; 4];
+type BlockTexels = [[Texel; 4]; 4];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Etc2Format {
     Rgb8,
@@ -77,15 +82,18 @@ fn clamp(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
-fn shade(color: [i32; 3], delta: i32) -> [u8; 3] {
-    color.map(|c| clamp(c + delta))
+fn shade(color: [i32; 3], delta: i32) -> Texel {
+    [
+        clamp(color[0] + delta),
+        clamp(color[1] + delta),
+        clamp(color[2] + delta),
+        OPAQUE,
+    ]
 }
 
 fn pixel_index(word: u64, x: usize, y: usize) -> usize {
     let i = x * 4 + y;
-    let msb = (word >> (16 + i)) & 1;
-    let lsb = (word >> i) & 1;
-    (msb * 2 + lsb) as usize
+    (((word >> (15 + i)) & 2) | ((word >> i) & 1)) as usize
 }
 
 fn signed3(v: u32) -> i32 {
@@ -96,14 +104,36 @@ fn signed3(v: u32) -> i32 {
     }
 }
 
-fn decode_rgb_block(block: &[u8; 8]) -> [[[u8; 3]; 4]; 4] {
+#[derive(Clone, Copy)]
+enum Halves {
+    LeftRight,
+    TopBottom,
+}
+
+fn paint(word: u64, halves: Halves, palettes: [[Texel; 4]; 2]) -> BlockTexels {
+    std::array::from_fn(|y| {
+        std::array::from_fn(|x| {
+            let half = match halves {
+                Halves::LeftRight => x / 2,
+                Halves::TopBottom => y / 2,
+            };
+            palettes[half][pixel_index(word, x, y)]
+        })
+    })
+}
+
+fn decode_rgb_block(block: &[u8; 8]) -> BlockTexels {
     let word = u64::from_be_bytes(*block);
 
     let differential = bits(word, 33, 1) == 1;
-    if differential {
-        let r = bits(word, 63, 5) as i32 + signed3(bits(word, 58, 3));
-        let g = bits(word, 55, 5) as i32 + signed3(bits(word, 50, 3));
-        let b = bits(word, 47, 5) as i32 + signed3(bits(word, 42, 3));
+    let (first, second) = if differential {
+        let base = [bits(word, 63, 5), bits(word, 55, 5), bits(word, 47, 5)];
+        let delta = [
+            signed3(bits(word, 58, 3)),
+            signed3(bits(word, 50, 3)),
+            signed3(bits(word, 42, 3)),
+        ];
+        let [r, g, b] = [0, 1, 2].map(|c| base[c] as i32 + delta[c]);
         if !(0..=31).contains(&r) {
             return decode_t_block(word);
         }
@@ -113,51 +143,33 @@ fn decode_rgb_block(block: &[u8; 8]) -> [[[u8; 3]; 4]; 4] {
         if !(0..=31).contains(&b) {
             return decode_planar_block(word);
         }
-    }
-
-    let (first, second) = if differential {
-        let base = [bits(word, 63, 5), bits(word, 55, 5), bits(word, 47, 5)];
-        let delta = [
-            signed3(bits(word, 58, 3)),
-            signed3(bits(word, 50, 3)),
-            signed3(bits(word, 42, 3)),
-        ];
-        (
-            base.map(extend5),
-            [0, 1, 2].map(|c| extend5((base[c] as i32 + delta[c]) as u32)),
-        )
+        (base.map(extend5), [r, g, b].map(|c| extend5(c as u32)))
     } else {
         (
             [bits(word, 63, 4), bits(word, 55, 4), bits(word, 47, 4)].map(extend4),
             [bits(word, 59, 4), bits(word, 51, 4), bits(word, 43, 4)].map(extend4),
         )
     };
-    let tables = [bits(word, 39, 3) as usize, bits(word, 36, 3) as usize];
-    let flip = bits(word, 32, 1) == 1;
-
-    let mut out = [[[0u8; 3]; 4]; 4];
-    for (y, row) in out.iter_mut().enumerate() {
-        for (x, pixel) in row.iter_mut().enumerate() {
-            let sub = usize::from(if flip { y >= 2 } else { x >= 2 });
-            let [small, large] = MODIFIERS[tables[sub]];
-            let delta = [small, large, -small, -large][pixel_index(word, x, y)];
-            *pixel = shade(if sub == 0 { first } else { second }, delta);
-        }
-    }
-    out
+    let palette = |color: [i32; 3], table: u32| {
+        let [small, large] = MODIFIERS[table as usize];
+        [small, large, -small, -large].map(|delta| shade(color, delta))
+    };
+    let halves = if bits(word, 32, 1) == 1 {
+        Halves::TopBottom
+    } else {
+        Halves::LeftRight
+    };
+    paint(
+        word,
+        halves,
+        [
+            palette(first, bits(word, 39, 3)),
+            palette(second, bits(word, 36, 3)),
+        ],
+    )
 }
 
-fn paint(word: u64, colors: [[u8; 3]; 4]) -> [[[u8; 3]; 4]; 4] {
-    let mut out = [[[0u8; 3]; 4]; 4];
-    for (y, row) in out.iter_mut().enumerate() {
-        for (x, pixel) in row.iter_mut().enumerate() {
-            *pixel = colors[pixel_index(word, x, y)];
-        }
-    }
-    out
-}
-
-fn decode_t_block(word: u64) -> [[[u8; 3]; 4]; 4] {
+fn decode_t_block(word: u64) -> BlockTexels {
     let first = [
         (bits(word, 60, 2) << 2) | bits(word, 57, 2),
         bits(word, 55, 4),
@@ -166,18 +178,16 @@ fn decode_t_block(word: u64) -> [[[u8; 3]; 4]; 4] {
     .map(extend4);
     let second = [bits(word, 47, 4), bits(word, 43, 4), bits(word, 39, 4)].map(extend4);
     let d = DISTANCES[((bits(word, 35, 2) << 1) | bits(word, 32, 1)) as usize];
-    paint(
-        word,
-        [
-            shade(first, 0),
-            shade(second, d),
-            shade(second, 0),
-            shade(second, -d),
-        ],
-    )
+    let palette = [
+        shade(first, 0),
+        shade(second, d),
+        shade(second, 0),
+        shade(second, -d),
+    ];
+    paint(word, Halves::LeftRight, [palette; 2])
 }
 
-fn decode_h_block(word: u64) -> [[[u8; 3]; 4]; 4] {
+fn decode_h_block(word: u64) -> BlockTexels {
     let first4 = [
         bits(word, 62, 4),
         (bits(word, 58, 3) << 1) | bits(word, 52, 1),
@@ -188,18 +198,16 @@ fn decode_h_block(word: u64) -> [[[u8; 3]; 4]; 4] {
     let order = u32::from(packed(first4) >= packed(second4));
     let d = DISTANCES[((bits(word, 34, 1) << 2) | (bits(word, 32, 1) << 1) | order) as usize];
     let (first, second) = (first4.map(extend4), second4.map(extend4));
-    paint(
-        word,
-        [
-            shade(first, d),
-            shade(first, -d),
-            shade(second, d),
-            shade(second, -d),
-        ],
-    )
+    let palette = [
+        shade(first, d),
+        shade(first, -d),
+        shade(second, d),
+        shade(second, -d),
+    ];
+    paint(word, Halves::LeftRight, [palette; 2])
 }
 
-fn decode_planar_block(word: u64) -> [[[u8; 3]; 4]; 4] {
+fn decode_planar_block(word: u64) -> BlockTexels {
     let origin = [
         extend6(bits(word, 62, 6)),
         extend7((bits(word, 56, 1) << 6) | bits(word, 54, 6)),
@@ -215,11 +223,10 @@ fn decode_planar_block(word: u64) -> [[[u8; 3]; 4]; 4] {
         extend7(bits(word, 12, 7)),
         extend6(bits(word, 5, 6)),
     ];
-    let mut out = [[[0u8; 3]; 4]; 4];
-    for (y, row) in out.iter_mut().enumerate() {
-        for (x, pixel) in row.iter_mut().enumerate() {
+    std::array::from_fn(|y| {
+        std::array::from_fn(|x| {
             let (x, y) = (x as i32, y as i32);
-            *pixel = [0, 1, 2].map(|c| {
+            let channel = |c: usize| {
                 clamp(
                     (x * (horizontal[c] - origin[c])
                         + y * (vertical[c] - origin[c])
@@ -227,26 +234,37 @@ fn decode_planar_block(word: u64) -> [[[u8; 3]; 4]; 4] {
                         + 2)
                         >> 2,
                 )
-            });
-        }
-    }
-    out
+            };
+            [channel(0), channel(1), channel(2), OPAQUE]
+        })
+    })
 }
 
 fn decode_alpha_block(block: &[u8; 8]) -> [[u8; 4]; 4] {
     let word = u64::from_be_bytes(*block);
     let base = bits(word, 63, 8) as i32;
     let multiplier = bits(word, 55, 4) as i32;
-    let table = EAC_MODIFIERS[bits(word, 51, 4) as usize];
-    let mut out = [[0u8; 4]; 4];
-    for (y, row) in out.iter_mut().enumerate() {
-        for (x, alpha) in row.iter_mut().enumerate() {
-            let i = (x * 4 + y) as u32;
-            let index = bits(word, 47 - 3 * i, 3) as usize;
-            *alpha = clamp(base + table[index] * multiplier);
+    let alphas = EAC_MODIFIERS[bits(word, 51, 4) as usize].map(|m| clamp(base + m * multiplier));
+    std::array::from_fn(|y| {
+        std::array::from_fn(|x| alphas[((word >> (45 - 3 * (x * 4 + y))) & 7) as usize])
+    })
+}
+
+fn decode_block(format: Etc2Format, block: &[u8]) -> BlockTexels {
+    match format {
+        Etc2Format::Rgb8 => decode_rgb_block(block.try_into().expect("8-byte color block")),
+        Etc2Format::Rgba8 => {
+            let (alpha, color) = block.split_at(8);
+            let alpha = decode_alpha_block(alpha.try_into().expect("8-byte alpha half"));
+            let mut texels = decode_rgb_block(color.try_into().expect("8-byte color half"));
+            for (texels, alphas) in texels.iter_mut().zip(alpha) {
+                for (texel, alpha) in texels.iter_mut().zip(alphas) {
+                    texel[3] = alpha;
+                }
+            }
+            texels
         }
     }
-    out
 }
 
 pub(crate) fn decode(
@@ -258,52 +276,51 @@ pub(crate) fn decode(
     dst: &mut [u8],
 ) {
     let (width, height) = (width as usize, height as usize);
-    let blocks_x = width.div_ceil(4);
+    if width == 0 || blocks_per_row == 0 {
+        return;
+    }
     let block_bytes = format.block_bytes();
     let row_bytes = width * 4;
+    let block_rows = src
+        .chunks(blocks_per_row * block_bytes)
+        .take(height.div_ceil(4));
 
-    for by in 0..height.div_ceil(4) {
-        for bx in 0..blocks_x {
-            let at = (by * blocks_per_row + bx) * block_bytes;
-            let Some(block) = src.get(at..at + block_bytes) else {
-                return;
-            };
-            let (alpha, color) = match format {
-                Etc2Format::Rgb8 => (None, block),
-                Etc2Format::Rgba8 => (
-                    Some(decode_alpha_block(
-                        block[..8].try_into().expect("8-byte alpha half"),
-                    )),
-                    &block[8..],
-                ),
-            };
-            let color = decode_rgb_block(color.try_into().expect("8-byte color half"));
-
-            for (dy, row) in color.iter().enumerate() {
-                let y = by * 4 + dy;
-                if y >= height {
-                    break;
-                }
-                for (dx, rgb) in row.iter().enumerate() {
-                    let x = bx * 4 + dx;
-                    if x >= width {
-                        break;
-                    }
-                    let out = y * row_bytes + x * 4;
-                    let a = alpha.map_or(255, |alpha| alpha[dy][dx]);
-                    dst[out..out + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], a]);
-                }
+    for (block_row, band) in block_rows.zip(dst.chunks_mut(4 * row_bytes)) {
+        let blocks = block_row.chunks_exact(block_bytes).take(width.div_ceil(4));
+        for (bx, block) in blocks.enumerate() {
+            let texels = decode_block(format, block);
+            let columns = bx * 16..(bx * 16 + 16).min(row_bytes);
+            for (row, texels) in band.chunks_exact_mut(row_bytes).zip(&texels) {
+                row[columns.clone()].copy_from_slice(&texels.as_flattened()[..columns.len()]);
             }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
+    pub(crate) fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xCBF2_9CE4_8422_2325, |hash, &byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
+        })
+    }
+
     fn rgb_block(word: u64) -> [[[u8; 3]; 4]; 4] {
-        decode_rgb_block(&word.to_be_bytes())
+        decode_rgb_block(&word.to_be_bytes()).map(|row| row.map(|[r, g, b, _]| [r, g, b]))
     }
 
     #[test]
@@ -422,6 +439,28 @@ mod tests {
         let mut dst = vec![0u8; 4 * 4 * 4];
         decode(Etc2Format::Rgba8, &block, 1, 4, 4, &mut dst);
         assert!(dst.chunks(4).all(|px| px[3] == 0x40));
+    }
+
+    #[test]
+    fn noise_in_every_block_mode_decodes_to_the_reference_texels() {
+        for (format, texels) in [
+            (Etc2Format::Rgb8, 0x3C16_E939_170F_F0CC),
+            (Etc2Format::Rgba8, 0x6C6B_5F3D_B2DC_67F0),
+        ] {
+            let src = noise(32 * 32 * format.block_bytes());
+            let mut dst = vec![0u8; 128 * 128 * 4];
+            decode(format, &src, 32, 128, 128, &mut dst);
+            assert_eq!(fnv1a(&dst), texels, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn an_image_without_texels_or_blocks_decodes_nothing() {
+        let block = (0xF0u64 << 56).to_be_bytes();
+        let mut dst = [7u8; 16];
+        decode(Etc2Format::Rgb8, &block, 1, 0, 4, &mut dst);
+        decode(Etc2Format::Rgb8, &block, 0, 4, 4, &mut dst);
+        assert_eq!(dst, [7u8; 16]);
     }
 
     #[test]
