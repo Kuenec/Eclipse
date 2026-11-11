@@ -6,6 +6,7 @@ use std::ffi::{c_void, CStr};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -29,31 +30,168 @@ static HOST_UNMAP_MEMORY: AtomicU64 = AtomicU64::new(0);
 static HOST_FREE_MEMORY: AtomicU64 = AtomicU64::new(0);
 static HOST_CMD_COPY_BUFFER_TO_IMAGE: AtomicU64 = AtomicU64::new(0);
 
-struct Decoded {
+const SLAB_BYTES: u64 = 16 * 1024 * 1024;
+const PREPARED_SLABS: usize = 4;
+const IDLE_SLAB_KEEP_BYTES: u64 = 256 * 1024 * 1024;
+const REGION_ALIGN_BYTES: u64 = 64;
+const MAX_DECODE_THREADS: usize = 4;
+const BLOCKS_PER_DECODE_TASK: usize = 4096;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SlabSpace {
+    capacity: u64,
+    used: u64,
+    regions: usize,
+}
+
+impl SlabSpace {
+    fn next_offset(self) -> u64 {
+        match self.regions {
+            0 => 0,
+            _ => self.used.next_multiple_of(REGION_ALIGN_BYTES),
+        }
+    }
+
+    fn has_room(self, len: u64) -> bool {
+        self.next_offset()
+            .checked_add(len)
+            .is_some_and(|end| end <= self.capacity)
+    }
+
+    fn is_idle(self) -> bool {
+        self.regions == 0
+    }
+
+    fn reserve(&mut self, len: u64) -> Option<u64> {
+        if !self.has_room(len) {
+            return None;
+        }
+        let offset = self.next_offset();
+        self.used = offset + len;
+        self.regions += 1;
+        Some(offset)
+    }
+
+    fn release(&mut self) {
+        self.regions = self
+            .regions
+            .checked_sub(1)
+            .expect("a released staging region was reserved");
+    }
+}
+
+fn slab_with_room(spaces: impl Iterator<Item = SlabSpace>, len: u64) -> Option<usize> {
+    let mut smallest_idle: Option<(usize, u64)> = None;
+    for (index, space) in spaces.enumerate() {
+        if !space.has_room(len) {
+            continue;
+        }
+        if !space.is_idle() {
+            return Some(index);
+        }
+        if smallest_idle.is_none_or(|(_, capacity)| space.capacity < capacity) {
+            smallest_idle = Some((index, space.capacity));
+        }
+    }
+    smallest_idle.map(|(index, _)| index)
+}
+
+fn surplus_idle_slab(spaces: impl Iterator<Item = SlabSpace> + Clone) -> Option<usize> {
+    let idle = spaces
+        .clone()
+        .enumerate()
+        .filter(|(_, space)| space.is_idle());
+    let idle_bytes: u64 = idle.clone().map(|(_, space)| space.capacity).sum();
+    if idle_bytes <= IDLE_SLAB_KEEP_BYTES {
+        return None;
+    }
+    idle.max_by_key(|(_, space)| space.capacity)
+        .map(|(index, _)| index)
+}
+
+struct Slab {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
-    capacity: u64,
+    mapped: usize,
+    space: SlabSpace,
+}
+
+struct Staged {
+    slab: vk::Buffer,
+    offset: u64,
     mapped: usize,
 }
 
-const MIN_STAGING_BYTES: u64 = 64 * 1024;
-const POOL_KEEP_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_DECODE_THREADS: usize = 4;
-const BLOCKS_PER_DECODE_TASK: usize = 4096;
+#[derive(Default)]
+struct UploadTotals {
+    calls: u64,
+    texel_bytes: u64,
+    time: Duration,
+    longest: Duration,
+    slabs_added: u64,
+}
 
-static POOL: Mutex<Vec<Decoded>> = Mutex::new(Vec::new());
+impl UploadTotals {
+    fn record(&mut self, texel_bytes: u64, elapsed: Duration) {
+        self.calls += 1;
+        self.texel_bytes += texel_bytes;
+        self.time += elapsed;
+        self.longest = self.longest.max(elapsed);
+    }
+}
 
 #[derive(Default)]
 struct Tracking {
     images: HashMap<u64, Etc2Format>,
     buffer_memory: HashMap<u64, (u64, u64)>,
     mappings: HashMap<u64, (usize, u64)>,
-    decoded: HashMap<u64, Vec<Decoded>>,
+    decoded: HashMap<u64, Vec<vk::Buffer>>,
 }
 
 struct Host {
     device: ash::Device,
     memory: vk::PhysicalDeviceMemoryProperties,
+    slabs: Vec<Slab>,
+    uploads: UploadTotals,
+}
+
+impl Host {
+    unsafe fn add_slab(&mut self, capacity: u64) -> Option<usize> {
+        let slab = unsafe { allocate_slab(&self.device, &self.memory, capacity)? };
+        self.slabs.push(slab);
+        Some(self.slabs.len() - 1)
+    }
+
+    unsafe fn stage(&mut self, len: u64) -> Option<Staged> {
+        let index = match slab_with_room(self.slabs.iter().map(|slab| slab.space), len) {
+            Some(index) => index,
+            None => {
+                let index = unsafe { self.add_slab(len.next_power_of_two().max(SLAB_BYTES))? };
+                self.uploads.slabs_added += 1;
+                index
+            }
+        };
+        let slab = &mut self.slabs[index];
+        let offset = slab.space.reserve(len)?;
+        Some(Staged {
+            slab: slab.buffer,
+            offset,
+            mapped: slab.mapped + offset as usize,
+        })
+    }
+
+    unsafe fn release(&mut self, regions: Vec<vk::Buffer>) {
+        for buffer in regions {
+            if let Some(slab) = self.slabs.iter_mut().find(|slab| slab.buffer == buffer) {
+                slab.space.release();
+            }
+        }
+        while let Some(surplus) = surplus_idle_slab(self.slabs.iter().map(|slab| slab.space)) {
+            let slab = self.slabs.swap_remove(surplus);
+            unsafe { free_slab(&self.device, &slab) };
+        }
+    }
 }
 
 static TRACKING: Mutex<Option<Tracking>> = Mutex::new(None);
@@ -201,43 +339,48 @@ pub(crate) fn device_created(
     let instance = unsafe { ash::Instance::load(entry.static_fn(), instance) };
     let memory = unsafe { instance.get_physical_device_memory_properties(physical_device) };
     let device = unsafe { ash::Device::load(instance.fp_v1_0(), device) };
-    if let Ok(mut host) = HOST.lock() {
-        *host = Some(Host { device, memory });
+    let mut host = Host {
+        device,
+        memory,
+        slabs: Vec::new(),
+        uploads: UploadTotals::default(),
+    };
+    for _ in 0..PREPARED_SLABS {
+        if unsafe { host.add_slab(SLAB_BYTES) }.is_none() {
+            break;
+        }
+    }
+    if let Ok(mut slot) = HOST.lock() {
+        *slot = Some(host);
     }
 }
 
 pub(crate) fn device_destroyed() {
-    let tracking = with_tracking(std::mem::take).unwrap_or_default();
-    let pooled = POOL
-        .lock()
-        .map(|mut pool| std::mem::take(&mut *pool))
-        .unwrap_or_default();
+    with_tracking(std::mem::take);
     let Ok(mut host) = HOST.lock() else { return };
-    if let Some(host) = host.take() {
-        for decoded in tracking.decoded.into_values().flatten().chain(pooled) {
-            unsafe { free_decoded(&host.device, &decoded) };
-        }
+    let Some(host) = host.take() else { return };
+    let uploads = &host.uploads;
+    if uploads.calls > 0 {
+        let staging_bytes: u64 = host.slabs.iter().map(|slab| slab.space.capacity).sum();
+        tracing::info!(
+            uploads = uploads.calls,
+            decoded_mib = uploads.texel_bytes / BYTES_PER_MIB,
+            total_ms = uploads.time.as_millis() as u64,
+            longest_us = uploads.longest.as_micros() as u64,
+            staging_mib = staging_bytes / BYTES_PER_MIB,
+            slabs_added = uploads.slabs_added,
+            "vk-etc2: ETC2 uploads on the Vulkan device Roblox destroyed"
+        );
+    }
+    for slab in &host.slabs {
+        unsafe { free_slab(&host.device, slab) };
     }
 }
 
-fn recycle(host: &Host, finished: Vec<Decoded>) {
-    let Ok(mut pool) = POOL.lock() else { return };
-    pool.extend(finished);
-    let mut kept: u64 = pool.iter().map(|d| d.capacity).sum();
-    while kept > POOL_KEEP_BYTES {
-        let Some(largest) = (0..pool.len()).max_by_key(|&i| pool[i].capacity) else {
-            break;
-        };
-        let decoded = pool.swap_remove(largest);
-        kept -= decoded.capacity;
-        unsafe { free_decoded(&host.device, &decoded) };
-    }
-}
-
-unsafe fn free_decoded(device: &ash::Device, decoded: &Decoded) {
+unsafe fn free_slab(device: &ash::Device, slab: &Slab) {
     unsafe {
-        device.destroy_buffer(decoded.buffer, None);
-        device.free_memory(decoded.memory, None);
+        device.destroy_buffer(slab.buffer, None);
+        device.free_memory(slab.memory, None);
     }
 }
 
@@ -412,10 +555,10 @@ unsafe extern "system" fn destroy_buffer(
         t.decoded.remove(&buffer.as_raw())
     })
     .flatten();
-    if let Some(decoded) = decoded {
-        if let Ok(host) = HOST.lock() {
-            if let Some(host) = host.as_ref() {
-                recycle(host, decoded);
+    if let Some(regions) = decoded {
+        if let Ok(mut host) = HOST.lock() {
+            if let Some(host) = host.as_mut() {
+                unsafe { host.release(regions) };
             }
         }
     }
@@ -603,21 +746,11 @@ unsafe fn source_bytes<'a>(
     Some(unsafe { std::slice::from_raw_parts((base + at as usize) as *const u8, len) })
 }
 
-unsafe fn take_staging(host: &Host, len: u64) -> Option<Decoded> {
-    let reused = POOL.lock().ok().and_then(|mut pool| {
-        let best = (0..pool.len())
-            .filter(|&i| pool[i].capacity >= len)
-            .min_by_key(|&i| pool[i].capacity)?;
-        Some(pool.swap_remove(best))
-    });
-    match reused {
-        Some(decoded) => Some(decoded),
-        None => unsafe { allocate_staging(host, len.next_power_of_two().max(MIN_STAGING_BYTES)) },
-    }
-}
-
-unsafe fn allocate_staging(host: &Host, capacity: u64) -> Option<Decoded> {
-    let device = &host.device;
+unsafe fn allocate_slab(
+    device: &ash::Device,
+    memory: &vk::PhysicalDeviceMemoryProperties,
+    capacity: u64,
+) -> Option<Slab> {
     let info = vk::BufferCreateInfo::default()
         .size(capacity)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC)
@@ -625,9 +758,9 @@ unsafe fn allocate_staging(host: &Host, capacity: u64) -> Option<Decoded> {
     let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
     let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
     let coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    let Some(memory_type) = (0..host.memory.memory_type_count).find(|&i| {
+    let Some(memory_type) = (0..memory.memory_type_count).find(|&i| {
         requirements.memory_type_bits & (1 << i) != 0
-            && host.memory.memory_types[i as usize]
+            && memory.memory_types[i as usize]
                 .property_flags
                 .contains(coherent)
     }) else {
@@ -651,17 +784,20 @@ unsafe fn allocate_staging(host: &Host, capacity: u64) -> Option<Decoded> {
                     .ok()
             })
     };
-    let decoded = Decoded {
+    let slab = Slab {
         buffer,
         memory,
-        capacity,
         mapped: mapped.map_or(0, |ptr| ptr as usize),
+        space: SlabSpace {
+            capacity,
+            ..SlabSpace::default()
+        },
     };
-    if decoded.mapped == 0 {
-        unsafe { free_decoded(device, &decoded) };
+    if slab.mapped == 0 {
+        unsafe { free_slab(device, &slab) };
         return None;
     }
-    Some(decoded)
+    Some(slab)
 }
 
 fn read_mapped(src: &[u8], dst: &mut [u8]) {
@@ -730,6 +866,8 @@ unsafe extern "system" fn cmd_copy_buffer_to_image(
     static UNMAPPED: AtomicBool = AtomicBool::new(false);
     static NO_STAGING: AtomicBool = AtomicBool::new(false);
     static UPLOADED: AtomicBool = AtomicBool::new(false);
+    let started = Instant::now();
+    let mut texel_bytes = 0;
 
     for region in regions {
         let mapped =
@@ -742,21 +880,22 @@ unsafe extern "system" fn cmd_copy_buffer_to_image(
             continue;
         };
         let len = decoded_bytes(format, region);
-        let decoded = HOST
+        let staged = HOST
             .lock()
             .ok()
-            .and_then(|host| unsafe { take_staging(host.as_ref()?, len as u64) });
-        let Some(decoded) = decoded else {
+            .and_then(|mut host| unsafe { host.as_mut()?.stage(len as u64) });
+        let Some(staged) = staged else {
             warn_once(
                 &NO_STAGING,
                 "no staging buffer for decoded ETC2 texels; that texture stays blank",
             );
             continue;
         };
-        let staging = unsafe { std::slice::from_raw_parts_mut(decoded.mapped as *mut u8, len) };
+        let staging = unsafe { std::slice::from_raw_parts_mut(staged.mapped as *mut u8, len) };
         decode_region(format, mapped, region, staging);
+        texel_bytes += len as u64;
         let copy = vk::BufferImageCopy {
-            buffer_offset: 0,
+            buffer_offset: staged.offset,
             buffer_row_length: 0,
             buffer_image_height: 0,
             ..*region
@@ -764,7 +903,7 @@ unsafe extern "system" fn cmd_copy_buffer_to_image(
         unsafe {
             host_copy(
                 command_buffer,
-                decoded.buffer,
+                staged.slab,
                 dst_image,
                 dst_image_layout,
                 1,
@@ -775,10 +914,15 @@ unsafe extern "system" fn cmd_copy_buffer_to_image(
             t.decoded
                 .entry(src_buffer.as_raw())
                 .or_default()
-                .push(decoded)
+                .push(staged.slab)
         });
         if !UPLOADED.swap(true, Ordering::Relaxed) {
             tracing::info!(?format, "vk-etc2: first ETC2 texture decoded and uploaded");
+        }
+    }
+    if let Ok(mut host) = HOST.lock() {
+        if let Some(host) = host.as_mut() {
+            host.uploads.record(texel_bytes, started.elapsed());
         }
     }
 }
@@ -818,6 +962,75 @@ mod tests {
         let mut staging = vec![0u8; decoded_bytes(format, region)];
         decode_region(format, mapped, region, &mut staging);
         staging
+    }
+
+    fn space(capacity: u64, used: u64, regions: usize) -> SlabSpace {
+        SlabSpace {
+            capacity,
+            used,
+            regions,
+        }
+    }
+
+    #[test]
+    fn regions_pack_into_a_slab_at_aligned_offsets_until_it_is_full() {
+        let mut slab = space(1024, 0, 0);
+        assert_eq!(slab.reserve(100), Some(0));
+        assert_eq!(slab.reserve(100), Some(128));
+        assert_eq!(slab.reserve(768), Some(256));
+        assert_eq!(slab.reserve(1), None);
+        assert_eq!(slab, space(1024, 1024, 3));
+    }
+
+    #[test]
+    fn a_slab_starts_over_once_every_region_is_released() {
+        let mut slab = space(1024, 0, 0);
+        assert_eq!(slab.reserve(600), Some(0));
+        assert_eq!(slab.reserve(100), Some(640));
+        slab.release();
+        assert_eq!(slab.reserve(400), None);
+        slab.release();
+        assert_eq!(slab.reserve(1024), Some(0));
+    }
+
+    #[test]
+    fn uploads_fill_a_slab_in_use_before_touching_an_idle_one() {
+        let slabs = [space(1024, 0, 0), space(1024, 512, 2), space(1024, 1000, 1)];
+        assert_eq!(slab_with_room(slabs.into_iter(), 256), Some(1));
+        assert_eq!(slab_with_room(slabs.into_iter(), 600), Some(0));
+    }
+
+    #[test]
+    fn an_idle_slab_is_chosen_by_the_smallest_capacity_that_fits() {
+        let slabs = [space(4096, 0, 0), space(1024, 900, 0), space(2048, 0, 0)];
+        assert_eq!(slab_with_room(slabs.into_iter(), 1000), Some(1));
+        assert_eq!(slab_with_room(slabs.into_iter(), 1500), Some(2));
+        assert_eq!(slab_with_room(slabs.into_iter(), 5000), None);
+    }
+
+    #[test]
+    fn idle_slabs_beyond_the_keep_limit_are_given_up_largest_first() {
+        let kept = [space(IDLE_SLAB_KEEP_BYTES, 0, 0), space(SLAB_BYTES, 0, 1)];
+        assert_eq!(surplus_idle_slab(kept.into_iter()), None);
+        let over = [
+            space(SLAB_BYTES, 0, 0),
+            space(2 * IDLE_SLAB_KEEP_BYTES, 0, 1),
+            space(IDLE_SLAB_KEEP_BYTES, 0, 0),
+            space(SLAB_BYTES, 0, 0),
+        ];
+        assert_eq!(surplus_idle_slab(over.into_iter()), Some(2));
+    }
+
+    #[test]
+    fn upload_totals_keep_the_sum_and_the_longest_call() {
+        let mut totals = UploadTotals::default();
+        totals.record(4096, Duration::from_micros(300));
+        totals.record(1024, Duration::from_micros(900));
+        totals.record(16, Duration::from_micros(100));
+        assert_eq!(totals.calls, 3);
+        assert_eq!(totals.texel_bytes, 5136);
+        assert_eq!(totals.time, Duration::from_micros(1300));
+        assert_eq!(totals.longest, Duration::from_micros(900));
     }
 
     #[test]
