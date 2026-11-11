@@ -512,6 +512,17 @@ class DesktopWindowsTest(unittest.TestCase):
         )
 
 
+class SteppedClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
 class FakeHyprlandTest(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -540,6 +551,9 @@ class FakeHyprlandTest(unittest.TestCase):
         grace = mock.patch("measure.HIDE_RULE_GRACE_S", 0.5)
         grace.start()
         self.addCleanup(grace.stop)
+        clock = mock.patch("measure.time", SteppedClock())
+        clock.start()
+        self.addCleanup(clock.stop)
 
     def compositor(self, output=None, **overrides):
         with mock.patch.dict(os.environ, self.environment | overrides):
