@@ -428,6 +428,82 @@ fn burst_follows_performance_mode_and_device_limits() {
     );
 }
 
+struct AskedDevice {
+    route: &'static AtomicU64,
+    last_reported: Option<HostDeviceConfigs>,
+    asked: usize,
+}
+
+impl AskedDevice {
+    fn on(route: &'static AtomicU64) -> Self {
+        Self {
+            route,
+            last_reported: None,
+            asked: 0,
+        }
+    }
+
+    fn open(&mut self, data_path: DataPath, answer: Result<u32, i32>) -> Result<u32, i32> {
+        let (route, asked) = (self.route, &mut self.asked);
+        device_configs(&mut self.last_reported, data_path, || {
+            *asked += 1;
+            answer.map(|sample_rate| HostDeviceConfigs {
+                route: Route::on(route),
+                default: device_default(2, sample_rate, cpal::SampleFormat::F32),
+                ranges: vec![range(2, cpal::SampleFormat::F32)],
+            })
+        })
+        .map(|configs| configs.default.sample_rate())
+    }
+}
+
+const WITH_DATA_CALLBACK: DataPath = DataPath::Callback(DataCallbackTarget {
+    func: write_silence,
+    user_data: 0,
+});
+
+#[test]
+fn an_open_without_a_data_callback_reuses_what_the_device_last_reported() {
+    static ROUTE: AtomicU64 = AtomicU64::new(0);
+    let mut device = AskedDevice::on(&ROUTE);
+    assert_eq!(device.open(DataPath::ReadWrite, Ok(44_100)), Ok(44_100));
+    assert_eq!(device.open(DataPath::ReadWrite, Ok(48_000)), Ok(44_100));
+    assert_eq!(device.asked, 1);
+}
+
+#[test]
+fn an_open_with_a_data_callback_asks_the_device_again() {
+    static ROUTE: AtomicU64 = AtomicU64::new(0);
+    let mut device = AskedDevice::on(&ROUTE);
+    assert_eq!(device.open(DataPath::ReadWrite, Ok(44_100)), Ok(44_100));
+    assert_eq!(device.open(WITH_DATA_CALLBACK, Ok(48_000)), Ok(48_000));
+    assert_eq!(device.open(DataPath::ReadWrite, Ok(96_000)), Ok(48_000));
+    assert_eq!(device.asked, 2);
+}
+
+#[test]
+fn a_route_change_makes_the_next_open_ask_the_device_again() {
+    static ROUTE: AtomicU64 = AtomicU64::new(0);
+    let mut device = AskedDevice::on(&ROUTE);
+    assert_eq!(device.open(DataPath::ReadWrite, Ok(44_100)), Ok(44_100));
+    ROUTE.fetch_add(1, Ordering::AcqRel);
+    assert_eq!(device.open(DataPath::ReadWrite, Ok(48_000)), Ok(48_000));
+    assert_eq!(device.asked, 2);
+}
+
+#[test]
+fn a_device_that_stops_answering_is_asked_again_at_the_next_open() {
+    static ROUTE: AtomicU64 = AtomicU64::new(0);
+    let mut device = AskedDevice::on(&ROUTE);
+    assert_eq!(device.open(DataPath::ReadWrite, Ok(44_100)), Ok(44_100));
+    assert_eq!(
+        device.open(WITH_DATA_CALLBACK, Err(AAUDIO_ERROR_UNAVAILABLE)),
+        Err(AAUDIO_ERROR_UNAVAILABLE)
+    );
+    assert_eq!(device.open(DataPath::ReadWrite, Ok(48_000)), Ok(48_000));
+    assert_eq!(device.asked, 3);
+}
+
 #[test]
 fn builder_parameters_are_validated_at_open() {
     unsafe extern "C" fn cb(_: *mut c_void, _: *mut c_void, _: *mut c_void, _: i32) -> i32 {

@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -1234,37 +1234,91 @@ where
     )
 }
 
+struct HostDeviceConfigs {
+    route: Route,
+    default: cpal::SupportedStreamConfig,
+    ranges: Vec<cpal::SupportedStreamConfigRange>,
+}
+
+impl HostDeviceConfigs {
+    fn ask(device: &cpal::Device, direction: Direction) -> Result<Self, i32> {
+        let unavailable = |error: &dyn std::fmt::Display| {
+            tracing::warn!(target: "eclipse::audio", %error, "AAudio: host device configuration unavailable");
+            AAUDIO_ERROR_UNAVAILABLE
+        };
+        let route = Route::of(direction);
+        let (default, ranges) = match direction {
+            Direction::Output => (
+                device
+                    .default_output_config()
+                    .map_err(|e| unavailable(&e))?,
+                device
+                    .supported_output_configs()
+                    .map_err(|e| unavailable(&e))?
+                    .collect(),
+            ),
+            Direction::Input => (
+                device.default_input_config().map_err(|e| unavailable(&e))?,
+                device
+                    .supported_input_configs()
+                    .map_err(|e| unavailable(&e))?
+                    .collect(),
+            ),
+        };
+        Ok(Self {
+            route,
+            default,
+            ranges,
+        })
+    }
+}
+
+static OUTPUT_DEVICE_CONFIGS: Mutex<Option<HostDeviceConfigs>> = Mutex::new(None);
+
+static INPUT_DEVICE_CONFIGS: Mutex<Option<HostDeviceConfigs>> = Mutex::new(None);
+
+fn last_reported_configs(direction: Direction) -> &'static Mutex<Option<HostDeviceConfigs>> {
+    match direction {
+        Direction::Output => &OUTPUT_DEVICE_CONFIGS,
+        Direction::Input => &INPUT_DEVICE_CONFIGS,
+    }
+}
+
+fn device_configs(
+    last_reported: &mut Option<HostDeviceConfigs>,
+    data_path: DataPath,
+    ask: impl FnOnce() -> Result<HostDeviceConfigs, i32>,
+) -> Result<&HostDeviceConfigs, i32> {
+    let opens_no_host_stream = matches!(data_path, DataPath::ReadWrite);
+    let still_current = last_reported
+        .take()
+        .filter(|configs| opens_no_host_stream && !configs.route.changed());
+    let configs = match still_current {
+        Some(configs) => configs,
+        None => ask()?,
+    };
+    Ok(last_reported.insert(configs))
+}
+
 fn plan_host_stream(
     device: &cpal::Device,
     params: &StreamParameters,
 ) -> Result<HostStreamPlan, i32> {
-    let unavailable = |error: &dyn std::fmt::Display| {
-        tracing::warn!(target: "eclipse::audio", %error, "AAudio: host device configuration unavailable");
-        AAUDIO_ERROR_UNAVAILABLE
-    };
-    let (device_default, ranges): (_, Vec<_>) = match params.direction {
-        Direction::Output => (
-            device
-                .default_output_config()
-                .map_err(|e| unavailable(&e))?,
-            device
-                .supported_output_configs()
-                .map_err(|e| unavailable(&e))?
-                .collect(),
-        ),
-        Direction::Input => (
-            device.default_input_config().map_err(|e| unavailable(&e))?,
-            device
-                .supported_input_configs()
-                .map_err(|e| unavailable(&e))?
-                .collect(),
-        ),
-    };
-    let format = negotiate_format(params.format, &device_default, ranges)?;
+    let mut last_reported = last_reported_configs(params.direction)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let configs = device_configs(&mut last_reported, params.data_path, || {
+        HostDeviceConfigs::ask(device, params.direction)
+    })?;
+    let format = negotiate_format(
+        params.format,
+        &configs.default,
+        configs.ranges.iter().cloned(),
+    )?;
     let burst = burst_frames(
         format.sample_rate,
         params.performance_mode,
-        device_default.buffer_size(),
+        configs.default.buffer_size(),
     );
     Ok(HostStreamPlan {
         format,
