@@ -24,7 +24,7 @@
   <screenshots>
     <screenshot type="default">
       <caption>The launch window downloading the official Roblox client</caption>
-      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.19/packaging/flatpak/screenshots/first-launch.png</image>
+      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.20/packaging/flatpak/screenshots/first-launch.png</image>
     </screenshot>
   </screenshots>
   <url type="homepage">https://github.com/Kuenec/Eclipse</url>
@@ -57,6 +57,19 @@
     <color type="primary" scheme_preference="dark">#9e391b</color>
   </branding>
   <releases>
+    <release version="0.1.20" date="2026-11-11">
+      <description>
+        <ul>
+          <li>
+            Less stutter on Vulkan when a game starts: Eclipse sets up the memory for decoded
+            textures when Roblox opens its graphics device, not while frames are drawn.
+          </li>
+          <li>
+            Updated dependencies.
+          </li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.19" date="2026-11-10">
       <description>
         <ul>
