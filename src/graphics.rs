@@ -25,7 +25,7 @@ mod wayland_window;
 mod window_activity;
 pub mod window_state;
 
-const CLEAR_COLOR: [f32; 4] = [0.149, 0.408, 0.722, 1.0];
+const CLEAR_COLOR: [f32; 4] = [0.098, 0.106, 0.122, 1.0];
 
 const QUAD_VERT_SPV: &[u8] = include_bytes!("../shaders/quad.vert.spv");
 const QUAD_FRAG_SPV: &[u8] = include_bytes!("../shaders/quad.frag.spv");
@@ -165,6 +165,8 @@ struct GameWindow<'vm> {
     dialogs: dialog_window::DialogWindows,
 
     commands: Option<&'vm std::sync::mpsc::Receiver<launch_window::WindowCommand>>,
+
+    splash: Option<launch_window::Splash>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -591,6 +593,18 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                     self.window_frame_shown();
                 }
                 self.drive_custom_view_draw();
+                // Wayland maps a window at its first drawn frame, so not drawing keeps the game
+                // window hidden behind the splash until Roblox draws.
+                let first_frame = crate::first_frame::shown();
+                if let Some(splash) = &self.splash {
+                    if splash.hides_game_window(first_frame, std::time::Instant::now()) {
+                        if let Some(window) = self.window.as_ref() {
+                            window.request_redraw();
+                        }
+                        return;
+                    }
+                    self.splash = None;
+                }
                 if let (Some(window), Some(renderer)) =
                     (self.window.as_ref(), self.renderer.as_mut())
                 {
@@ -2573,9 +2587,15 @@ pub fn run_windowed(
     title: &str,
     vm: Option<&crate::runtime::Vm>,
     config: &eclipse_config::Config,
-    commands: Option<&std::sync::mpsc::Receiver<launch_window::WindowCommand>>,
+    launch: Option<(
+        &std::sync::mpsc::Receiver<launch_window::WindowCommand>,
+        launch_window::Splash,
+    )>,
     window_state: window_state::WindowStateFile,
 ) -> Result<(), GraphicsError> {
+    let (commands, splash) = launch.map_or((None, None), |(commands, splash)| {
+        (Some(commands), Some(splash))
+    });
     let hidden_pacing =
         window_activity::HiddenPacing::from_env().map_err(GraphicsError::HiddenPacing)?;
     let _event_loop_thread = crate::framework::lifecycle::EventLoopThread::enter();
@@ -2639,6 +2659,7 @@ pub fn run_windowed(
         activation_token,
         dialogs: dialog_window::DialogWindows::default(),
         commands,
+        splash,
     };
     let run = event_loop.run_app_on_demand(&mut app);
 
