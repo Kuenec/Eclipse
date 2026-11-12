@@ -221,45 +221,51 @@ impl PcmRing {
     }
 }
 
-fn fill_output(ring: &mut PcmRing, out: &mut [f32]) -> u32 {
-    let mut fires = 0;
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Filled {
+    samples: usize,
+    fires: u32,
+}
+
+fn fill_output(ring: &mut PcmRing, out: &mut [f32]) -> Filled {
+    let mut filled = Filled::default();
     if ring.play_state != SL_PLAYSTATE_PLAYING {
         out.fill(0.0);
-        return fires;
+        return filled;
     }
-    let mut written = 0usize;
-    while written < out.len() {
+    while filled.samples < out.len() {
         let Some(front) = ring.queue.front() else {
-            out[written..].fill(0.0);
             break;
         };
-        if ring.front_pos >= front.len() {
-            if let Some(drained) = ring.queue.pop_front() {
-                ring.spare.push(drained);
-            }
-            ring.front_pos = 0;
-            ring.drained_buffers += 1;
-            if ring.callback.is_some() {
-                ring.callback_fires += 1;
-                fires += 1;
-            }
+        let n = (front.len() - ring.front_pos).min(out.len() - filled.samples);
+        out[filled.samples..filled.samples + n]
+            .copy_from_slice(&front[ring.front_pos..ring.front_pos + n]);
+        ring.front_pos += n;
+        filled.samples += n;
+        if ring.front_pos < front.len() {
             continue;
         }
-        let avail = front.len() - ring.front_pos;
-        let n = avail.min(out.len() - written);
-        out[written..written + n].copy_from_slice(&front[ring.front_pos..ring.front_pos + n]);
-        ring.front_pos += n;
-        written += n;
+        if let Some(drained) = ring.queue.pop_front() {
+            ring.spare.push(drained);
+        }
+        ring.front_pos = 0;
+        ring.drained_buffers += 1;
+        if ring.callback.is_some() {
+            ring.callback_fires += 1;
+            filled.fires += 1;
+        }
     }
+    let (played, silent) = out.split_at_mut(filled.samples);
+    silent.fill(0.0);
     let gain = if ring.muted {
         0.0
     } else {
         10.0_f32.powf(f32::from(ring.volume_level_mb) / 2000.0)
     };
     if gain != 1.0 {
-        out.iter_mut().for_each(|sample| *sample *= gain);
+        played.iter_mut().for_each(|sample| *sample *= gain);
     }
-    fires
+    filled
 }
 
 enum ObjectKind {
@@ -401,6 +407,22 @@ struct EngineItfVtable {
         *const c_void,
         *const c_void,
     ) -> u32,
+    create_midi_player: extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        u32,
+        *const c_void,
+        *const c_void,
+    ) -> u32,
+    create_listener:
+        extern "C" fn(*mut c_void, *mut c_void, u32, *const c_void, *const c_void) -> u32,
+    create_3d_group:
+        extern "C" fn(*mut c_void, *mut c_void, u32, *const c_void, *const c_void) -> u32,
     create_output_mix:
         extern "C" fn(*mut c_void, *mut c_void, u32, *const c_void, *const c_void) -> u32,
     create_metadata_extractor: extern "C" fn(
@@ -553,6 +575,9 @@ fn engine_vtable() -> *const EngineItfVtable {
             create_vibra_device: eng_create_unsupported7,
             create_audio_player: eng_create_audio_player,
             create_audio_recorder: eng_create_recorder,
+            create_midi_player: eng_create_midi_player,
+            create_listener: eng_create_unsupported5,
+            create_3d_group: eng_create_unsupported5,
             create_output_mix: eng_create_output_mix,
             create_metadata_extractor: eng_create_metadata,
             create_extension_object: eng_create_extension,
@@ -929,6 +954,31 @@ extern "C" fn eng_create_recorder(
     _d: u32,
     _e: *const c_void,
     _f: *const c_void,
+) -> u32 {
+    SL_RESULT_FEATURE_UNSUPPORTED
+}
+
+extern "C" fn eng_create_midi_player(
+    _s: *mut c_void,
+    _a: *mut c_void,
+    _b: *mut c_void,
+    _c: *mut c_void,
+    _d: *mut c_void,
+    _e: *mut c_void,
+    _f: *mut c_void,
+    _g: u32,
+    _h: *const c_void,
+    _i: *const c_void,
+) -> u32 {
+    SL_RESULT_FEATURE_UNSUPPORTED
+}
+
+extern "C" fn eng_create_unsupported5(
+    _s: *mut c_void,
+    _a: *mut c_void,
+    _b: u32,
+    _c: *const c_void,
+    _d: *const c_void,
 ) -> u32 {
     SL_RESULT_FEATURE_UNSUPPORTED
 }
@@ -1691,26 +1741,32 @@ impl RingRenderer {
         T: cpal::SizedSample + cpal::FromSample<f32>,
     {
         self.host_callbacks.fetch_add(1, Ordering::Relaxed);
-        let (fires, callback) = match self.ring.lock() {
-            Ok(mut guard) => {
-                let mut fires = 0;
-                for chunk in data.chunks_mut(self.scratch.len()) {
-                    let scratch = &mut self.scratch[..chunk.len()];
-                    fires += fill_output(&mut guard, scratch);
-                    for (o, s) in chunk.iter_mut().zip(scratch.iter()) {
-                        *o = T::from_sample(*s);
+        for chunk in data.chunks_mut(self.scratch.len()) {
+            let scratch = &mut self.scratch[..chunk.len()];
+            let mut written = 0;
+            loop {
+                let (filled, callback) = match self.ring.lock() {
+                    Ok(mut guard) => (
+                        fill_output(&mut guard, &mut scratch[written..]),
+                        guard.callback,
+                    ),
+                    Err(_) => {
+                        scratch[written..].fill(0.0);
+                        break;
                     }
+                };
+                written += filled.samples;
+                let Some(callback) = callback.filter(|_| filled.fires > 0) else {
+                    break;
+                };
+                fire_buffer_callbacks(&self.ring, callback, filled.fires);
+                if written == scratch.len() {
+                    break;
                 }
-                (fires, guard.callback)
             }
-            Err(_) => {
-                data.iter_mut().for_each(|s| *s = T::from_sample(0.0));
-                return;
+            for (o, s) in chunk.iter_mut().zip(scratch.iter()) {
+                *o = T::from_sample(*s);
             }
-        };
-
-        if let Some(callback) = callback.filter(|_| fires > 0) {
-            fire_buffer_callbacks(&self.ring, callback, fires);
         }
     }
 }

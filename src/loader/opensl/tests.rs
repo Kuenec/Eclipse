@@ -107,8 +107,8 @@ fn fill_output_silence_when_not_playing() {
     let mut ring = PcmRing::new(MONO_16, 2);
     ring.queue.push_back(vec![0.5; 8]);
     let mut out = [9.0_f32; 4];
-    let fired = fill_output(&mut ring, &mut out);
-    assert_eq!(fired, 0);
+    let filled = fill_output(&mut ring, &mut out);
+    assert_eq!(filled, Filled::default());
     assert_eq!(out, [0.0; 4], "not PLAYING → silence");
 
     assert_eq!(ring.queue, [vec![0.5; 8]]);
@@ -128,15 +128,22 @@ fn fill_output_drains_and_fires_callback_on_buffer_end() {
     });
 
     let mut out4 = [0.0_f32; 4];
-    let fired = fill_output(&mut ring, &mut out4);
+    let filled = fill_output(&mut ring, &mut out4);
     assert_eq!(out4, [0.1, 0.2, 0.3, 0.4]);
-    assert_eq!(fired, 0, "buffer consumed but not yet popped");
-
-    let mut out2 = [9.0_f32; 2];
-    let fired = fill_output(&mut ring, &mut out2);
-    assert_eq!(fired, 1, "one bq-callback fires on buffer end");
+    assert_eq!(
+        filled,
+        Filled {
+            samples: 4,
+            fires: 1
+        },
+        "one bq-callback fires on buffer end"
+    );
     assert_eq!(ring.drained_buffers, 1);
     assert_eq!(ring.callback_fires, 1);
+
+    let mut out2 = [9.0_f32; 2];
+    let filled = fill_output(&mut ring, &mut out2);
+    assert_eq!(filled, Filled::default());
     assert_eq!(out2, [0.0, 0.0], "underrun → silence");
 }
 
@@ -150,7 +157,54 @@ fn fill_output_spans_multiple_buffers() {
     let _ = fill_output(&mut ring, &mut out);
     assert_eq!(out, [1.0, 2.0, 3.0, 4.0], "drains across buffer boundary");
 
-    assert_eq!(ring.drained_buffers, 1);
+    assert_eq!(ring.drained_buffers, 2);
+}
+
+#[test]
+fn a_host_buffer_longer_than_the_queue_plays_what_the_callback_enqueues() {
+    const BUFFER_SAMPLES: u32 = 4;
+    static NEXT_SAMPLE: AtomicU32 = AtomicU32::new(0);
+    static REJECTED: AtomicU32 = AtomicU32::new(0);
+    fn ramp(first: u32) -> Vec<u8> {
+        (first..first + BUFFER_SAMPLES)
+            .flat_map(|sample| (sample as i16 * 256).to_le_bytes())
+            .collect()
+    }
+    extern "C" fn enqueue_next(_caller: *mut c_void, ctx: *mut c_void) {
+        let ring = unsafe { &*(ctx as *const Mutex<PcmRing>) };
+        let first = NEXT_SAMPLE.fetch_add(BUFFER_SAMPLES, Ordering::SeqCst);
+        let enqueued = ring.lock().map(|mut ring| ring.enqueue(&ramp(first)));
+        if !matches!(enqueued, Ok(SL_RESULT_SUCCESS)) {
+            REJECTED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let ring = Arc::new(Mutex::new(PcmRing::new(MONO_16, 2)));
+    {
+        let mut guard = ring.lock().unwrap();
+        guard.play_state = SL_PLAYSTATE_PLAYING;
+        guard.callback = Some(BufferQueueCallback {
+            func: enqueue_next,
+            context: Arc::as_ptr(&ring) as usize,
+            caller: 0,
+        });
+        assert_eq!(guard.enqueue(&ramp(1)), SL_RESULT_SUCCESS);
+        assert_eq!(guard.enqueue(&ramp(1 + BUFFER_SAMPLES)), SL_RESULT_SUCCESS);
+    }
+    NEXT_SAMPLE.store(1 + 2 * BUFFER_SAMPLES, Ordering::SeqCst);
+
+    let mut renderer = RingRenderer::new(Arc::clone(&ring), Arc::default());
+    let mut out = [9.0_f32; 20];
+    renderer.render(&mut out);
+
+    let expected: [f32; 20] = std::array::from_fn(|i| (i as f32 + 1.0) * 256.0 / 32768.0);
+    assert_eq!(out, expected, "the buffers enqueued mid-callback play on");
+    assert_eq!(REJECTED.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        ring.lock().unwrap().queue.len(),
+        2,
+        "every finished buffer was replaced"
+    );
 }
 
 extern "C" fn noop_cb(_caller: *mut c_void, _ctx: *mut c_void) {}
@@ -180,7 +234,7 @@ fn render_larger_than_the_scratch_matches_one_fill_and_fires_every_drained_buffe
 
     let mut reference_ring = playing_ring();
     let mut expected = vec![0.0f32; total];
-    let expected_fires = fill_output(&mut reference_ring, &mut expected);
+    let expected_fires = fill_output(&mut reference_ring, &mut expected).fires;
 
     let ring = Arc::new(Mutex::new(playing_ring()));
     let mut renderer = RingRenderer::new(Arc::clone(&ring), Arc::default());
@@ -207,6 +261,150 @@ fn public_opensl_constants_match_khronos_abi() {
     assert_eq!(SL_DATALOCATOR_OUTPUTMIX, 4);
     assert_eq!(SL_DATALOCATOR_BUFFERQUEUE, 6);
     assert_eq!(SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 0x8000_07BD);
+}
+
+#[test]
+fn interface_tables_follow_the_khronos_slot_order() {
+    use std::mem::offset_of;
+    fn slots<const N: usize>() -> [usize; N] {
+        std::array::from_fn(|slot| slot * std::mem::size_of::<usize>())
+    }
+
+    assert_eq!(
+        [
+            offset_of!(ObjectItfVtable, realize),
+            offset_of!(ObjectItfVtable, resume),
+            offset_of!(ObjectItfVtable, get_state),
+            offset_of!(ObjectItfVtable, get_interface),
+            offset_of!(ObjectItfVtable, register_callback),
+            offset_of!(ObjectItfVtable, abort_async_operation),
+            offset_of!(ObjectItfVtable, destroy),
+            offset_of!(ObjectItfVtable, set_priority),
+            offset_of!(ObjectItfVtable, get_priority),
+            offset_of!(ObjectItfVtable, set_loss_of_control_interfaces),
+        ],
+        slots(),
+        "SLObjectItf"
+    );
+    assert_eq!(
+        [
+            offset_of!(EngineItfVtable, create_led_device),
+            offset_of!(EngineItfVtable, create_vibra_device),
+            offset_of!(EngineItfVtable, create_audio_player),
+            offset_of!(EngineItfVtable, create_audio_recorder),
+            offset_of!(EngineItfVtable, create_midi_player),
+            offset_of!(EngineItfVtable, create_listener),
+            offset_of!(EngineItfVtable, create_3d_group),
+            offset_of!(EngineItfVtable, create_output_mix),
+            offset_of!(EngineItfVtable, create_metadata_extractor),
+            offset_of!(EngineItfVtable, create_extension_object),
+            offset_of!(EngineItfVtable, query_num_supported_interfaces),
+            offset_of!(EngineItfVtable, query_supported_interfaces),
+            offset_of!(EngineItfVtable, query_num_supported_extensions),
+            offset_of!(EngineItfVtable, query_supported_extension),
+            offset_of!(EngineItfVtable, is_extension_supported),
+        ],
+        slots(),
+        "SLEngineItf"
+    );
+    assert_eq!(
+        [
+            offset_of!(PlayItfVtable, set_play_state),
+            offset_of!(PlayItfVtable, get_play_state),
+            offset_of!(PlayItfVtable, get_duration),
+            offset_of!(PlayItfVtable, get_position),
+            offset_of!(PlayItfVtable, register_callback),
+            offset_of!(PlayItfVtable, set_callback_events_mask),
+            offset_of!(PlayItfVtable, get_callback_events_mask),
+            offset_of!(PlayItfVtable, set_marker_position),
+            offset_of!(PlayItfVtable, clear_marker_position),
+            offset_of!(PlayItfVtable, get_marker_position),
+            offset_of!(PlayItfVtable, set_position_update_period),
+            offset_of!(PlayItfVtable, get_position_update_period),
+        ],
+        slots(),
+        "SLPlayItf"
+    );
+    assert_eq!(
+        [
+            offset_of!(BufferQueueItfVtable, enqueue),
+            offset_of!(BufferQueueItfVtable, clear),
+            offset_of!(BufferQueueItfVtable, get_state),
+            offset_of!(BufferQueueItfVtable, register_callback),
+        ],
+        slots(),
+        "SLAndroidSimpleBufferQueueItf"
+    );
+    assert_eq!(
+        [
+            offset_of!(VolumeItfVtable, set_volume_level),
+            offset_of!(VolumeItfVtable, get_volume_level),
+            offset_of!(VolumeItfVtable, get_max_volume_level),
+            offset_of!(VolumeItfVtable, set_mute),
+            offset_of!(VolumeItfVtable, get_mute),
+            offset_of!(VolumeItfVtable, enable_stereo_position),
+            offset_of!(VolumeItfVtable, is_stereo_position_enabled),
+            offset_of!(VolumeItfVtable, set_stereo_position),
+            offset_of!(VolumeItfVtable, get_stereo_position),
+        ],
+        slots(),
+        "SLVolumeItf"
+    );
+    assert_eq!(
+        [
+            offset_of!(AndroidConfigurationItfVtable, set_configuration),
+            offset_of!(AndroidConfigurationItfVtable, get_configuration),
+            offset_of!(AndroidConfigurationItfVtable, acquire_java_proxy),
+            offset_of!(AndroidConfigurationItfVtable, release_java_proxy),
+        ],
+        slots(),
+        "SLAndroidConfigurationItf"
+    );
+}
+
+#[test]
+fn the_eighth_engine_slot_creates_an_output_mix() {
+    const CREATE_OUTPUT_MIX_SLOT: usize = 7;
+    type CreateOutputMix =
+        extern "C" fn(*mut c_void, *mut c_void, u32, *const c_void, *const c_void) -> u32;
+
+    let mut engine: *mut c_void = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            eclipse_sl_create_engine(
+                std::ptr::addr_of_mut!(engine).cast(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        SL_RESULT_SUCCESS
+    );
+    assert_eq!(obj_realize(engine, 0), SL_RESULT_SUCCESS);
+    let eng_itf = interface(engine, 3);
+
+    let create_output_mix = unsafe {
+        let table = *(eng_itf as *const *const CreateOutputMix);
+        *table.add(CREATE_OUTPUT_MIX_SLOT)
+    };
+    let mut mix: *mut c_void = std::ptr::null_mut();
+    assert_eq!(
+        create_output_mix(
+            eng_itf,
+            std::ptr::addr_of_mut!(mix).cast(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        ),
+        SL_RESULT_SUCCESS
+    );
+    assert!(!mix.is_null(), "CreateOutputMix wrote the output mix");
+    assert_eq!(obj_realize(mix, 0), SL_RESULT_SUCCESS);
+
+    obj_destroy(mix);
+    obj_destroy(engine);
 }
 
 #[test]
@@ -1076,6 +1274,204 @@ fn reopened_players_play_on_a_new_host_output() {
 
             obj_destroy(test_player.player);
             test_player.destroy_rest();
+        },
+    );
+}
+
+unsafe fn khronos_slot<F: Copy>(itf: *mut c_void, slot: usize) -> F {
+    unsafe {
+        let table = *(itf as *const *const F);
+        *table.add(slot)
+    }
+}
+
+#[test]
+fn fmod_start_up_plays_through_the_khronos_slots() {
+    const BLOCK: [u8; 512 * 4] = [0; 512 * 4];
+    const REFILLS_WANTED: u32 = 8;
+    type Realize = extern "C" fn(*mut c_void, u32) -> u32;
+    type GetInterface = extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> u32;
+    type Destroy = extern "C" fn(*mut c_void);
+    type CreateOutputMix =
+        extern "C" fn(*mut c_void, *mut c_void, u32, *const c_void, *const c_void) -> u32;
+    type CreateAudioPlayer = extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        u32,
+        *const c_void,
+        *const c_void,
+    ) -> u32;
+    type SetConfiguration =
+        extern "C" fn(*mut c_void, *const std::ffi::c_char, *const c_void, u32) -> u32;
+    type SetPlayState = extern "C" fn(*mut c_void, u32) -> u32;
+    type Enqueue = extern "C" fn(*mut c_void, *const c_void, u32) -> u32;
+    type Clear = extern "C" fn(*mut c_void) -> u32;
+    type RegisterCallback = extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> u32;
+
+    static REFILLS: AtomicU32 = AtomicU32::new(0);
+    static REJECTED: AtomicU32 = AtomicU32::new(0);
+    extern "C" fn refill(caller: *mut c_void, _ctx: *mut c_void) {
+        let enqueue: Enqueue = unsafe { khronos_slot(caller, 0) };
+        if enqueue(caller, BLOCK.as_ptr().cast(), BLOCK.len() as u32) != SL_RESULT_SUCCESS {
+            REJECTED.fetch_add(1, Ordering::SeqCst);
+        }
+        REFILLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    on_host_output(
+        HostOutput::Null,
+        "fmod_start_up_plays_through_the_khronos_slots",
+        || {
+            let realize = |object: *mut c_void| {
+                let realize: Realize = unsafe { khronos_slot(object, 0) };
+                realize(object, SL_BOOLEAN_FALSE)
+            };
+            let get_interface = |object: *mut c_void, index: usize| {
+                let get_interface: GetInterface = unsafe { khronos_slot(object, 3) };
+                let mut itf: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    get_interface(object, iid_value(index), std::ptr::addr_of_mut!(itf).cast()),
+                    SL_RESULT_SUCCESS
+                );
+                itf
+            };
+            let destroy = |object: *mut c_void| {
+                let destroy: Destroy = unsafe { khronos_slot(object, 6) };
+                destroy(object);
+            };
+
+            let mut engine: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    eclipse_sl_create_engine(
+                        std::ptr::addr_of_mut!(engine).cast(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                SL_RESULT_SUCCESS
+            );
+            assert_eq!(realize(engine), SL_RESULT_SUCCESS);
+            let engine_itf = get_interface(engine, 3);
+
+            let mut mix: *mut c_void = std::ptr::null_mut();
+            let create_output_mix: CreateOutputMix = unsafe { khronos_slot(engine_itf, 7) };
+            assert_eq!(
+                create_output_mix(
+                    engine_itf,
+                    std::ptr::addr_of_mut!(mix).cast(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                SL_RESULT_SUCCESS
+            );
+            assert_eq!(realize(mix), SL_RESULT_SUCCESS);
+
+            let mut queue = SlDataLocatorBufferQueue {
+                locator_type: SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE,
+                num_buffers: 2,
+            };
+            let mut pcm = SlDataFormatPcm {
+                format_type: SL_DATAFORMAT_PCM,
+                num_channels: 2,
+                samples_per_sec: 48_000_000,
+                bits_per_sample: 16,
+                container_size: 16,
+                channel_mask: 3,
+                endianness: 2,
+            };
+            let source = SlDataSource {
+                p_locator: std::ptr::addr_of_mut!(queue).cast(),
+                p_format: std::ptr::addr_of_mut!(pcm).cast(),
+            };
+            let mut mix_locator = SlDataLocatorOutputMix {
+                locator_type: SL_DATALOCATOR_OUTPUTMIX,
+                output_mix: mix,
+            };
+            let sink = SlDataSink {
+                p_locator: std::ptr::addr_of_mut!(mix_locator).cast(),
+                p_format: std::ptr::null(),
+            };
+            let requested = [iid_value(1), iid_value(0)];
+            let required = [SL_BOOLEAN_TRUE; 2];
+            let mut player: *mut c_void = std::ptr::null_mut();
+            let create_audio_player: CreateAudioPlayer = unsafe { khronos_slot(engine_itf, 2) };
+            assert_eq!(
+                create_audio_player(
+                    engine_itf,
+                    std::ptr::addr_of_mut!(player).cast(),
+                    std::ptr::addr_of!(source) as *mut c_void,
+                    std::ptr::addr_of!(sink) as *mut c_void,
+                    requested.len() as u32,
+                    requested.as_ptr().cast(),
+                    required.as_ptr().cast(),
+                ),
+                SL_RESULT_SUCCESS
+            );
+
+            let config = get_interface(player, 0);
+            let set_configuration: SetConfiguration = unsafe { khronos_slot(config, 0) };
+            let stream_type = SL_ANDROID_STREAM_MEDIA;
+            assert_eq!(
+                set_configuration(
+                    config,
+                    c"androidPlaybackStreamType".as_ptr(),
+                    std::ptr::addr_of!(stream_type).cast(),
+                    std::mem::size_of_val(&stream_type) as u32,
+                ),
+                SL_RESULT_SUCCESS
+            );
+            assert_eq!(realize(player), SL_RESULT_SUCCESS);
+
+            let play = get_interface(player, 4);
+            let buffer_queue = get_interface(player, 1);
+            let register_callback: RegisterCallback = unsafe { khronos_slot(buffer_queue, 3) };
+            assert_eq!(
+                register_callback(buffer_queue, refill as *const c_void, std::ptr::null_mut()),
+                SL_RESULT_SUCCESS
+            );
+            let enqueue: Enqueue = unsafe { khronos_slot(buffer_queue, 0) };
+            for _ in 0..2 {
+                assert_eq!(
+                    enqueue(buffer_queue, BLOCK.as_ptr().cast(), BLOCK.len() as u32),
+                    SL_RESULT_SUCCESS
+                );
+            }
+            let set_play_state: SetPlayState = unsafe { khronos_slot(play, 0) };
+            assert_eq!(
+                set_play_state(play, SL_PLAYSTATE_PLAYING),
+                SL_RESULT_SUCCESS
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while REFILLS.load(Ordering::SeqCst) < REFILLS_WANTED {
+                assert!(
+                    Instant::now() < deadline,
+                    "the player stopped asking for buffers"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                REJECTED.load(Ordering::SeqCst),
+                0,
+                "every refill found room in the queue"
+            );
+
+            assert_eq!(
+                set_play_state(play, SL_PLAYSTATE_STOPPED),
+                SL_RESULT_SUCCESS
+            );
+            let clear: Clear = unsafe { khronos_slot(buffer_queue, 1) };
+            assert_eq!(clear(buffer_queue), SL_RESULT_SUCCESS);
+            destroy(player);
+            destroy(mix);
+            destroy(engine);
         },
     );
 }
