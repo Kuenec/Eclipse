@@ -409,7 +409,8 @@ connectivity_sm="$work/smali/android/net/ConnectivityManager.smali"
 [ -f "$connectivity_sm" ] || fail "ConnectivityManager.smali not found after baksmali of the installed framework"
 for connectivity_method in \
     'getLinkProperties(Landroid/net/Network;)Landroid/net/LinkProperties;' \
-    'getNetworkInfo(Landroid/net/Network;)Landroid/net/NetworkInfo;'
+    'getNetworkInfo(Landroid/net/Network;)Landroid/net/NetworkInfo;' \
+    'getRestrictBackgroundStatus()I'
 do
     ! grep -qF "$connectivity_method" "$connectivity_sm" \
         || fail "ConnectivityManager.smali already declares $connectivity_method — installed framework drifted; update patch-framework.sh"
@@ -436,10 +437,20 @@ cat >> "$connectivity_sm" <<'ECLIPSE_CONNECTIVITY_MANAGER_METHODS'
 
     return-object v0
 .end method
+
+.method public getRestrictBackgroundStatus()I
+    .registers 2
+
+    # RESTRICT_BACKGROUND_STATUS_DISABLED: no Data Saver on the host.
+    const/4 v0, 0x1
+
+    return v0
+.end method
 ECLIPSE_CONNECTIVITY_MANAGER_METHODS
 for connectivity_method in \
     'getLinkProperties(Landroid/net/Network;)Landroid/net/LinkProperties;' \
-    'getNetworkInfo(Landroid/net/Network;)Landroid/net/NetworkInfo;'
+    'getNetworkInfo(Landroid/net/Network;)Landroid/net/NetworkInfo;' \
+    'getRestrictBackgroundStatus()I'
 do
     grep -qF "$connectivity_method" "$connectivity_sm" \
         || fail "ConnectivityManager $connectivity_method insert failed"

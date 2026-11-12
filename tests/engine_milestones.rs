@@ -474,6 +474,7 @@ fn framework_overlay_preserves_connectivity_v2_contract() {
     for needle in [
         ".method public getLinkProperties(Landroid/net/Network;)Landroid/net/LinkProperties;",
         ".method public getNetworkInfo(Landroid/net/Network;)Landroid/net/NetworkInfo;",
+        ".method public getRestrictBackgroundStatus()I",
         "cp \"$connectivity_sm\" \"$work/smali-view/android/net/ConnectivityManager.smali\"",
         "smali/android/net/LinkProperties.smali",
         "smali/android/net/LinkAddress.smali",
