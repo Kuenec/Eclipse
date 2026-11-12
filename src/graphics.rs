@@ -25,7 +25,7 @@ mod wayland_window;
 mod window_activity;
 pub mod window_state;
 
-const CLEAR_COLOR: [f32; 4] = [0.149, 0.408, 0.722, 1.0];
+const CLEAR_COLOR: [f32; 4] = [0.098, 0.106, 0.122, 1.0];
 
 const QUAD_VERT_SPV: &[u8] = include_bytes!("../shaders/quad.vert.spv");
 const QUAD_FRAG_SPV: &[u8] = include_bytes!("../shaders/quad.frag.spv");
@@ -52,7 +52,7 @@ const ENGINE_SURFACE_SIZE_FIRST_RETRY_DELAY: std::time::Duration =
 const ENGINE_SURFACE_SIZE_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 const TEXT_PX: f32 = 28.0;
-const TEXT_COLOR: [f32; 4] = [0.08, 0.09, 0.12, 1.0];
+const TEXT_COLOR: [f32; 4] = [0.93, 0.94, 0.96, 1.0];
 
 const TEXT_PAD_X: f32 = 12.0;
 
@@ -165,6 +165,8 @@ struct GameWindow<'vm> {
     dialogs: dialog_window::DialogWindows,
 
     commands: Option<&'vm std::sync::mpsc::Receiver<launch_window::WindowCommand>>,
+
+    splash: Option<launch_window::Splash>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -591,6 +593,18 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                     self.window_frame_shown();
                 }
                 self.drive_custom_view_draw();
+                // Wayland maps a window at its first drawn frame, so not drawing keeps the game
+                // window hidden behind the splash until Roblox draws.
+                let first_frame = crate::first_frame::shown();
+                if let Some(splash) = &self.splash {
+                    if splash.hides_game_window(first_frame, std::time::Instant::now()) {
+                        if let Some(window) = self.window.as_ref() {
+                            window.request_redraw();
+                        }
+                        return;
+                    }
+                    self.splash = None;
+                }
                 if let (Some(window), Some(renderer)) =
                     (self.window.as_ref(), self.renderer.as_mut())
                 {
@@ -2573,9 +2587,15 @@ pub fn run_windowed(
     title: &str,
     vm: Option<&crate::runtime::Vm>,
     config: &eclipse_config::Config,
-    commands: Option<&std::sync::mpsc::Receiver<launch_window::WindowCommand>>,
+    launch: Option<(
+        &std::sync::mpsc::Receiver<launch_window::WindowCommand>,
+        launch_window::Splash,
+    )>,
     window_state: window_state::WindowStateFile,
 ) -> Result<(), GraphicsError> {
+    let (commands, splash) = launch.map_or((None, None), |(commands, splash)| {
+        (Some(commands), Some(splash))
+    });
     let hidden_pacing =
         window_activity::HiddenPacing::from_env().map_err(GraphicsError::HiddenPacing)?;
     let _event_loop_thread = crate::framework::lifecycle::EventLoopThread::enter();
@@ -2639,6 +2659,7 @@ pub fn run_windowed(
         activation_token,
         dialogs: dialog_window::DialogWindows::default(),
         commands,
+        splash,
     };
     let run = event_loop.run_app_on_demand(&mut app);
 
@@ -2754,12 +2775,8 @@ fn is_custom_view_class(class_name: &str) -> bool {
     !class_name.is_empty() && !FRAMEWORK_PREFIXES.iter().any(|p| class_name.starts_with(p))
 }
 
-const DEPTH_PALETTE: [[f32; 4]; 4] = [
-    [0.93, 0.94, 0.96, 1.0],
-    [0.80, 0.85, 0.92, 1.0],
-    [0.66, 0.74, 0.86, 1.0],
-    [0.55, 0.64, 0.80, 1.0],
-];
+// Flat dark fill: views whose drawables Eclipse can't render read as empty, not as nested boxes.
+const DEPTH_PALETTE: [[f32; 4]; 4] = [[0.098, 0.106, 0.122, 1.0]; 4];
 
 const WRAP_FALLBACK_W: f32 = 64.0;
 const WRAP_FALLBACK_H: f32 = TEXT_PX;
