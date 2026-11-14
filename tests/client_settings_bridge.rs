@@ -237,7 +237,10 @@ fn without_user_fflags_a_spaced_app_data_path_stages_the_default_flag_and_contin
             .expect("parse the staged client settings");
     assert_eq!(
         staged,
-        serde_json::json!({"FFlagGameBasicSettingsFramerateCap5": "True"})
+        serde_json::json!({
+            "FFlagDisableLegacyRatingPrompt": "True",
+            "FFlagGameBasicSettingsFramerateCap5": "True",
+        })
     );
 }
 
@@ -263,7 +266,7 @@ fn a_bad_setting_is_reported_once_and_the_other_settings_still_reach_roblox() {
 }
 
 #[test]
-fn an_unreadable_config_stages_only_the_default_flag() {
+fn an_unreadable_config_stages_only_the_default_flags() {
     let root = sandbox_with_config("syntax-error", br#"{"fflags": {"#);
     let app_data = root.join("app-data");
     let output = run_missing_apk(&root, &app_data, false);
@@ -275,7 +278,10 @@ fn an_unreadable_config_stages_only_the_default_flag() {
     assert_eq!(stderr.matches(&problem).count(), 1, "{stderr}");
     assert_eq!(
         staged,
-        serde_json::json!({"FFlagGameBasicSettingsFramerateCap5": "True"})
+        serde_json::json!({
+            "FFlagDisableLegacyRatingPrompt": "True",
+            "FFlagGameBasicSettingsFramerateCap5": "True",
+        })
     );
 }
 

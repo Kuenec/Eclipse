@@ -52,6 +52,7 @@ const CLIENT_SETTINGS_PATH_SHIM_NAME: &str = "libeclipse_client_settings_path.so
 const CLIENT_SETTINGS_PATH_SHIM: &[u8] =
     include_bytes!(env!("ECLIPSE_CLIENT_SETTINGS_PATH_SHIM_SO"));
 const MAXIMUM_FRAME_RATE_ROW_FLAG: &str = "FFlagGameBasicSettingsFramerateCap5";
+const NO_RATING_PROMPT_FLAG: &str = "FFlagDisableLegacyRatingPrompt";
 
 const RUN_COMMAND: &str = "run";
 const CHECK_UPDATE_OPTION: &str = "--check-update";
@@ -957,10 +958,10 @@ fn prepend_search_list_entry(
 }
 
 fn client_app_settings_json(fflags: &BTreeMap<String, serde_json::Value>) -> Vec<u8> {
-    let mut settings = serde_json::Map::from_iter([(
-        MAXIMUM_FRAME_RATE_ROW_FLAG.to_owned(),
-        serde_json::Value::from("True"),
-    )]);
+    let mut settings = serde_json::Map::from_iter(
+        [MAXIMUM_FRAME_RATE_ROW_FLAG, NO_RATING_PROMPT_FLAG]
+            .map(|flag| (flag.to_owned(), serde_json::Value::from("True"))),
+    );
     settings.extend(fflags.clone());
     format!("{:#}\n", serde_json::Value::Object(settings)).into_bytes()
 }
@@ -4972,10 +4973,13 @@ mod tests {
     }
 
     #[test]
-    fn client_app_settings_enable_only_the_maximum_frame_rate_row_by_default() {
+    fn client_app_settings_show_the_frame_rate_row_and_hide_the_rating_prompt_by_default() {
         assert_eq!(
             client_app_settings(&BTreeMap::new()),
-            serde_json::json!({"FFlagGameBasicSettingsFramerateCap5": "True"})
+            serde_json::json!({
+                "FFlagDisableLegacyRatingPrompt": "True",
+                "FFlagGameBasicSettingsFramerateCap5": "True",
+            })
         );
     }
 
@@ -4989,6 +4993,7 @@ mod tests {
             client_app_settings(&fflags),
             serde_json::json!({
                 "DFIntExample": 42,
+                "FFlagDisableLegacyRatingPrompt": "True",
                 "FFlagGameBasicSettingsFramerateCap5": "True",
             })
         );
@@ -5002,7 +5007,10 @@ mod tests {
         )]);
         assert_eq!(
             client_app_settings(&fflags),
-            serde_json::json!({"FFlagGameBasicSettingsFramerateCap5": "False"})
+            serde_json::json!({
+                "FFlagDisableLegacyRatingPrompt": "True",
+                "FFlagGameBasicSettingsFramerateCap5": "False",
+            })
         );
     }
 }
