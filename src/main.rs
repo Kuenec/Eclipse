@@ -2547,14 +2547,14 @@ impl Host<'_> {
     ) -> Result<(), eclipse::graphics::GraphicsError> {
         match &mut self.window {
             Some((window, _)) => {
-                let (event_loop, activation_token, commands) = window.event_loop();
+                let (event_loop, activation_token, commands, splash) = window.event_loop();
                 eclipse::graphics::run_windowed(
                     event_loop,
                     activation_token,
                     title,
                     Some(vm),
                     config,
-                    Some(commands),
+                    Some((commands, splash)),
                     window_state,
                 )
             }

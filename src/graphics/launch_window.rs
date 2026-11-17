@@ -30,17 +30,18 @@ use crate::status::{Progress, StatusUpdate};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ACTIVATION_WAIT: Duration = Duration::from_millis(500);
-const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(820.0, 460.0);
-const PADDING: i32 = 32;
+// Fits the step, progress bar and progress line; failures also get the separate failure report.
+const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(480.0, 140.0);
+const PADDING: i32 = 24;
 const SECTION_GAP: i32 = 16;
 const BAR_HEIGHT: i32 = 14;
 const MAX_WARNINGS: usize = 3;
-const BACKGROUND: i32 = 0xFFF3_F5F8_u32 as i32;
-const BAR_TRACK: i32 = 0xFFD5_DBE5_u32 as i32;
+const BACKGROUND: i32 = 0xFF19_1B1F_u32 as i32;
+const BAR_TRACK: i32 = 0xFF2C_2F36_u32 as i32;
 const BAR_FILL: i32 = 0xFF2F_6FD6_u32 as i32;
-const WARNING_BACKGROUND: i32 = 0xFFFF_F2CC_u32 as i32;
-const ERROR_BACKGROUND: i32 = 0xFFFD_E2E1_u32 as i32;
-pub(super) const BUTTON_BACKGROUND: i32 = 0xFFC9_D8F2_u32 as i32;
+const WARNING_BACKGROUND: i32 = 0xFF4A_3F1A_u32 as i32;
+const ERROR_BACKGROUND: i32 = 0xFF4A_2226_u32 as i32;
+pub(super) const BUTTON_BACKGROUND: i32 = 0xFF3A_4150_u32 as i32;
 const LINEAR_LAYOUT: &str = "android.widget.LinearLayout";
 const FRAME_LAYOUT: &str = "android.widget.FrameLayout";
 const TEXT_VIEW: &str = "android.widget.TextView";
@@ -208,10 +209,16 @@ impl LaunchWindow {
         &mut HostEventLoop,
         Option<ActivationToken>,
         &Receiver<WindowCommand>,
+        Splash,
     ) {
         let token = self.activation_token();
+        let splash = Splash {
+            _renderer: self.screen.renderer.take(),
+            window: self.screen.window.take(),
+            since: Instant::now(),
+        };
         self.close();
-        (&mut self.event_loop, token, &self.screen.commands)
+        (&mut self.event_loop, token, &self.screen.commands, splash)
     }
 
     pub fn ask(&mut self, prompt: Prompt) -> Result<Answered, WindowClosed> {
@@ -289,6 +296,27 @@ impl LaunchWindow {
             PumpStatus::Exit(_) => false,
         };
     }
+}
+
+/// The launch window, left on screen while the game window stays hidden until Roblox draws.
+pub struct Splash {
+    // Field order is drop order: the renderer goes before the window it draws on.
+    _renderer: Option<WindowRenderer>,
+    window: Option<Window>,
+    since: Instant,
+}
+
+/// Longest the game window stays hidden, in case Roblox shows only Android views.
+const SPLASH_LIMIT: Duration = Duration::from_secs(30);
+
+impl Splash {
+    pub(crate) fn hides_game_window(&self, first_frame_shown: bool, now: Instant) -> bool {
+        self.window.is_some() && hides_game_window(first_frame_shown, self.since, now)
+    }
+}
+
+fn hides_game_window(first_frame_shown: bool, since: Instant, now: Instant) -> bool {
+    !first_frame_shown && now < since + SPLASH_LIMIT
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1275,6 +1303,14 @@ mod tests {
     }
 
     #[test]
+    fn the_game_window_stays_hidden_until_roblox_draws_or_the_limit_passes() {
+        let since = Instant::now();
+        assert!(hides_game_window(false, since, since));
+        assert!(!hides_game_window(true, since, since));
+        assert!(!hides_game_window(false, since, since + SPLASH_LIMIT));
+    }
+
+    #[test]
     fn spacing_follows_the_display_scale() {
         let atlas = monospace_atlas();
         let extent = vk::Extent2D {
@@ -1286,7 +1322,7 @@ mod tests {
             done: 1,
             total: Some(2),
         }));
-        for (scale, padding) in [(1.0, PADDING), (2.0, 2 * PADDING), (1.5, 48)] {
+        for (scale, padding) in [(1.0, PADDING), (2.0, 2 * PADDING), (1.5, PADDING * 3 / 2)] {
             let nodes = content.nodes(&atlas, extent, scale);
             assert_eq!(nodes[0].layout.padding, [padding; 4], "{scale}");
             let track = nodes
