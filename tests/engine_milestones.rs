@@ -469,6 +469,22 @@ fn framework_overlay_preserves_shortcut_manager_contract() {
 }
 
 #[test]
+fn framework_overlay_declares_roblox_haptics_api() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        ".method public vibrate(Landroid/os/VibrationEffect;)V",
+        ".method public static createWaveform([J[II)Landroid/os/VibrationEffect;",
+        ".method public static createPredefined(I)Landroid/os/VibrationEffect;",
+        "cp \"$vesm\" \"$work/smali-view/android/os/VibrationEffect.smali\"",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost haptics fragment {needle:?}; Roblox haptics would abort with NoSuchMethodError (Kuenec/Eclipse#36)"
+        );
+    }
+}
+
+#[test]
 fn framework_overlay_preserves_connectivity_v2_contract() {
     let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
     for needle in [
