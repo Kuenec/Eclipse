@@ -107,6 +107,12 @@ jobs:
         if: env.PUBLISH == 'true'
         uses: actions/configure-pages@v6
 
+      - name: Copy the image's Flatpak runtimes into the writable layer so an update can rename them
+        run: |
+          cp -a /var/lib/flatpak /var/lib/flatpak.writable
+          rm -rf /var/lib/flatpak
+          mv /var/lib/flatpak.writable /var/lib/flatpak
+
       - name: Build the Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3
         with:
