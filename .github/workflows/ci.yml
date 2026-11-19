@@ -121,6 +121,9 @@ jobs:
       - name: Test the NDK surface generator
         run: python3 -m unittest discover --start-directory tools/ndk-surface --pattern 'test_*.py'
 
+      - name: Test the framework surface generator
+        run: python3 -m unittest discover --start-directory tools/framework-overlay --pattern 'test_*.py'
+
       - name: Test the audio harness
         run: python3 -m unittest discover --start-directory tools/audio-harness --pattern 'test_*.py'
 

@@ -469,6 +469,39 @@ fn framework_overlay_preserves_shortcut_manager_contract() {
 }
 
 #[test]
+fn framework_overlay_adds_the_members_roblox_references() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "\"$PYTHON3\" \"$here/surface.py\" --surface \"$surface_list\"",
+        "--view \"$work/smali-view\" --stock \"$work/smali\" --fixed \"$work/smali-check\"",
+        "assemble --api 26 \"$work/smali-view\" -o \"$work/jar/classes2.dex\"",
+        "assemble --api 26 \"$work/smali-check\" -o \"$work/jar/classes.dex\"",
+        "'android/util/EclipseMissingApi*.class'",
+        ".method public getCodeCacheDir()Ljava/io/File;",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost surface fragment {needle:?}; a method Roblox references and \
+             the framework lacks would abort with NoSuchMethodError again"
+        );
+    }
+    let listed: Vec<&str> = include_str!("../tools/framework-overlay/roblox-surface.txt")
+        .lines()
+        .collect();
+    assert!(!listed.is_empty());
+    assert!(
+        listed.windows(2).all(|pair| pair[0] < pair[1]),
+        "roblox-surface.txt is sorted and free of duplicates"
+    );
+    assert!(listed.iter().all(|line| {
+        line.starts_with("method static L")
+            || line.starts_with("method instance L")
+            || line.starts_with("field static L")
+            || line.starts_with("field instance L")
+    }));
+}
+
+#[test]
 fn framework_overlay_declares_the_share_sheet_roblox_opens() {
     let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
     for needle in [

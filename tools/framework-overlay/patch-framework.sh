@@ -214,6 +214,12 @@ grep -qF 'listener.onPixelCopyFinished(ERROR_SOURCE_NO_DATA);' "$pc_src" || fail
 si_src="$here/src/android/content/pm/SigningInfo.java"
 [ -f "$si_src" ] || fail "SigningInfo implementation missing at $si_src"
 grep -qF 'return pastSigningCertificates;' "$si_src" || fail "SigningInfo.java no longer reports the rotation history — the AOSP getSigningCertificateHistory contract regressed"
+missing_api_src="$here/src/android/util/EclipseMissingApi.java"
+[ -f "$missing_api_src" ] || fail "missing-API reporter not found at $missing_api_src"
+surface_list="$here/roblox-surface.txt"
+[ -s "$surface_list" ] || fail "list of the members Roblox references and the framework lacks not found at $surface_list"
+PYTHON3="${PYTHON3:-$(command -v python3 || true)}"
+require_executable "$PYTHON3" "python3 not found (set PYTHON3)"
 sc_src="$here/src/android/content/pm/SigningCertificates.java"
 [ -f "$sc_src" ] || fail "host signing-certificate bridge missing at $sc_src"
 grep -qF 'private static native byte[][] native_signingCertificateHistory();' "$sc_src" || fail "SigningCertificates.java lost its host-verified certificate native"
@@ -261,9 +267,10 @@ grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+th
     "$mcl_src" \
     "$mci_src" \
     "$range_src" \
+    "$missing_api_src" \
     "$r_src"
 
-for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/webkit/WebResourceError*.class' 'android/webkit/EclipseWebResourceRequest*.class' 'android/app/KeyguardManager*.class' 'android/media/audiofx/AudioEffect*.class' 'android/media/audiofx/AcousticEchoCanceler*.class' 'android/media/audiofx/NoiseSuppressor*.class' 'android/security/keystore/KeyGenParameterSpec*.class' 'android/content/pm/SigningInfo*.class' 'android/content/pm/SigningCertificates*.class' 'android/os/PreloadedLibrary*.class' 'android/media/MediaCodecList*.class' 'android/media/MediaCodecInfo*.class' 'android/util/Range*.class'; do
+for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/webkit/WebResourceError*.class' 'android/webkit/EclipseWebResourceRequest*.class' 'android/app/KeyguardManager*.class' 'android/media/audiofx/AudioEffect*.class' 'android/media/audiofx/AcousticEchoCanceler*.class' 'android/media/audiofx/NoiseSuppressor*.class' 'android/security/keystore/KeyGenParameterSpec*.class' 'android/content/pm/SigningInfo*.class' 'android/content/pm/SigningCertificates*.class' 'android/os/PreloadedLibrary*.class' 'android/media/MediaCodecList*.class' 'android/media/MediaCodecInfo*.class' 'android/util/Range*.class' 'android/util/EclipseMissingApi*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     mapfile -t class_files < <(compgen -G "$work/classes/$pattern")
@@ -1423,6 +1430,29 @@ UPSTREAM_CACHE_DIR=$'    new-instance v0, Ljava/io/File;\n\n    new-instance v1,
 CLIENT_CACHE_DIR=$'    const-string v0, "eclipse.client_cache_dir"\n\n    invoke-static {v0}, Ljava/lang/System;->getProperty(Ljava/lang/String;)Ljava/lang/String;\n\n    move-result-object v1\n\n    if-nez v1, :eclipse_client_cache_dir_set\n\n    new-instance v0, Ljava/lang/IllegalStateException;\n\n    const-string v1, "eclipse.client_cache_dir is unset; Eclipse sets it when it boots Roblox"\n\n    invoke-direct {v0, v1}, Ljava/lang/IllegalStateException;-><init>(Ljava/lang/String;)V\n\n    throw v0\n\n    :eclipse_client_cache_dir_set\n    new-instance v0, Ljava/io/File;\n\n    invoke-direct {v0, v1}, Ljava/io/File;-><init>(Ljava/lang/String;)V\n\n    iput-object v0, p0, Landroid/content/Context;->cache_dir:Ljava/io/File;\n'
 replace_upstream_method "$ctxsm" "$UPSTREAM_CACHE_DIR" "$CLIENT_CACHE_DIR" 'getCacheDir /tmp/atl_cache location'
 ! grep -qF '/tmp/atl_cache' "$ctxsm" || fail "Context.smali still names /tmp/atl_cache; Roblox's cache would stay in /tmp"
+! grep -qF '.method public getCodeCacheDir()Ljava/io/File;' "$ctxsm" \
+    || fail "Context.smali already declares getCodeCacheDir() — installed Context drifted; update patch-framework.sh"
+cat >> "$ctxsm" <<'ECLIPSE_CONTEXT_METHODS'
+
+.method public getCodeCacheDir()Ljava/io/File;
+    .registers 4
+
+    new-instance v0, Ljava/io/File;
+
+    invoke-virtual {p0}, Landroid/content/Context;->getCacheDir()Ljava/io/File;
+
+    move-result-object v1
+
+    const-string v2, "code_cache"
+
+    invoke-direct {v0, v1, v2}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
+
+    invoke-virtual {v0}, Ljava/io/File;->mkdirs()Z
+
+    return-object v0
+.end method
+ECLIPSE_CONTEXT_METHODS
+grep -qF '.method public getCodeCacheDir()Ljava/io/File;' "$ctxsm" || fail "Context getCodeCacheDir() insert failed"
 
 afm="$work/smali/android/view/autofill/AutofillManager.smali"
 [ -f "$afm" ] || fail "AutofillManager.smali not found after baksmali"
@@ -2056,7 +2086,12 @@ cp "$jpm" "$work/smali-view/android/app/job/JobParameters.smali"
 cp "$psm" "$work/smali-view/android/graphics/Paint.smali"
 mkdir -p "$work/smali-view/android/widget"
 cp "$etsm" "$work/smali-view/android/widget/EditText.smali"
-"$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
+[ -f "$work/smali-check/android/util/EclipseMissingApi.smali" ] || fail "EclipseMissingApi.smali not in the built classes.dex — every generated method would throw NoClassDefFoundError"
+"$PYTHON3" "$here/surface.py" --surface "$surface_list" \
+    --view "$work/smali-view" --stock "$work/smali" --fixed "$work/smali-check" \
+    || fail "could not add the members Roblox references to the framework"
+"$JAVA" -jar "$SMALI_JAR" assemble --api 26 "$work/smali-check" -o "$work/jar/classes.dex" >/dev/null
+"$JAVA" -jar "$SMALI_JAR" assemble --api 26 "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
 
 cp "$work/stock-classes.dex" "$work/jar/classes3.dex"
 (cd "$work/jar" && "$JAR" cf api-impl.jar classes.dex classes2.dex classes3.dex)
