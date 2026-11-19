@@ -143,11 +143,15 @@ mod tests {
             Some(host(c"strtof128")),
             "libc's strtold reached through libm's NEEDED entry must be the binary128 parser"
         );
-        for name in ["frexpl", "__isnanl", "logl"] {
+        for (name, twin) in [
+            ("frexpl", c"frexpf128"),
+            ("__isnanl", c"__isnanf128"),
+            ("logl", c"logf128"),
+        ] {
             assert_eq!(
-                p.resolve(name),
-                None,
-                "{name} must not bind to glibc's x87 version"
+                p.resolve(name).map(|s| s.addr),
+                Some(host(twin)),
+                "{name} must bind to glibc's binary128 version, not the x87 one"
             );
         }
         assert_eq!(p.resolve("cos").map(|s| s.addr), Some(host(c"cos")));

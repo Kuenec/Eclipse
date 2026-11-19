@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::CString;
 
@@ -90,55 +91,225 @@ impl SymbolProvider for LoadedObjectProvider {
 
 pub struct HostDlsymProvider;
 
-fn glibc_name_for_bionic(abi: Abi, name: &str) -> Option<&str> {
+fn glibc_name_for_bionic(abi: Abi, name: &str) -> Option<Cow<'_, str>> {
     match (abi, name) {
-        (_, "sigsetjmp") => Some("__sigsetjmp"),
-        (Abi::Arm64V8a, name) => Some(name),
+        (_, "sigsetjmp") => Some(Cow::Borrowed("__sigsetjmp")),
+        (Abi::Arm64V8a, name) => Some(Cow::Borrowed(name)),
         (Abi::X86_64, name) => glibc_binary128_name(name),
     }
 }
 
-fn glibc_binary128_name(name: &str) -> Option<&str> {
+fn glibc_binary128_name(name: &str) -> Option<Cow<'_, str>> {
     match name {
-        "fmal" => Some("fmaf128"),
-        "powl" => Some("powf128"),
-        "strtold" => Some("strtof128"),
-        "strtold_l" => Some("strtof128_l"),
-        "wcstold" => Some("wcstof128"),
-        "__clog10l" | "__finitel" | "__fpclassifyl" | "__iscanonicall" | "__iseqsigl"
-        | "__isinfl" | "__isnanl" | "__issignalingl" | "__signbitl" | "__strtold_internal"
-        | "__strtold_l" | "__wcstold_internal" | "__wcstold_l" | "acoshl" | "acosl" | "acospil"
-        | "asinhl" | "asinl" | "asinpil" | "atan2l" | "atan2pil" | "atanhl" | "atanl"
-        | "atanpil" | "cabsl" | "cacoshl" | "cacosl" | "canonicalizel" | "cargl" | "casinhl"
-        | "casinl" | "catanhl" | "catanl" | "cbrtl" | "ccoshl" | "ccosl" | "ceill" | "cexpl"
-        | "cimagl" | "clog10l" | "clogl" | "compoundnl" | "conjl" | "copysignl" | "coshl"
-        | "cosl" | "cospil" | "cpowl" | "cprojl" | "creall" | "csinhl" | "csinl" | "csqrtl"
-        | "ctanhl" | "ctanl" | "daddl" | "ddivl" | "dfmal" | "dmull" | "dreml" | "dsqrtl"
-        | "dsubl" | "erfcl" | "erfl" | "exp10l" | "exp10m1l" | "exp2l" | "exp2m1l" | "expl"
-        | "expm1l" | "fabsl" | "faddl" | "fdiml" | "fdivl" | "ffmal" | "finitel" | "floorl"
-        | "fmaximum_mag_numl" | "fmaximum_magl" | "fmaximum_numl" | "fmaximuml" | "fmaxl"
-        | "fmaxmagl" | "fminimum_mag_numl" | "fminimum_magl" | "fminimum_numl" | "fminimuml"
-        | "fminl" | "fminmagl" | "fmodl" | "fmull" | "frexpl" | "fromfpl" | "fromfpxl"
-        | "fsqrtl" | "fsubl" | "gammal" | "getpayloadl" | "hypotl" | "ilogbl" | "isinfl"
-        | "isnanl" | "j0l" | "j1l" | "jnl" | "ldexpl" | "lgammal" | "lgammal_r" | "llogbl"
-        | "llrintl" | "llroundl" | "log10l" | "log10p1l" | "log1pl" | "log2l" | "log2p1l"
-        | "logbl" | "logl" | "logp1l" | "lrintl" | "lroundl" | "modfl" | "nanl" | "nearbyintl"
-        | "nextafterl" | "nextdownl" | "nexttoward" | "nexttowardf" | "nexttowardl" | "nextupl"
-        | "pownl" | "powrl" | "qecvt" | "qecvt_r" | "qfcvt" | "qfcvt_r" | "qgcvt"
-        | "remainderl" | "remquol" | "rintl" | "rootnl" | "roundevenl" | "roundl" | "rsqrtl"
-        | "scalbl" | "scalblnl" | "scalbnl" | "setpayloadl" | "setpayloadsigl" | "significandl"
-        | "sincosl" | "sinhl" | "sinl" | "sinpil" | "sqrtl" | "strfroml" | "tanhl" | "tanl"
-        | "tanpil" | "tgammal" | "totalorderl" | "totalordermagl" | "truncl" | "ufromfpl"
-        | "ufromfpxl" | "wcstold_l" | "y0l" | "y1l" | "ynl" => None,
-        other => Some(other),
+        "finitel" => Some(Cow::Borrowed("__finitef128")),
+        "isinfl" => Some(Cow::Borrowed("__isinff128")),
+        "isnanl" => Some(Cow::Borrowed("__isnanf128")),
+        "nexttowardl" => Some(Cow::Borrowed("nextafterf128")),
+        name if is_glibc_x87_name(name) => binary128_twin(name).map(Cow::Owned),
+        other => Some(Cow::Borrowed(other)),
     }
+}
+
+fn binary128_twin(name: &str) -> Option<String> {
+    for parser in ["strtold", "wcstold"] {
+        if let Some((before, after)) = name.split_once(parser) {
+            let stem = &parser[..parser.len() - 2];
+            return Some(format!("{before}{stem}f128{after}"));
+        }
+    }
+    let (body, reentrant) = match name.strip_suffix("_r") {
+        Some(body) => (body, "_r"),
+        None => (name, ""),
+    };
+    let stem = body.strip_suffix('l')?;
+    Some(format!("{stem}f128{reentrant}"))
+}
+
+fn is_glibc_x87_name(name: &str) -> bool {
+    matches!(
+        name,
+        "fmal"
+            | "powl"
+            | "strtold"
+            | "strtold_l"
+            | "wcstold"
+            | "__clog10l"
+            | "__finitel"
+            | "__fpclassifyl"
+            | "__iscanonicall"
+            | "__iseqsigl"
+            | "__isinfl"
+            | "__isnanl"
+            | "__issignalingl"
+            | "__signbitl"
+            | "__strtold_internal"
+            | "__strtold_l"
+            | "__wcstold_internal"
+            | "__wcstold_l"
+            | "acoshl"
+            | "acosl"
+            | "acospil"
+            | "asinhl"
+            | "asinl"
+            | "asinpil"
+            | "atan2l"
+            | "atan2pil"
+            | "atanhl"
+            | "atanl"
+            | "atanpil"
+            | "cabsl"
+            | "cacoshl"
+            | "cacosl"
+            | "canonicalizel"
+            | "cargl"
+            | "casinhl"
+            | "casinl"
+            | "catanhl"
+            | "catanl"
+            | "cbrtl"
+            | "ccoshl"
+            | "ccosl"
+            | "ceill"
+            | "cexpl"
+            | "cimagl"
+            | "clog10l"
+            | "clogl"
+            | "compoundnl"
+            | "conjl"
+            | "copysignl"
+            | "coshl"
+            | "cosl"
+            | "cospil"
+            | "cpowl"
+            | "cprojl"
+            | "creall"
+            | "csinhl"
+            | "csinl"
+            | "csqrtl"
+            | "ctanhl"
+            | "ctanl"
+            | "daddl"
+            | "ddivl"
+            | "dfmal"
+            | "dmull"
+            | "dreml"
+            | "dsqrtl"
+            | "dsubl"
+            | "erfcl"
+            | "erfl"
+            | "exp10l"
+            | "exp10m1l"
+            | "exp2l"
+            | "exp2m1l"
+            | "expl"
+            | "expm1l"
+            | "fabsl"
+            | "faddl"
+            | "fdiml"
+            | "fdivl"
+            | "ffmal"
+            | "finitel"
+            | "floorl"
+            | "fmaximum_mag_numl"
+            | "fmaximum_magl"
+            | "fmaximum_numl"
+            | "fmaximuml"
+            | "fmaxl"
+            | "fmaxmagl"
+            | "fminimum_mag_numl"
+            | "fminimum_magl"
+            | "fminimum_numl"
+            | "fminimuml"
+            | "fminl"
+            | "fminmagl"
+            | "fmodl"
+            | "fmull"
+            | "frexpl"
+            | "fromfpl"
+            | "fromfpxl"
+            | "fsqrtl"
+            | "fsubl"
+            | "gammal"
+            | "getpayloadl"
+            | "hypotl"
+            | "ilogbl"
+            | "isinfl"
+            | "isnanl"
+            | "j0l"
+            | "j1l"
+            | "jnl"
+            | "ldexpl"
+            | "lgammal"
+            | "lgammal_r"
+            | "llogbl"
+            | "llrintl"
+            | "llroundl"
+            | "log10l"
+            | "log10p1l"
+            | "log1pl"
+            | "log2l"
+            | "log2p1l"
+            | "logbl"
+            | "logl"
+            | "logp1l"
+            | "lrintl"
+            | "lroundl"
+            | "modfl"
+            | "nanl"
+            | "nearbyintl"
+            | "nextafterl"
+            | "nextdownl"
+            | "nexttoward"
+            | "nexttowardf"
+            | "nexttowardl"
+            | "nextupl"
+            | "pownl"
+            | "powrl"
+            | "qecvt"
+            | "qecvt_r"
+            | "qfcvt"
+            | "qfcvt_r"
+            | "qgcvt"
+            | "remainderl"
+            | "remquol"
+            | "rintl"
+            | "rootnl"
+            | "roundevenl"
+            | "roundl"
+            | "rsqrtl"
+            | "scalbl"
+            | "scalblnl"
+            | "scalbnl"
+            | "setpayloadl"
+            | "setpayloadsigl"
+            | "significandl"
+            | "sincosl"
+            | "sinhl"
+            | "sinl"
+            | "sinpil"
+            | "sqrtl"
+            | "strfroml"
+            | "tanhl"
+            | "tanl"
+            | "tanpil"
+            | "tgammal"
+            | "totalorderl"
+            | "totalordermagl"
+            | "truncl"
+            | "ufromfpl"
+            | "ufromfpxl"
+            | "wcstold_l"
+            | "y0l"
+            | "y1l"
+            | "ynl"
+    )
 }
 
 pub(super) unsafe fn dlsym_bionic_import(
     handle: *mut libc::c_void,
     name: &str,
 ) -> Option<ResolvedSym> {
-    let cname = CString::new(glibc_name_for_bionic(Abi::HOST, name)?).ok()?;
+    let cname = CString::new(glibc_name_for_bionic(Abi::HOST, name)?.as_ref()).ok()?;
 
     let ptr = unsafe { libc::dlsym(handle, cname.as_ptr()) };
     if ptr.is_null() {
@@ -425,13 +596,28 @@ mod tests {
         for (name, x86_64, arm64) in [
             ("sigsetjmp", Some("__sigsetjmp"), Some("__sigsetjmp")),
             ("strtold", Some("strtof128"), Some("strtold")),
+            ("wcstold_l", Some("wcstof128_l"), Some("wcstold_l")),
             ("powl", Some("powf128"), Some("powl")),
-            ("logl", None, Some("logl")),
+            ("logl", Some("logf128"), Some("logl")),
+            ("roundl", Some("roundf128"), Some("roundl")),
+            ("llroundl", Some("llroundf128"), Some("llroundl")),
+            ("lgammal_r", Some("lgammaf128_r"), Some("lgammal_r")),
+            ("isnanl", Some("__isnanf128"), Some("isnanl")),
+            ("nexttowardl", Some("nextafterf128"), Some("nexttowardl")),
             ("nexttoward", None, Some("nexttoward")),
+            ("qecvt_r", None, Some("qecvt_r")),
             ("memcpy", Some("memcpy"), Some("memcpy")),
         ] {
-            assert_eq!(glibc_name_for_bionic(Abi::X86_64, name), x86_64, "{name}");
-            assert_eq!(glibc_name_for_bionic(Abi::Arm64V8a, name), arm64, "{name}");
+            assert_eq!(
+                glibc_name_for_bionic(Abi::X86_64, name).as_deref(),
+                x86_64,
+                "{name}"
+            );
+            assert_eq!(
+                glibc_name_for_bionic(Abi::Arm64V8a, name).as_deref(),
+                arm64,
+                "{name}"
+            );
         }
     }
 
@@ -454,6 +640,7 @@ mod tests {
         use std::ffi::{c_char, c_int};
 
         const TWO: u64 = 0x4000_0000_0000_0000;
+        const TWO_AND_A_HALF: u64 = 0x4000_4000_0000_0000;
         const THREE: u64 = 0x4000_8000_0000_0000;
         const FOUR: u64 = 0x4001_0000_0000_0000;
         const TEN: u64 = 0x4002_4000_0000_0000;
@@ -488,6 +675,16 @@ mod tests {
             *const c_char,
             libc::locale_t,
         ) -> libc::locale_t = unsafe { std::mem::transmute(addr("newlocale")) };
+        let roundl: extern "C" fn(Binary128) -> Binary128 =
+            unsafe { std::mem::transmute(addr("roundl")) };
+        let llroundl: extern "C" fn(Binary128) -> std::ffi::c_longlong =
+            unsafe { std::mem::transmute(addr("llroundl")) };
+
+        assert_eq!(
+            binary128_bits(roundl(binary128(TWO_AND_A_HALF))),
+            [0, THREE]
+        );
+        assert_eq!(llroundl(binary128(FIFTEEN_HUNDRED)), 1500);
 
         assert_eq!(
             binary128_bits(powl(binary128(TEN), binary128(TWO))),
@@ -519,48 +716,52 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn host_dlsym_refuses_glibc_x87_long_double_functions() {
+    fn host_dlsym_binds_long_double_imports_to_binary128_twins_never_to_x87() {
         let p = HostDlsymProvider;
-        for name in [
-            "logl",
-            "sqrtl",
-            "nexttoward",
-            "wcstold_l",
-            "cabsl",
-            "__isnanl",
-            "exp10l",
-            "roundevenl",
-            "nextupl",
-            "j0l",
-            "ynl",
-            "llogbl",
-            "totalorderl",
-            "canonicalizel",
-            "fromfpl",
-            "getpayloadl",
-            "clog10l",
-            "strfroml",
-            "__issignalingl",
-            "__strtold_internal",
-            "gammal",
-            "dreml",
-            "scalbl",
-            "faddl",
-            "dfmal",
-            "qecvt",
-            "qfcvt_r",
-            "qgcvt",
-        ] {
+        let host = |name: &str| {
             let cname = std::ffi::CString::new(name).unwrap();
-            assert!(
-                unsafe { !libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()).is_null() },
-                "glibc exports {name}"
-            );
-            assert_eq!(
-                p.resolve(name),
-                None,
-                "{name} must not bind to glibc's x87 version"
-            );
+            unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) as u64 }
+        };
+        for (name, twin) in [
+            ("logl", Some("logf128")),
+            ("sqrtl", Some("sqrtf128")),
+            ("roundl", Some("roundf128")),
+            ("llroundl", Some("llroundf128")),
+            ("nexttoward", None),
+            ("wcstold_l", Some("wcstof128_l")),
+            ("cabsl", Some("cabsf128")),
+            ("__isnanl", Some("__isnanf128")),
+            ("exp10l", Some("exp10f128")),
+            ("roundevenl", Some("roundevenf128")),
+            ("nextupl", Some("nextupf128")),
+            ("j0l", Some("j0f128")),
+            ("ynl", Some("ynf128")),
+            ("llogbl", Some("llogbf128")),
+            ("totalorderl", Some("totalorderf128")),
+            ("canonicalizel", Some("canonicalizef128")),
+            ("fromfpl", Some("fromfpf128")),
+            ("getpayloadl", Some("getpayloadf128")),
+            ("clog10l", Some("clog10f128")),
+            ("strfroml", Some("strfromf128")),
+            ("__issignalingl", Some("__issignalingf128")),
+            ("__strtold_internal", Some("__strtof128_internal")),
+            ("gammal", None),
+            ("dreml", None),
+            ("scalbl", None),
+            ("faddl", None),
+            ("dfmal", None),
+            ("qecvt", None),
+            ("qfcvt_r", None),
+            ("qgcvt", None),
+        ] {
+            let x87 = host(name);
+            assert_ne!(x87, 0, "glibc exports {name}");
+            let binary128 = twin.map(host).filter(|addr| *addr != 0);
+            assert_eq!(p.resolve(name).map(|found| found.addr), binary128, "{name}");
+            assert_ne!(binary128, Some(x87), "{name} has its own binary128 entry");
+        }
+        for name in ["logl", "sqrtl", "roundl", "llroundl"] {
+            assert!(p.resolve(name).is_some(), "{name} binds");
         }
         for name in [
             "strtol",
