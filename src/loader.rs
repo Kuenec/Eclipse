@@ -30,6 +30,7 @@ pub mod opensl;
 pub(crate) mod present_pacing;
 pub mod reloc;
 pub mod resolve;
+pub mod stand_in;
 mod text_overlay;
 pub mod tls;
 mod vk_etc2;

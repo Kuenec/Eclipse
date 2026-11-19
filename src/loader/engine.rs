@@ -16,6 +16,7 @@ use super::elf::{DynSym, ElfImage, PF_X};
 use super::link::{Linker, LoadedObject};
 use super::map::{host_page_size, MappedObject};
 use super::resolve::{LoadedObjectProvider, Scope, SymbolProvider};
+use super::stand_in;
 
 use super::init_run::{constructor_addresses, init_array_count};
 
@@ -131,6 +132,29 @@ impl std::fmt::Display for EngineLoadError {
 
 impl std::error::Error for EngineLoadError {}
 
+fn report_stand_ins(filename: &str, log: &mut impl Write) {
+    let describe = |(function, answer): (String, Option<stand_in::Answer>)| match answer {
+        Some(_) => format!("{function} (answers that the device does not support it)"),
+        None => format!("{function} (stops Roblox if called)"),
+    };
+    let stand_ins: Vec<String> = stand_in::bound().into_iter().map(describe).collect();
+    if stand_ins.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        log,
+        "engine-load: after {filename}, {} function(s) Eclipse does not implement have \
+         stand-ins: {}",
+        stand_ins.len(),
+        stand_ins.join(", ")
+    );
+    tracing::warn!(
+        target: "eclipse::loader",
+        functions = %stand_ins.join(", "),
+        "Roblox imports functions Eclipse does not implement"
+    );
+}
+
 fn map_resolve_app_lib(
     lib_dir: &Path,
     filename: &str,
@@ -173,9 +197,11 @@ fn map_resolve_app_lib(
     for p in BionicEnv::with_host_baseline(true, true).into_providers() {
         scope.push(p);
     }
+    scope.stand_in_for_missing_functions();
     let sym_stats = mapped
         .relocate_symbols_partial(&img, &scope, page)
         .map_err(|e| link_error(&e))?;
+    report_stand_ins(filename, log);
     let _ = writeln!(
         log,
         "engine-load: symbol relocs applied_nonnull={} weak_zero={} unresolved_strong={}",

@@ -328,17 +328,21 @@ impl SymbolProvider for HostDlsymProvider {
 #[derive(Default)]
 pub struct Scope {
     providers: Vec<Box<dyn SymbolProvider>>,
+    stands_in_for_missing_functions: bool,
 }
 
 impl Scope {
     pub fn new() -> Self {
-        Self {
-            providers: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn push(&mut self, provider: Box<dyn SymbolProvider>) -> &mut Self {
         self.providers.push(provider);
+        self
+    }
+
+    pub fn stand_in_for_missing_functions(&mut self) -> &mut Self {
+        self.stands_in_for_missing_functions = true;
         self
     }
 
@@ -380,10 +384,12 @@ impl SymbolResolver for ScopedResolver<'_> {
         }
 
         if sym.bind == STB_WEAK {
-            Some(0)
-        } else {
-            None
+            return Some(0);
         }
+        if self.scope.stands_in_for_missing_functions && sym.sym_type == STT_FUNC {
+            return super::stand_in::for_function(&sym.name);
+        }
+        None
     }
 
     fn resolve_tls_offset(&self, _sym_index: u32) -> Option<u64> {
@@ -495,6 +501,33 @@ mod tests {
             ScopedResolver::new(&scope, &dynsyms).resolve_symbol(1),
             Some(0x1040)
         );
+    }
+
+    #[test]
+    fn a_missing_function_gets_a_stand_in_only_where_the_scope_allows_it() {
+        let object = DynSym {
+            sym_type: STT_OBJECT,
+            ..undef("eclipse_test_missing_object", STB_GLOBAL)
+        };
+        let dynsyms = vec![
+            undef("AMediaExtractor_seekTo", STB_GLOBAL),
+            object,
+            undef("eclipse_test_missing_weak", STB_WEAK),
+        ];
+        let strict = Scope::new();
+        assert_eq!(
+            ScopedResolver::new(&strict, &dynsyms).resolve_symbol(0),
+            None
+        );
+
+        let mut lenient = Scope::new();
+        lenient.stand_in_for_missing_functions();
+        let resolver = ScopedResolver::new(&lenient, &dynsyms);
+        let stand_in = resolver.resolve_symbol(0).expect("a stand-in");
+        assert_ne!(stand_in, 0);
+        assert_eq!(resolver.resolve_symbol(0), Some(stand_in));
+        assert_eq!(resolver.resolve_symbol(1), None, "data has no stand-in");
+        assert_eq!(resolver.resolve_symbol(2), Some(0), "weak stays null");
     }
 
     #[test]

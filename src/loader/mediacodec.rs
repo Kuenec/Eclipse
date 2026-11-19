@@ -11,12 +11,12 @@ pub mod self_test;
 
 pub const MEDIA_NDK_NATIVE_COUNT: usize = 56;
 
-type MediaStatus = c_int;
+pub(super) type MediaStatus = c_int;
 
 const AMEDIA_OK: MediaStatus = 0;
 const AMEDIA_ERROR_BASE: MediaStatus = -10000;
 const AMEDIA_ERROR_UNKNOWN: MediaStatus = AMEDIA_ERROR_BASE;
-const AMEDIA_ERROR_UNSUPPORTED: MediaStatus = AMEDIA_ERROR_BASE - 2;
+pub(super) const AMEDIA_ERROR_UNSUPPORTED: MediaStatus = AMEDIA_ERROR_BASE - 2;
 const AMEDIA_ERROR_INVALID_OBJECT: MediaStatus = AMEDIA_ERROR_BASE - 3;
 const AMEDIA_ERROR_INVALID_PARAMETER: MediaStatus = AMEDIA_ERROR_BASE - 4;
 const AMEDIA_ERROR_INVALID_OPERATION: MediaStatus = AMEDIA_ERROR_BASE - 5;
