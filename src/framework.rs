@@ -9603,6 +9603,18 @@ pub(crate) fn prepare_text_field_pointer_press(position: (f32, f32)) -> bool {
     true
 }
 
+fn text_box_pixels(
+    (x, y, width, height): (f32, f32, f32, f32),
+    density: f32,
+) -> (i32, i32, u32, u32) {
+    (
+        (x * density) as i32,
+        (y * density) as i32,
+        (width * density) as u32,
+        (height * density) as u32,
+    )
+}
+
 pub fn query_textbox_geometry(vm: &Vm) {
     let raw = vm.as_raw();
     if raw.is_null() {
@@ -9708,12 +9720,13 @@ pub fn query_textbox_geometry(vm: &Vm) {
             };
 
             if ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire) == widget {
+                let density = display_metrics::current().density();
                 record_textbox_session(Some(TextboxSession {
                     widget,
-                    geometry: (x as i32, y as i32, w as u32, h as u32),
+                    geometry: text_box_pixels((x, y, w, h), density),
                     input_type,
                     font,
-                    font_size,
+                    font_size: font_size * density,
                     multiline,
                     text_wrapped,
                     text_color,
@@ -14858,6 +14871,17 @@ mod tests {
                 HostShutdownStep::StopActivities,
                 HostShutdownStep::DestroyActivities,
             ]
+        );
+    }
+
+    #[test]
+    fn a_text_box_is_placed_in_pixels_at_the_display_density() {
+        let reported = (120.0, 381.4, 486.7, 30.0);
+        assert_eq!(text_box_pixels(reported, 1.0), (120, 381, 486, 30));
+        assert_eq!(text_box_pixels(reported, 1.5), (180, 572, 730, 45));
+        assert_eq!(
+            display_metrics::DisplayModel::new(1920, 1080, 1.5).density(),
+            1.5
         );
     }
 

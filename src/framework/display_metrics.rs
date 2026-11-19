@@ -129,6 +129,11 @@ impl DisplayModel {
     }
 
     #[must_use]
+    pub fn density(self) -> f32 {
+        self.density_dpi as f32 / BASELINE_DPI as f32
+    }
+
+    #[must_use]
     pub fn width_dp(self) -> i32 {
         self.dp(self.width_px)
     }
