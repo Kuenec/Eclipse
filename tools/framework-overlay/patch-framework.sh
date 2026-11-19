@@ -1317,6 +1317,58 @@ n="$(grep -cF '.method public vibrate(J)V' "$vibsm")" || true
 [ "$n" = "1" ] || fail "Vibrator.smali vibrate(J)V anchor not unique (found $n, expected 1) — installed Vibrator drifted; update patch-framework.sh"
 n="$(grep -cF '.method public cancel()V' "$vibsm")" || true
 [ "$n" = "1" ] || fail "Vibrator.smali upstream cancel count = $n (expected 1) — installed Vibrator drifted; update patch-framework.sh"
+! grep -qF '.method public vibrate(Landroid/os/VibrationEffect;)V' "$vibsm" \
+    || fail "Vibrator.smali already declares vibrate(VibrationEffect) — installed Vibrator drifted; update patch-framework.sh"
+cat >> "$vibsm" <<'ECLIPSE_VIBRATOR_METHODS'
+
+.method public vibrate(Landroid/os/VibrationEffect;)V
+    .registers 2
+
+    return-void
+.end method
+ECLIPSE_VIBRATOR_METHODS
+grep -qF '.method public vibrate(Landroid/os/VibrationEffect;)V' "$vibsm" || fail "Vibrator vibrate(VibrationEffect) insert failed"
+
+vesm="$work/smali/android/os/VibrationEffect.smali"
+[ -f "$vesm" ] || fail "VibrationEffect.smali not found after baksmali"
+grep -qF '.method public static createWaveform([JI)Landroid/os/VibrationEffect;' "$vesm" \
+    || fail "VibrationEffect.smali lost stock createWaveform([JI) — installed framework drifted; update patch-framework.sh"
+for vibration_effect_method in \
+    'createWaveform([J[II)Landroid/os/VibrationEffect;' \
+    'createPredefined(I)Landroid/os/VibrationEffect;'
+do
+    ! grep -qF "$vibration_effect_method" "$vesm" \
+        || fail "VibrationEffect.smali already declares $vibration_effect_method — installed framework drifted; update patch-framework.sh"
+done
+cat >> "$vesm" <<'ECLIPSE_VIBRATION_EFFECT_METHODS'
+
+.method public static createWaveform([J[II)Landroid/os/VibrationEffect;
+    .registers 4
+
+    new-instance v0, Landroid/os/VibrationEffect;
+
+    invoke-direct {v0}, Landroid/os/VibrationEffect;-><init>()V
+
+    return-object v0
+.end method
+
+.method public static createPredefined(I)Landroid/os/VibrationEffect;
+    .registers 2
+
+    new-instance v0, Landroid/os/VibrationEffect;
+
+    invoke-direct {v0}, Landroid/os/VibrationEffect;-><init>()V
+
+    return-object v0
+.end method
+ECLIPSE_VIBRATION_EFFECT_METHODS
+for vibration_effect_method in \
+    'createWaveform([J[II)Landroid/os/VibrationEffect;' \
+    'createPredefined(I)Landroid/os/VibrationEffect;'
+do
+    grep -qF "$vibration_effect_method" "$vesm" \
+        || fail "VibrationEffect $vibration_effect_method insert failed"
+done
 
 envsm="$work/smali/android/os/Environment.smali"
 [ -f "$envsm" ] || fail "Environment.smali not found after baksmali"
@@ -1959,6 +2011,7 @@ cp "$prd_sm" "$work/smali-view/android/app/"
 cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
 cp "$lmsm" "$work/smali-view/android/location/LocationManager.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
+cp "$vesm" "$work/smali-view/android/os/VibrationEffect.smali"
 cp "$envsm" "$work/smali-view/android/os/Environment.smali"
 cp "$winsm" "$work/smali-view/android/view/Window.smali"
 cp "$ctxsm" "$work/smali-view/android/content/Context.smali"
