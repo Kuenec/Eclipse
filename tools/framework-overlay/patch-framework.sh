@@ -1370,6 +1370,27 @@ do
         || fail "VibrationEffect $vibration_effect_method insert failed"
 done
 
+intent_sm="$work/smali/android/content/Intent.smali"
+[ -f "$intent_sm" ] || fail "Intent.smali not found after baksmali"
+grep -qF '.method public static createChooser(Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;' "$intent_sm" \
+    || fail "Intent.smali lost stock createChooser(Intent, CharSequence) — installed framework drifted; update patch-framework.sh"
+intent_sender_chooser='createChooser(Landroid/content/Intent;Ljava/lang/CharSequence;Landroid/content/IntentSender;)Landroid/content/Intent;'
+! grep -qF "$intent_sender_chooser" "$intent_sm" \
+    || fail "Intent.smali already declares $intent_sender_chooser — installed framework drifted; update patch-framework.sh"
+cat >> "$intent_sm" <<'ECLIPSE_INTENT_METHODS'
+
+.method public static createChooser(Landroid/content/Intent;Ljava/lang/CharSequence;Landroid/content/IntentSender;)Landroid/content/Intent;
+    .registers 4
+
+    invoke-static {p0, p1}, Landroid/content/Intent;->createChooser(Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;
+
+    move-result-object v0
+
+    return-object v0
+.end method
+ECLIPSE_INTENT_METHODS
+grep -qF "$intent_sender_chooser" "$intent_sm" || fail "Intent $intent_sender_chooser insert failed"
+
 envsm="$work/smali/android/os/Environment.smali"
 [ -f "$envsm" ] || fail "Environment.smali not found after baksmali"
 ! grep -qF 'native_get_pictures_dir' "$envsm" || fail "Environment.smali already declares native_get_pictures_dir — installed Environment drifted; update patch-framework.sh"
@@ -2012,6 +2033,7 @@ cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
 cp "$lmsm" "$work/smali-view/android/location/LocationManager.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
 cp "$vesm" "$work/smali-view/android/os/VibrationEffect.smali"
+cp "$intent_sm" "$work/smali-view/android/content/Intent.smali"
 cp "$envsm" "$work/smali-view/android/os/Environment.smali"
 cp "$winsm" "$work/smali-view/android/view/Window.smali"
 cp "$ctxsm" "$work/smali-view/android/content/Context.smali"

@@ -469,6 +469,20 @@ fn framework_overlay_preserves_shortcut_manager_contract() {
 }
 
 #[test]
+fn framework_overlay_declares_the_share_sheet_roblox_opens() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        ".method public static createChooser(Landroid/content/Intent;Ljava/lang/CharSequence;Landroid/content/IntentSender;)Landroid/content/Intent;",
+        "cp \"$intent_sm\" \"$work/smali-view/android/content/Intent.smali\"",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost share sheet fragment {needle:?}; forwarding a Moment would abort with NoSuchMethodError (Kuenec/Eclipse#39)"
+        );
+    }
+}
+
+#[test]
 fn framework_overlay_declares_roblox_haptics_api() {
     let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
     for needle in [
