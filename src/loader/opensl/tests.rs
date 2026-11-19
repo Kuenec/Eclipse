@@ -364,47 +364,36 @@ fn interface_tables_follow_the_khronos_slot_order() {
 
 #[test]
 fn the_eighth_engine_slot_creates_an_output_mix() {
-    const CREATE_OUTPUT_MIX_SLOT: usize = 7;
     type CreateOutputMix =
         extern "C" fn(*mut c_void, *mut c_void, u32, *const c_void, *const c_void) -> u32;
 
-    let mut engine: *mut c_void = std::ptr::null_mut();
-    assert_eq!(
-        unsafe {
-            eclipse_sl_create_engine(
-                std::ptr::addr_of_mut!(engine).cast(),
-                0,
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        },
-        SL_RESULT_SUCCESS
-    );
-    assert_eq!(obj_realize(engine, 0), SL_RESULT_SUCCESS);
-    let eng_itf = interface(engine, 3);
-
-    let create_output_mix = unsafe {
-        let table = *(eng_itf as *const *const CreateOutputMix);
-        *table.add(CREATE_OUTPUT_MIX_SLOT)
-    };
-    let mut mix: *mut c_void = std::ptr::null_mut();
-    assert_eq!(
-        create_output_mix(
-            eng_itf,
-            std::ptr::addr_of_mut!(mix).cast(),
+    let engine = created(|engine| unsafe {
+        eclipse_sl_create_engine(
+            engine,
+            0,
+            std::ptr::null(),
             0,
             std::ptr::null(),
             std::ptr::null(),
-        ),
-        SL_RESULT_SUCCESS
-    );
-    assert!(!mix.is_null(), "CreateOutputMix wrote the output mix");
-    assert_eq!(obj_realize(mix, 0), SL_RESULT_SUCCESS);
+        )
+    });
+    assert_eq!(obj_realize(engine.as_ptr(), 0), SL_RESULT_SUCCESS);
+    let engine_itf = created(|itf| obj_get_interface(engine.as_ptr(), iid_value(3), itf));
 
-    obj_destroy(mix);
-    obj_destroy(engine);
+    let create_output_mix: CreateOutputMix = unsafe { khronos_slot(engine_itf, 7) };
+    let mix = created(|mix| {
+        create_output_mix(
+            engine_itf.as_ptr(),
+            mix,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    });
+    assert_eq!(obj_realize(mix.as_ptr(), 0), SL_RESULT_SUCCESS);
+
+    obj_destroy(mix.as_ptr());
+    obj_destroy(engine.as_ptr());
 }
 
 #[test]
@@ -1278,11 +1267,20 @@ fn reopened_players_play_on_a_new_host_output() {
     );
 }
 
-unsafe fn khronos_slot<F: Copy>(itf: *mut c_void, slot: usize) -> F {
+unsafe fn khronos_slot<F: Copy>(itf: NonNull<c_void>, slot: usize) -> F {
     unsafe {
-        let table = *(itf as *const *const F);
-        *table.add(slot)
+        let table = itf.cast::<NonNull<F>>().read();
+        table.add(slot).read()
     }
+}
+
+fn created(call: impl FnOnce(*mut c_void) -> u32) -> NonNull<c_void> {
+    let mut object: Option<NonNull<c_void>> = None;
+    assert_eq!(
+        call(std::ptr::addr_of_mut!(object).cast()),
+        SL_RESULT_SUCCESS
+    );
+    object.expect("the call wrote the object")
 }
 
 #[test]
@@ -1313,7 +1311,11 @@ fn fmod_start_up_plays_through_the_khronos_slots() {
     static REFILLS: AtomicU32 = AtomicU32::new(0);
     static REJECTED: AtomicU32 = AtomicU32::new(0);
     extern "C" fn refill(caller: *mut c_void, _ctx: *mut c_void) {
-        let enqueue: Enqueue = unsafe { khronos_slot(caller, 0) };
+        let Some(queue) = NonNull::new(caller) else {
+            REJECTED.fetch_add(1, Ordering::SeqCst);
+            return;
+        };
+        let enqueue: Enqueue = unsafe { khronos_slot(queue, 0) };
         if enqueue(caller, BLOCK.as_ptr().cast(), BLOCK.len() as u32) != SL_RESULT_SUCCESS {
             REJECTED.fetch_add(1, Ordering::SeqCst);
         }
@@ -1324,53 +1326,42 @@ fn fmod_start_up_plays_through_the_khronos_slots() {
         HostOutput::Null,
         "fmod_start_up_plays_through_the_khronos_slots",
         || {
-            let realize = |object: *mut c_void| {
+            let realize = |object: NonNull<c_void>| {
                 let realize: Realize = unsafe { khronos_slot(object, 0) };
-                realize(object, SL_BOOLEAN_FALSE)
+                realize(object.as_ptr(), SL_BOOLEAN_FALSE)
             };
-            let get_interface = |object: *mut c_void, index: usize| {
+            let get_interface = |object: NonNull<c_void>, index: usize| {
                 let get_interface: GetInterface = unsafe { khronos_slot(object, 3) };
-                let mut itf: *mut c_void = std::ptr::null_mut();
-                assert_eq!(
-                    get_interface(object, iid_value(index), std::ptr::addr_of_mut!(itf).cast()),
-                    SL_RESULT_SUCCESS
-                );
-                itf
+                created(|itf| get_interface(object.as_ptr(), iid_value(index), itf))
             };
-            let destroy = |object: *mut c_void| {
+            let destroy = |object: NonNull<c_void>| {
                 let destroy: Destroy = unsafe { khronos_slot(object, 6) };
-                destroy(object);
+                destroy(object.as_ptr());
             };
 
-            let mut engine: *mut c_void = std::ptr::null_mut();
-            assert_eq!(
-                unsafe {
-                    eclipse_sl_create_engine(
-                        std::ptr::addr_of_mut!(engine).cast(),
-                        0,
-                        std::ptr::null(),
-                        0,
-                        std::ptr::null(),
-                        std::ptr::null(),
-                    )
-                },
-                SL_RESULT_SUCCESS
-            );
-            assert_eq!(realize(engine), SL_RESULT_SUCCESS);
-            let engine_itf = get_interface(engine, 3);
-
-            let mut mix: *mut c_void = std::ptr::null_mut();
-            let create_output_mix: CreateOutputMix = unsafe { khronos_slot(engine_itf, 7) };
-            assert_eq!(
-                create_output_mix(
-                    engine_itf,
-                    std::ptr::addr_of_mut!(mix).cast(),
+            let engine = created(|engine| unsafe {
+                eclipse_sl_create_engine(
+                    engine,
+                    0,
+                    std::ptr::null(),
                     0,
                     std::ptr::null(),
                     std::ptr::null(),
-                ),
-                SL_RESULT_SUCCESS
-            );
+                )
+            });
+            assert_eq!(realize(engine), SL_RESULT_SUCCESS);
+            let engine_itf = get_interface(engine, 3);
+
+            let create_output_mix: CreateOutputMix = unsafe { khronos_slot(engine_itf, 7) };
+            let mix = created(|mix| {
+                create_output_mix(
+                    engine_itf.as_ptr(),
+                    mix,
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            });
             assert_eq!(realize(mix), SL_RESULT_SUCCESS);
 
             let mut queue = SlDataLocatorBufferQueue {
@@ -1392,7 +1383,7 @@ fn fmod_start_up_plays_through_the_khronos_slots() {
             };
             let mut mix_locator = SlDataLocatorOutputMix {
                 locator_type: SL_DATALOCATOR_OUTPUTMIX,
-                output_mix: mix,
+                output_mix: mix.as_ptr(),
             };
             let sink = SlDataSink {
                 p_locator: std::ptr::addr_of_mut!(mix_locator).cast(),
@@ -1400,27 +1391,25 @@ fn fmod_start_up_plays_through_the_khronos_slots() {
             };
             let requested = [iid_value(1), iid_value(0)];
             let required = [SL_BOOLEAN_TRUE; 2];
-            let mut player: *mut c_void = std::ptr::null_mut();
             let create_audio_player: CreateAudioPlayer = unsafe { khronos_slot(engine_itf, 2) };
-            assert_eq!(
+            let player = created(|player| {
                 create_audio_player(
-                    engine_itf,
-                    std::ptr::addr_of_mut!(player).cast(),
+                    engine_itf.as_ptr(),
+                    player,
                     std::ptr::addr_of!(source) as *mut c_void,
                     std::ptr::addr_of!(sink) as *mut c_void,
                     requested.len() as u32,
                     requested.as_ptr().cast(),
                     required.as_ptr().cast(),
-                ),
-                SL_RESULT_SUCCESS
-            );
+                )
+            });
 
             let config = get_interface(player, 0);
             let set_configuration: SetConfiguration = unsafe { khronos_slot(config, 0) };
             let stream_type = SL_ANDROID_STREAM_MEDIA;
             assert_eq!(
                 set_configuration(
-                    config,
+                    config.as_ptr(),
                     c"androidPlaybackStreamType".as_ptr(),
                     std::ptr::addr_of!(stream_type).cast(),
                     std::mem::size_of_val(&stream_type) as u32,
@@ -1433,19 +1422,27 @@ fn fmod_start_up_plays_through_the_khronos_slots() {
             let buffer_queue = get_interface(player, 1);
             let register_callback: RegisterCallback = unsafe { khronos_slot(buffer_queue, 3) };
             assert_eq!(
-                register_callback(buffer_queue, refill as *const c_void, std::ptr::null_mut()),
+                register_callback(
+                    buffer_queue.as_ptr(),
+                    refill as *const c_void,
+                    std::ptr::null_mut()
+                ),
                 SL_RESULT_SUCCESS
             );
             let enqueue: Enqueue = unsafe { khronos_slot(buffer_queue, 0) };
             for _ in 0..2 {
                 assert_eq!(
-                    enqueue(buffer_queue, BLOCK.as_ptr().cast(), BLOCK.len() as u32),
+                    enqueue(
+                        buffer_queue.as_ptr(),
+                        BLOCK.as_ptr().cast(),
+                        BLOCK.len() as u32
+                    ),
                     SL_RESULT_SUCCESS
                 );
             }
             let set_play_state: SetPlayState = unsafe { khronos_slot(play, 0) };
             assert_eq!(
-                set_play_state(play, SL_PLAYSTATE_PLAYING),
+                set_play_state(play.as_ptr(), SL_PLAYSTATE_PLAYING),
                 SL_RESULT_SUCCESS
             );
 
@@ -1464,11 +1461,11 @@ fn fmod_start_up_plays_through_the_khronos_slots() {
             );
 
             assert_eq!(
-                set_play_state(play, SL_PLAYSTATE_STOPPED),
+                set_play_state(play.as_ptr(), SL_PLAYSTATE_STOPPED),
                 SL_RESULT_SUCCESS
             );
             let clear: Clear = unsafe { khronos_slot(buffer_queue, 1) };
-            assert_eq!(clear(buffer_queue), SL_RESULT_SUCCESS);
+            assert_eq!(clear(buffer_queue.as_ptr()), SL_RESULT_SUCCESS);
             destroy(player);
             destroy(mix);
             destroy(engine);
