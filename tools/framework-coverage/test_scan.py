@@ -38,7 +38,7 @@ from fixtures import (
     write_archive,
 )
 from resources import ResourceError
-from scan import scan, summary
+from scan import scan, summary, survey
 
 SCRIPT = Path(__file__).resolve().with_name("scan.py")
 RUNNABLE = "Ljava/lang/Runnable;"
@@ -801,6 +801,25 @@ class ReachTest(unittest.TestCase):
         )
         self.assertEqual(
             gaps, [(build_gap("SKU"), True), (build_gap("ODM_SKU"), False)]
+        )
+
+    def test_the_surface_lists_missing_members_of_defined_classes_with_their_binding(self):
+        self.scan_main(
+            (
+                build_field("SKU"),
+                call(INVOKE_VIRTUAL, ACTIVITY, "enterPictureInPictureMode", "()V"),
+                call(INVOKE_STATIC, LOCALE_MANAGER, "current", "()" + LOCALE_MANAGER),
+                call(INVOKE_STATIC, TRACE, "setCounter", "(Ljava/lang/String;J)V"),
+                call(INVOKE_VIRTUAL, TRACE, "setCounter", "(Ljava/lang/String;J)V"),
+            )
+        )
+        _, surface = survey(self.root / "framework", [self.root / "app.apk"])
+        self.assertEqual(
+            surface,
+            [
+                "field static " + build_gap("SKU"),
+                "method instance Landroid/app/Activity;->enterPictureInPictureMode()V",
+            ],
         )
 
     def test_an_array_of_a_missing_class_is_a_class_gap(self):

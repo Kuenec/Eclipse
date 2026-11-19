@@ -50,6 +50,13 @@ MANIFEST_ENTRY = "AndroidManifest.xml"
 RESOURCE_TABLE_ENTRY = "resources.arsc"
 NATIVE_LIBRARY = re.compile(r"lib/[^/]+/[^/]+\.so")
 NATIVE_CLASS_NAME = re.compile(rb"\0([A-Za-z0-9_$]+(?:/[A-Za-z0-9_$]+)+)(?=\0)")
+BINDINGS = {
+    Ref.STATIC_FIELD: "static",
+    Ref.STATIC_CALL: "static",
+    Ref.INSTANCE_FIELD: "instance",
+    Ref.DIRECT_CALL: "instance",
+    Ref.VIRTUAL_CALL: "instance",
+}
 
 
 class GapKind(Enum):
@@ -176,6 +183,18 @@ class GapFinder:
     def __init__(self, hierarchy):
         self.hierarchy = hierarchy
         self._gaps = {}
+        self._bindings = defaultdict(set)
+
+    def surface(self, references):
+        missing = {gap.id for gap in references if gap.kind is GapKind.CLASS}
+        lines = []
+        for gap in references:
+            bindings = self._bindings[gap]
+            owner = gap.id.partition("->")[0]
+            if gap.kind is GapKind.CLASS or owner in missing or len(bindings) != 1:
+                continue
+            lines.append(f"{gap.kind.value} {min(bindings)} {gap.id}")
+        return sorted(lines)
 
     def find(self):
         references = defaultdict(lambda: defaultdict(set))
@@ -190,6 +209,8 @@ class GapFinder:
                 for ref, index in definition.dex.code_refs(method.code_off):
                     for gap in self._gaps_of(definition.dex, REF_TABLE[ref], index):
                         references[gap][definition.name].add(key)
+                        if ref in BINDINGS:
+                            self._bindings[gap].add(BINDINGS[ref])
         return references
 
     def _gaps_of(self, dex, table, index):
@@ -532,6 +553,10 @@ def gap_report(gap, users, reach, loaded):
 
 
 def scan(framework_dir, apks):
+    return survey(framework_dir, apks)[0]
+
+
+def survey(framework_dir, apks):
     framework = load_classes(sorted(Path(framework_dir).rglob("*.jar")))
     if OBJECT not in framework:
         raise DexError(
@@ -549,14 +574,16 @@ def scan(framework_dir, apks):
                 f"the manifest names {name}, which no dex defines; "
                 "pass every APK of the set"
             )
-    references = GapFinder(hierarchy).find()
+    finder = GapFinder(hierarchy)
+    references = finder.find()
     reach = StartupReach(
         hierarchy, entries, native_class_names(apks), read_xml_resources(apks)
     )
     loaded = reach.loaded_classes()
     gaps = [gap_report(gap, users, reach, loaded) for gap, users in references.items()]
     gaps.sort(key=lambda gap: (not gap["startup"], gap["id"]))
-    return {"entry_classes": [name for name, _ in entries], "gaps": gaps}
+    report = {"entry_classes": [name for name, _ in entries], "gaps": gaps}
+    return report, finder.surface(references)
 
 
 def count_line(gaps, label):
@@ -598,6 +625,13 @@ def parse_arguments(argv):
         help="where to write every gap as JSON",
     )
     parser.add_argument(
+        "--surface",
+        type=Path,
+        metavar="FILE",
+        help="the list tools/framework-overlay/surface.py reads; the missing methods and "
+        "fields of classes the framework defines are added to it, one per line",
+    )
+    parser.add_argument(
         "apks",
         type=Path,
         nargs="+",
@@ -610,8 +644,12 @@ def parse_arguments(argv):
 def main(argv):
     arguments = parse_arguments(argv)
     try:
-        result = scan(arguments.framework, arguments.apks)
+        result, surface = survey(arguments.framework, arguments.apks)
         arguments.json.write_text(json.dumps(result, indent=2) + "\n", "utf-8")
+        if arguments.surface is not None:
+            listed = arguments.surface.read_text("utf-8") if arguments.surface.exists() else ""
+            merged = sorted({*listed.splitlines(), *surface})
+            arguments.surface.write_text("".join(f"{line}\n" for line in merged), "utf-8")
     except (
         OSError,
         zipfile.BadZipFile,
