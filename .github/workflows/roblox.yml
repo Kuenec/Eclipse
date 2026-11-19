@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "37 */3 * * *"
   workflow_dispatch:
+    inputs:
+      retest:
+        description: Start Roblox again even when the list already names it
+        type: boolean
+        default: false
 
 concurrency:
   group: roblox
@@ -110,7 +115,7 @@ jobs:
           key: roblox-files-${{ steps.roblox.outputs.code }}
 
       - name: Start Roblox on a virtual display and require it to keep running
-        if: steps.roblox.outputs.standing == 'untested'
+        if: steps.roblox.outputs.standing == 'untested' || inputs.retest
         env:
           ECLIPSE: ${{ steps.eclipse.outputs.version }}
           ROBLOX_CODE: ${{ steps.roblox.outputs.code }}
@@ -125,15 +130,22 @@ jobs:
           state="$(jq --raw-output --argjson code "$ROBLOX_CODE" \
             '.entries[] | select(.kind == "roblox_version" and .version_code == $code) | .state' \
             "$RUNNER_TEMP/storage.json")"
+          report="$(find "$HOME/.var/app/$FLATPAK_ID/data/eclipse/app-data/logs" \
+            -name '*.report.txt' -print -quit)"
           tail --lines=40 "$RUNNER_TEMP/run.log"
-          echo "Roblox ended with status $status, where 124 means it still ran after $RUN_SECONDS seconds, and its start is recorded as $state"
-          if [ "$status" != 124 ] || { [ "$state" != proven ] && [ "$state" != played ]; }; then
+          echo "Roblox ended with status $status, where 124 means Eclipse still ran after $RUN_SECONDS seconds, and its start is recorded as $state"
+          if [ -n "$report" ]; then
+            echo "Eclipse wrote a failure report:"
+            head --lines=20 "$report"
+          fi
+          if [ "$status" != 124 ] || [ -n "$report" ] ||
+            { [ "$state" != proven ] && [ "$state" != played ]; }; then
             echo "::error::Roblox $ROBLOX_NAME did not start and keep running with Eclipse $ECLIPSE"
             exit 1
           fi
 
       - name: Upload the logs of the start
-        if: always() && steps.roblox.outputs.standing == 'untested'
+        if: always() && (steps.roblox.outputs.standing == 'untested' || inputs.retest)
         uses: actions/upload-artifact@v7
         with:
           name: roblox-start-logs
