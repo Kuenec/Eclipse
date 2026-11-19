@@ -29,7 +29,7 @@ To update Eclipse later, close it and run:
 flatpak update --user io.github.kuenec.Eclipse
 ```
 
-Roblox itself updates automatically when Eclipse starts.
+Roblox itself updates automatically when Eclipse starts, once a [scheduled test](https://github.com/Kuenec/Eclipse/actions/workflows/roblox.yml) has started the new version with Eclipse. `update` installs it right away.
 
 You need an x86-64 Linux desktop (Wayland or X11) and a GPU driver with Vulkan or OpenGL ES. Eclipse takes about 100 MB on top of the shared GNOME runtime. A [standalone bundle](https://github.com/Kuenec/Eclipse/releases/latest) is also available; it needs GTK 4.10+ and WebKitGTK 6.0 (2.42+) from your distribution for sign-in and web pages, and xdg-desktop-portal with a GTK, GNOME or KDE backend for links and notifications.
 

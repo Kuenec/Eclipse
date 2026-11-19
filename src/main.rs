@@ -94,8 +94,11 @@ COMMANDS:
                 download and any error: the first run downloads Roblox, and later runs check
                 for a Roblox update at most every 6 hours, or 30 minutes after a failed check,
                 and start the installed Roblox if no source has answered within 3 seconds.
-                Once Roblox says the installed version is too old, every start checks and
-                waits for the answer. --check-update checks now and waits for the answer.
+                A newer Roblox is installed once Eclipse's scheduled test has started it with
+                this Eclipse; until then Eclipse keeps the installed one.
+                Once Roblox says the installed version is too old, every start checks, waits
+                for the answer and installs the newest Roblox without waiting for that test.
+                --check-update checks now and waits for the answer.
                 With roblox_auto_update set to false in config.json, only `update`,
                 `run --check-update` and a first install download Roblox.
                 A new Roblox that fails to start twice is replaced by the version kept before it.
@@ -117,8 +120,8 @@ COMMANDS:
     update [--play]
                 Download and install the newest Roblox client. Eclipse asks APKPure, without
                 any account, and Google Play once play-login has saved an account, and installs
-                the newest release; when one source fails it uses the next. With --play, ask
-                Google Play only.
+                the newest release, tested with Eclipse or not; when one source fails it uses
+                the next. With --play, ask Google Play only.
     play-login  Sign in to Google Play with your own Google account (once, for update --play).
     rollback    Go back to the Roblox version before the current one, which Eclipse keeps until a
                 new version has been played and closed once. Automatic updates skip the one left.

@@ -12,6 +12,7 @@ mod proto;
 pub mod res_config;
 pub mod signature;
 pub mod store;
+pub mod tested;
 pub mod update;
 
 use std::collections::HashSet;

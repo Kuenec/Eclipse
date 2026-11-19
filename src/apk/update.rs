@@ -8,6 +8,7 @@ use super::store::{
     plan, Candidate, CheckMode, CheckOutcome, DeclaredFile, InstalledVersion, LeftBecause, Plan,
     Rejection, Staging, Store, StoreError, UpdateCheck, UpdateOutcome,
 };
+use super::tested::{self, EclipseVersion, ListError, Standing, TestedVersions};
 use super::{ApkSet, VersionCode};
 use crate::abi::Abi;
 use crate::status::StatusSink;
@@ -299,7 +300,9 @@ pub fn update(
         .join(" and ");
     status.step(format!("Checking {names} for the newest Roblox client…"));
     let installed = current.map(ApkSet::version_code);
-    let answers = std::thread::scope(|scope| {
+    let waits = waits_for_tests(store, Abi::HOST, installed, mode)?;
+    let (answers, tests) = std::thread::scope(|scope| {
+        let tests = waits.then(|| scope.spawn(move || tested::fetch(deadline)));
         let pending: Vec<_> = asking
             .into_iter()
             .map(|asked| {
@@ -309,7 +312,7 @@ pub fn update(
                 )
             })
             .collect();
-        pending
+        let answers = pending
             .into_iter()
             .map(|(source, pending)| {
                 let answer = pending
@@ -317,12 +320,19 @@ pub fn update(
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                 (source, answer)
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let tests = tests.map(|pending| {
+            pending
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        (answers, tests)
     });
     settle(
         store,
         current.map(InstalledVersion::from).as_ref(),
         mode,
+        tests,
         answers,
         status,
         |offer, staging, status| match offer {
@@ -336,6 +346,71 @@ pub fn update(
                 .map_err(SourceError::GooglePlay),
         },
     )
+}
+
+fn waits_for_tests(
+    store: &Store,
+    abi: Abi,
+    installed: Option<VersionCode>,
+    mode: CheckMode,
+) -> Result<bool, StoreError> {
+    match mode {
+        CheckMode::Scheduled if abi == tested::LISTED_ABI => {
+            Ok(installed.is_none() || store.upgrade_required()? != installed)
+        }
+        CheckMode::Scheduled | CheckMode::Explicit => Ok(false),
+    }
+}
+
+fn tested_offers<'a>(
+    mut offers: Vec<Offer<'a>>,
+    tests: Result<TestedVersions, ListError>,
+    installed: Option<&InstalledVersion>,
+    status: &StatusSink,
+) -> Vec<Offer<'a>> {
+    let tests = match tests {
+        Ok(tests) => tests,
+        Err(error) => {
+            status.warning(format!(
+                "could not load the list of Roblox versions tested with Eclipse, so this check \
+                 goes on without it: {error}"
+            ));
+            return offers;
+        }
+    };
+    let standing = |offer: &Offer<'_>| tests.standing(offer.version(), EclipseVersion::RUNNING);
+    let Some(installed) = installed else {
+        offers.sort_by_key(|offer| standing(offer) != Standing::Tested);
+        return offers;
+    };
+    let mut tested = Vec::new();
+    let mut waiting = None;
+    for offer in offers {
+        match standing(&offer) {
+            Standing::Tested => tested.push(offer),
+            Standing::TestedWithNewer(eclipse) => {
+                waiting.get_or_insert((offer, Some(eclipse)));
+            }
+            Standing::Untested => {
+                waiting.get_or_insert((offer, None));
+            }
+        }
+    }
+    match waiting {
+        Some((offer, Some(eclipse))) => status.warning(format!(
+            "{} is tested with Eclipse {eclipse} and newer, and this is Eclipse {}, so Eclipse \
+             keeps the installed Roblox {installed}; update Eclipse to get it",
+            offer.release(),
+            EclipseVersion::RUNNING
+        )),
+        Some((offer, None)) => status.step(format!(
+            "{} has not been tested with Eclipse yet, so Eclipse keeps the installed Roblox \
+             {installed} for now; run `eclipse update` to install it anyway",
+            offer.release()
+        )),
+        None => {}
+    }
+    tested
 }
 
 #[derive(Clone, Copy)]
@@ -381,6 +456,7 @@ fn settle<'a>(
     store: &Store,
     installed: Option<&InstalledVersion>,
     mode: CheckMode,
+    tests: Option<Result<TestedVersions, ListError>>,
     answers: Vec<(Source, Result<Listed<'a>, SourceError>)>,
     status: &StatusSink,
     mut install: impl FnMut(&Offer<'a>, Staging<'_>, &StatusSink) -> Result<ApkSet, SourceError>,
@@ -423,6 +499,10 @@ fn settle<'a>(
         offers.extend(fresh);
     }
     offers.sort_by_key(|offer| (Reverse(offer.version()), offer.source()));
+    let offers = match tests {
+        Some(tests) if !offers.is_empty() => tested_offers(offers, tests, installed, status),
+        Some(_) | None => offers,
+    };
     let mut downloads = 0;
     let mut failed_transfers: Vec<(Source, VersionCode)> = Vec::new();
     for offer in &offers {
@@ -727,6 +807,7 @@ mod tests {
             &store,
             Some(&installed(&store, 3212)),
             CheckMode::Scheduled,
+            None,
             vec![unreachable_apkpure(), play_answer(&credentials, 3222)],
             &StatusSink::terminal(),
             |offer, _, _| {
@@ -765,6 +846,7 @@ mod tests {
                 &store,
                 None,
                 CheckMode::Scheduled,
+                None,
                 vec![apkpure_answer(), play_answer(&credentials, play)],
                 &StatusSink::terminal(),
                 |offer, _, _| {
@@ -795,6 +877,7 @@ mod tests {
             &store,
             None,
             CheckMode::Scheduled,
+            None,
             vec![apkpure_answer()],
             &StatusSink::terminal(),
             |offer, _, _| {
@@ -827,6 +910,7 @@ mod tests {
             &store,
             None,
             CheckMode::Scheduled,
+            None,
             vec![apkpure_answer(), play_answer(&credentials, 3084)],
             &StatusSink::terminal(),
             |offer, _, _| {
@@ -874,6 +958,7 @@ mod tests {
             &store,
             None,
             CheckMode::Scheduled,
+            None,
             vec![apkpure_answer(), play_answer(&credentials, 3000)],
             &StatusSink::with_window(updates),
             |offer, _, _| {
@@ -963,6 +1048,7 @@ mod tests {
                 &store,
                 Some(&current),
                 CheckMode::Scheduled,
+                None,
                 answers,
                 &StatusSink::terminal(),
                 never,
@@ -976,6 +1062,7 @@ mod tests {
             &store,
             Some(&current),
             CheckMode::Scheduled,
+            None,
             vec![unreachable_apkpure()],
             &StatusSink::terminal(),
             never,
@@ -993,6 +1080,7 @@ mod tests {
             &store,
             None,
             CheckMode::Scheduled,
+            None,
             vec![(
                 Source::ApkPure,
                 Ok(Listed {
@@ -1035,6 +1123,7 @@ mod tests {
                 &store,
                 Some(&current),
                 mode,
+                None,
                 vec![apkpure_answer()],
                 &StatusSink::terminal(),
                 install,
@@ -1081,6 +1170,152 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    fn tested(entries: &[(u32, &str)]) -> Option<Result<TestedVersions, ListError>> {
+        let roblox: Vec<_> = entries
+            .iter()
+            .map(|(code, eclipse)| serde_json::json!({"version_code": code, "eclipse": eclipse}))
+            .collect();
+        let list = serde_json::json!({"schema": 1, "roblox": roblox}).to_string();
+        Some(TestedVersions::parse(list.as_bytes()))
+    }
+
+    fn scheduled(
+        store: &Store,
+        installed: Option<&InstalledVersion>,
+        tests: Option<Result<TestedVersions, ListError>>,
+    ) -> (Vec<(Source, u32)>, bool, Vec<StatusUpdate>) {
+        let attempts = RefCell::new(Vec::new());
+        let (updates, shown) = std::sync::mpsc::channel();
+        let outcome = settle(
+            store,
+            installed,
+            CheckMode::Scheduled,
+            tests,
+            vec![apkpure_answer()],
+            &StatusSink::with_window(updates),
+            |offer, _, _| {
+                tried(&attempts, offer);
+                Err(unavailable(offer))
+            },
+        );
+        let up_to_date = matches!(
+            (&outcome, installed),
+            (Ok(UpdateOutcome::UpToDate { installed: kept }), Some(installed)) if kept == installed
+        );
+        (
+            attempts.into_inner(),
+            up_to_date,
+            shown.try_iter().collect(),
+        )
+    }
+
+    #[test]
+    fn a_newer_roblox_waits_until_it_is_tested_with_this_eclipse() {
+        let (dir, store) = temp_store("waits");
+        let current = installed(&store, 3212);
+        let offered = "Roblox 2.742.1059 (versionCode 3222) (APK, 224.0 MiB)";
+
+        let (attempts, up_to_date, shown) =
+            scheduled(&store, Some(&current), tested(&[(3212, crate::VERSION)]));
+        assert!(attempts.is_empty(), "{attempts:?}");
+        assert!(up_to_date, "a waiting release is no failed check");
+        let waits = format!(
+            "{offered} has not been tested with Eclipse yet, so Eclipse keeps the installed \
+             Roblox versionCode 3212 for now; run `eclipse update` to install it anyway"
+        );
+        assert!(shown.contains(&StatusUpdate::Step(waits)), "{shown:?}");
+
+        let (attempts, up_to_date, shown) =
+            scheduled(&store, Some(&current), tested(&[(3222, "999.0.0")]));
+        assert!(attempts.is_empty() && up_to_date, "{attempts:?}");
+        let needs = format!(
+            "{offered} is tested with Eclipse 999.0.0 and newer, and this is Eclipse {}, so \
+             Eclipse keeps the installed Roblox versionCode 3212; update Eclipse to get it",
+            crate::VERSION
+        );
+        assert!(shown.contains(&StatusUpdate::Warning(needs)), "{shown:?}");
+
+        let (attempts, up_to_date, _) =
+            scheduled(&store, Some(&current), tested(&[(3222, crate::VERSION)]));
+        assert_eq!(attempts, [(Source::ApkPure, 3222)]);
+        assert!(
+            !up_to_date,
+            "the tested release was tried and its download failed"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_newest_tested_release_is_installed_while_a_newer_one_waits() {
+        let (dir, store) = temp_store("newest-tested");
+        let current = installed(&store, 3084);
+        let (attempts, _, _) = scheduled(&store, Some(&current), tested(&[(3092, "0.1.0")]));
+        assert_eq!(attempts, [(Source::ApkPure, 3092)]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_first_install_prefers_a_tested_release_and_still_tries_the_newest() {
+        let (dir, store) = temp_store("first-tested");
+        let (attempts, _, _) = scheduled(&store, None, tested(&[(3092, "0.1.0")]));
+        assert_eq!(
+            attempts,
+            [(Source::ApkPure, 3092), (Source::ApkPure, 3222)],
+            "with nothing installed there is no Roblox to keep, so an untested one is tried too"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_list_that_cannot_be_read_holds_nothing_back() {
+        let (dir, store) = temp_store("unreadable-list");
+        let current = installed(&store, 3212);
+        let warned = |shown: &[StatusUpdate]| {
+            shown.iter().any(|update| {
+                matches!(
+                    update,
+                    StatusUpdate::Warning(text) if text.starts_with(
+                        "could not load the list of Roblox versions tested with Eclipse"
+                    )
+                )
+            })
+        };
+        let (attempts, _, shown) =
+            scheduled(&store, Some(&current), Some(Err(ListError::Schema(2))));
+        assert_eq!(attempts, [(Source::ApkPure, 3222)]);
+        assert!(warned(&shown), "{shown:?}");
+
+        let newest = installed(&store, 3222);
+        let (attempts, up_to_date, shown) =
+            scheduled(&store, Some(&newest), Some(Err(ListError::Schema(2))));
+        assert!(attempts.is_empty() && up_to_date, "{attempts:?}");
+        assert!(!warned(&shown), "nothing newer needed the list: {shown:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_a_scheduled_check_of_a_roblox_that_still_joins_games_waits_for_tests() {
+        let (dir, store) = temp_store("asks-tests");
+        let current = installed(&store, 3212).version_code;
+        let waits =
+            |installed, mode| waits_for_tests(&store, Abi::X86_64, installed, mode).unwrap();
+        assert!(waits(Some(current), CheckMode::Scheduled));
+        assert!(waits(None, CheckMode::Scheduled));
+        assert!(!waits(Some(current), CheckMode::Explicit));
+        assert!(
+            !waits_for_tests(&store, Abi::Arm64V8a, Some(current), CheckMode::Scheduled).unwrap(),
+            "only x86-64 builds of Roblox are tested and listed"
+        );
+        store.record_upgrade_required(current).unwrap();
+        assert!(
+            !waits(Some(current), CheckMode::Scheduled),
+            "Roblox refuses this version, so the newest one is installed untested"
+        );
+        assert!(waits(Some(VersionCode(3222)), CheckMode::Scheduled));
+        assert!(waits(None, CheckMode::Scheduled));
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn the_newest_verified_release_is_installed_when_an_older_source_also_offers_one() {
         let Some(paths) = ApkSetPaths::from_env().expect("ECLIPSE_ROBLOX_APK must be usable")
@@ -1097,6 +1332,7 @@ mod tests {
             &store,
             None,
             CheckMode::Scheduled,
+            None,
             vec![apkpure_answer(), play_answer(&credentials, version.0 + 100)],
             &StatusSink::terminal(),
             |offer, staging, _| {

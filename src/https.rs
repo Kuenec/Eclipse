@@ -63,12 +63,17 @@ pub(crate) fn request_agent() -> ureq::Agent {
 }
 
 pub(crate) fn api_agent() -> ureq::Agent {
+    api_agent_within(API_TIMEOUT)
+}
+
+pub(crate) fn api_agent_within(limit: Duration) -> ureq::Agent {
+    let total = limit.min(API_TIMEOUT);
     ureq::Agent::config_builder()
         .https_only(true)
         .http_status_as_error(false)
         .max_redirects(0)
-        .timeout_global(Some(API_TIMEOUT))
-        .timeout_connect(Some(API_CONNECT_TIMEOUT))
+        .timeout_global(Some(total))
+        .timeout_connect(Some(total.min(API_CONNECT_TIMEOUT)))
         .build()
         .into()
 }
