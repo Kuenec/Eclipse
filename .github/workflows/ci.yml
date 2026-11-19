@@ -127,6 +127,9 @@ jobs:
       - name: Test the audio harness
         run: python3 -m unittest discover --start-directory tools/audio-harness --pattern 'test_*.py'
 
+      - name: Test the tested Roblox list
+        run: python3 -m unittest discover --start-directory tools/roblox-tests --pattern 'test_*.py'
+
   msrv:
     name: MSRV / Rust 1.95 / ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}

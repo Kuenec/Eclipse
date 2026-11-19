@@ -1,0 +1,186 @@
+name: Roblox
+
+on:
+  schedule:
+    - cron: "37 */3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: roblox
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FLATPAK_ID: io.github.kuenec.Eclipse
+  FLATPAK_REF: https://kuenec.github.io/Eclipse/io.github.kuenec.Eclipse.flatpakref
+  FLATHUB_REPO: https://dl.flathub.org/repo/flathub.flatpakrepo
+  LIST_BRANCH: compatibility
+  LIST_FILE: roblox-x86_64.json
+  RUN_SECONDS: 150
+
+jobs:
+  start:
+    name: Start the newest Roblox with the released Eclipse
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      eclipse: ${{ steps.eclipse.outputs.version }}
+      roblox-code: ${{ steps.roblox.outputs.code }}
+      roblox-name: ${{ steps.roblox.outputs.name }}
+      standing: ${{ steps.roblox.outputs.standing }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Flatpak, a virtual display and the released Eclipse
+        id: eclipse
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes dbus flatpak xvfb
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/runtime"
+          mkdir --mode=700 "$XDG_RUNTIME_DIR"
+          bus="$(dbus-daemon --session --fork --print-address)"
+          {
+            echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+            echo "DBUS_SESSION_BUS_ADDRESS=$bus"
+          } >> "$GITHUB_ENV"
+          export DBUS_SESSION_BUS_ADDRESS="$bus"
+          flatpak remote-add --user --if-not-exists flathub "$FLATHUB_REPO"
+          flatpak install --user --noninteractive "$FLATPAK_REF"
+          version="$(flatpak run "$FLATPAK_ID" --version)"
+          version="${version#eclipse }"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the released Eclipse did not print its version: $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Roblox files an earlier run downloaded
+        id: files
+        uses: actions/cache/restore@v6
+        with:
+          path: roblox-files
+          key: roblox-files-${{ github.run_id }}
+          restore-keys: roblox-files-
+
+      - name: Install the newest Roblox Eclipse can download and look it up in the list
+        id: roblox
+        env:
+          ECLIPSE: ${{ steps.eclipse.outputs.version }}
+        run: |
+          if [ -f roblox-files/base.apk ]; then
+            flatpak run --filesystem="$PWD/roblox-files:ro" "$FLATPAK_ID" \
+              install "$PWD"/roblox-files/*.apk
+          fi
+          flatpak run "$FLATPAK_ID" update
+          flatpak run "$FLATPAK_ID" storage --json > "$RUNNER_TEMP/storage.json"
+          current='.entries[] | select(.kind == "roblox_version" and .role == "current")'
+          code="$(jq --raw-output "$current | .version_code" "$RUNNER_TEMP/storage.json")"
+          name="$(jq --raw-output "$current | .version_name" "$RUNNER_TEMP/storage.json")"
+          files="$(jq --raw-output "$current | .path" "$RUNNER_TEMP/storage.json")"
+          if ! [[ "$code" =~ ^[0-9]+$ && "$name" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "::error::Eclipse reports no installed Roblox version: $code $name"
+            exit 1
+          fi
+          rm -rf roblox-files
+          mkdir roblox-files
+          cp "$files"/*.apk roblox-files/
+          if git ls-remote --exit-code --heads origin "$LIST_BRANCH" > /dev/null; then
+            git fetch --quiet --depth=1 origin "$LIST_BRANCH"
+            git show "FETCH_HEAD:$LIST_FILE" > "$RUNNER_TEMP/$LIST_FILE"
+          fi
+          standing="$(python3 tools/roblox-tests/record.py status \
+            --list "$RUNNER_TEMP/$LIST_FILE" --roblox-code "$code" --eclipse "$ECLIPSE")"
+          echo "Roblox $name (versionCode $code) is $standing with Eclipse $ECLIPSE"
+          {
+            echo "code=$code"
+            echo "name=$name"
+            echo "standing=$standing"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Keep the Roblox files for the next run
+        if: steps.files.outputs.cache-matched-key != format('roblox-files-{0}', steps.roblox.outputs.code)
+        uses: actions/cache/save@v6
+        with:
+          path: roblox-files
+          key: roblox-files-${{ steps.roblox.outputs.code }}
+
+      - name: Start Roblox on a virtual display and require it to keep running
+        if: steps.roblox.outputs.standing == 'untested'
+        env:
+          ECLIPSE: ${{ steps.eclipse.outputs.version }}
+          ROBLOX_CODE: ${{ steps.roblox.outputs.code }}
+          ROBLOX_NAME: ${{ steps.roblox.outputs.name }}
+        run: |
+          status=0
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" \
+            timeout --kill-after=20 "$RUN_SECONDS" flatpak run "$FLATPAK_ID" run \
+            > "$RUNNER_TEMP/run.log" 2>&1 || status=$?
+          flatpak kill "$FLATPAK_ID" 2> /dev/null || true
+          flatpak run "$FLATPAK_ID" storage --json > "$RUNNER_TEMP/storage.json"
+          state="$(jq --raw-output --argjson code "$ROBLOX_CODE" \
+            '.entries[] | select(.kind == "roblox_version" and .version_code == $code) | .state' \
+            "$RUNNER_TEMP/storage.json")"
+          tail --lines=40 "$RUNNER_TEMP/run.log"
+          echo "Roblox ended with status $status, where 124 means it still ran after $RUN_SECONDS seconds, and its start is recorded as $state"
+          if [ "$status" != 124 ] || { [ "$state" != proven ] && [ "$state" != played ]; }; then
+            echo "::error::Roblox $ROBLOX_NAME did not start and keep running with Eclipse $ECLIPSE"
+            exit 1
+          fi
+
+      - name: Upload the logs of the start
+        if: always() && steps.roblox.outputs.standing == 'untested'
+        uses: actions/upload-artifact@v7
+        with:
+          name: roblox-start-logs
+          path: |
+            ${{ runner.temp }}/run.log
+            ~/.var/app/io.github.kuenec.Eclipse/data/eclipse/app-data/logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+  publish:
+    name: List the Roblox version as tested
+    needs: start
+    if: needs.start.outputs.standing == 'untested'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REMOTE: ${{ github.server_url }}/${{ github.repository }}.git
+      ECLIPSE: ${{ needs.start.outputs.eclipse }}
+      ROBLOX_CODE: ${{ needs.start.outputs.roblox-code }}
+      ROBLOX_NAME: ${{ needs.start.outputs.roblox-name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Add the version to the list on the compatibility branch
+        run: |
+          gh auth setup-git
+          list="$RUNNER_TEMP/list"
+          if git ls-remote --exit-code --heads "$REMOTE" "$LIST_BRANCH" > /dev/null; then
+            git clone --quiet --depth=1 --branch "$LIST_BRANCH" "$REMOTE" "$list"
+          else
+            git init --quiet --initial-branch="$LIST_BRANCH" "$list"
+          fi
+          python3 tools/roblox-tests/record.py add --list "$list/$LIST_FILE" \
+            --roblox-code "$ROBLOX_CODE" --roblox-name "$ROBLOX_NAME" --eclipse "$ECLIPSE"
+          cd "$list"
+          git add "$LIST_FILE"
+          if git diff --cached --quiet; then
+            echo "The list already names this version"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet --message="Roblox $ROBLOX_NAME starts with Eclipse $ECLIPSE"
+          git push --quiet "$REMOTE" "HEAD:refs/heads/$LIST_BRANCH"
