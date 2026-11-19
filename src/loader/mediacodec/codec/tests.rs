@@ -677,6 +677,52 @@ fn unknown_mimes_and_unavailable_backends_get_no_decoder() {
 }
 
 #[test]
+fn decoders_are_created_by_eclipses_names_and_androids_software_decoder_names() {
+    for (name, codec) in [
+        (c"h264", Codec::H264),
+        (c"c2.android.avc.decoder", Codec::H264),
+        (c"OMX.google.h264.decoder", Codec::H264),
+        (c"hevc", Codec::Hevc),
+        (c"c2.android.hevc.decoder", Codec::Hevc),
+        (c"OMX.google.hevc.decoder", Codec::Hevc),
+        (c"opus", Codec::Opus),
+    ] {
+        assert_eq!(
+            Codec::for_decoder_name(name.to_bytes()),
+            Some(codec),
+            "{name:?}"
+        );
+    }
+
+    let by_name = unsafe {
+        std::mem::transmute::<u64, CreateFn>(
+            EclipseNativeProvider::with_bionic_natives()
+                .resolve("AMediaCodec_createCodecByName")
+                .expect("AMediaCodec_createCodecByName is registered")
+                .addr,
+        )
+    };
+    assert!(unsafe { by_name(c"c2.android.vp9.decoder".as_ptr()) }.is_null());
+    assert!(unsafe { by_name(std::ptr::null()) }.is_null());
+
+    let codecs = Codecs::new();
+    assert!(matches!(
+        codecs.create_named(missing_backend, c"c2.android.avc.decoder"),
+        Err(Refusal::Unavailable(BackendUnavailable::NotFound { .. }))
+    ));
+    assert!(matches!(
+        codecs.create_named(avcodec::backend, c"c2.android.vp9.decoder"),
+        Err(Refusal::UnknownName)
+    ));
+    if avcodec::backend().decoders().contains(&Codec::H264) {
+        let named = codecs
+            .create_named(avcodec::backend, c"c2.android.avc.decoder")
+            .expect("FFmpeg's H.264 decoder answers to Android's software decoder name");
+        codecs.delete(handle_to_ptr(named)).expect("delete");
+    }
+}
+
+#[test]
 fn the_seventeenth_live_codec_is_refused() {
     let Some(&codec) = avcodec::backend().decoders().first() else {
         eprintln!("the_seventeenth_live_codec_is_refused: no FFmpeg decoders; skipping");

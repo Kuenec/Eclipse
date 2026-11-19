@@ -9,7 +9,7 @@ mod format;
 mod image_reader;
 pub mod self_test;
 
-pub const MEDIA_NDK_NATIVE_COUNT: usize = 55;
+pub const MEDIA_NDK_NATIVE_COUNT: usize = 56;
 
 type MediaStatus = c_int;
 
@@ -76,6 +76,10 @@ pub(crate) fn register_natives(mut register: impl FnMut(&'static str, u64)) {
     reg!(
         "AMediaCodec_configure",
         codec::eclipse_amediacodec_configure
+    );
+    reg!(
+        "AMediaCodec_createCodecByName",
+        codec::eclipse_amediacodec_createcodecbyname
     );
     reg!(
         "AMediaCodec_createDecoderByType",

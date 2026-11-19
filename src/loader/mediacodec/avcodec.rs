@@ -250,6 +250,24 @@ impl Codec {
             .find(|codec| mime.eq_ignore_ascii_case(codec.mime().as_bytes()))
     }
 
+    pub(crate) fn for_decoder_name(name: &[u8]) -> Option<Codec> {
+        Codec::ALL.into_iter().find(|codec| {
+            name == codec.decoder_name().to_bytes()
+                || codec
+                    .android_software_decoder_names()
+                    .iter()
+                    .any(|android| android.as_bytes() == name)
+        })
+    }
+
+    fn android_software_decoder_names(self) -> &'static [&'static str] {
+        match self {
+            Codec::H264 => &["c2.android.avc.decoder", "OMX.google.h264.decoder"],
+            Codec::Hevc => &["c2.android.hevc.decoder", "OMX.google.hevc.decoder"],
+            Codec::Aac | Codec::Mp3 | Codec::Opus => &[],
+        }
+    }
+
     pub(crate) fn mime(self) -> &'static str {
         match self {
             Codec::Aac => "audio/mp4a-latm",

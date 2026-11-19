@@ -3073,7 +3073,7 @@ mod tests {
                 + super::super::aaudio::AAUDIO_NATIVE_COUNT,
             "6 liblog + 18 bionic-libc + 25 bionic-stdio + 9 bionic-signal + 2 link-map \
              introspection + 4 netdb resolver-ABI + 2 EGL display and swap interception + 3 \
-             Vulkan WSI interception + 4 dlfcn + 28 ndk-android + 55 media-ndk + 8 OpenSL ES + \
+             Vulkan WSI interception + 4 dlfcn + 28 ndk-android + 56 media-ndk + 8 OpenSL ES + \
              26 AAudio + 53 pthread + 6 sysconf system-query + 1 locale natives registered"
         );
         for name in [
@@ -3179,6 +3179,7 @@ mod tests {
             "ANativeWindow_acquire",
             "ANativeWindow_release",
             "AMediaCodec_configure",
+            "AMediaCodec_createCodecByName",
             "AMediaCodec_createDecoderByType",
             "AMediaCodec_createEncoderByType",
             "AMediaCodec_delete",

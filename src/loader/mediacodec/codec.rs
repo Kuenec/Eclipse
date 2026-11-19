@@ -195,6 +195,8 @@ fn failure<T>(result: &Result<T, CodecError>) -> Option<DisplayValue<&CodecError
 pub(super) enum Refusal {
     NoMime,
     UnknownMime,
+    NoName,
+    UnknownName,
     Unavailable(&'static BackendUnavailable),
     NoDecoder { codec: Codec, soname: &'static str },
     TooManyCodecs,
@@ -206,6 +208,8 @@ impl fmt::Display for Refusal {
         match self {
             Self::NoMime => f.write_str("no MIME type was given"),
             Self::UnknownMime => f.write_str("Eclipse has no decoder for this MIME type"),
+            Self::NoName => f.write_str("no codec name was given"),
+            Self::UnknownName => f.write_str("Eclipse has no decoder with this name"),
             Self::Unavailable(reason) => reason.fmt(f),
             Self::NoDecoder { codec, soname } => {
                 write!(
@@ -1064,7 +1068,25 @@ impl Codecs {
         backend: impl FnOnce() -> &'static Backend,
         mime: &CStr,
     ) -> Result<NdkHandle, Refusal> {
-        let (codec, library) = decoder_for(backend, mime)?;
+        let codec = Codec::for_mime(mime.to_bytes()).ok_or(Refusal::UnknownMime)?;
+        self.create(backend, codec)
+    }
+
+    fn create_named(
+        &self,
+        backend: impl FnOnce() -> &'static Backend,
+        name: &CStr,
+    ) -> Result<NdkHandle, Refusal> {
+        let codec = Codec::for_decoder_name(name.to_bytes()).ok_or(Refusal::UnknownName)?;
+        self.create(backend, codec)
+    }
+
+    fn create(
+        &self,
+        backend: impl FnOnce() -> &'static Backend,
+        codec: Codec,
+    ) -> Result<NdkHandle, Refusal> {
+        let library = library_with(backend, codec)?;
         self.live
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
                 (live < MAX_LIVE_CODECS).then_some(live + 1)
@@ -1107,6 +1129,13 @@ pub(super) fn decoder_for(
     mime: &CStr,
 ) -> Result<(Codec, &'static Avcodec), Refusal> {
     let codec = Codec::for_mime(mime.to_bytes()).ok_or(Refusal::UnknownMime)?;
+    Ok((codec, library_with(backend, codec)?))
+}
+
+fn library_with(
+    backend: impl FnOnce() -> &'static Backend,
+    codec: Codec,
+) -> Result<&'static Avcodec, Refusal> {
     let backend = backend();
     let library = backend.library().map_err(Refusal::Unavailable)?;
     if !backend.decoders().contains(&codec) {
@@ -1115,7 +1144,7 @@ pub(super) fn decoder_for(
             soname: library.soname(),
         });
     }
-    Ok((codec, library))
+    Ok(library)
 }
 
 fn codecs() -> &'static Codecs {
@@ -1123,9 +1152,9 @@ fn codecs() -> &'static Codecs {
     &CODECS
 }
 
-fn report_refusal(mime: Option<&CStr>, refusal: &Refusal) {
+fn report_refusal(function: &str, asked: Option<&CStr>, refusal: &Refusal) {
     static REPORTED: Mutex<Vec<CString>> = Mutex::new(Vec::new());
-    let key = mime.unwrap_or_default();
+    let key = asked.unwrap_or_default();
     let mut reported = REPORTED.lock().unwrap_or_else(PoisonError::into_inner);
     if reported.len() >= MAX_REPORTED_MIMES || reported.iter().any(|seen| seen.as_c_str() == key) {
         return;
@@ -1134,8 +1163,8 @@ fn report_refusal(mime: Option<&CStr>, refusal: &Refusal) {
     drop(reported);
     tracing::info!(
         target: "mediandk",
-        mime = %key.to_string_lossy(),
-        "AMediaCodec_createDecoderByType returns NULL: {refusal}"
+        asked = %key.to_string_lossy(),
+        "{function} returns NULL: {refusal}"
     );
 }
 
@@ -1150,7 +1179,7 @@ pub(super) unsafe extern "C" fn eclipse_amediacodec_createdecoderbytype(
     let codec = match &created {
         Ok(handle) => handle_to_ptr(*handle),
         Err(refusal) => {
-            report_refusal(mime, refusal);
+            report_refusal("AMediaCodec_createDecoderByType", mime, refusal);
             std::ptr::null_mut()
         }
     };
@@ -1160,6 +1189,31 @@ pub(super) unsafe extern "C" fn eclipse_amediacodec_createdecoderbytype(
         ?codec,
         refusal = ?created.err(),
         "AMediaCodec_createDecoderByType"
+    );
+    codec
+}
+
+pub(super) unsafe extern "C" fn eclipse_amediacodec_createcodecbyname(
+    name: *const c_char,
+) -> *mut c_void {
+    let name = unsafe { c_text(name) };
+    let created = match name {
+        Some(name) => codecs().create_named(avcodec::backend, name),
+        None => Err(Refusal::NoName),
+    };
+    let codec = match &created {
+        Ok(handle) => handle_to_ptr(*handle),
+        Err(refusal) => {
+            report_refusal("AMediaCodec_createCodecByName", name, refusal);
+            std::ptr::null_mut()
+        }
+    };
+    tracing::debug!(
+        target: "mediandk",
+        ?name,
+        ?codec,
+        refusal = ?created.err(),
+        "AMediaCodec_createCodecByName"
     );
     codec
 }
