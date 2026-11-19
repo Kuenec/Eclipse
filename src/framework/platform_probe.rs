@@ -111,6 +111,23 @@ impl fmt::Display for CachedAudioParameters {
     }
 }
 
+enum WebRtcVoice {
+    Read(WebRtcVoiceReadback),
+    HelpersRenamed,
+}
+
+impl fmt::Display for WebRtcVoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(readback) => readback.fmt(f),
+            Self::HelpersRenamed => f.write_str(
+                "WebRtcAudioManager was not driven: this Roblox build has no org.webrtc.ContextUtils \
+                 or WebRtcAudioUtils under those names",
+            ),
+        }
+    }
+}
+
 struct WebRtcVoiceReadback {
     parameters: Option<CachedAudioParameters>,
     initialized: bool,
@@ -240,7 +257,7 @@ pub struct PlatformProbeReport {
     host_clipboard: Option<String>,
     second_finger: TouchEventReadback,
     point_move: PointEventReadback,
-    webrtc_voice: WebRtcVoiceReadback,
+    webrtc_voice: WebRtcVoice,
 }
 
 impl fmt::Display for PlatformProbeReport {
@@ -373,7 +390,13 @@ fn probe(
     })
 }
 
-fn webrtc_voice(env: &mut Env) -> Result<WebRtcVoiceReadback, FrameworkError> {
+fn webrtc_voice(env: &mut Env) -> Result<WebRtcVoice, FrameworkError> {
+    for helper in [CONTEXT_UTILS_CLASS, WEBRTC_AUDIO_UTILS_CLASS] {
+        if env.find_class(helper).is_err() {
+            env.exception_clear();
+            return Ok(WebRtcVoice::HelpersRenamed);
+        }
+    }
     let context = checked(env, "ATLLoadedApp primary Context", |env| {
         let loaded_app = env
             .call_static_method(
@@ -479,7 +502,7 @@ fn webrtc_voice(env: &mut Env) -> Result<WebRtcVoiceReadback, FrameworkError> {
             .z()
         },
     )?;
-    Ok(WebRtcVoiceReadback {
+    Ok(WebRtcVoice::Read(WebRtcVoiceReadback {
         parameters,
         initialized,
         open_sl_es_blacklisted,
@@ -487,7 +510,7 @@ fn webrtc_voice(env: &mut Env) -> Result<WebRtcVoiceReadback, FrameworkError> {
         communication_mode_after_voice_chat,
         has_microphone,
         record_audio_permission,
-    })
+    }))
 }
 
 fn restore_normal_audio_mode(env: &mut Env, context: &JObject) -> Result<(), FrameworkError> {
