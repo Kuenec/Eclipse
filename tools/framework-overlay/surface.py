@@ -71,7 +71,9 @@ def parameter_words(parameters):
     return sum(2 if parameter in ("J", "D") else 1 for parameter in PARAMETER.findall(parameters))
 
 
-def default_return(returns):
+def default_return(member, returns):
+    if not member.static and returns == member.owner:
+        return ["    return-object p0"]
     if returns == "V":
         return ["    return-void"]
     if returns in ("J", "D"):
@@ -100,7 +102,7 @@ def method_stub(member, chained_constructor):
             "",
             f"    invoke-static {{v0}}, {REPORT}",
             "",
-            *default_return(method["returns"]),
+            *default_return(member, method["returns"]),
             ".end method",
             "",
         ]
@@ -201,7 +203,8 @@ def parse_arguments(argv):
     parser = argparse.ArgumentParser(
         description="Give framework classes the methods and fields a Roblox client "
         "references and they lack. Each added method reports its first call and "
-        "returns zero, false or null."
+        "returns zero, false or null, or the object itself when it returns its own "
+        "class, as a builder's setters do."
     )
     parser.add_argument("--surface", type=Path, required=True, metavar="FILE")
     parser.add_argument(

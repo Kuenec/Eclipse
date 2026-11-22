@@ -65,6 +65,27 @@ class SurfaceTest(unittest.TestCase):
         self.assertIn(".method public cancel()V\n    .registers 3\n", text)
         self.assertIn("    return-void\n", text)
 
+    def test_a_method_that_returns_its_own_class_returns_the_object_like_a_builder(self):
+        builder = "Landroid/app/job/JobInfo$Builder;"
+        file = self.write(self.view, builder)
+        outcomes, _ = self.add(
+            f"method instance {builder}->setImportantWhileForeground(Z){builder}",
+            f"method static {builder}->obtain(){builder}",
+        )
+        self.assertEqual(outcomes["added"], 2)
+        text = file.read_text("utf-8")
+        self.assertIn(
+            f".method public setImportantWhileForeground(Z){builder}\n"
+            "    .registers 4\n\n"
+            f'    const-string v0, "{builder}->setImportantWhileForeground(Z){builder}"\n\n'
+            "    invoke-static {v0}, "
+            "Landroid/util/EclipseMissingApi;->used(Ljava/lang/String;)V\n\n"
+            "    return-object p0\n"
+            ".end method\n",
+            text,
+        )
+        self.assertIn("    const/4 v0, 0x0\n\n    return-object v0\n.end method\n", text)
+
     def test_a_stock_class_changes_only_as_a_copy_in_the_view(self):
         stock = self.write(self.stock, VIEW)
         outcomes, _ = self.add(
