@@ -478,6 +478,7 @@ fn framework_overlay_adds_the_members_roblox_references() {
         "assemble --api 26 \"$work/smali-check\" -o \"$work/jar/classes.dex\"",
         "'android/util/EclipseMissingApi*.class'",
         ".method public getCodeCacheDir()Ljava/io/File;",
+        ".method public getOpPackageName()Ljava/lang/String;",
     ] {
         assert!(
             generator.contains(needle),

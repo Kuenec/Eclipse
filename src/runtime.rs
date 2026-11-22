@@ -19,7 +19,7 @@ use crate::loader::map::host_page_size;
 
 const DEFAULT_SDK_INT: u32 = 33;
 
-const JAVA_SDK_INT_CEILING: u32 = 28;
+const JAVA_SDK_INT_CEILING: u32 = 29;
 
 pub(crate) const HEAP_MIB: u32 = 768;
 
@@ -1707,13 +1707,13 @@ mod tests {
         );
         let vm = plan.vm_options();
         assert!(
-            vm.contains(&"-DBuild.VERSION.SDK_INT=28".to_owned()),
-            "manifest targetSdk=35 must be clamped to 28: {vm:?}"
+            vm.contains(&"-DBuild.VERSION.SDK_INT=29".to_owned()),
+            "manifest targetSdk=35 must be clamped to 29: {vm:?}"
         );
         assert!(
             !vm.iter()
                 .any(|o| o.contains("SDK_INT=23") || o.contains("SDK_INT=35")),
-            "must neither fall back to 23 nor exceed the androidx API-29 switch: {vm:?}"
+            "must neither fall back to 23 nor report an Android newer than 10: {vm:?}"
         );
 
         let low = BootPlan::new(
@@ -1724,9 +1724,9 @@ mod tests {
         assert!(
             low.vm_options()
                 .contains(&"-DBuild.VERSION.SDK_INT=21".to_owned()),
-            "a sub-28 target is propagated verbatim"
+            "a target below Android 10 is propagated verbatim"
         );
-        assert_eq!(plan.java_sdk_int(), 28);
+        assert_eq!(plan.java_sdk_int(), 29);
         assert_eq!(low.java_sdk_int(), 21);
     }
 

@@ -1431,6 +1431,8 @@ replace_upstream_method "$ctxsm" "$UPSTREAM_CACHE_DIR" "$CLIENT_CACHE_DIR" 'getC
 ! grep -qF '/tmp/atl_cache' "$ctxsm" || fail "Context.smali still names /tmp/atl_cache; Roblox's cache would stay in /tmp"
 ! grep -qF '.method public getCodeCacheDir()Ljava/io/File;' "$ctxsm" \
     || fail "Context.smali already declares getCodeCacheDir() — installed Context drifted; update patch-framework.sh"
+! grep -qF '.method public getOpPackageName()Ljava/lang/String;' "$ctxsm" \
+    || fail "Context.smali already declares getOpPackageName() — installed Context drifted; update patch-framework.sh"
 cat >> "$ctxsm" <<'ECLIPSE_CONTEXT_METHODS'
 
 .method public getCodeCacheDir()Ljava/io/File;
@@ -1447,6 +1449,16 @@ cat >> "$ctxsm" <<'ECLIPSE_CONTEXT_METHODS'
     invoke-direct {v0, v1, v2}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
 
     invoke-virtual {v0}, Ljava/io/File;->mkdirs()Z
+
+    return-object v0
+.end method
+
+.method public getOpPackageName()Ljava/lang/String;
+    .registers 2
+
+    invoke-virtual {p0}, Landroid/content/Context;->getPackageName()Ljava/lang/String;
+
+    move-result-object v0
 
     return-object v0
 .end method

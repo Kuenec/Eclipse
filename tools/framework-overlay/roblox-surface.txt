@@ -185,7 +185,6 @@ method instance Landroid/content/Context;->deleteFile(Ljava/lang/String;)Z
 method instance Landroid/content/Context;->getCodeCacheDir()Ljava/io/File;
 method instance Landroid/content/Context;->getDeviceId()I
 method instance Landroid/content/Context;->getMainExecutor()Ljava/util/concurrent/Executor;
-method instance Landroid/content/Context;->getOpPackageName()Ljava/lang/String;
 method instance Landroid/content/Context;->registerReceiver(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;I)Landroid/content/Intent;
 method instance Landroid/content/Context;->registerReceiver(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;Ljava/lang/String;Landroid/os/Handler;I)Landroid/content/Intent;
 method instance Landroid/content/Context;->sendBroadcast(Landroid/content/Intent;Ljava/lang/String;Landroid/os/Bundle;)V
