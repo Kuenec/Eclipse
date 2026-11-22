@@ -13500,12 +13500,17 @@ fn main_window_is_mouse_locked_center_method(
     Ok(*MAIN_WINDOW_IS_MOUSE_LOCKED_CENTER.get_or_init(|| method))
 }
 
+fn engine_mouse_units<const N: usize>(window_pixels: [f32; N], density: f32) -> [f32; N] {
+    window_pixels.map(|pixels| pixels / density)
+}
+
 pub fn dispatch_scroll(vm: &Vm, x: f32, y: f32, delta: f32) {
     let raw = vm.as_raw();
     if raw.is_null() {
         return;
     }
 
+    let [x, y] = engine_mouse_units([x, y], display_metrics::current().density());
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -13547,6 +13552,7 @@ pub fn dispatch_mouse_button(
         return Err(FrameworkError::NullVm);
     }
 
+    let [x, y] = engine_mouse_units([x, y], display_metrics::current().density());
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -13588,6 +13594,7 @@ pub fn dispatch_mouse_move(
         return Err(FrameworkError::NullVm);
     }
 
+    let [x, y, dx, dy] = engine_mouse_units([x, y, dx, dy], display_metrics::current().density());
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -14872,6 +14879,16 @@ mod tests {
                 HostShutdownStep::DestroyActivities,
             ]
         );
+    }
+
+    #[test]
+    fn the_engine_gets_mouse_positions_divided_by_the_display_density() {
+        assert_eq!(
+            engine_mouse_units([450.0, 450.0, 30.0, -15.0], 1.5),
+            [300.0, 300.0, 20.0, -10.0],
+            "Roblox's Java divides MotionEvent pixels by DisplayMetrics.density"
+        );
+        assert_eq!(engine_mouse_units([450.0, 450.0], 1.0), [450.0, 450.0]);
     }
 
     #[test]
