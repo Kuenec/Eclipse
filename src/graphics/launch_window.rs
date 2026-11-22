@@ -30,7 +30,6 @@ use crate::status::{Progress, StatusUpdate};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ACTIVATION_WAIT: Duration = Duration::from_millis(500);
-// Fits the step, progress bar and progress line; failures also get the separate failure report.
 const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(480.0, 140.0);
 const PADDING: i32 = 24;
 const SECTION_GAP: i32 = 16;
@@ -298,15 +297,12 @@ impl LaunchWindow {
     }
 }
 
-/// The launch window, left on screen while the game window stays hidden until Roblox draws.
 pub struct Splash {
-    // Field order is drop order: the renderer goes before the window it draws on.
     _renderer: Option<WindowRenderer>,
     window: Option<Window>,
     since: Instant,
 }
 
-/// Longest the game window stays hidden, in case Roblox shows only Android views.
 const SPLASH_LIMIT: Duration = Duration::from_secs(30);
 
 impl Splash {

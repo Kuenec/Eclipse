@@ -593,8 +593,6 @@ impl ApplicationHandler<crate::framework::HostWake> for GameWindow<'_> {
                     self.window_frame_shown();
                 }
                 self.drive_custom_view_draw();
-                // Wayland maps a window at its first drawn frame, so not drawing keeps the game
-                // window hidden behind the splash until Roblox draws.
                 let first_frame = crate::first_frame::shown();
                 if let Some(splash) = &self.splash {
                     if splash.hides_game_window(first_frame, std::time::Instant::now()) {

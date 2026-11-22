@@ -448,7 +448,6 @@ cat >> "$connectivity_sm" <<'ECLIPSE_CONNECTIVITY_MANAGER_METHODS'
 .method public getRestrictBackgroundStatus()I
     .registers 2
 
-    # RESTRICT_BACKGROUND_STATUS_DISABLED: no Data Saver on the host.
     const/4 v0, 0x1
 
     return v0

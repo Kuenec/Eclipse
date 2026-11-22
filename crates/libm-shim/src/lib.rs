@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(clippy::missing_safety_doc)]
 
 use core::ffi::{c_char, c_int, c_long, c_longlong};
 
