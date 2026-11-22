@@ -1897,6 +1897,20 @@ fn installed_apk_set(
     Ok(InstalledClient { apks: set, proving })
 }
 
+fn desktop_night_mode() -> eclipse::framework::display_metrics::NightMode {
+    match eclipse::portal::desktop_color_scheme() {
+        Ok(scheme) => scheme.into(),
+        Err(error) => {
+            tracing::info!(
+                %error,
+                "the desktop did not say whether it prefers a dark appearance, so Roblox is told \
+                 it is light"
+            );
+            eclipse::framework::display_metrics::NightMode::No
+        }
+    }
+}
+
 fn remove_other_version_oats(
     cache: &std::path::Path,
     store_root: &std::path::Path,
@@ -2782,7 +2796,9 @@ fn boot_and_play(
     println!("ART VM booted with Roblox's Java on the classpath ✓");
     eclipse::framework::display_metrics::apply(
         &vm,
-        window_state.display_model(host.launch_window()),
+        window_state
+            .display_model(host.launch_window())
+            .with_night_mode(desktop_night_mode()),
     )?;
     host.refresh()?;
 

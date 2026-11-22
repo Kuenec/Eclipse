@@ -18,10 +18,13 @@ const MAX_DPI: i32 = 640;
 const SCREENLAYOUT_LONG_NO: i32 = 0x10;
 const SCREENLAYOUT_LONG_YES: i32 = 0x20;
 
+const UI_MODE_TYPE_NORMAL: i32 = 0x01;
+
 const WINDOWLESS: DisplayModel = DisplayModel {
     width_px: 1280,
     height_px: 720,
     density_dpi: BASELINE_DPI,
+    night: NightMode::No,
 };
 
 const DISPLAY_METRICS_CLASS: &JNIStr = jni_str!("android/util/DisplayMetrics");
@@ -93,10 +96,44 @@ impl SizeClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NightMode {
+    No,
+    Yes,
+}
+
+impl NightMode {
+    const fn configuration_value(self) -> i32 {
+        match self {
+            Self::No => 0x10,
+            Self::Yes => 0x20,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::No => "notnight",
+            Self::Yes => "night",
+        }
+    }
+}
+
+impl From<crate::portal::ColorScheme> for NightMode {
+    fn from(scheme: crate::portal::ColorScheme) -> Self {
+        match scheme {
+            crate::portal::ColorScheme::Dark => Self::Yes,
+            crate::portal::ColorScheme::Light | crate::portal::ColorScheme::NoPreference => {
+                Self::No
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayModel {
     width_px: i32,
     height_px: i32,
     density_dpi: i32,
+    night: NightMode,
 }
 
 impl DisplayModel {
@@ -106,7 +143,18 @@ impl DisplayModel {
             width_px: pixels(width_px),
             height_px: pixels(height_px),
             density_dpi: density_for(monitor_scale),
+            night: NightMode::No,
         }
+    }
+
+    #[must_use]
+    pub fn with_night_mode(self, night: NightMode) -> Self {
+        Self { night, ..self }
+    }
+
+    #[must_use]
+    pub const fn ui_mode(self) -> i32 {
+        UI_MODE_TYPE_NORMAL | self.night.configuration_value()
     }
 
     #[must_use]
@@ -191,7 +239,7 @@ impl fmt::Display for DisplayModel {
         let length = if self.is_long() { " long" } else { "" };
         write!(
             f,
-            "{}x{} px, densityDpi {}, xdpi {}, {}x{} dp, {}, {}{length}",
+            "{}x{} px, densityDpi {}, xdpi {}, {}x{} dp, {}, {}{length}, {}",
             self.width_px,
             self.height_px,
             self.density_dpi,
@@ -200,6 +248,7 @@ impl fmt::Display for DisplayModel {
             self.height_dp(),
             self.orientation().name(),
             self.size_class().name(),
+            self.night.name(),
         )
     }
 }
@@ -269,6 +318,7 @@ pub(super) fn write_configuration(env: &mut Env, config: &JObject) -> jni::error
             model.orientation().configuration_value(),
         ),
         (jni_str!("screenLayout"), model.screen_layout()),
+        (jni_str!("uiMode"), model.ui_mode()),
     ];
     for (field, value) in fields {
         env.set_field(config, field, int_field_sig(), JValue::Int(value))?;
@@ -382,12 +432,26 @@ mod tests {
     fn the_log_line_names_every_reported_value() {
         assert_eq!(
             DisplayModel::new(2560, 1440, 2.0).to_string(),
-            "2560x1440 px, densityDpi 320, xdpi 320, 1280x720 dp, landscape, xlarge long"
+            "2560x1440 px, densityDpi 320, xdpi 320, 1280x720 dp, landscape, xlarge long, notnight"
         );
         assert_eq!(
-            DisplayModel::new(800, 600, 1.0).to_string(),
-            "800x600 px, densityDpi 160, xdpi 160, 800x600 dp, landscape, large"
+            DisplayModel::new(800, 600, 1.0)
+                .with_night_mode(NightMode::Yes)
+                .to_string(),
+            "800x600 px, densityDpi 160, xdpi 160, 800x600 dp, landscape, large, night"
         );
+    }
+
+    #[test]
+    fn the_desktop_colour_scheme_sets_androids_night_mode() {
+        use crate::portal::ColorScheme;
+
+        let model = DisplayModel::new(1280, 720, 1.0);
+        assert_eq!(model.ui_mode(), 0x11, "a normal screen, not night");
+        let ui_mode = |scheme: ColorScheme| model.with_night_mode(scheme.into()).ui_mode();
+        assert_eq!(ui_mode(ColorScheme::Dark), 0x21);
+        assert_eq!(ui_mode(ColorScheme::Light), 0x11);
+        assert_eq!(ui_mode(ColorScheme::NoPreference), 0x11);
     }
 
     #[test]
@@ -408,13 +472,14 @@ mod tests {
                 "smallestScreenWidthDp",
                 "orientation",
                 "screenLayout",
+                "uiMode",
             ]
             .map(|field| fake_jvm::int_field(&config, field))
         });
         assert_eq!(
             written,
-            [160, 1280, 720, 720, 2, 0x24].map(Some),
-            "densityDpi, dp size, smallest width, landscape and xlarge long"
+            [160, 1280, 720, 720, 2, 0x24, 0x11].map(Some),
+            "densityDpi, dp size, smallest width, landscape, xlarge long and not night"
         );
     }
 }

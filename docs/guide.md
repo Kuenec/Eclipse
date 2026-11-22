@@ -49,6 +49,10 @@ On Wayland, Eclipse marks its game window as a game, which compositors such as H
 
 Roblox's interface follows the scale your desktop gives Eclipse's launch window. After you move Eclipse to a monitor with another scale, the interface changes size at its next launch.
 
+## Light and dark
+
+Eclipse tells Roblox whether your desktop prefers a dark appearance each time it starts.
+
 ## Settings
 
 | Key | Default | Effect |

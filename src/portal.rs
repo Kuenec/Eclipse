@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use dbus::arg::{prop_cast, AppendAll, Dict, PropMap, ReadAll, Variant};
+use dbus::arg::{prop_cast, AppendAll, Dict, PropMap, ReadAll, RefArg, Variant};
 use dbus::blocking::Connection;
 use dbus::message::MatchRule;
 
@@ -27,6 +27,10 @@ const INHIBIT: &str = "org.freedesktop.portal.Inhibit";
 const NOTIFICATION: &str = "org.freedesktop.portal.Notification";
 const REQUEST: &str = "org.freedesktop.portal.Request";
 const REQUEST_OBJECTS: &str = "/org/freedesktop/portal/desktop/request";
+const SETTINGS: &str = "org.freedesktop.portal.Settings";
+const APPEARANCE: &str = "org.freedesktop.appearance";
+const COLOR_SCHEME: &str = "color-scheme";
+const SETTING_TIMEOUT: Duration = Duration::from_secs(1);
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 const DYNAMIC_LAUNCHER: &str = "org.freedesktop.portal.DynamicLauncher";
 const BUS: &str = "org.freedesktop.DBus";
@@ -238,6 +242,7 @@ pub enum PortalError {
         cause: dbus::Error,
     },
     Receive(dbus::Error),
+    ColorSchemeNotANumber,
     OwnPidfd(std::io::Error),
     GameModeRejected(i32),
     LauncherUnavailable,
@@ -284,6 +289,10 @@ impl fmt::Display for PortalError {
             Self::Receive(cause) => {
                 write!(f, "cannot read from the session bus: {}", DbusCause(cause))
             }
+            Self::ColorSchemeNotANumber => write!(
+                f,
+                "{SETTINGS} answered {APPEARANCE} {COLOR_SCHEME} with a value that is not a number"
+            ),
             Self::OwnPidfd(error) => write!(
                 f,
                 "cannot open a pidfd for Eclipse's own process to send to {GAME_MODE}: {error}"
@@ -329,6 +338,7 @@ impl std::error::Error for PortalError {
             | Self::NoSessionBus
             | Self::NonUtf8BusAddress
             | Self::Autolaunch(_)
+            | Self::ColorSchemeNotANumber
             | Self::GameModeRejected(_)
             | Self::LauncherUnavailable
             | Self::LauncherRequestPath(_)
@@ -510,6 +520,27 @@ fn acknowledge(done: SyncSender<()>) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorScheme {
+    NoPreference,
+    Dark,
+    Light,
+}
+
+impl ColorScheme {
+    fn from_setting(value: u64) -> Self {
+        match value {
+            1 => Self::Dark,
+            2 => Self::Light,
+            _ => Self::NoPreference,
+        }
+    }
+}
+
+pub fn desktop_color_scheme() -> Result<ColorScheme, PortalError> {
+    PortalSession::open(&environment_bus_address()?)?.color_scheme()
+}
+
 pub struct PortalSession {
     connection: Connection,
     inhibit: Option<dbus::Path<'static>>,
@@ -597,6 +628,23 @@ impl PortalSession {
             }
             rejected => Err(PortalError::GameModeRejected(rejected)),
         }
+    }
+
+    pub fn color_scheme(&self) -> Result<ColorScheme, PortalError> {
+        let (setting,): (Variant<Box<dyn RefArg>>,) = self
+            .connection
+            .with_proxy(PORTAL_BUS_NAME, PORTAL_OBJECT, SETTING_TIMEOUT)
+            .method_call(SETTINGS, "Read", (APPEARANCE, COLOR_SCHEME))
+            .map_err(|cause| PortalError::Call {
+                interface: SETTINGS,
+                method: "Read",
+                cause,
+            })?;
+        setting
+            .0
+            .as_u64()
+            .map(ColorScheme::from_setting)
+            .ok_or(PortalError::ColorSchemeNotANumber)
     }
 
     fn hold_idle_inhibit(&mut self) -> Result<(), PortalError> {
@@ -805,6 +853,14 @@ fn request_path(unique_name: &str, handle_token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_appearance_setting_names_the_colour_scheme() {
+        assert_eq!(ColorScheme::from_setting(1), ColorScheme::Dark);
+        assert_eq!(ColorScheme::from_setting(2), ColorScheme::Light);
+        assert_eq!(ColorScheme::from_setting(0), ColorScheme::NoPreference);
+        assert_eq!(ColorScheme::from_setting(7), ColorScheme::NoPreference);
+    }
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
