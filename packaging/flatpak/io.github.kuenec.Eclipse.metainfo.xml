@@ -24,7 +24,7 @@
   <screenshots>
     <screenshot type="default">
       <caption>The launch window downloading the official Roblox client</caption>
-      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.25/packaging/flatpak/screenshots/first-launch.png</image>
+      <image>https://raw.githubusercontent.com/Kuenec/Eclipse/v0.1.26/packaging/flatpak/screenshots/first-launch.png</image>
     </screenshot>
   </screenshots>
   <url type="homepage">https://github.com/Kuenec/Eclipse</url>
@@ -57,6 +57,21 @@
     <color type="primary" scheme_preference="dark">#9e391b</color>
   </branding>
   <releases>
+    <release version="0.1.26" date="2026-11-23">
+      <description>
+        <ul>
+          <li>
+            On displays scaled above 100%, clicks land where the pointer is. Roblox drew its
+            cursor further from the top left corner than the real pointer.
+          </li>
+          <li>
+            Roblox's theme options appear under Settings, Device Preferences. Eclipse now presents
+            itself to Roblox as Android 10, which Roblox requires for them, and tells it whether
+            your desktop prefers a dark appearance.
+          </li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.25" date="2026-11-20">
       <description>
         <ul>
